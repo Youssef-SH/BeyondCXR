@@ -816,7 +816,7 @@ def test_bundle_reference_allows_new_operational_metadata_for_same_identity(
     _, result = _tables(tmp_path)
     written = write_bundle(result, tmp_path / "manifests")
     configured = replace(
-        load_experiment_config("configs/image_densenet.yaml").dataset,
+        load_experiment_config("configs/image_densenet_seed42.yaml").dataset,
         manifest_directory=tmp_path / "manifests",
         bundle_id=written.paths.bundle_id,
     )
@@ -865,7 +865,7 @@ def test_image_test_manifest_mismatch_fails_before_partition_access(
     _, result = _tables(tmp_path)
     written = write_bundle(result, tmp_path / "manifests")
     configured = replace(
-        load_experiment_config("configs/image_densenet.yaml").dataset,
+        load_experiment_config("configs/image_densenet_seed42.yaml").dataset,
         manifest_directory=tmp_path / "manifests",
         bundle_id=written.paths.bundle_id,
         dataset_root=tmp_path / "raw",

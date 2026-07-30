@@ -55,7 +55,7 @@ def test_cxr_classifier_exposes_raw_logits_embeddings_and_freezing() -> None:
 
 
 def test_image_registry_builds_with_injected_encoder_without_weights() -> None:
-    config = load_experiment_config("configs/image_densenet.yaml")
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
     model = ImageDenseNetModel(encoder_factory=_TinyEncoder).build(config.model)
 
     assert get_model("image_densenet") is MODELS["image_densenet"]
@@ -115,7 +115,7 @@ def test_cxr_classifier_requires_module_encoder() -> None:
 
 
 def test_image_builder_rejects_non_module_factory_output() -> None:
-    config = load_experiment_config("configs/image_densenet.yaml")
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
 
     with pytest.raises(TypeError, match="factory must return"):
         ImageDenseNetModel(encoder_factory=lambda **_: object()).build(config.model)
@@ -210,7 +210,7 @@ def test_evaluation_architecture_is_built_without_pretrained_cache_access() -> N
         observed_weights.append(kwargs["weights"])
         return _TinyEncoder(**kwargs)
 
-    config = load_experiment_config("configs/image_densenet.yaml")
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
     model = ImageDenseNetModel(encoder_factory=factory).build_architecture(config.model)
 
     assert isinstance(model, CxrBinaryClassifier)
