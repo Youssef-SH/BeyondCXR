@@ -9,6 +9,7 @@ import mlflow
 import pandas as pd
 
 from radfusion.training.compare import COMPARISON_COLUMNS, regenerate_comparison
+from radfusion.training.completed_runs import require_completed_run
 from radfusion.utils.mlflow_utils import configure_mlflow
 
 
@@ -95,6 +96,22 @@ def test_image_comparison_uses_canonical_test_evaluation_run_kind(tmp_path: Path
 
     assert count == 1
     assert table["run_id"].tolist() == [test_id]
+
+
+def test_completed_run_record_normalizes_existing_metadata_compatibility(tmp_path: Path) -> None:
+    tracking_uri = _tracking_uri(tmp_path)
+    client = configure_mlflow(experiment_name="comparison-test", tracking_uri=tracking_uri)
+    run_id = _run(scope="validation")
+
+    record = require_completed_run(client.get_run(run_id))
+
+    assert record.run_id == run_id
+    assert record.run_kind == "training"
+    assert record.evaluation_scope == "validation"
+    assert record.modality == "metadata"
+    assert record.integer_seed() == 42
+    assert record.metrics["average_precision"] == 0.4
+    assert record.metrics["model_size_mib"] == 2.0
 
 
 def test_comparison_is_regenerated_from_complete_mlflow_runs(tmp_path: Path) -> None:
