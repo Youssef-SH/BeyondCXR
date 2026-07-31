@@ -64,8 +64,9 @@ identity and acceptance rules are defined in [`data_contract.md`](data_contract.
 make rsna-audit
 make train CONFIG=configs/metadata_logistic.yaml
 make train CONFIG=configs/metadata_lightgbm.yaml
-make train CONFIG=configs/image_densenet.yaml
+make train CONFIG=configs/image_densenet_seed42.yaml
 make evaluate RUN_ID=<training-run-id>
+make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
 make compare
 ```
 
@@ -108,8 +109,10 @@ and package lineage, including the selected checkpoint and observed bundle-manif
 Runtime provenance, operational paths, and training-run ID remain outside this identity; the
 archived YAML is validated separately by its exact byte hash.
 
-Each invocation runs one explicit seed. Current commands do not aggregate seeds; planned reporting
-may summarize independent runs. No favorable seed is selected as canonical.
+Each training invocation runs one explicit seed. The RSNA image seed summarizer accepts only
+explicit linked test runs for seeds 17, 42, and 2026, verifies their stored compatibility, and
+reports individual metrics with arithmetic means and sample standard deviations. Thresholds remain
+seed-specific, and no favorable seed is selected as canonical.
 
 ## Probability and operating-point metrics
 

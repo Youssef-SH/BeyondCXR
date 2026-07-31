@@ -20,6 +20,7 @@ baselines.
 - Partition-scoped authentication of external DICOM bytes before image access
 - Observed bundle-manifest SHA-256 lineage for image training and linked evaluation
 - Separate validation and explicit test-evaluation runs with MLflow lineage
+- Explicit RSNA image three-seed summaries with individual, mean, and sample-SD results
 - Immutable run-qualified metadata and neural model packages
 - Ruff, pytest, pre-commit, and continuous-integration checks
 
@@ -46,8 +47,9 @@ make rsna-manifest   # publish an RSNA bundle
 make rsna-audit      # generate reports under reports/rsna/audit/<bundle-id>
 make train CONFIG=configs/metadata_logistic.yaml
 make train CONFIG=configs/metadata_lightgbm.yaml
-make train CONFIG=configs/image_densenet.yaml
+make train CONFIG=configs/image_densenet_seed42.yaml
 make evaluate RUN_ID=<training-run-id>
+make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
 make compare         # regenerate CSV and Markdown comparison views from MLflow
 make clean           # remove caches and interrupted-publication staging state
 make purge-generated # deliberately remove all reproducible generated outputs
@@ -72,6 +74,10 @@ and validation DICOMs, fingerprints the pretrained weight file immediately befor
 construction, and requires exact equality. It packages exact bundle and run lineage.
 `make evaluate` verifies the selected immutable package before accessing test data and reconstructs
 the model without the pretrained-weight cache.
+
+The image configs lock seeds 17, 42, and 2026. Their linked test runs can be summarized only by
+supplying all three run IDs explicitly. The summary retains individual results and reports their
+mean and sample standard deviation without selecting a canonical seed or averaging models.
 
 ## Cleaning generated artifacts
 

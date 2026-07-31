@@ -25,6 +25,7 @@ The lifecycle is: source dataset → build execution → immutable bundle → va
 | Tabular runner | Fit a metadata model and select operating thresholds on validation |
 | Neural runner | Authenticate source images, train one seed, and select one validation state |
 | Test evaluator | Verify a completed package before applying it to the test partition |
+| Seed summarizer | Validate three explicit linked RSNA image test runs and report aggregate statistics |
 | Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
 
 Dataset adapters isolate source-specific behavior. Training reads validated bundle records through
