@@ -164,9 +164,20 @@ class ExperimentConfig:
 
 def image_semantic_config_sha256(config: ExperimentConfig) -> str:
     """Hash the meaning-bearing, path-independent image experiment configuration."""
+    return _canonical_sha256(_image_semantic_config(config))
+
+
+def image_seed_compatibility_sha256(config: ExperimentConfig) -> str:
+    """Hash image experiment meaning after excluding only the training seed."""
+    payload = _image_semantic_config(config)
+    del payload["training"]["seed"]
+    return _canonical_sha256(payload)
+
+
+def _image_semantic_config(config: ExperimentConfig) -> dict[str, Any]:
     if config.model.modality != "image" or config.image is None:
         raise ConfigError("Semantic image configuration requires image modality")
-    payload = {
+    return {
         "config_version": config.config_version,
         "dataset": {
             "registry_key": config.dataset.registry_key,
@@ -186,6 +197,9 @@ def image_semantic_config_sha256(config: ExperimentConfig) -> str:
         },
         "image": asdict(config.image),
     }
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     ).hexdigest()

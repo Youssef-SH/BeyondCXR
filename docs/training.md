@@ -35,8 +35,9 @@ mlflow:
 The loader rejects missing, unknown, and duplicate keys. Each experiment names an exact immutable
 bundle ID. `training.seed` is the single randomness authority.
 
-All executable configs use schema version 1. They are `configs/metadata_logistic.yaml`,
-`configs/metadata_lightgbm.yaml`, and `configs/image_densenet.yaml`.
+All executable configs use schema version 1. Metadata configs are `configs/metadata_logistic.yaml`
+and `configs/metadata_lightgbm.yaml`. Image configs are `configs/image_densenet_seed17.yaml`,
+`configs/image_densenet_seed42.yaml`, and `configs/image_densenet_seed2026.yaml`.
 
 ## Feature boundary
 
@@ -60,8 +61,9 @@ semantics, and the policy version. The fitted preprocessing pipeline is embedded
 
 ```bash
 make train CONFIG=configs/metadata_logistic.yaml
-make train CONFIG=configs/image_densenet.yaml
+make train CONFIG=configs/image_densenet_seed42.yaml
 make evaluate RUN_ID=<training-run-id>
+make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
 make compare
 ```
 
@@ -202,6 +204,12 @@ Publication requires exactly this set after privacy validation. `make compare` d
 regenerates `reports/model_comparison_table.csv` and `.md` from complete, finite MLflow records.
 Rows include modality, task, and model package identity. Image rows are published only for verified
 test-evaluation runs; failed, unfinished, and incomplete runs are excluded.
+
+`make summarize-seeds` accepts exactly three explicit compatible image test-run IDs for seeds 17,
+42, and 2026. It publishes deterministic JSON, CSV, and Markdown under
+`reports/<dataset>/seed-summaries/<report-id>/`, preserving every seed-specific metric and reporting
+arithmetic means and sample standard deviations for applicable results. Thresholds remain
+seed-specific; the summary selects no canonical seed and creates no averaged model.
 
 The training, evaluation, and comparison CLIs default to `sqlite:///mlflow.db` and accept
 `--tracking-uri` when an isolated local SQLite database is required.

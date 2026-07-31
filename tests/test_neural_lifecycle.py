@@ -111,7 +111,7 @@ def _runtime():
 
 
 def _image_config():
-    config = load_experiment_config("configs/image_densenet.yaml")
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
     assert config.image is not None
     return replace(
         config.image,
@@ -626,7 +626,7 @@ def test_inference_rejects_identifier_length_mismatch() -> None:
 def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     configure_logging("INFO", stream=log_stream)
-    config = load_experiment_config("configs/image_densenet.yaml").dataset
+    config = load_experiment_config("configs/image_densenet_seed42.yaml").dataset
     root = tmp_path / "raw"
     image_directory = root / "images"
     image_directory.mkdir(parents=True)
@@ -757,7 +757,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
 
 
 def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, object]:
-    config_path = Path("configs/image_densenet.yaml")
+    config_path = Path("configs/image_densenet_seed42.yaml")
     config = load_experiment_config(config_path)
     image = config.image
     assert image is not None
@@ -878,7 +878,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "checkpoint.pt")
     restored = load_neural_checkpoint(checkpoint_path)
     strict_load_checkpoint(_TinyImageModel(), restored)
-    config_bytes = Path("configs/image_densenet.yaml").read_bytes()
+    config_bytes = Path("configs/image_densenet_seed42.yaml").read_bytes()
     published = publish_neural_model_run(
         model_root=tmp_path / "models" / "rsna",
         mlflow_run_id="training-run",
@@ -930,7 +930,7 @@ def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutat
         validation_average_precision=0.5,
     )
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "checkpoint.pt")
-    config_bytes = Path("configs/image_densenet.yaml").read_bytes()
+    config_bytes = Path("configs/image_densenet_seed42.yaml").read_bytes()
     published = publish_neural_model_run(
         model_root=tmp_path / "models" / "rsna",
         mlflow_run_id="training-run",
@@ -1003,7 +1003,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         validation_average_precision=0.6,
     )
     identity = {
-        **_manifest(Path("configs/image_densenet.yaml").read_bytes(), checkpoint),
+        **_manifest(Path("configs/image_densenet_seed42.yaml").read_bytes(), checkpoint),
         "model_package_schema_version": 1,
         "training_mlflow_run_id": "run",
         "checkpoint_sha256": "d" * 64,
@@ -1061,7 +1061,9 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
 def test_source_authentication_failure_precedes_model_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    document = yaml.safe_load(Path("configs/image_densenet.yaml").read_text(encoding="utf-8"))
+    document = yaml.safe_load(
+        Path("configs/image_densenet_seed42.yaml").read_text(encoding="utf-8")
+    )
     document["dataset"]["dataset_root"] = str(tmp_path / "raw")
     document["training"]["model_directory"] = str(tmp_path / "models" / "rsna")
     document["training"]["report_directory"] = str(tmp_path / "reports")
@@ -1112,7 +1114,9 @@ class _SyntheticImageLifecycle:
 def _synthetic_image_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> _SyntheticImageLifecycle:
-    document = yaml.safe_load(Path("configs/image_densenet.yaml").read_text(encoding="utf-8"))
+    document = yaml.safe_load(
+        Path("configs/image_densenet_seed42.yaml").read_text(encoding="utf-8")
+    )
     document["dataset"].update(
         {
             "bundle_id": "build-synthetic",

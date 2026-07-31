@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import sys
 import tempfile
@@ -14,6 +13,13 @@ import pandas as pd
 from mlflow.exceptions import MlflowException
 from sqlalchemy.exc import SQLAlchemyError
 
+from radfusion.training.completed_runs import (
+    COMPARISON_SCOPED_METRIC_NAMES,
+    CompletedRunRecord,
+    comparison_metrics_are_valid,
+    completed_run_record,
+    has_matching_training_parent,
+)
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI, configure_mlflow
 from radfusion.utils.operational_logging import (
     add_logging_argument,
@@ -55,54 +61,6 @@ COMPARISON_COLUMNS = (
     "latency_ms",
     "model_size_mib",
 )
-_COMMON_TAGS = (
-    "experiment_name",
-    "model",
-    "model_package_id",
-    "dataset_bundle_id",
-    "split_assignment_id",
-    "seed",
-    "evaluation_scope",
-    "run_kind",
-    "task",
-)
-_PREFIXED_METRICS = (
-    "average_precision",
-    "roc_auc",
-    "brier_score",
-    "expected_calibration_error",
-    "calibration_slope",
-    "calibration_intercept",
-    "youden_j_threshold",
-    "youden_j_precision",
-    "youden_j_recall",
-    "youden_j_specificity",
-    "youden_j_f1",
-    "target_sensitivity_threshold",
-    "target_sensitivity_precision",
-    "target_sensitivity_recall",
-    "target_sensitivity_specificity",
-    "target_sensitivity_f1",
-    "latency_ms",
-)
-_BOUNDED_METRICS = frozenset(
-    {
-        "average_precision",
-        "roc_auc",
-        "brier_score",
-        "expected_calibration_error",
-        "youden_j_threshold",
-        "youden_j_precision",
-        "youden_j_recall",
-        "youden_j_specificity",
-        "youden_j_f1",
-        "target_sensitivity_threshold",
-        "target_sensitivity_precision",
-        "target_sensitivity_recall",
-        "target_sensitivity_specificity",
-        "target_sensitivity_f1",
-    }
-)
 
 
 def regenerate_comparison(
@@ -128,25 +86,28 @@ def regenerate_comparison(
             if record := _comparison_record(run):
                 candidates.append(record)
         training = {
-            record["run_id"]: record
+            record.run_id: record
             for record in candidates
-            if record["evaluation_scope"] == "validation"
+            if record.evaluation_scope == "validation"
         }
         records = [
             record
             for record in candidates
-            if (record["evaluation_scope"] == "validation" and record["modality"] == "metadata")
+            if (record.evaluation_scope == "validation" and record.modality == "metadata")
             or _has_matching_training_parent(record, training)
         ]
         records.sort(
             key=lambda item: (
-                item["experiment_name"],
-                item["model"],
-                item["evaluation_scope"],
-                item["run_id"],
+                item.experiment_name,
+                item.model,
+                item.evaluation_scope,
+                item.run_id,
             )
         )
-        table = pd.DataFrame.from_records(records, columns=COMPARISON_COLUMNS)
+        table = pd.DataFrame.from_records(
+            [_comparison_row(record) for record in records],
+            columns=COMPARISON_COLUMNS,
+        )
         output = Path(output_directory)
         output.mkdir(parents=True, exist_ok=True)
         csv_path = output / "model_comparison_table.csv"
@@ -161,75 +122,39 @@ def regenerate_comparison(
 
 
 def _has_matching_training_parent(
-    test_record: dict[str, object],
-    training_records: dict[object, dict[str, object]],
+    test_record: CompletedRunRecord,
+    training_records: dict[str, CompletedRunRecord],
 ) -> bool:
-    parent = training_records.get(test_record["parent_training_run_id"])
-    return parent is not None and all(
-        test_record[field] == parent[field]
-        for field in (
-            "experiment_name",
-            "model",
-            "modality",
-            "task",
-            "model_package_id",
-            "bundle_id",
-            "split_assignment_id",
-            "seed",
-        )
+    parent = training_records.get(test_record.source_training_run_id)
+    return parent is not None and has_matching_training_parent(
+        test_record,
+        parent,
     )
 
 
-def _comparison_record(run) -> dict[str, object] | None:
-    tags = run.data.tags
-    if tags.get("run_complete") != "true" or any(
-        not isinstance(tags.get(key), str) or not tags[key].strip() for key in _COMMON_TAGS
-    ):
+def _comparison_record(run) -> CompletedRunRecord | None:
+    record = completed_run_record(run)
+    if record is None or not comparison_metrics_are_valid(record):
         return None
-    scope = tags["evaluation_scope"]
-    kind = tags["run_kind"]
-    if (kind, scope) not in {
-        ("training", "validation"),
-        ("test_evaluation", "test"),
-    }:
-        return None
-    parent = tags.get("source_training_run_id", "")
-    if scope == "test" and (not isinstance(parent, str) or not parent.strip()):
-        return None
-    metrics = {name: run.data.metrics.get(f"{scope}_{name}") for name in _PREFIXED_METRICS}
-    metrics["model_size_mib"] = run.data.metrics.get("model_size_mib")
-    modality = tags.get("modality", "metadata")
-    if modality not in {"metadata", "image"} or not _valid_metrics(metrics, modality=modality):
-        return None
+    return record
+
+
+def _comparison_row(record: CompletedRunRecord) -> dict[str, object]:
     return {
-        "run_id": run.info.run_id,
-        "parent_training_run_id": parent,
-        "experiment_name": tags["experiment_name"],
-        "model": tags["model"],
-        "modality": modality,
-        "task": tags["task"],
-        "model_package_id": tags["model_package_id"],
-        "bundle_id": tags["dataset_bundle_id"],
-        "split_assignment_id": tags["split_assignment_id"],
-        "seed": tags["seed"],
-        "evaluation_scope": scope,
-        **metrics,
+        "run_id": record.run_id,
+        "parent_training_run_id": record.source_training_run_id,
+        "experiment_name": record.experiment_name,
+        "model": record.model,
+        "modality": record.modality,
+        "task": record.task,
+        "model_package_id": record.model_package_id,
+        "bundle_id": record.bundle_id,
+        "split_assignment_id": record.split_assignment_id,
+        "seed": record.seed,
+        "evaluation_scope": record.evaluation_scope,
+        **{name: record.metrics[name] for name in COMPARISON_SCOPED_METRIC_NAMES},
+        "model_size_mib": record.metrics["model_size_mib"],
     }
-
-
-def _valid_metrics(metrics: dict[str, object], *, modality: str) -> bool:
-    for name, value in metrics.items():
-        if name == "latency_ms" and modality == "image" and value is None:
-            continue
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int | float)
-            or not math.isfinite(value)
-        ):
-            return False
-        if name in _BOUNDED_METRICS and not 0.0 <= value <= 1.0:
-            return False
-    return (modality == "image" or metrics["latency_ms"] >= 0.0) and metrics["model_size_mib"] > 0.0
 
 
 def _atomic_write_csv(table: pd.DataFrame, path: Path) -> None:

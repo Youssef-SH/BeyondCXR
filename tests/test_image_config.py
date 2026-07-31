@@ -7,6 +7,7 @@ import yaml
 
 from radfusion.training.config import (
     ConfigError,
+    image_seed_compatibility_sha256,
     image_semantic_config_sha256,
     load_experiment_config,
 )
@@ -14,7 +15,7 @@ from radfusion.training.train import main as train_main
 
 
 def _image_document() -> dict[str, object]:
-    return yaml.safe_load(Path("configs/image_densenet.yaml").read_text(encoding="utf-8"))
+    return yaml.safe_load(Path("configs/image_densenet_seed42.yaml").read_text(encoding="utf-8"))
 
 
 def _write(tmp_path: Path, document: dict[str, object]) -> Path:
@@ -24,7 +25,7 @@ def _write(tmp_path: Path, document: dict[str, object]) -> Path:
 
 
 def test_image_config_is_strict_single_seed_and_executable() -> None:
-    config = load_experiment_config("configs/image_densenet.yaml")
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
 
     assert config.config_version == 1
     assert config.executable is True
@@ -45,10 +46,31 @@ def test_image_config_is_strict_single_seed_and_executable() -> None:
     assert config.image.pin_memory_policy == "auto"
 
 
+def test_locked_image_seed_configs_differ_only_by_training_seed() -> None:
+    paths = (
+        Path("configs/image_densenet_seed17.yaml"),
+        Path("configs/image_densenet_seed42.yaml"),
+        Path("configs/image_densenet_seed2026.yaml"),
+    )
+    documents = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in paths]
+    configs = [load_experiment_config(path) for path in paths]
+    seeds = {config.training.seed for config in configs}
+    semantic_hashes = {image_semantic_config_sha256(config) for config in configs}
+    compatibility_hashes = {image_seed_compatibility_sha256(config) for config in configs}
+
+    for document in documents:
+        del document["training"]["seed"]
+
+    assert seeds == {17, 42, 2026}
+    assert documents[1:] == documents[:-1]
+    assert len(semantic_hashes) == 3
+    assert len(compatibility_hashes) == 1
+
+
 def test_image_semantic_config_identity_excludes_paths_but_binds_training_meaning(
     tmp_path: Path,
 ) -> None:
-    baseline = load_experiment_config("configs/image_densenet.yaml")
+    baseline = load_experiment_config("configs/image_densenet_seed42.yaml")
     path_changed = _image_document()
     path_changed["dataset"]["dataset_root"] = "/different/raw/root"
     path_changed["dataset"]["manifest_directory"] = "/different/manifests"
@@ -66,7 +88,7 @@ def test_image_semantic_config_identity_excludes_paths_but_binds_training_meanin
 
 
 def test_operational_image_fields_do_not_change_semantic_identity(tmp_path: Path) -> None:
-    baseline = load_experiment_config("configs/image_densenet.yaml")
+    baseline = load_experiment_config("configs/image_densenet_seed42.yaml")
     document = _image_document()
     document["executable"] = False
     document["evaluation"]["latency_warmup_calls"] = 1
@@ -105,7 +127,7 @@ def test_image_config_dispatches_to_image_runner(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr("radfusion.training.train.train_image_experiment", fake_training)
 
-    assert train_main(["--config", "configs/image_densenet.yaml"]) == 0
+    assert train_main(["--config", "configs/image_densenet_seed42.yaml"]) == 0
     assert captured["config"].model.modality == "image"
     assert captured["tracking_uri"] == "sqlite:///mlflow.db"
     assert '"mlflow_run_id": "image-run"' in capsys.readouterr().out
