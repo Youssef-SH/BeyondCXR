@@ -26,7 +26,7 @@ class NeuralTrainingError(ValueError):
     """Raised when neural training or inference violates its numeric contract."""
 
 
-class NeuralImageModel(Protocol):
+class TwoStageBinaryModel(Protocol):
     """Minimal model surface required by the neural lifecycle."""
 
     encoder: nn.Module
@@ -36,7 +36,7 @@ class NeuralImageModel(Protocol):
     def eval(self) -> Any: ...
     def parameters(self) -> Any: ...
     def state_dict(self) -> Any: ...
-    def __call__(self, images: torch.Tensor) -> torch.Tensor: ...
+    def __call__(self, *inputs: torch.Tensor) -> torch.Tensor: ...
     def freeze_encoder(self) -> None: ...
     def unfreeze_encoder(self) -> None: ...
 
@@ -211,7 +211,7 @@ def copy_state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def train_one_epoch(
-    model: NeuralImageModel,
+    model: TwoStageBinaryModel,
     loader: DataLoader[Any],
     *,
     optimizer: torch.optim.Optimizer,
@@ -219,6 +219,7 @@ def train_one_epoch(
     runtime: ResolvedDevice,
     gradient_clip_norm: float,
     warmup: bool,
+    input_keys: tuple[str, ...] = ("image",),
     scaler: torch.amp.GradScaler | None = None,
     progress_callback: BatchProgressCallback | None = None,
 ) -> float:
@@ -231,7 +232,7 @@ def train_one_epoch(
     effective_scaler = scaler if runtime.mixed_precision_effective else None
     total_batches = _progress_total(loader) if progress_callback is not None else None
     for completed_batches, batch in enumerate(loader, start=1):
-        images, targets = _device_batch(batch, runtime)
+        inputs, targets = _device_batch(batch, runtime, input_keys=input_keys)
         optimizer.zero_grad(set_to_none=True)
         context = (
             torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -239,7 +240,7 @@ def train_one_epoch(
             else nullcontext()
         )
         with context:
-            logits = model(images)
+            logits = model(*inputs)
             _require_finite_logits(logits, len(targets))
             loss = loss_function(logits, targets)
         if loss.ndim != 0 or not torch.isfinite(loss):
@@ -272,6 +273,7 @@ def deterministic_inference(
     loader: DataLoader[Any],
     *,
     runtime: ResolvedDevice,
+    input_keys: tuple[str, ...] = ("image",),
     progress_callback: BatchProgressCallback | None = None,
 ) -> InferenceResult:
     """Run one ordered inference pass and calculate finite validation AP."""
@@ -283,14 +285,14 @@ def deterministic_inference(
     with torch.inference_mode():
         total_batches = _progress_total(loader) if progress_callback is not None else None
         for completed_batches, batch in enumerate(loader, start=1):
-            images, batch_targets = _device_batch(batch, runtime)
+            inputs, batch_targets = _device_batch(batch, runtime, input_keys=input_keys)
             context = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
                 if runtime.mixed_precision_effective
                 else nullcontext()
             )
             with context:
-                batch_logits = model(images)
+                batch_logits = model(*inputs)
             _require_finite_logits(batch_logits, len(batch_targets))
             targets.append(batch_targets.detach().cpu().numpy().astype(np.int8))
             logits.append(batch_logits.detach().float().cpu().numpy())
@@ -348,6 +350,37 @@ def fit_image_model(
     progress_callback: NeuralProgressCallback | None = None,
 ) -> NeuralFitResult:
     """Run head warm-up and full fine-tuning with validation checkpoint selection."""
+    return fit_two_stage_binary_model(
+        model,
+        loaders.train,
+        loaders.validation,
+        input_keys=("image",),
+        config=config,
+        runtime=runtime,
+        pos_weight=pos_weight,
+        epoch_callback=epoch_callback,
+        epoch_started_callback=epoch_started_callback,
+        stage_callback=stage_callback,
+        progress_callback=progress_callback,
+    )
+
+
+def fit_two_stage_binary_model(
+    model: nn.Module,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    *,
+    input_keys: tuple[str, ...],
+    config: ImageConfig,
+    runtime: ResolvedDevice,
+    pos_weight: float,
+    epoch_callback: EpochCallback | None = None,
+    epoch_started_callback: EpochStartedCallback | None = None,
+    stage_callback: StageCallback | None = None,
+    progress_callback: NeuralProgressCallback | None = None,
+) -> NeuralFitResult:
+    """Run the fixed two-stage binary lifecycle over ordered tensor inputs."""
+    _validate_input_keys(input_keys)
     neural_model = _validated_neural_model(model)
     encoder = neural_model.encoder
     classifier = neural_model.classifier
@@ -376,12 +409,13 @@ def fit_image_model(
         _best_effort_callback(epoch_started_callback, "warmup", global_epoch, stage_epoch)
         loss = train_one_epoch(
             neural_model,
-            loaders.train,
+            train_loader,
             optimizer=warmup_optimizer,
             loss_function=loss_function,
             runtime=runtime,
             gradient_clip_norm=config.gradient_clip_norm,
             warmup=True,
+            input_keys=input_keys,
             scaler=scaler,
             progress_callback=_operation_callback(
                 progress_callback, "training", "warmup", global_epoch
@@ -389,8 +423,9 @@ def fit_image_model(
         )
         validation = deterministic_inference(
             model,
-            loaders.validation,
+            validation_loader,
             runtime=runtime,
+            input_keys=input_keys,
             progress_callback=_operation_callback(
                 progress_callback, "validation", "warmup", global_epoch
             ),
@@ -452,12 +487,13 @@ def fit_image_model(
         head_learning_rate_used = float(fine_optimizer.param_groups[1]["lr"])
         loss = train_one_epoch(
             neural_model,
-            loaders.train,
+            train_loader,
             optimizer=fine_optimizer,
             loss_function=loss_function,
             runtime=runtime,
             gradient_clip_norm=config.gradient_clip_norm,
             warmup=False,
+            input_keys=input_keys,
             scaler=scaler,
             progress_callback=_operation_callback(
                 progress_callback, "training", "fine_tune", global_epoch
@@ -465,8 +501,9 @@ def fit_image_model(
         )
         validation = deterministic_inference(
             model,
-            loaders.validation,
+            validation_loader,
             runtime=runtime,
+            input_keys=input_keys,
             progress_callback=_operation_callback(
                 progress_callback, "validation", "fine_tune", global_epoch
             ),
@@ -513,26 +550,49 @@ def fit_image_model(
 
 
 def _device_batch(
-    batch: dict[str, Any], runtime: ResolvedDevice
-) -> tuple[torch.Tensor, torch.Tensor]:
-    images = batch["image"]
+    batch: dict[str, Any],
+    runtime: ResolvedDevice,
+    *,
+    input_keys: tuple[str, ...],
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    _validate_input_keys(input_keys)
+    inputs = tuple(batch.get(key) for key in input_keys)
     targets = batch["target"]
-    if not isinstance(images, torch.Tensor) or not isinstance(targets, torch.Tensor):
-        raise NeuralTrainingError("Image DataLoader batches must contain tensors")
-    if images.ndim < 1:
-        raise NeuralTrainingError("Image batch must expose a batch dimension")
+    if not all(isinstance(value, torch.Tensor) for value in inputs) or not isinstance(
+        targets, torch.Tensor
+    ):
+        raise NeuralTrainingError(
+            "Neural DataLoader batches must contain tensor inputs and targets"
+        )
+    tensors = cast(tuple[torch.Tensor, ...], inputs)
+    if any(value.ndim < 1 for value in tensors):
+        raise NeuralTrainingError("Neural inputs must expose a batch dimension")
+    batch_size = len(tensors[0])
+    if any(len(value) != batch_size for value in tensors):
+        raise NeuralTrainingError("Neural inputs must have equal batch dimensions")
     if (
         not targets.is_floating_point()
-        or targets.shape != (len(images),)
+        or targets.shape != (batch_size,)
         or not torch.isfinite(targets).all()
         or not torch.all((targets == 0) | (targets == 1))
     ):
         raise NeuralTrainingError("Targets must be finite floating binary values shaped [batch]")
     non_blocking = runtime.device.type == "cuda" and runtime.pin_memory_effective
     return (
-        images.to(runtime.device, non_blocking=non_blocking),
+        tuple(value.to(runtime.device, non_blocking=non_blocking) for value in tensors),
         targets.to(runtime.device, non_blocking=non_blocking),
     )
+
+
+def _validate_input_keys(input_keys: object) -> None:
+    if (
+        not isinstance(input_keys, tuple)
+        or not input_keys
+        or any(not isinstance(key, str) or not key for key in input_keys)
+        or len(input_keys) != len(set(input_keys))
+        or any(key in {"target", "sample_id", "patient_id"} for key in input_keys)
+    ):
+        raise NeuralTrainingError("Neural input keys must be distinct non-empty field names")
 
 
 def _operation_callback(
@@ -582,16 +642,16 @@ def _validate_seed(seed: object) -> None:
         raise ValueError("Neural seed must be an integer between 0 and 2147483647")
 
 
-def _validated_neural_model(model: nn.Module) -> NeuralImageModel:
+def _validated_neural_model(model: nn.Module) -> TwoStageBinaryModel:
     """Validate the neural lifecycle surface once and return its typed view."""
     if not isinstance(model, nn.Module):
-        raise NeuralTrainingError("Image model does not implement the neural lifecycle contract")
+        raise NeuralTrainingError("Neural model does not implement the neural lifecycle contract")
     encoder = getattr(model, "encoder", None)
     classifier = getattr(model, "classifier", None)
     freeze_encoder = getattr(model, "freeze_encoder", None)
     unfreeze_encoder = getattr(model, "unfreeze_encoder", None)
     if not isinstance(encoder, nn.Module) or not isinstance(classifier, nn.Module):
-        raise NeuralTrainingError("Image model must expose encoder and classifier modules")
+        raise NeuralTrainingError("Neural model must expose encoder and classifier modules")
     if not callable(freeze_encoder) or not callable(unfreeze_encoder):
-        raise NeuralTrainingError("Image model must expose encoder freeze controls")
-    return cast(NeuralImageModel, model)
+        raise NeuralTrainingError("Neural model must expose encoder freeze controls")
+    return cast(TwoStageBinaryModel, model)
