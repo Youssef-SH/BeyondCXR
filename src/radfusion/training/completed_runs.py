@@ -245,7 +245,11 @@ def comparison_metrics_are_valid(record: CompletedRunRecord) -> bool:
 
 def validated_image_test_metrics(record: CompletedRunRecord) -> dict[str, float]:
     """Return the complete finite scalar contract for one image test run."""
-    if record.modality != "image" or record.run_kind != "test_evaluation":
+    if (
+        record.modality != "image"
+        or record.run_kind != "test_evaluation"
+        or record.evaluation_scope != "test"
+    ):
         raise ValueError(f"Run {record.run_id} is not an image test-evaluation run")
     validated: dict[str, float] = {}
     for name in SEED_SPECIFIC_METRIC_NAMES:

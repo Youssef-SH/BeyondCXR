@@ -534,5 +534,13 @@ def test_image_test_metric_contract_rejects_missing_boolean_and_nonfinite_values
         validated_image_test_metrics(replace(record, metrics=metrics))
 
 
+def test_image_test_metric_contract_requires_test_scope(family: _Family) -> None:
+    client = configure_mlflow(tracking_uri=family.tracking_uri)
+    record = require_completed_run(client.get_run(family.test_ids[17]))
+
+    with pytest.raises(ValueError):
+        validated_image_test_metrics(replace(record, evaluation_scope="validation"))
+
+
 def test_seed_specific_metric_contract_is_complete() -> None:
     assert set(_metrics(0.5)) == set(SEED_SPECIFIC_METRIC_NAMES)
