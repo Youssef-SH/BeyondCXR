@@ -48,6 +48,7 @@ from radfusion.training.neural import (
     candidate_is_improvement,
     deterministic_inference,
     fit_image_model,
+    fit_two_stage_binary_model,
     seed_neural_runtime,
     train_one_epoch,
     training_class_weight,
@@ -102,6 +103,59 @@ class _TinyImageModel(nn.Module):
             parameter.requires_grad = False
 
     def unfreeze_encoder(self) -> None:
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = True
+
+
+class _MultiInputDataset(Dataset[dict[str, object]]):
+    def __init__(self, targets: list[int]) -> None:
+        self.targets = targets
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return {
+            "image": torch.tensor([float(index % 2), 1.0], dtype=torch.float32),
+            "structured": torch.tensor([float(index), -float(index)], dtype=torch.float32),
+            "target": torch.tensor(float(self.targets[index]), dtype=torch.float32),
+            "sample_id": f"sample-{index}",
+            "patient_id": f"patient-{index}",
+        }
+
+
+class _TinyCompositeClassifier(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.structured_projection = nn.Linear(2, 2)
+        self.output = nn.Linear(4, 1)
+
+    def forward(
+        self,
+        image_embedding: torch.Tensor,
+        structured: torch.Tensor,
+    ) -> torch.Tensor:
+        structured_embedding = self.structured_projection(structured)
+        return self.output(torch.cat((image_embedding, structured_embedding), dim=1)).squeeze(1)
+
+
+class _TinyMultiInputModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Linear(2, 2)
+        self.classifier = _TinyCompositeClassifier()
+        self.transitions: list[str] = []
+
+    def forward(self, image: torch.Tensor, structured: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.encoder(image), structured)
+
+    def freeze_encoder(self) -> None:
+        self.transitions.append("freeze")
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = False
+
+    def unfreeze_encoder(self) -> None:
+        self.transitions.append("unfreeze")
         for parameter in self.encoder.parameters():
             parameter.requires_grad = True
 
@@ -218,6 +272,98 @@ def test_repeated_tiny_training_is_deterministic() -> None:
     assert set(first.selected_state_dict) == set(second.selected_state_dict)
     for key in first.selected_state_dict:
         torch.testing.assert_close(first.selected_state_dict[key], second.selected_state_dict[key])
+
+
+def test_two_stage_core_dispatches_ordered_multiple_inputs() -> None:
+    dataset = _MultiInputDataset([0, 1, 0, 1])
+    config = replace(_image_config(), warmup_epochs=1, fine_tune_epochs=1)
+    loaders = build_image_loaders(dataset, dataset, config=config, runtime=_runtime(), seed=42)
+    seed_neural_runtime(42)
+    model = _TinyMultiInputModel()
+    structured_before = {
+        name: value.detach().clone()
+        for name, value in model.classifier.structured_projection.state_dict().items()
+    }
+    fit = fit_two_stage_binary_model(
+        model,
+        loaders.train,
+        loaders.validation,
+        input_keys=("image", "structured"),
+        config=config,
+        runtime=_runtime(),
+        pos_weight=1.0,
+    )
+    model.load_state_dict(fit.selected_state_dict, strict=True)
+    inference = deterministic_inference(
+        model,
+        loaders.validation,
+        runtime=_runtime(),
+        input_keys=("image", "structured"),
+    )
+    expected_logits = []
+    with torch.inference_mode():
+        for batch in loaders.validation:
+            expected_logits.append(model(batch["image"], batch["structured"]).numpy())
+
+    assert model.transitions == ["freeze", "unfreeze"]
+    assert len(fit.history) == 2
+    assert any(
+        not torch.equal(
+            fit.selected_state_dict[f"classifier.structured_projection.{name}"],
+            value,
+        )
+        for name, value in structured_before.items()
+    )
+    assert inference.sample_ids == tuple(f"sample-{index}" for index in range(4))
+    np.testing.assert_allclose(inference.logits, np.concatenate(expected_logits))
+    assert np.isfinite(inference.probabilities).all()
+
+
+@pytest.mark.parametrize(
+    "input_keys",
+    [(), ("image", "image"), ("target",), ("",)],
+)
+def test_multi_input_seam_rejects_invalid_input_keys(input_keys: tuple[str, ...]) -> None:
+    batch = {
+        "image": torch.ones((2, 2), dtype=torch.float32),
+        "target": torch.tensor([0.0, 1.0]),
+        "sample_id": ["a", "b"],
+        "patient_id": ["p-a", "p-b"],
+    }
+    with pytest.raises(NeuralTrainingError):
+        deterministic_inference(
+            _TinyImageModel(),
+            [batch],
+            runtime=_runtime(),
+            input_keys=input_keys,
+        )
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        None,
+        [1.0, 2.0],
+        torch.ones((1, 2), dtype=torch.float32),
+    ],
+)
+def test_multi_input_seam_rejects_malformed_batches(structured: object) -> None:
+    batch = {
+        "image": torch.ones((2, 2), dtype=torch.float32),
+        "target": torch.tensor([0.0, 1.0]),
+        "sample_id": ["a", "b"],
+        "patient_id": ["p-a", "p-b"],
+    }
+    if structured is not None:
+        batch["structured"] = structured
+
+    with pytest.raises(NeuralTrainingError):
+        deterministic_inference(
+            _TinyMultiInputModel(),
+            [batch],
+            runtime=_runtime(),
+            input_keys=("image", "structured"),
+        )
 
 
 def test_different_loader_seeds_change_training_order() -> None:
