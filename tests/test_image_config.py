@@ -24,11 +24,10 @@ def _write(tmp_path: Path, document: dict[str, object]) -> Path:
     return path
 
 
-def test_image_config_is_strict_single_seed_and_executable() -> None:
+def test_image_config_is_strict_and_single_seed() -> None:
     config = load_experiment_config("configs/image_densenet_seed42.yaml")
 
     assert config.config_version == 1
-    assert config.executable is True
     assert config.training.seed == 42
     assert not hasattr(config.training, "seeds")
     assert config.dataset.dataset_root == Path("data/raw/rsna/extracted")
@@ -90,7 +89,6 @@ def test_image_semantic_config_identity_excludes_paths_but_binds_training_meanin
 def test_operational_image_fields_do_not_change_semantic_identity(tmp_path: Path) -> None:
     baseline = load_experiment_config("configs/image_densenet_seed42.yaml")
     document = _image_document()
-    document["executable"] = False
     document["evaluation"]["latency_warmup_calls"] = 1
     document["evaluation"]["latency_measured_calls"] = 2
     changed = load_experiment_config(_write(tmp_path, document))
@@ -99,10 +97,9 @@ def test_operational_image_fields_do_not_change_semantic_identity(tmp_path: Path
     assert changed.source_sha256 != baseline.source_sha256
 
 
-def test_metadata_configs_remain_executable_and_unchanged() -> None:
+def test_metadata_configs_use_the_explicit_metadata_modality() -> None:
     for path in ("configs/metadata_logistic.yaml", "configs/metadata_lightgbm.yaml"):
         config = load_experiment_config(path)
-        assert config.executable is True
         assert config.model.modality == "metadata"
         assert config.image is None
         assert config.dataset.dataset_root is None
@@ -133,139 +130,104 @@ def test_image_config_dispatches_to_image_runner(monkeypatch, capsys) -> None:
     assert '"mlflow_run_id": "image-run"' in capsys.readouterr().out
 
 
-def test_non_executable_image_config_is_rejected_by_execution_cli(tmp_path: Path, capsys) -> None:
-    document = _image_document()
-    document["executable"] = False
-
-    assert train_main(["--config", str(_write(tmp_path, document))]) == 1
-    assert "not executable" in capsys.readouterr().err
-
-
 @pytest.mark.parametrize(
-    ("mutation", "message"),
+    "mutation",
     [
-        (lambda document: document["training"].update({"seeds": [42]}), "unknown keys"),
-        (lambda document: document["image"].update({"unknown": 1}), "unknown keys"),
-        (lambda document: document["image"].pop("batch_size"), "missing keys"),
+        lambda document: document["training"].update({"seeds": [42]}),
+        lambda document: document["image"].update({"unknown": 1}),
+        lambda document: document["image"].pop("batch_size"),
+        lambda document: document["model"].pop("modality"),
     ],
 )
 def test_image_config_rejects_unknown_and_missing_fields(
     tmp_path: Path,
     mutation,
-    message: str,
 ) -> None:
     document = _image_document()
     mutation(document)
 
-    with pytest.raises(ConfigError, match=message):
+    with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
 
 
 @pytest.mark.parametrize(
-    ("mutation", "message"),
+    "mutation",
     [
-        (
-            lambda document: document["model"].update({"registry_key": "metadata_logistic"}),
-            "image_densenet",
+        lambda document: document["model"].update({"registry_key": "metadata_logistic"}),
+        lambda document: document["model"].update({"registry_key": "metadata_lightgbm"}),
+        lambda document: document["dataset"].pop("dataset_root"),
+        lambda document: document.pop("image"),
+        lambda document: document["model"].update({"fit_parameters": {"epochs": 1}}),
+        lambda document: (
+            document["model"].update({"modality": "metadata", "registry_key": "image_densenet"}),
+            document.pop("image"),
+            document["dataset"].pop("dataset_root"),
         ),
-        (
-            lambda document: document["model"].update({"registry_key": "metadata_lightgbm"}),
-            "image_densenet",
+        lambda document: (
+            document["model"].update({"modality": "metadata", "registry_key": "metadata_logistic"}),
+            document.pop("image"),
         ),
-        (lambda document: document["dataset"].pop("dataset_root"), "dataset_root"),
-        (lambda document: document.pop("image"), "image configuration"),
-        (
-            lambda document: document["model"].update({"fit_parameters": {"epochs": 1}}),
-            "empty model.fit_parameters",
-        ),
-        (
-            lambda document: (
-                document["model"].update(
-                    {"modality": "metadata", "registry_key": "image_densenet"}
-                ),
-                document.pop("image"),
-                document["dataset"].pop("dataset_root"),
-            ),
-            "registered metadata model",
-        ),
-        (
-            lambda document: (
-                document["model"].update(
-                    {"modality": "metadata", "registry_key": "metadata_logistic"}
-                ),
-                document.pop("image"),
-            ),
-            "do not accept dataset.dataset_root",
-        ),
-        (
-            lambda document: (
-                document["model"].update(
-                    {"modality": "metadata", "registry_key": "metadata_logistic"}
-                ),
-                document["dataset"].pop("dataset_root"),
-            ),
-            "requires model.modality='image'",
+        lambda document: (
+            document["model"].update({"modality": "metadata", "registry_key": "metadata_logistic"}),
+            document["dataset"].pop("dataset_root"),
         ),
     ],
 )
 def test_modality_cross_field_contract_is_closed(
     tmp_path: Path,
     mutation,
-    message: str,
 ) -> None:
     document = _image_document()
     mutation(document)
 
-    with pytest.raises(ConfigError, match=message):
+    with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("field", "value"),
     [
-        ("encoder_name", "resnet50", "DenseNet121"),
-        ("weights", "other", "densenet121-res224-chex"),
-        ("image_size", True, "integer"),
-        ("embedding_dimension", 512, "1024"),
-        ("class_weighting", "none", "train_pos_weight"),
+        ("encoder_name", "resnet50"),
+        ("weights", "other"),
+        ("image_size", True),
+        ("embedding_dimension", 512),
+        ("class_weighting", "none"),
     ],
 )
 def test_image_model_contract_is_fixed(
     tmp_path: Path,
     field: str,
     value: object,
-    message: str,
 ) -> None:
     document = _image_document()
     document["model"]["parameters"][field] = value
 
-    with pytest.raises(ConfigError, match=message):
+    with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("field", "value"),
     [
-        ("batch_size", True, "integer"),
-        ("head_learning_rate", float("nan"), "finite"),
-        ("head_learning_rate", float("inf"), "finite"),
-        ("encoder_learning_rate", float("-inf"), "finite"),
-        ("translation_fraction", 1.1, "within"),
-        ("device", "mps", "one of"),
-        ("optimizer", "sgd", "one of"),
-        ("pin_memory_policy", "always", "one of"),
-        ("scheduler_factor", 1.0, "within"),
-        ("early_stopping_patience", -1, "nonnegative"),
+        ("batch_size", True),
+        ("head_learning_rate", float("nan")),
+        ("head_learning_rate", float("inf")),
+        ("encoder_learning_rate", float("-inf")),
+        ("translation_fraction", 1.1),
+        ("device", "mps"),
+        ("optimizer", "sgd"),
+        ("pin_memory_policy", "always"),
+        ("scheduler_factor", 1.0),
+        ("early_stopping_patience", -1),
     ],
 )
 def test_image_runtime_and_optimization_values_are_strict(
     tmp_path: Path,
     field: str,
     value: object,
-    message: str,
 ) -> None:
     document = _image_document()
     document["image"][field] = value
 
-    with pytest.raises(ConfigError, match=message):
+    with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))

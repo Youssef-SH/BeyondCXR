@@ -72,8 +72,11 @@ def evaluate_training_run(
     """Apply a completed training run's model and thresholds to test data."""
     client = configure_mlflow(tracking_uri=tracking_uri)
     source_run = client.get_run(training_run_id)
-    if source_run.data.tags.get("modality") == "image":
+    source_modality = source_run.data.tags.get("modality")
+    if source_modality == "image":
         return evaluate_image_training_run(training_run_id, tracking_uri=tracking_uri)
+    if source_modality != "metadata":
+        raise ValueError("Source training run has no valid modality")
     if (
         source_run.info.status != "FINISHED"
         or source_run.data.tags.get("run_kind") != "training"
@@ -123,6 +126,7 @@ def evaluate_training_run(
         "dataset_bundle_id": manifest["bundle_id"],
         "split_assignment_id": manifest["split_assignment_id"],
         "task": manifest["task"],
+        "modality": "metadata",
         "model": config.model.registry_key,
         "seed": str(manifest["seed"]),
         "model_sha256": manifest["model_sha256"],

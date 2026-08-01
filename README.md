@@ -66,7 +66,7 @@ Instrumented manifest, audit, training, evaluation, and comparison commands emit
 records to stderr while preserving machine-readable stdout; see the training guide for capture
 examples.
 
-Every executable experiment is declared by a validated YAML file under `configs/`. See
+Every experiment is declared by a validated YAML file under `configs/`. See
 [`docs/training.md`](docs/training.md) for the training workflow.
 
 Image training executes one configured seed per invocation. It reads and authenticates only train

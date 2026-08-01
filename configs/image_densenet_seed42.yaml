@@ -1,6 +1,5 @@
 config_version: 1
 name: image_densenet121
-executable: true
 
 dataset:
   registry_key: rsna

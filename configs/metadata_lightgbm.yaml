@@ -9,6 +9,7 @@ dataset:
 
 model:
   registry_key: metadata_lightgbm
+  modality: metadata
   parameters:
     objective: binary
     n_estimators: 500

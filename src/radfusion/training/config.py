@@ -150,7 +150,6 @@ class ExperimentConfig:
 
     config_version: int
     name: str
-    executable: bool
     dataset: DatasetConfig
     model: ModelConfig
     training: TrainingConfig
@@ -230,7 +229,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             "evaluation",
             "mlflow",
         },
-        optional={"executable", "image"},
+        optional={"image"},
         context="config",
     )
     config_version = _integer(root["config_version"], "config_version")
@@ -238,7 +237,6 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         raise ConfigError(f"Unsupported config_version: {config_version}")
     model = _model_config(root["model"])
     dataset = _dataset_config(root["dataset"])
-    executable = _boolean(root.get("executable", True), "executable")
     if model.modality == "image":
         if model.registry_key != "image_densenet":
             raise ConfigError("Image experiments require model.registry_key='image_densenet'")
@@ -256,7 +254,6 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     return ExperimentConfig(
         config_version=config_version,
         name=_text(root["name"], "name"),
-        executable=executable,
         dataset=dataset,
         model=model,
         training=_training_config(root["training"]),
@@ -296,13 +293,13 @@ def _model_config(value: object) -> ModelConfig:
         data,
         required={
             "registry_key",
+            "modality",
             "parameters",
             "fit_parameters",
         },
-        optional={"modality"},
         context="model",
     )
-    modality = _text(data.get("modality", "metadata"), "model.modality")
+    modality = _text(data["modality"], "model.modality")
     if modality not in {"metadata", "image"}:
         raise ConfigError("model.modality must be 'metadata' or 'image'")
     parameters = _mapping(data["parameters"], "model.parameters")

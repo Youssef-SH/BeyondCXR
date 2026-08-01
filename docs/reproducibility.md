@@ -75,7 +75,7 @@ make compare
 Audits are published under `reports/rsna/audit/<bundle-id>/`. Rebuilding one audit replaces only
 that bundle-qualified audit directory.
 
-Executable configs pin the exact bundle ID and one training seed. Preprocessing is fitted on
+Experiment configs pin the exact bundle ID and one training seed. Preprocessing is fitted on
 training data. Validation selects the LightGBM stopping point and both operating thresholds.
 `make evaluate` verifies those choices against the source training run before applying them to
 test in a separate linked run.
@@ -125,7 +125,7 @@ counts are grouped by operating point:
 
 - the Youden-J threshold maximizes validation sensitivity minus false-positive rate;
 - the target-sensitivity threshold is the highest validation threshold meeting the configured
-  sensitivity, which is 0.90 in the executable configs.
+  sensitivity, which is 0.90 in the experiment configs.
 
 Both policies enumerate every finite ROC threshold and choose the highest threshold among ties or
 qualifying candidates. The thresholds are applied unchanged to test probabilities. They are
@@ -136,7 +136,7 @@ benchmark operating points, not clinical optima.
 Expected calibration error uses the configured number of equal-width bins over `[0, 1]`. Bins are
 lower-inclusive; the final bin includes 1. Empty bins contribute zero. Each non-empty bin
 contributes its sample fraction times the absolute difference between mean predicted probability
-and observed positive fraction. Executable configs use 15 bins, and the plot uses the same count
+and observed positive fraction. Experiment configs use 15 bins, and the plot uses the same count
 and strategy.
 
 Calibration slope and intercept come from an L2 logistic regression of the target on predicted

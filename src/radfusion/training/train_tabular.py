@@ -97,6 +97,7 @@ def train_configured_experiment(
         "dataset": config.dataset.registry_key,
         "dataset_bundle_id": config.dataset.bundle_id,
         "task": config.dataset.task_id,
+        "modality": "metadata",
         "model": config.model.registry_key,
         "seed": str(config.training.seed),
         "git_commit": commit,

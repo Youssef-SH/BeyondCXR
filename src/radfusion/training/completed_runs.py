@@ -57,6 +57,7 @@ SEED_AGGREGATE_METRIC_NAMES = tuple(
 _COMMON_REQUIRED_TAGS = (
     "experiment_name",
     "model",
+    "modality",
     "model_package_id",
     "dataset_bundle_id",
     "split_assignment_id",
@@ -160,7 +161,7 @@ def require_completed_run(run) -> CompletedRunRecord:
     parent = tags.get("source_training_run_id", "")
     if scope == "test" and (not isinstance(parent, str) or not parent.strip()):
         raise ValueError(f"Run {run.info.run_id} has no source training run")
-    modality = tags.get("modality", "metadata")
+    modality = tags["modality"]
     if modality not in {"metadata", "image"}:
         raise ValueError(f"Run {run.info.run_id} has an invalid modality")
     metrics = {name: run.data.metrics.get(f"{scope}_{name}") for name in SCOPED_METRIC_NAMES}

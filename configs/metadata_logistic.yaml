@@ -9,6 +9,7 @@ dataset:
 
 model:
   registry_key: metadata_logistic
+  modality: metadata
   parameters:
     l1_ratio: 0.0
     solver: liblinear

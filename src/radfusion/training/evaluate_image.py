@@ -339,8 +339,8 @@ def _verify_package_lineage(
     evaluator_dirty: bool,
     evaluator_lock_hash: str,
 ) -> None:
-    if not config.executable or config.model.modality != "image":
-        raise ValueError("Neural package does not contain an executable image configuration")
+    if config.model.modality != "image":
+        raise ValueError("Neural package does not contain an image configuration")
     expected_package = config.training.model_directory / "runs" / training_run_id
     observed_package = Path(source_run.data.tags["local_model_path"]).parent.resolve()
     if observed_package != expected_package.resolve():

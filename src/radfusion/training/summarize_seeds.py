@@ -175,8 +175,8 @@ def _validate_member_lineage(
     manifest: Mapping[str, Any],
     seed: int,
 ) -> None:
-    if not config.executable or config.model.modality != "image" or config.image is None:
-        raise ValueError("Seed summary package does not contain an executable image config")
+    if config.model.modality != "image" or config.image is None:
+        raise ValueError("Seed summary package does not contain an image config")
     if test.dataset == "" or training.dataset == "" or test.dataset != training.dataset:
         raise ValueError("Seed summary dataset lineage is missing or inconsistent")
     if (

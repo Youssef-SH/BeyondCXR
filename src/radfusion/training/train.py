@@ -37,8 +37,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
     try:
         config = load_experiment_config(args.config)
-        if not config.executable:
-            raise ConfigError("This experiment configuration is not executable yet")
         result = (
             train_image_experiment(config, tracking_uri=args.tracking_uri)
             if config.model.modality == "image"

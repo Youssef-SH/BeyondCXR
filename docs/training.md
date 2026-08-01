@@ -1,6 +1,6 @@
 # Experiments
 
-Each executable experiment is defined by one strict YAML file:
+Each experiment is defined by one strict YAML file:
 
 ```yaml
 config_version: 1
@@ -35,7 +35,7 @@ mlflow:
 The loader rejects missing, unknown, and duplicate keys. Each experiment names an exact immutable
 bundle ID. `training.seed` is the single randomness authority.
 
-All executable configs use schema version 1. Metadata configs are `configs/metadata_logistic.yaml`
+All experiment configs use schema version 1. Metadata configs are `configs/metadata_logistic.yaml`
 and `configs/metadata_lightgbm.yaml`. Image configs are `configs/image_densenet_seed17.yaml`,
 `configs/image_densenet_seed42.yaml`, and `configs/image_densenet_seed2026.yaml`.
 
