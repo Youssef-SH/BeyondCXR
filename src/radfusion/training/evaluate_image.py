@@ -52,6 +52,10 @@ from radfusion.utils.operational_logging import (
     timed_phase,
 )
 from radfusion.utils.privacy import validate_public_reports
+from radfusion.utils.private_predictions import (
+    private_root_for_reports,
+    publish_private_neural_predictions,
+)
 from radfusion.utils.publication import publish_directory, staging_directory
 
 _LOGGER = get_operational_logger(__name__)
@@ -64,6 +68,7 @@ class ImageTestEvaluationResult:
     run_id: str
     training_run_id: str
     artifact_directory: Path
+    private_prediction_directory: Path
     average_precision: float
 
 
@@ -119,7 +124,7 @@ def evaluate_image_training_run(
         package_directory = model_path.parent
         manifest = validate_neural_package_metadata(package_directory)
         config = load_experiment_config(package_directory / "resolved_config.yaml")
-        _verify_package_lineage(
+        verify_image_training_package(
             source_run,
             config,
             manifest,
@@ -263,6 +268,13 @@ def evaluate_image_training_run(
             raise FileExistsError(f"Image test report already exists: {report_directory}")
         report_stage = staging_directory(report_directory)
         report_published = False
+        private_prediction_directory = (
+            private_root_for_reports(config.training.report_directory)
+            / "predictions"
+            / config.dataset.registry_key
+            / evaluation_run_id
+        )
+        private_predictions_published = False
         try:
             write_run_reports(
                 report_stage,
@@ -276,6 +288,20 @@ def evaluate_image_training_run(
                 report_stage.iterdir(),
                 forbidden_source_values={*inference.sample_ids, *inference.patient_ids},
             )
+            publish_private_neural_predictions(
+                private_root=private_root_for_reports(config.training.report_directory),
+                dataset=config.dataset.registry_key,
+                training_run_id=training_run_id,
+                test_evaluation_run_id=evaluation_run_id,
+                model_package_id=str(manifest["model_package_id"]),
+                seed=config.training.seed,
+                sample_ids=inference.sample_ids,
+                patient_keys=inference.patient_ids,
+                targets=inference.targets,
+                logits=inference.logits,
+                probabilities=inference.probabilities,
+            )
+            private_predictions_published = True
             metrics = mlflow_metrics(
                 scope="test",
                 document=document,
@@ -316,6 +342,8 @@ def evaluate_image_training_run(
         except BaseException:
             if report_published and report_directory.exists():
                 shutil.rmtree(report_directory)
+            if private_predictions_published and private_prediction_directory.exists():
+                shutil.rmtree(private_prediction_directory)
             raise
         finally:
             if report_stage.exists():
@@ -325,11 +353,12 @@ def evaluate_image_training_run(
         run_id=evaluation_run_id,
         training_run_id=training_run_id,
         artifact_directory=report_directory,
+        private_prediction_directory=private_prediction_directory,
         average_precision=probability_metrics.average_precision,
     )
 
 
-def _verify_package_lineage(
+def verify_image_training_package(
     source_run,
     config: ExperimentConfig,
     manifest: dict[str, Any],
