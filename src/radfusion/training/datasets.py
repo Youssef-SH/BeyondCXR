@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 from radfusion.data.dicom_loader import DicomRecord, read_dicom
 from radfusion.data.hashing import sha256_file
 from radfusion.data.rsna_artifacts import (
+    ANNOTATIONS_FILENAME,
     BUNDLES_DIRECTORY,
     LABELS_FILENAME,
     METADATA_FILENAME,
@@ -35,6 +36,14 @@ from radfusion.training.interfaces import DatasetLineage, DatasetPartition, Data
 from radfusion.utils.operational_logging import CountProgress, get_operational_logger, log_event
 
 _IMAGE_FRAME_COLUMNS = ("sample_id", "patient_id", "image_path", "split_name", "target")
+_FUSION_FRAME_COLUMNS = (
+    "sample_id",
+    "patient_id",
+    "image_path",
+    *SOURCE_FEATURES,
+    "split_name",
+    "target",
+)
 SOURCE_AUTHENTICATION_POLICY_VERSION = "partition-inventory-sha256-v1"
 _LOGGER = get_operational_logger(__name__)
 
@@ -46,6 +55,12 @@ class ImageSample(TypedDict):
     target: torch.Tensor
     sample_id: str
     patient_id: str
+
+
+class FusionSample(ImageSample):
+    """One lazily decoded image aligned with one transformed metadata row."""
+
+    structured: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -100,6 +115,36 @@ class ImageTestData:
     lineage: DatasetLineage
     bundle_manifest_sha256: str
     authentication: SourceAuthentication
+
+
+@dataclass(frozen=True)
+class FusionRunData:
+    """Authenticated aligned train and validation rows for fusion training."""
+
+    train: pd.DataFrame
+    validation: pd.DataFrame
+    lineage: DatasetLineage
+    bundle_manifest_sha256: str
+    authentication: SourceAuthentication
+
+
+@dataclass(frozen=True)
+class FusionTestData:
+    """Authenticated aligned test rows for explicit fusion evaluation."""
+
+    test: pd.DataFrame
+    lineage: DatasetLineage
+    bundle_manifest_sha256: str
+    authentication: SourceAuthentication
+
+
+@dataclass(frozen=True)
+class LocalizationTestData:
+    """Authenticated image test rows with positive-case box geometry."""
+
+    images: ImageTestData
+    dimensions: pd.DataFrame
+    annotations: pd.DataFrame
 
 
 class RsnaImageDataset(Dataset[ImageSample]):
@@ -176,6 +221,55 @@ class RsnaImageDataset(Dataset[ImageSample]):
             "sample_id": row.sample_id,
             "patient_id": row.patient_id,
         }
+
+
+class RsnaFusionDataset(Dataset[FusionSample]):
+    """Expose aligned RSNA images and eagerly transformed metadata tensors."""
+
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        structured: np.ndarray,
+        *,
+        structured_sample_ids: tuple[str, ...],
+        dataset_root: str | Path,
+        partition: str,
+        transform: Callable[[np.ndarray], torch.Tensor],
+        decoder: Callable[[str | Path], tuple[np.ndarray, DicomRecord]] = read_dicom,
+    ) -> None:
+        if tuple(frame.columns) != _FUSION_FRAME_COLUMNS:
+            raise ManifestBuildError(
+                f"RSNA fusion frame columns must be exactly {_FUSION_FRAME_COLUMNS}"
+            )
+        sample_ids = tuple(frame["sample_id"].astype(str))
+        if sample_ids != structured_sample_ids:
+            raise ManifestBuildError("Structured rows are not aligned with fusion sample IDs")
+        try:
+            matrix = np.asarray(structured, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ManifestBuildError("Fusion structured values are not numeric") from exc
+        if (
+            matrix.ndim != 2
+            or matrix.shape[0] != len(frame)
+            or matrix.shape[1] == 0
+            or not np.isfinite(matrix).all()
+        ):
+            raise ManifestBuildError("Fusion structured matrix must be finite N x D data")
+        self._structured = torch.from_numpy(np.ascontiguousarray(matrix)).contiguous()
+        self._images = RsnaImageDataset(
+            frame.loc[:, _IMAGE_FRAME_COLUMNS],
+            dataset_root=dataset_root,
+            partition=partition,
+            transform=transform,
+            decoder=decoder,
+        )
+
+    def __len__(self) -> int:
+        return len(self._images)
+
+    def __getitem__(self, index: int) -> FusionSample:
+        image = self._images[index]
+        return {**image, "structured": self._structured[index]}
 
 
 class RsnaDataset:
@@ -279,6 +373,101 @@ class RsnaDataset:
             bundle_manifest_sha256=manifest_sha256,
             authentication=authentication,
         )
+
+    def load_fusion_train_validation(self, config: DatasetConfig) -> FusionRunData:
+        """Load and authenticate aligned train and validation fusion rows."""
+        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
+        frame = _task_frame(
+            bundle,
+            config.task_id,
+            partitions=("train", "validation"),
+            feature_columns=("image_path", *SOURCE_FEATURES),
+        )
+        authentication = _authenticate_source_rows(
+            config,
+            bundle,
+            metadata,
+            frame,
+            partitions=("train", "validation"),
+        )
+        return FusionRunData(
+            train=_fusion_partition(frame, "train"),
+            validation=_fusion_partition(frame, "validation"),
+            lineage=_lineage(config, metadata),
+            bundle_manifest_sha256=_required_manifest_sha256(bundle),
+            authentication=authentication,
+        )
+
+    def load_fusion_test(
+        self,
+        config: DatasetConfig,
+        *,
+        expected_manifest_sha256: str,
+    ) -> FusionTestData:
+        """Load and authenticate aligned test fusion rows."""
+        bundle, metadata = _load_pinned_bundle(
+            config,
+            materialize_all_rows=False,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+        frame = _task_frame(
+            bundle,
+            config.task_id,
+            partitions=("test",),
+            feature_columns=("image_path", *SOURCE_FEATURES),
+        )
+        authentication = _authenticate_source_rows(
+            config,
+            bundle,
+            metadata,
+            frame,
+            partitions=("test",),
+        )
+        return FusionTestData(
+            test=_fusion_partition(frame, "test"),
+            lineage=_lineage(config, metadata),
+            bundle_manifest_sha256=_required_manifest_sha256(bundle),
+            authentication=authentication,
+        )
+
+    def load_localization_test(
+        self,
+        config: DatasetConfig,
+        *,
+        expected_manifest_sha256: str,
+    ) -> LocalizationTestData:
+        """Load authenticated test images and validated positive-box geometry."""
+        images = self.load_image_test(
+            config,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+        bundle, _ = _load_pinned_bundle(
+            config,
+            materialize_all_rows=False,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+        sample_ids = images.test["sample_id"].astype(str).tolist()
+        dimensions = pq.read_table(
+            bundle.samples_path,
+            columns=["sample_id", "image_rows", "image_columns"],
+            filters=[("sample_id", "in", sample_ids)],
+        ).to_pandas()
+        annotation_path = bundle.metadata_path.parent / ANNOTATIONS_FILENAME
+        annotations = pq.read_table(
+            annotation_path,
+            columns=["sample_id", "annotation_id", "x", "y", "width", "height"],
+            filters=[("sample_id", "in", sample_ids)],
+        ).to_pandas()
+        dimensions = dimensions.sort_values("sample_id", kind="stable").reset_index(drop=True)
+        annotations = annotations.sort_values("annotation_id", kind="stable").reset_index(drop=True)
+        if dimensions["sample_id"].astype(str).tolist() != sorted(sample_ids) or len(
+            dimensions
+        ) != len(sample_ids):
+            raise ManifestBuildError("Localization dimensions do not cover the test partition")
+        positive_ids = set(images.test.loc[images.test["target"] == 1, "sample_id"].astype(str))
+        if set(annotations["sample_id"].astype(str)) != positive_ids:
+            raise ManifestBuildError("Localization boxes do not cover every positive test sample")
+        return LocalizationTestData(images, dimensions, annotations)
 
 
 @dataclass(frozen=True)
@@ -392,6 +581,25 @@ def _image_partition(frame: pd.DataFrame, name: str) -> pd.DataFrame:
     selected = frame.loc[frame["split_name"] == name, _IMAGE_FRAME_COLUMNS].copy()
     if selected.empty:
         raise ManifestBuildError(f"Bundle partition {name!r} is empty")
+    return selected.reset_index(drop=True)
+
+
+def _fusion_partition(frame: pd.DataFrame, name: str) -> pd.DataFrame:
+    selected = frame.loc[frame["split_name"] == name, _FUSION_FRAME_COLUMNS].copy()
+    if selected.empty:
+        raise ManifestBuildError(f"Bundle partition {name!r} is empty")
+    sample_ids = selected["sample_id"].astype(str).tolist()
+    patient_ids = selected["patient_id"].astype(str).tolist()
+    targets = validated_binary_targets(selected["target"].to_numpy())
+    if (
+        len(sample_ids) != len(set(sample_ids))
+        or sample_ids != sorted(sample_ids)
+        or any(not value for value in patient_ids)
+        or len(targets) != len(selected)
+        or set(selected["split_name"].astype(str)) != {name}
+    ):
+        raise ManifestBuildError("RSNA fusion row alignment contract is invalid")
+    selected["target"] = targets
     return selected.reset_index(drop=True)
 
 

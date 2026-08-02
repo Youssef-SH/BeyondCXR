@@ -114,6 +114,9 @@ class CompletedRunRecord:
     local_model_sha256: str
     checkpoint_sha256: str
     source_training_run_parameter: str
+    source_cxr_training_run_id: str
+    source_cxr_model_package_id: str
+    source_cxr_checkpoint_sha256: str
     metrics: Mapping[str, object]
 
     def __post_init__(self) -> None:
@@ -162,7 +165,7 @@ def require_completed_run(run) -> CompletedRunRecord:
     if scope == "test" and (not isinstance(parent, str) or not parent.strip()):
         raise ValueError(f"Run {run.info.run_id} has no source training run")
     modality = tags["modality"]
-    if modality not in {"metadata", "image"}:
+    if modality not in {"metadata", "image", "fusion"}:
         raise ValueError(f"Run {run.info.run_id} has an invalid modality")
     metrics = {name: run.data.metrics.get(f"{scope}_{name}") for name in SCOPED_METRIC_NAMES}
     metrics["model_size_mib"] = run.data.metrics.get("model_size_mib")
@@ -192,6 +195,9 @@ def require_completed_run(run) -> CompletedRunRecord:
         local_model_sha256=tags.get("local_model_sha256", ""),
         checkpoint_sha256=tags.get("checkpoint_sha256", ""),
         source_training_run_parameter=run.data.params.get("source_training_run_id", ""),
+        source_cxr_training_run_id=tags.get("source_cxr_training_run_id", ""),
+        source_cxr_model_package_id=tags.get("source_cxr_model_package_id", ""),
+        source_cxr_checkpoint_sha256=tags.get("source_cxr_checkpoint_sha256", ""),
         metrics=metrics,
     )
 
@@ -227,7 +233,7 @@ def comparison_metrics_are_valid(record: CompletedRunRecord) -> bool:
     """Validate the scalar subset required by the comparison views."""
     for name in (*COMPARISON_SCOPED_METRIC_NAMES, "model_size_mib"):
         value = record.metrics[name]
-        if name == "latency_ms" and record.modality == "image" and value is None:
+        if name == "latency_ms" and record.modality in {"image", "fusion"} and value is None:
             continue
         if not _finite_number(value):
             return False
@@ -237,7 +243,7 @@ def comparison_metrics_are_valid(record: CompletedRunRecord) -> bool:
     latency = record.metrics["latency_ms"]
     size = record.metrics["model_size_mib"]
     return (
-        (record.modality == "image" or float(latency) >= 0.0)
+        (record.modality in {"image", "fusion"} or float(latency) >= 0.0)
         and _finite_number(size)
         and float(size) > 0.0
     )
@@ -251,6 +257,19 @@ def validated_image_test_metrics(record: CompletedRunRecord) -> dict[str, float]
         or record.evaluation_scope != "test"
     ):
         raise ValueError(f"Run {record.run_id} is not an image test-evaluation run")
+    return _validated_seed_metrics(record)
+
+
+def validated_neural_test_metrics(record: CompletedRunRecord) -> dict[str, float]:
+    """Return the complete finite scalar contract for an image or fusion test run."""
+    if record.modality not in {"image", "fusion"}:
+        raise ValueError(f"Run {record.run_id} is not a neural test-evaluation run")
+    if record.run_kind != "test_evaluation" or record.evaluation_scope != "test":
+        raise ValueError(f"Run {record.run_id} is not a neural test-evaluation run")
+    return _validated_seed_metrics(record)
+
+
+def _validated_seed_metrics(record: CompletedRunRecord) -> dict[str, float]:
     validated: dict[str, float] = {}
     for name in SEED_SPECIFIC_METRIC_NAMES:
         value = record.metrics[name]

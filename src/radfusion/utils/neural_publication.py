@@ -20,6 +20,9 @@ from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
 from radfusion.training.config import (
     ExperimentConfig,
+    fusion_architecture_contract,
+    fusion_semantic_config_sha256,
+    fusion_structured_input_conversion_contract,
     image_semantic_config_sha256,
     load_experiment_config,
 )
@@ -28,6 +31,7 @@ from radfusion.utils.model_publication import threshold_contract
 NEURAL_MODEL_FILENAME = "model.pt"
 CONFIG_FILENAME = "resolved_config.yaml"
 MANIFEST_FILENAME = "model_manifest.json"
+STRUCTURED_PREPROCESSOR_FILENAME = "structured_preprocessor.skops"
 NEURAL_CHECKPOINT_SCHEMA_VERSION = 1
 NEURAL_PACKAGE_SCHEMA_VERSION = 1
 NEURAL_PACKAGE_ID_PREFIX = "model-package-"
@@ -70,11 +74,12 @@ NEURAL_MANIFEST_FIELDS = frozenset(
         "runtime_provenance",
     }
 )
-NEURAL_IDENTITY_FIELDS = NEURAL_MANIFEST_FIELDS - {
-    "model_package_id",
-    "runtime_provenance",
-    "source_config_sha256",
-    "training_mlflow_run_id",
+FUSION_MANIFEST_FIELDS = NEURAL_MANIFEST_FIELDS | {
+    "structured_preprocessor_sha256",
+    "structured_preprocessor_contract",
+    "structured_input_conversion",
+    "fusion_architecture",
+    "source_cxr_lineage",
 }
 
 
@@ -157,6 +162,7 @@ def publish_neural_model_run(
     checkpoint_path: str | Path,
     source_config_bytes: bytes,
     manifest: Mapping[str, Any],
+    structured_preprocessor_path: str | Path | None = None,
 ) -> PublishedNeuralModel:
     """Publish one newly created immutable neural model package."""
     _validate_component(mlflow_run_id, "mlflow_run_id")
@@ -171,6 +177,18 @@ def publish_neural_model_run(
         config_path = stage / CONFIG_FILENAME
         shutil.copyfile(checkpoint_path, model_path)
         config_path.write_bytes(source_config_bytes)
+        modality = manifest.get("modality")
+        if modality == "fusion":
+            if structured_preprocessor_path is None:
+                raise ValueError("Fusion publication requires a fitted structured preprocessor")
+            _require_regular_file(structured_preprocessor_path, "structured preprocessor")
+            preprocessor_path = stage / STRUCTURED_PREPROCESSOR_FILENAME
+            shutil.copyfile(structured_preprocessor_path, preprocessor_path)
+        elif modality == "image":
+            if structured_preprocessor_path is not None:
+                raise ValueError("Image publication does not accept a structured preprocessor")
+        else:
+            raise ValueError("Neural publication requires image or fusion modality")
         checkpoint = load_neural_checkpoint(model_path)
         document = {
             **dict(manifest),
@@ -211,23 +229,33 @@ def validate_neural_package_metadata(run_directory: str | Path) -> dict[str, Any
     directory = Path(run_directory)
     if directory.parent.name != "runs" or directory.is_symlink() or not directory.is_dir():
         raise ValueError("Neural model package must be a physical directory beneath runs")
-    expected = {NEURAL_MODEL_FILENAME, CONFIG_FILENAME, MANIFEST_FILENAME}
     with os.scandir(directory) as entries:
         inspected = list(entries)
-    if {entry.name for entry in inspected} != expected:
-        raise ValueError("Neural model package contains an unexpected artifact set")
     if any(entry.is_symlink() or not entry.is_file(follow_symlinks=False) for entry in inspected):
         raise ValueError("Neural model package entries must be regular non-symlink files")
+    actual = {entry.name for entry in inspected}
+    if MANIFEST_FILENAME not in actual:
+        raise ValueError("Neural model package is missing its manifest")
     try:
         document = json.loads((directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Neural model manifest is unreadable") from exc
+    modality = document.get("modality") if isinstance(document, dict) else None
+    expected = {NEURAL_MODEL_FILENAME, CONFIG_FILENAME, MANIFEST_FILENAME}
+    if modality == "fusion":
+        expected.add(STRUCTURED_PREPROCESSOR_FILENAME)
+    if actual != expected:
+        raise ValueError("Neural model package contains an unexpected artifact set")
     _validate_manifest_metadata(
         document,
         directory.name,
         directory / NEURAL_MODEL_FILENAME,
         directory / CONFIG_FILENAME,
     )
+    if modality == "fusion" and sha256_file(
+        directory / STRUCTURED_PREPROCESSOR_FILENAME
+    ) != document.get("structured_preprocessor_sha256"):
+        raise ValueError("Fusion structured preprocessor SHA-256 mismatch")
     return document
 
 
@@ -244,13 +272,22 @@ def load_validated_neural_checkpoint(
 
 def neural_model_package_id(document: Mapping[str, Any]) -> str:
     """Return the deterministic exact provenance identity of a neural package."""
+    manifest_fields = _manifest_fields(document.get("modality"))
+    identity_fields = _identity_fields(manifest_fields)
     if set(document) not in {
-        NEURAL_IDENTITY_FIELDS,
-        NEURAL_MANIFEST_FIELDS,
-        NEURAL_MANIFEST_FIELDS - {"model_package_id"},
+        identity_fields,
+        manifest_fields,
+        manifest_fields - {"model_package_id"},
     }:
         raise ValueError("Neural package identity payload contains an unexpected field set")
-    payload = {field: document[field] for field in sorted(NEURAL_IDENTITY_FIELDS)}
+    payload = {field: document[field] for field in sorted(identity_fields)}
+    if document.get("modality") == "fusion":
+        source_lineage = document["source_cxr_lineage"]
+        if not isinstance(source_lineage, Mapping):
+            raise ValueError("Fusion source CXR lineage must be a mapping")
+        payload["source_cxr_lineage"] = {
+            key: source_lineage[key] for key in sorted(source_lineage) if key != "training_run_id"
+        }
     try:
         encoded = json.dumps(
             payload,
@@ -310,7 +347,10 @@ def _validate_manifest_metadata(
     model_path: Path,
     config_path: Path,
 ) -> None:
-    if not isinstance(document, dict) or set(document) != NEURAL_MANIFEST_FIELDS:
+    if not isinstance(document, dict):
+        raise ValueError("Neural model manifest contains an unexpected field set")
+    manifest_fields = _manifest_fields(document.get("modality"))
+    if set(document) != manifest_fields:
         raise ValueError("Neural model manifest contains an unexpected field set")
     schema_version = document["model_package_schema_version"]
     if (
@@ -319,7 +359,10 @@ def _validate_manifest_metadata(
         or schema_version != NEURAL_PACKAGE_SCHEMA_VERSION
     ):
         raise ValueError("Neural package schema version is invalid")
-    if document["training_mlflow_run_id"] != run_id or document["modality"] != "image":
+    if document["training_mlflow_run_id"] != run_id or document["modality"] not in {
+        "image",
+        "fusion",
+    }:
         raise ValueError("Neural package run or modality identity is invalid")
     for field in (
         "model",
@@ -354,7 +397,12 @@ def _validate_manifest_metadata(
         document["bundle_id"] != config.dataset.bundle_id
         or document["task"] != config.dataset.task_id
         or document["model"] != config.model.registry_key
-        or document["semantic_config_sha256"] != image_semantic_config_sha256(config)
+        or document["semantic_config_sha256"]
+        != (
+            image_semantic_config_sha256(config)
+            if config.model.modality == "image"
+            else fusion_semantic_config_sha256(config)
+        )
     ):
         raise ValueError("Neural package identity differs from archived configuration")
     selection = document["selection"]
@@ -447,8 +495,10 @@ def _validate_manifest_metadata(
 
 
 def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig) -> None:
-    if config.model.modality != "image" or config.image is None:
-        raise ValueError("Neural package archived configuration is not an image experiment")
+    if config.model.modality not in {"image", "fusion"} or config.image is None:
+        raise ValueError("Neural package archived configuration is not a neural experiment")
+    if document["modality"] != config.model.modality:
+        raise ValueError("Neural package modality differs from archived configuration")
     source = _exact_mapping(
         document["source_provenance"],
         {
@@ -486,7 +536,7 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
     )
     expected_model = {
         "registry_key": config.model.registry_key,
-        "modality": "image",
+        "modality": config.model.modality,
         "encoder_architecture": config.model.parameters["encoder_name"],
         "image_size": config.model.parameters["image_size"],
         "embedding_dimension": config.model.parameters["embedding_dimension"],
@@ -538,7 +588,82 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
         raise ValueError("Neural package evaluation transform differs from archived configuration")
     if document["input_contract"] != expected_evaluation_transform["input"]:
         raise ValueError("Neural package input contract is invalid")
+    _validate_training_and_metrics(document, config, image)
+    if config.model.modality == "fusion":
+        _validate_fusion_manifest(document, config)
 
+
+def _validate_fusion_manifest(document: dict[str, Any], config: ExperimentConfig) -> None:
+    contract = document["structured_preprocessor_contract"]
+    if (
+        not isinstance(contract, dict)
+        or not isinstance(contract.get("transformed_feature_names"), list)
+        or isinstance(contract.get("transformed_dimension"), bool)
+        or not isinstance(contract.get("transformed_dimension"), int)
+        or contract["transformed_dimension"] <= 0
+        or len(contract["transformed_feature_names"]) != contract["transformed_dimension"]
+        or contract.get("output_structure") != "dense"
+        or contract.get("output_dtype") != "float64"
+        or not _is_sha256(document["structured_preprocessor_sha256"])
+    ):
+        raise ValueError("Fusion structured preprocessor identity is invalid")
+    if document["structured_input_conversion"] != fusion_structured_input_conversion_contract():
+        raise ValueError("Fusion structured tensor conversion contract is invalid")
+    expected_architecture = fusion_architecture_contract(
+        config.model,
+        structured_input_dimension=contract["transformed_dimension"],
+    )
+    if document["fusion_architecture"] != expected_architecture:
+        raise ValueError("Fusion architecture identity is invalid")
+    lineage = _exact_mapping(
+        document["source_cxr_lineage"],
+        {
+            "training_run_id",
+            "model_package_id",
+            "checkpoint_sha256",
+            "semantic_config_sha256",
+            "git_commit",
+            "dependency_lock_sha256",
+        },
+        "source CXR lineage",
+    )
+    if not all(isinstance(value, str) and value for value in lineage.values()) or not all(
+        _is_sha256(lineage[field])
+        for field in (
+            "checkpoint_sha256",
+            "semantic_config_sha256",
+            "dependency_lock_sha256",
+        )
+    ):
+        raise ValueError("Fusion source CXR lineage is invalid")
+    source = document["source_provenance"]
+    if (
+        lineage["git_commit"] != source["git_commit"]
+        or lineage["dependency_lock_sha256"] != source["dependency_lock_sha256"]
+    ):
+        raise ValueError("Fusion source CXR revision differs from fusion package provenance")
+
+
+def _manifest_fields(modality: object) -> frozenset[str]:
+    if modality == "image":
+        return NEURAL_MANIFEST_FIELDS
+    if modality == "fusion":
+        return FUSION_MANIFEST_FIELDS
+    raise ValueError("Neural package has an invalid modality")
+
+
+def _identity_fields(manifest_fields: frozenset[str]) -> frozenset[str]:
+    return manifest_fields - {
+        "model_package_id",
+        "runtime_provenance",
+        "source_config_sha256",
+        "training_mlflow_run_id",
+    }
+
+
+def _validate_training_and_metrics(
+    document: dict[str, Any], config: ExperimentConfig, image: Any
+) -> None:
     policy = _exact_mapping(
         document["training_policy"],
         {
@@ -745,3 +870,10 @@ def _validate_component(value: object, field: str) -> None:
         or Path(value).name != value
     ):
         raise ValueError(f"{field} must be one safe path component")
+
+
+def _require_regular_file(path: str | Path, name: str) -> Path:
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"Neural package {name} must be a regular non-symlink file")
+    return source

@@ -68,6 +68,21 @@ MODEL_RANDOMNESS_KEYS = frozenset(
     }
 )
 
+_FUSION_MODEL_PARAMETERS = MappingProxyType(
+    {
+        "encoder_name": "densenet121",
+        "weights": "densenet121-res224-chex",
+        "image_size": 224,
+        "embedding_dimension": 1024,
+        "image_projection_dimension": 256,
+        "structured_hidden_dimension": 128,
+        "structured_projection_dimension": 64,
+        "fusion_hidden_dimension": 128,
+        "dropout": 0.2,
+        "class_weighting": "train_pos_weight",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DatasetConfig:
@@ -173,9 +188,33 @@ def image_seed_compatibility_sha256(config: ExperimentConfig) -> str:
     return _canonical_sha256(payload)
 
 
+def fusion_semantic_config_sha256(config: ExperimentConfig) -> str:
+    """Hash the meaning-bearing, path-independent fusion experiment configuration."""
+    return _canonical_sha256(_fusion_semantic_config(config))
+
+
+def fusion_seed_compatibility_sha256(config: ExperimentConfig) -> str:
+    """Hash fusion experiment meaning after excluding only the training seed."""
+    payload = _fusion_semantic_config(config)
+    del payload["training"]["seed"]
+    return _canonical_sha256(payload)
+
+
 def _image_semantic_config(config: ExperimentConfig) -> dict[str, Any]:
-    if config.model.modality != "image" or config.image is None:
-        raise ConfigError("Semantic image configuration requires image modality")
+    return _neural_semantic_config(config, modality="image")
+
+
+def _fusion_semantic_config(config: ExperimentConfig) -> dict[str, Any]:
+    return _neural_semantic_config(config, modality="fusion")
+
+
+def _neural_semantic_config(
+    config: ExperimentConfig,
+    *,
+    modality: str,
+) -> dict[str, Any]:
+    if config.model.modality != modality or config.image is None:
+        raise ConfigError(f"Semantic {modality} configuration requires {modality} modality")
     return {
         "config_version": config.config_version,
         "dataset": {
@@ -237,20 +276,24 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         raise ConfigError(f"Unsupported config_version: {config_version}")
     model = _model_config(root["model"])
     dataset = _dataset_config(root["dataset"])
-    if model.modality == "image":
-        if model.registry_key != "image_densenet":
-            raise ConfigError("Image experiments require model.registry_key='image_densenet'")
+    if model.modality in {"image", "fusion"}:
+        expected_key = "image_densenet" if model.modality == "image" else "fusion_concat"
+        if model.registry_key != expected_key:
+            raise ConfigError(
+                f"{model.modality.capitalize()} experiments require "
+                f"model.registry_key={expected_key!r}"
+            )
         if "image" not in root:
-            raise ConfigError("Image experiments require an image configuration section")
+            raise ConfigError("Neural experiments require an image configuration section")
         if dataset.dataset_root is None:
-            raise ConfigError("Image experiments require dataset.dataset_root")
+            raise ConfigError("Neural experiments require dataset.dataset_root")
     else:
         if model.registry_key not in {"metadata_logistic", "metadata_lightgbm"}:
             raise ConfigError("Metadata experiments require a registered metadata model")
         if dataset.dataset_root is not None:
             raise ConfigError("Metadata experiments do not accept dataset.dataset_root")
         if "image" in root:
-            raise ConfigError("The image configuration requires model.modality='image'")
+            raise ConfigError("The image configuration requires a neural modality")
     return ExperimentConfig(
         config_version=config_version,
         name=_text(root["name"], "name"),
@@ -300,8 +343,8 @@ def _model_config(value: object) -> ModelConfig:
         context="model",
     )
     modality = _text(data["modality"], "model.modality")
-    if modality not in {"metadata", "image"}:
-        raise ConfigError("model.modality must be 'metadata' or 'image'")
+    if modality not in {"metadata", "image", "fusion"}:
+        raise ConfigError("model.modality must be 'metadata', 'image', or 'fusion'")
     parameters = _mapping(data["parameters"], "model.parameters")
     randomness_conflicts = sorted(MODEL_RANDOMNESS_KEYS & parameters.keys())
     if randomness_conflicts:
@@ -313,6 +356,10 @@ def _model_config(value: object) -> ModelConfig:
         _validate_image_model_parameters(parameters)
         if _mapping(data["fit_parameters"], "model.fit_parameters"):
             raise ConfigError("Image models require empty model.fit_parameters")
+    elif modality == "fusion":
+        _validate_fusion_model_parameters(parameters)
+        if _mapping(data["fit_parameters"], "model.fit_parameters"):
+            raise ConfigError("Fusion models require empty model.fit_parameters")
     return ModelConfig(
         registry_key=_path_component(data["registry_key"], "model.registry_key"),
         modality=modality,
@@ -391,6 +438,74 @@ def _validate_image_model_parameters(parameters: dict[str, Any]) -> None:
         != "train_pos_weight"
     ):
         raise ConfigError("The image model requires train_pos_weight class weighting")
+
+
+def _validate_fusion_model_parameters(parameters: dict[str, Any]) -> None:
+    required = set(_FUSION_MODEL_PARAMETERS)
+    _keys(parameters, required=required, context="model.parameters")
+    encoder = _FUSION_MODEL_PARAMETERS["encoder_name"]
+    if _text(parameters["encoder_name"], "model.parameters.encoder_name") != encoder:
+        raise ConfigError(f"The fusion image encoder must be {encoder}")
+    weights = _FUSION_MODEL_PARAMETERS["weights"]
+    if _text(parameters["weights"], "model.parameters.weights") != weights:
+        raise ConfigError(f"The fusion image encoder must use {weights} weights")
+    expected_dimensions = {
+        field: value
+        for field, value in _FUSION_MODEL_PARAMETERS.items()
+        if field.endswith("dimension") or field == "image_size"
+    }
+    for field, expected in expected_dimensions.items():
+        if _integer(parameters[field], f"model.parameters.{field}") != expected:
+            raise ConfigError(f"The fusion model requires {field}={expected}")
+    dropout = _FUSION_MODEL_PARAMETERS["dropout"]
+    if _number(parameters["dropout"], "model.parameters.dropout") != dropout:
+        raise ConfigError(f"The fusion model requires dropout={dropout}")
+    class_weighting = _FUSION_MODEL_PARAMETERS["class_weighting"]
+    if _text(parameters["class_weighting"], "model.parameters.class_weighting") != class_weighting:
+        raise ConfigError(f"The fusion model requires {class_weighting} class weighting")
+
+
+def fusion_architecture_contract(
+    config: ModelConfig,
+    *,
+    structured_input_dimension: int,
+) -> dict[str, int | float]:
+    """Derive the fixed concat-fusion architecture from validated configuration."""
+    if config.modality != "fusion" or config.registry_key != "fusion_concat":
+        raise ConfigError("Concat fusion requires the registered fusion configuration")
+    if config.fit_parameters:
+        raise ConfigError("Concat fusion does not accept model.fit_parameters")
+    _validate_fusion_model_parameters(dict(config.parameters))
+    if (
+        isinstance(structured_input_dimension, bool)
+        or not isinstance(structured_input_dimension, int)
+        or structured_input_dimension <= 0
+    ):
+        raise ConfigError("Fusion structured input dimension must be a positive integer")
+    parameters = config.parameters
+    return {
+        "image_embedding_dimension": parameters["embedding_dimension"],
+        "image_projection_dimension": parameters["image_projection_dimension"],
+        "structured_input_dimension": structured_input_dimension,
+        "structured_hidden_dimension": parameters["structured_hidden_dimension"],
+        "structured_projection_dimension": parameters["structured_projection_dimension"],
+        "fusion_input_dimension": parameters["image_projection_dimension"]
+        + parameters["structured_projection_dimension"],
+        "fusion_hidden_dimension": parameters["fusion_hidden_dimension"],
+        "dropout": parameters["dropout"],
+        "output_dimension": 1,
+    }
+
+
+def fusion_structured_input_conversion_contract() -> dict[str, object]:
+    """Return the fixed conversion from fitted metadata output to neural input."""
+    return {
+        "source_dtype": "float64",
+        "tensor_dtype": "torch.float32",
+        "layout": "contiguous",
+        "finite": True,
+        "feature_order": "structured_preprocessor_contract.transformed_feature_names",
+    }
 
 
 def _image_config(value: object) -> ImageConfig:

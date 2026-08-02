@@ -1,4 +1,4 @@
-"""Summarize three explicit compatible RSNA image test-evaluation runs."""
+"""Summarize three explicit compatible RSNA neural test-evaluation runs."""
 
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ from radfusion.training.completed_runs import (
     CompletedRunRecord,
     has_matching_training_parent,
     require_completed_run,
-    validated_image_test_metrics,
+    validated_neural_test_metrics,
 )
 from radfusion.training.config import (
     ExperimentConfig,
+    fusion_seed_compatibility_sha256,
     image_seed_compatibility_sha256,
     load_experiment_config,
 )
@@ -55,7 +56,7 @@ _LOGGER = get_operational_logger(__name__)
 
 @dataclass(frozen=True)
 class SeedSummaryResult:
-    """Published result of one explicit RSNA image three-seed summary."""
+    """Published result of one explicit RSNA neural three-seed summary."""
 
     report_id: str
     report_directory: Path
@@ -80,7 +81,7 @@ def summarize_seed_runs(
     tracking_uri: str = DEFAULT_TRACKING_URI,
     output_directory: str | Path = "reports",
 ) -> SeedSummaryResult:
-    """Validate and summarize exactly three explicit RSNA image test runs."""
+    """Validate and summarize exactly three explicit RSNA neural test runs."""
     run_ids = tuple(test_run_ids)
     _validate_membership_input(run_ids)
     client = configure_mlflow(tracking_uri=tracking_uri)
@@ -138,8 +139,8 @@ def _load_member(client, test_run_id: str) -> _Member:
     test = require_completed_run(test_run)
     if test.run_kind != "test_evaluation" or test.evaluation_scope != "test":
         raise ValueError(f"Run {test_run_id} is not a test-evaluation run")
-    if test.modality != "image":
-        raise ValueError(f"Run {test_run_id} is not an image run")
+    if test.modality not in {"image", "fusion"}:
+        raise ValueError(f"Run {test_run_id} is not an image or fusion run")
     seed = test.integer_seed()
     parent_run = client.get_run(test.source_training_run_id)
     training = require_completed_run(parent_run)
@@ -153,8 +154,9 @@ def _load_member(client, test_run_id: str) -> _Member:
     package_directory = model_path.parent
     manifest = validate_neural_package_metadata(package_directory)
     config = load_experiment_config(package_directory / CONFIG_FILENAME)
-    metrics = validated_image_test_metrics(test)
+    metrics = validated_neural_test_metrics(test)
     _validate_member_lineage(test_run, parent_run, test, training, config, manifest, seed)
+    source_compatibility = _source_cxr_compatibility(client, test, training, manifest, seed)
     return _Member(
         seed,
         test,
@@ -162,7 +164,7 @@ def _load_member(client, test_run_id: str) -> _Member:
         config,
         manifest,
         metrics,
-        _compatibility_document(test, config, manifest),
+        _compatibility_document(test, config, manifest, source_compatibility),
     )
 
 
@@ -175,8 +177,10 @@ def _validate_member_lineage(
     manifest: Mapping[str, Any],
     seed: int,
 ) -> None:
-    if config.model.modality != "image" or config.image is None:
-        raise ValueError("Seed summary package does not contain an image config")
+    if config.model.modality not in {"image", "fusion"} or config.image is None:
+        raise ValueError("Seed summary package does not contain a neural config")
+    if config.model.modality != test.modality:
+        raise ValueError("Seed summary package and completed-run modalities differ")
     if test.dataset == "" or training.dataset == "" or test.dataset != training.dataset:
         raise ValueError("Seed summary dataset lineage is missing or inconsistent")
     if (
@@ -266,11 +270,16 @@ def _compatibility_document(
     test: CompletedRunRecord,
     config: ExperimentConfig,
     manifest: Mapping[str, Any],
+    source_cxr_compatibility: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     training_policy = dict(manifest["training_policy"])
     del training_policy["seed"]
     return {
-        "config_compatibility_sha256": image_seed_compatibility_sha256(config),
+        "config_compatibility_sha256": (
+            image_seed_compatibility_sha256(config)
+            if config.model.modality == "image"
+            else fusion_seed_compatibility_sha256(config)
+        ),
         "dataset": test.dataset,
         "task": manifest["task"],
         "label_policy_version": manifest["label_policy_version"],
@@ -294,6 +303,69 @@ def _compatibility_document(
         "threshold_contract": manifest["threshold_contract"],
         "metrics_policy": manifest["metrics_policy"],
         "source_authentication": manifest["source_authentication"],
+        **(
+            {
+                "structured_preprocessor_contract": manifest["structured_preprocessor_contract"],
+                "structured_input_conversion": manifest["structured_input_conversion"],
+                "fusion_architecture": manifest["fusion_architecture"],
+                "source_cxr_compatibility": dict(source_cxr_compatibility),
+            }
+            if config.model.modality == "fusion"
+            else {}
+        ),
+    }
+
+
+def _source_cxr_compatibility(
+    client,
+    test: CompletedRunRecord,
+    training: CompletedRunRecord,
+    manifest: Mapping[str, Any],
+    seed: int,
+) -> dict[str, Any] | None:
+    if test.modality == "image":
+        return None
+    lineage = manifest["source_cxr_lineage"]
+    source_run_id = lineage["training_run_id"]
+    if (
+        training.source_cxr_training_run_id != source_run_id
+        or test.source_cxr_training_run_id != source_run_id
+        or training.source_cxr_model_package_id != lineage["model_package_id"]
+        or test.source_cxr_model_package_id != lineage["model_package_id"]
+        or training.source_cxr_checkpoint_sha256 != lineage["checkpoint_sha256"]
+        or test.source_cxr_checkpoint_sha256 != lineage["checkpoint_sha256"]
+    ):
+        raise ValueError("Fusion source CXR completed-run lineage is inconsistent")
+    source = require_completed_run(client.get_run(source_run_id))
+    if (
+        source.modality != "image"
+        or source.model != "image_densenet"
+        or source.run_kind != "training"
+        or source.evaluation_scope != "validation"
+        or source.integer_seed() != seed
+        or source.model_package_id != lineage["model_package_id"]
+        or source.checkpoint_sha256 != lineage["checkpoint_sha256"]
+        or source.semantic_config_sha256 != lineage["semantic_config_sha256"]
+        or source.git_commit != lineage["git_commit"]
+        or source.dependency_lock_sha256 != lineage["dependency_lock_sha256"]
+    ):
+        raise ValueError("Fusion source CXR run is incompatible or not same-seed")
+    source_package = Path(source.local_model_path).parent
+    source_manifest = validate_neural_package_metadata(source_package)
+    source_config = load_experiment_config(source_package / CONFIG_FILENAME)
+    if source_manifest["model_package_id"] != lineage["model_package_id"]:
+        raise ValueError("Fusion source CXR package identity is inconsistent")
+    return {
+        "config_compatibility_sha256": image_seed_compatibility_sha256(source_config),
+        "dataset": source.dataset,
+        "task": source.task,
+        "bundle_id": source.bundle_id,
+        "bundle_manifest_sha256": source.bundle_manifest_sha256,
+        "split_assignment_id": source.split_assignment_id,
+        "label_policy_version": source.label_policy_version,
+        "model_identity": source_manifest["model_identity"],
+        "training_transform_contract": source_manifest["training_transform_contract"],
+        "evaluation_transform_contract": source_manifest["evaluation_transform_contract"],
     }
 
 
@@ -438,7 +510,7 @@ def _markdown_report(
     aggregates: Mapping[str, Mapping[str, float]],
 ) -> str:
     lines = [
-        "# RSNA image three-seed summary",
+        f"# RSNA {report['modality']} three-seed summary",
         "",
         f"- Report ID: `{report['report_id']}`",
         f"- Dataset: `{report['dataset']}`",

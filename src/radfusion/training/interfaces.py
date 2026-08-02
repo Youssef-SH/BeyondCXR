@@ -83,6 +83,17 @@ class DatasetImplementation(Protocol):
     ) -> Any:
         """Load and authenticate image test rows."""
 
+    def load_fusion_train_validation(self, config: DatasetConfig) -> Any:
+        """Load and authenticate aligned fusion train and validation rows."""
+
+    def load_fusion_test(
+        self,
+        config: DatasetConfig,
+        *,
+        expected_manifest_sha256: str,
+    ) -> Any:
+        """Load and authenticate aligned fusion test rows."""
+
 
 class ModelImplementation(Protocol):
     """Registered model implementation used by the experiment runner."""
@@ -104,3 +115,16 @@ class ImageModelImplementation(Protocol):
 
     def build(self, config: ModelConfig) -> nn.Module:
         """Build an unfitted image model."""
+
+
+class FusionModelImplementation(Protocol):
+    """Registered fusion model builder used by the neural runner."""
+
+    def build(
+        self,
+        config: ModelConfig,
+        *,
+        structured_dimension: int,
+        weights: str | None = None,
+    ) -> nn.Module:
+        """Build a fusion model for an exact transformed metadata width."""
