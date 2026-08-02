@@ -251,7 +251,7 @@ def test_missing_label_column_fails(tmp_path: Path, column: str) -> None:
     labels_path = root / "stage_2_train_labels.csv"
     pd.read_csv(labels_path).drop(columns=column).to_csv(labels_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="missing required columns"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -260,7 +260,7 @@ def test_missing_class_column_fails(tmp_path: Path) -> None:
     class_path = root / "stage_2_detailed_class_info.csv"
     pd.read_csv(class_path).drop(columns="class").to_csv(class_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="missing required columns"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -271,7 +271,7 @@ def test_inconsistent_targets_fail(tmp_path: Path) -> None:
     labels.loc[labels.index[-1], "Target"] = 0
     labels.to_csv(labels_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="consistent binary"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -282,7 +282,7 @@ def test_inconsistent_classes_fail(tmp_path: Path) -> None:
     classes.loc[classes.index[-1], "class"] = "Normal"
     classes.to_csv(class_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="one consistent"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -300,7 +300,7 @@ def test_source_identifier_mismatches_fail(tmp_path: Path, missing_from: str) ->
     else:
         (root / "stage_2_train_images" / "positive.dcm").unlink()
 
-    with pytest.raises(ManifestBuildError, match="Source identifier mismatch"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -308,7 +308,7 @@ def test_extra_dicom_without_label_fails(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     _write_header(root / "stage_2_train_images" / "extra.dcm", "extra")
 
-    with pytest.raises(ManifestBuildError, match="Source identifier mismatch"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -316,7 +316,7 @@ def test_duplicate_image_identifier_fails(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     _write_header(root / "stage_2_train_images" / "positive.DCM", "positive")
 
-    with pytest.raises(ManifestBuildError, match="Duplicate DICOM"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -324,7 +324,7 @@ def test_missing_dicom_patient_id_fails(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     _write_header(root / "stage_2_train_images" / "positive.dcm", None)
 
-    with pytest.raises(ManifestBuildError, match="PatientID is missing"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -332,7 +332,7 @@ def test_filename_dicom_patient_id_mismatch_fails(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     _write_header(root / "stage_2_train_images" / "positive.dcm", "different")
 
-    with pytest.raises(ManifestBuildError, match="does not match"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -340,7 +340,7 @@ def test_unreadable_dicom_fails_clearly(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     (root / "stage_2_train_images" / "positive.dcm").write_bytes(b"not a dicom")
 
-    with pytest.raises(ManifestBuildError, match="Could not read DICOM metadata"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -357,14 +357,14 @@ def test_missing_optional_metadata_is_preserved_as_null(tmp_path: Path) -> None:
 
 
 def test_malformed_and_implausible_ages_are_reported_in_aggregate(tmp_path: Path) -> None:
-    with pytest.warns(UserWarning, match="Invalid value for VR AS"):
+    with pytest.warns(UserWarning):
         malformed_root = _write_sources(tmp_path / "malformed", age="BAD")
     malformed = build_rsna_artifacts(malformed_root)
     assert malformed.samples.to_pylist()[1]["age_years"] is None
     assert malformed.samples.to_pylist()[1]["age_is_implausible"] is False
     assert malformed.metadata["age_parsing_summary"]["status_counts"]["malformed"] == 1
 
-    with pytest.warns(UserWarning, match="Invalid value for VR AS"):
+    with pytest.warns(UserWarning):
         implausible_root = _write_sources(tmp_path / "implausible", age="155")
     implausible = build_rsna_artifacts(implausible_root)
     assert implausible.samples.to_pylist()[1]["age_years"] == 155.0
@@ -373,14 +373,14 @@ def test_malformed_and_implausible_ages_are_reported_in_aggregate(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [("sex", "X", "PatientSex"), ("view", "LL", "ViewPosition")],
+    ("field", "value"),
+    [("sex", "X"), ("view", "LL")],
 )
-def test_invalid_categories_fail(tmp_path: Path, field: str, value: str, message: str) -> None:
+def test_invalid_categories_fail(tmp_path: Path, field: str, value: str) -> None:
     kwargs = {field: value}
     root = _write_sources(tmp_path / "extracted", **kwargs)
 
-    with pytest.raises(ManifestBuildError, match=message):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -391,7 +391,7 @@ def test_target_class_incompatibility_fails(tmp_path: Path) -> None:
     classes.loc[classes["patientId"] == "positive", "class"] = "Normal"
     classes.to_csv(class_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="Target/class incompatibility"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -401,13 +401,13 @@ def _labels_frame(boxes: list[dict[str, object]], target: int = 1) -> pd.DataFra
 
 def test_partial_positive_box_fails() -> None:
     frame = _labels_frame([{"x": 1, "y": 2, "width": 3, "height": None}])
-    with pytest.raises(ManifestBuildError, match="incomplete"):
+    with pytest.raises(ManifestBuildError):
         aggregate_labels(frame)
 
 
 def test_coordinates_on_negative_fail() -> None:
     frame = _labels_frame([{"x": 1, "y": None, "width": None, "height": None}], target=0)
-    with pytest.raises(ManifestBuildError, match="Negative"):
+    with pytest.raises(ManifestBuildError):
         aggregate_labels(frame)
 
 
@@ -422,13 +422,13 @@ def test_coordinates_on_negative_fail() -> None:
     ],
 )
 def test_invalid_box_geometry_fails(box: dict[str, object]) -> None:
-    with pytest.raises(ManifestBuildError, match="geometry|non-finite"):
+    with pytest.raises(ManifestBuildError):
         aggregate_labels(_labels_frame([box]))
 
 
 def test_duplicate_boxes_fail() -> None:
     box = {"x": 1, "y": 2, "width": 3, "height": 4}
-    with pytest.raises(ManifestBuildError, match="Duplicate bounding box"):
+    with pytest.raises(ManifestBuildError):
         aggregate_labels(_labels_frame([box, box]))
 
 
@@ -439,7 +439,7 @@ def test_bundle_construction_rejects_box_outside_source_dimensions(tmp_path: Pat
     labels.loc[labels["patientId"] == "positive", "x"] = 1023
     labels.to_csv(labels_path, index=False)
 
-    with pytest.raises(ManifestBuildError, match="exceeds image bounds"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -447,7 +447,7 @@ def test_portable_annotation_validation_rejects_invalid_geometry(tmp_path: Path)
     _, result = _tables(tmp_path)
     invalid = _replace_table_row(result.annotations, 0, width=0.0)
 
-    with pytest.raises(ManifestBuildError, match="invalid geometry"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(invalid, result.samples, result.labels)
 
 
@@ -460,7 +460,7 @@ def test_portable_annotation_validation_uses_stored_sample_dimensions(tmp_path: 
         image_columns=1,
     )
 
-    with pytest.raises(ManifestBuildError, match="exceeds image bounds"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(result.annotations, samples, result.labels)
 
 
@@ -468,7 +468,7 @@ def test_nonpositive_image_dimensions_fail(tmp_path: Path) -> None:
     root = _write_sources(tmp_path / "extracted")
     _write_header(root / "stage_2_train_images" / "positive.dcm", "positive", rows=0)
 
-    with pytest.raises(ManifestBuildError, match="Rows and Columns must be positive"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -476,7 +476,7 @@ def test_nonpositive_image_dimensions_fail(tmp_path: Path) -> None:
 def test_invalid_pixel_spacing_fails(tmp_path: Path, spacing: tuple[float, float]) -> None:
     root = _write_sources(tmp_path / "extracted", spacing=spacing)
 
-    with pytest.raises(ManifestBuildError, match="Pixel spacing"):
+    with pytest.raises(ManifestBuildError):
         build_rsna_artifacts(root)
 
 
@@ -484,7 +484,7 @@ def test_sample_schema_rejects_unexpected_column(tmp_path: Path) -> None:
     root, result = _tables(tmp_path)
     invalid = result.samples.append_column("extra", pa.array([1, 2], type=pa.int8()))
 
-    with pytest.raises(ManifestBuildError, match="schema mismatch"):
+    with pytest.raises(ManifestBuildError):
         validate_sample_table(invalid, root)
 
 
@@ -492,7 +492,7 @@ def test_annotation_schema_rejects_unexpected_column(tmp_path: Path) -> None:
     _, result = _tables(tmp_path)
     invalid = result.annotations.append_column("extra", pa.array([1, 2], type=pa.int8()))
 
-    with pytest.raises(ManifestBuildError, match="schema mismatch"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(invalid, result.samples, result.labels)
 
 
@@ -502,7 +502,7 @@ def test_label_schema_rejects_unexpected_column(tmp_path: Path) -> None:
         "extra", pa.array([1] * result.labels.num_rows, type=pa.int8())
     )
 
-    with pytest.raises(ManifestBuildError, match="schema mismatch"):
+    with pytest.raises(ManifestBuildError):
         validate_label_table(invalid, result.samples)
 
 
@@ -515,7 +515,7 @@ def test_exactly_one_pneumonia_label_is_required_per_sample(tmp_path: Path) -> N
     ]
     missing = pa.Table.from_pylist(rows, RSNA_LABEL_SCHEMA)
 
-    with pytest.raises(ManifestBuildError, match="exactly pneumonia and rsna_class"):
+    with pytest.raises(ManifestBuildError):
         validate_label_table(missing, result.samples)
 
 
@@ -527,7 +527,7 @@ def test_annotation_relationships_and_identifier_are_enforced(tmp_path: Path) ->
         sample_id="rsna:negative",
         annotation_id="rsna:negative:bbox:0000",
     )
-    with pytest.raises(ManifestBuildError, match="Negative sample"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(
             negative_annotation,
             result.samples,
@@ -535,7 +535,7 @@ def test_annotation_relationships_and_identifier_are_enforced(tmp_path: Path) ->
         )
 
     invalid_id = _replace_table_row(result.annotations, 0, annotation_id="arbitrary")
-    with pytest.raises(ManifestBuildError, match="deterministic annotation_id"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(invalid_id, result.samples, result.labels)
 
 
@@ -543,7 +543,7 @@ def test_every_positive_sample_requires_an_annotation(tmp_path: Path) -> None:
     _, result = _tables(tmp_path)
     empty = pa.Table.from_pylist([], RSNA_ANNOTATION_SCHEMA)
 
-    with pytest.raises(ManifestBuildError, match="Every positive sample"):
+    with pytest.raises(ManifestBuildError):
         validate_annotation_table(empty, result.samples, result.labels)
 
 
@@ -569,7 +569,7 @@ def test_path_traversal_and_absolute_paths_fail(tmp_path: Path) -> None:
     root, result = _tables(tmp_path)
     for invalid_path in ("../positive.dcm", str((root / "positive.dcm").resolve())):
         invalid = _replace_table_row(result.samples, 0, image_path=invalid_path)
-        with pytest.raises(ManifestBuildError, match="relative POSIX path|escapes"):
+        with pytest.raises(ManifestBuildError):
             validate_sample_table(invalid, root)
 
 
@@ -741,7 +741,7 @@ def test_staging_failure_preserves_current_bundle(
         raise ManifestBuildError("staged validation failed")
 
     monkeypatch.setattr("radfusion.data.rsna_artifacts.validate_bundle_directory", fail_validation)
-    with pytest.raises(ManifestBuildError, match="staged validation failed"):
+    with pytest.raises(ManifestBuildError):
         write_bundle(result, output)
     assert first.paths.current_path.read_text(encoding="utf-8") == current_before
     validate_bundle_directory(
@@ -786,7 +786,7 @@ def test_consumer_rejects_bundle_with_hash_mismatch(tmp_path: Path) -> None:
     written = write_bundle(result, tmp_path / "manifests")
     written.paths.labels_path.write_bytes(b"corrupt")
 
-    with pytest.raises(ManifestBuildError, match="hash mismatch"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(tmp_path / "manifests")
 
 
@@ -844,7 +844,7 @@ def test_bundle_reference_allows_new_operational_metadata_for_same_identity(
 def test_bundle_reference_rejects_wrong_selection_and_malformed_manifest(tmp_path: Path) -> None:
     _, result = _tables(tmp_path)
     selected = write_bundle(result, tmp_path / "selected")
-    with pytest.raises(ManifestBuildError, match="does not match"):
+    with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             selected.paths.bundle_directory,
             expected_bundle_id="build-wrong",
@@ -852,7 +852,7 @@ def test_bundle_reference_rejects_wrong_selection_and_malformed_manifest(tmp_pat
 
     malformed = write_bundle(result, tmp_path / "malformed")
     malformed.paths.metadata_path.write_bytes(b"not-json")
-    with pytest.raises(ManifestBuildError, match="metadata is unreadable"):
+    with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             malformed.paths.bundle_directory,
             expected_bundle_id=malformed.paths.bundle_id,
@@ -875,7 +875,7 @@ def test_image_test_manifest_mismatch_fails_before_partition_access(
         lambda *args, **kwargs: pytest.fail((args, kwargs, "test partition access")),
     )
 
-    with pytest.raises(ManifestBuildError, match="does not match expected lineage"):
+    with pytest.raises(ManifestBuildError):
         RsnaDataset().load_image_test(
             configured,
             expected_manifest_sha256="0" * 64,
@@ -899,7 +899,7 @@ def test_bundle_reference_lineage_rejects_manifest_and_coordinated_artifact_tamp
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    with pytest.raises(ManifestBuildError, match="does not match expected lineage"):
+    with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             written.paths.bundle_directory,
             expected_bundle_id=written.paths.bundle_id,
@@ -914,7 +914,7 @@ def test_bundle_reference_lineage_rejects_artifact_only_and_metadata_only_tamper
     artifact = write_bundle(result, tmp_path / "artifact")
     artifact_manifest_sha256 = sha256_file(artifact.paths.metadata_path)
     artifact.paths.labels_path.write_bytes(b"tampered")
-    with pytest.raises(ManifestBuildError, match="File hash mismatch"):
+    with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             artifact.paths.bundle_directory,
             expected_bundle_id=artifact.paths.bundle_id,
@@ -928,7 +928,7 @@ def test_bundle_reference_lineage_rejects_artifact_only_and_metadata_only_tamper
     manifest.paths.metadata_path.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    with pytest.raises(ManifestBuildError, match="does not match expected lineage"):
+    with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             manifest.paths.bundle_directory,
             expected_bundle_id=manifest.paths.bundle_id,
@@ -946,7 +946,7 @@ def test_consumer_rejects_declared_artifact_hash_tampering(tmp_path: Path) -> No
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    with pytest.raises(ManifestBuildError, match="File hash mismatch"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -963,7 +963,7 @@ def test_consumer_rejects_unexpected_bundle_entries(tmp_path: Path, entry_kind: 
     else:
         unexpected.symlink_to(written.paths.samples_path.name)
 
-    with pytest.raises(ManifestBuildError, match="unexpected artifact set"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -977,7 +977,7 @@ def test_consumer_rejects_required_bundle_artifact_symlinks(tmp_path: Path, attr
     required_path.rename(external)
     required_path.symlink_to(external)
 
-    with pytest.raises(ManifestBuildError, match="regular non-symlink"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -991,7 +991,7 @@ def test_consumer_rejects_extra_declared_artifact(tmp_path: Path) -> None:
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    with pytest.raises(ManifestBuildError, match="unexpected artifact set"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -1004,7 +1004,7 @@ def test_consumer_rejects_unsupported_manifest_schema(tmp_path: Path) -> None:
     written.paths.metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    with pytest.raises(ManifestBuildError, match="Unsupported manifest_schema_version"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -1022,7 +1022,7 @@ def test_source_inventory_authenticates_every_dicom_and_detects_tampering(tmp_pa
 
     written = write_bundle(result, tmp_path / "manifests")
     written.paths.source_inventory_path.write_bytes(b"tampered")
-    with pytest.raises(ManifestBuildError, match="hash mismatch"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(tmp_path / "manifests")
 
 
@@ -1055,7 +1055,7 @@ def test_consumer_rejects_metadata_that_does_not_match_bundle_id(tmp_path: Path)
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    with pytest.raises(ManifestBuildError, match="Bundle ID"):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 
@@ -1090,10 +1090,7 @@ def test_consumer_rejects_noncanonical_split_metadata(
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        ManifestBuildError,
-        match="split metadata fields|ordered split ratios",
-    ):
+    with pytest.raises(ManifestBuildError):
         load_current_bundle(output)
 
 

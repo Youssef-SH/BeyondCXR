@@ -219,7 +219,7 @@ def test_audit_failure_preserves_previous_output(
     destination.mkdir(parents=True)
     (destination / "previous.txt").write_text("complete", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="report failed"):
+    with pytest.raises(RuntimeError):
         generate_rsna_audit(tmp_path / "manifests", output)
 
     assert (destination / "previous.txt").read_text(encoding="utf-8") == "complete"

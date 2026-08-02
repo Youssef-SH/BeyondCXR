@@ -7,6 +7,7 @@ from pathlib import Path
 
 import mlflow
 import pandas as pd
+import pytest
 
 from radfusion.training.compare import COMPARISON_COLUMNS, regenerate_comparison
 from radfusion.training.completed_runs import require_completed_run
@@ -26,7 +27,7 @@ def _run(
     parent_training_run_id: str | None = None,
     metric_override: tuple[str, float] | None = None,
     tag_override: tuple[str, str] | None = None,
-    modality: str = "metadata",
+    modality: str | None = "metadata",
 ) -> str:
     kind = "training" if scope == "validation" else "test_evaluation"
     parent = (
@@ -40,7 +41,6 @@ def _run(
         "evaluation_scope": scope,
         "experiment_name": "experiment",
         "model": "metadata_logistic",
-        "modality": modality,
         "task": "pneumonia",
         "model_package_id": "model-package-test",
         "dataset_bundle_id": "bundle",
@@ -48,6 +48,8 @@ def _run(
         "seed": "42",
         "source_training_run_id": parent,
     }
+    if modality is not None:
+        tags["modality"] = modality
     if tag_override is not None:
         tags[tag_override[0]] = tag_override[1]
     with mlflow.start_run(tags=tags) as run:
@@ -98,7 +100,7 @@ def test_image_comparison_uses_canonical_test_evaluation_run_kind(tmp_path: Path
     assert table["run_id"].tolist() == [test_id]
 
 
-def test_completed_run_record_normalizes_existing_metadata_compatibility(tmp_path: Path) -> None:
+def test_completed_metadata_run_requires_the_current_explicit_contract(tmp_path: Path) -> None:
     tracking_uri = _tracking_uri(tmp_path)
     client = configure_mlflow(experiment_name="comparison-test", tracking_uri=tracking_uri)
     run_id = _run(scope="validation")
@@ -112,6 +114,15 @@ def test_completed_run_record_normalizes_existing_metadata_compatibility(tmp_pat
     assert record.integer_seed() == 42
     assert record.metrics["average_precision"] == 0.4
     assert record.metrics["model_size_mib"] == 2.0
+
+
+def test_completed_run_rejects_missing_modality(tmp_path: Path) -> None:
+    tracking_uri = _tracking_uri(tmp_path)
+    client = configure_mlflow(experiment_name="comparison-test", tracking_uri=tracking_uri)
+    run_id = _run(scope="validation", modality=None)
+
+    with pytest.raises(ValueError):
+        require_completed_run(client.get_run(run_id))
 
 
 def test_comparison_is_regenerated_from_complete_mlflow_runs(tmp_path: Path) -> None:

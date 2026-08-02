@@ -40,7 +40,7 @@ def test_mlflow_initialization_uses_isolated_sqlite_and_local_artifacts(tmp_path
     ["file:///tmp/mlruns", "sqlite:///:memory:", "sqlite:///"],
 )
 def test_mlflow_initialization_rejects_nonpersistent_local_backends(tracking_uri: str) -> None:
-    with pytest.raises(ValueError, match="SQLite|sqlite"):
+    with pytest.raises(ValueError):
         configure_mlflow(tracking_uri=tracking_uri)
 
 

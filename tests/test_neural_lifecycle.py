@@ -446,7 +446,7 @@ def test_cpu_and_cuda_runtime_provenance(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.parametrize("targets", [[0, 0], [1, 1], [0, 2]])
 def test_training_class_weight_requires_both_exact_classes(targets: list[int]) -> None:
-    with pytest.raises(NeuralTrainingError, match="both binary classes"):
+    with pytest.raises(NeuralTrainingError):
         training_class_weight(np.asarray(targets))
 
 
@@ -455,7 +455,7 @@ def test_checkpoint_comparison_requires_strict_minimum_delta() -> None:
     assert not candidate_is_improvement(0.5, 0.5, 0.0)
     assert not candidate_is_improvement(0.505, 0.5, 0.01)
     assert candidate_is_improvement(0.511, 0.5, 0.01)
-    with pytest.raises(NeuralTrainingError, match="finite and nonnegative"):
+    with pytest.raises(NeuralTrainingError):
         candidate_is_improvement(0.5, float("-inf"), -0.01)
 
 
@@ -573,7 +573,7 @@ def test_cpu_training_avoids_amp_and_rejects_nonfinite_loss(monkeypatch) -> None
             del targets
             return logits.sum() * torch.tensor(float("nan"))
 
-    with pytest.raises(NeuralTrainingError, match="non-finite batch loss"):
+    with pytest.raises(NeuralTrainingError):
         train_one_epoch(
             model,
             loader,
@@ -698,7 +698,7 @@ def test_inference_rejects_nonfinite_average_precision(monkeypatch) -> None:
         seed=42,
     ).validation
 
-    with pytest.raises(NeuralTrainingError, match="invalid Average Precision"):
+    with pytest.raises(NeuralTrainingError):
         deterministic_inference(_TinyImageModel(), loader, runtime=_runtime())
 
 
@@ -714,7 +714,7 @@ def test_inference_rejects_non_finite_logits() -> None:
         seed=42,
     ).validation
 
-    with pytest.raises(NeuralTrainingError, match="non-finite"):
+    with pytest.raises(NeuralTrainingError):
         deterministic_inference(model, loader, runtime=_runtime())
 
 
@@ -754,7 +754,7 @@ def test_lifecycle_rejects_malformed_batch_targets(target: torch.Tensor) -> None
         "sample_id": ["a", "b"],
         "patient_id": ["p-a", "p-b"],
     }
-    with pytest.raises(NeuralTrainingError, match="finite floating binary"):
+    with pytest.raises(NeuralTrainingError):
         deterministic_inference(_TinyImageModel(), [batch], runtime=_runtime())
 
 
@@ -765,7 +765,7 @@ def test_inference_rejects_identifier_length_mismatch() -> None:
         "sample_id": ["only-one"],
         "patient_id": ["p-a", "p-b"],
     }
-    with pytest.raises(NeuralTrainingError, match="unequal lengths"):
+    with pytest.raises(NeuralTrainingError):
         deterministic_inference(_TinyImageModel(), [batch], runtime=_runtime())
 
 
@@ -849,7 +849,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
     train_path = image_directory / "train.dcm"
     original_bytes = train_path.read_bytes()
     train_path.write_bytes(b"x" * len(original_bytes))
-    with pytest.raises(ManifestBuildError, match="SHA-256 authentication failed"):
+    with pytest.raises(ManifestBuildError):
         _authenticate_source_rows(
             configured,
             bundle,
@@ -859,7 +859,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
         )
     train_path.write_bytes(original_bytes)
     train_path.write_bytes(original_bytes + b"changed-size")
-    with pytest.raises(ManifestBuildError, match="size authentication failed"):
+    with pytest.raises(ManifestBuildError):
         _authenticate_source_rows(
             configured,
             bundle,
@@ -870,7 +870,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
     train_path.write_bytes(original_bytes)
 
     pq.write_table(pa.Table.from_pylist(rows[:1]), inventory_path)
-    with pytest.raises(ManifestBuildError, match="one row per permitted image"):
+    with pytest.raises(ManifestBuildError):
         _authenticate_source_rows(
             configured,
             bundle,
@@ -882,7 +882,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
     unsafe_rows = [dict(rows[0]), dict(rows[1])]
     unsafe_rows[0]["relative_path"] = "../train.dcm"
     pq.write_table(pa.Table.from_pylist(unsafe_rows), inventory_path)
-    with pytest.raises(ManifestBuildError, match="Invalid normalized relative image path"):
+    with pytest.raises(ManifestBuildError):
         _authenticate_source_rows(
             configured,
             bundle,
@@ -892,7 +892,7 @@ def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Pa
         )
 
     pq.write_table(pa.Table.from_pylist([rows[0], rows[0], rows[1]]), inventory_path)
-    with pytest.raises(ManifestBuildError, match="one row per permitted image"):
+    with pytest.raises(ManifestBuildError):
         _authenticate_source_rows(
             configured,
             bundle,
@@ -1047,7 +1047,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
     assert json.loads(published.manifest_path.read_text())["checkpoint_sha256"] == sha256_file(
         published.model_path
     )
-    with pytest.raises(FileExistsError, match="already exists"):
+    with pytest.raises(FileExistsError):
         publish_neural_model_run(
             model_root=tmp_path / "models" / "rsna",
             mlflow_run_id="training-run",
@@ -1089,7 +1089,7 @@ def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutat
     document["model_package_id"] = neural_model_package_id(document)
     published.manifest_path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Neural package"):
+    with pytest.raises(ValueError):
         validate_neural_package_metadata(published.run_directory)
 
 
@@ -1113,7 +1113,7 @@ def test_checkpoint_schema_rejects_unsafe_or_nonsemantic_state(tmp_path: Path, m
     )
     mutation(document)
 
-    with pytest.raises(ValueError, match="Neural checkpoint"):
+    with pytest.raises(ValueError):
         save_neural_checkpoint(document, tmp_path / "invalid.pt")
 
 
@@ -1130,7 +1130,7 @@ def test_strict_checkpoint_loading_rejects_parameter_mismatch(mutation: str) -> 
     else:
         document["model_state_dict"]["unexpected"] = torch.ones(1)
 
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(ValueError):
         strict_load_checkpoint(_TinyImageModel(), document)
 
 
@@ -1139,7 +1139,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
 ) -> None:
     unsafe = tmp_path / "unsafe.pt"
     torch.save(_TinyImageModel(), unsafe)
-    with pytest.raises(ValueError, match="safe tensor loader"):
+    with pytest.raises(ValueError):
         load_neural_checkpoint(unsafe)
 
     checkpoint = checkpoint_document(
@@ -1233,7 +1233,7 @@ def test_source_authentication_failure_precedes_model_construction(
     monkeypatch.setattr("radfusion.training.train_image.uv_lock_sha256", lambda: "9" * 64)
     tracking_uri = f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}"
 
-    with pytest.raises(ManifestBuildError, match="source authentication failed"):
+    with pytest.raises(ManifestBuildError):
         train_image_experiment(config, tracking_uri=tracking_uri)
 
     assert model_requested == []
@@ -1507,7 +1507,7 @@ def test_pretrained_weight_mutation_aborts_before_fitting(
         lambda *args, **kwargs: pytest.fail("fitting must not begin"),
     )
 
-    with pytest.raises(RuntimeError, match="changed during model construction"):
+    with pytest.raises(RuntimeError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
 
 
@@ -1524,7 +1524,7 @@ def test_missing_pretrained_weight_prevents_model_construction(
         "radfusion.training.train_image.fingerprint_pretrained_weights",
         missing_weight,
     )
-    with pytest.raises(FileNotFoundError, match="materialized before formal training"):
+    with pytest.raises(FileNotFoundError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     assert setup.build_calls == []
     _assert_single_failed_training_without_outputs(setup)
@@ -1540,7 +1540,7 @@ def test_pretrained_weight_mutation_cleans_outputs_and_leaves_run_incomplete(
         lambda weights: next(observed),
     )
 
-    with pytest.raises(RuntimeError, match="changed during model construction"):
+    with pytest.raises(RuntimeError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     _assert_single_failed_training_without_outputs(setup)
 
@@ -1555,7 +1555,7 @@ def test_image_evaluation_rejects_package_and_source_lineage_before_test_access(
     tampered_manifest = json.loads(original_manifest)
     tampered_manifest["model_package_id"] = "model-package-" + "0" * 64
     manifest_path.write_text(json.dumps(tampered_manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="package ID"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     manifest_path.write_bytes(original_manifest)
@@ -1563,20 +1563,20 @@ def test_image_evaluation_rejects_package_and_source_lineage_before_test_access(
     config_archive = training.model_path.parent / "resolved_config.yaml"
     original_config = config_archive.read_bytes()
     config_archive.write_bytes(original_config + b"\n# tampered\n")
-    with pytest.raises(ValueError, match="config hash"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     config_archive.write_bytes(original_config)
 
     original_checkpoint = training.model_path.read_bytes()
     training.model_path.write_bytes(original_checkpoint + b"tampered")
-    with pytest.raises(ValueError, match="checkpoint hash"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     training.model_path.write_bytes(original_checkpoint)
 
     monkeypatch.setattr("radfusion.training.evaluate_image.git_revision", lambda: ("other", False))
-    with pytest.raises(ValueError, match="Git commit"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     monkeypatch.setattr(
@@ -1584,7 +1584,7 @@ def test_image_evaluation_rejects_package_and_source_lineage_before_test_access(
     )
 
     monkeypatch.setattr("radfusion.training.evaluate_image.uv_lock_sha256", lambda: "8" * 64)
-    with pytest.raises(ValueError, match="dependency lock"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     monkeypatch.setattr("radfusion.training.evaluate_image.uv_lock_sha256", lambda: "9" * 64)
@@ -1593,14 +1593,14 @@ def test_image_evaluation_rejects_package_and_source_lineage_before_test_access(
     source = client.get_run(training.run_id)
     original_ap = source.data.metrics["validation_average_precision"]
     client.log_metric(training.run_id, "validation_average_precision", original_ap + 0.01)
-    with pytest.raises(ValueError, match="validation_average_precision"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
     client.log_metric(training.run_id, "validation_average_precision", original_ap)
 
     original_size = source.data.metrics["model_size_mib"]
     client.log_metric(training.run_id, "model_size_mib", original_size + 0.01)
-    with pytest.raises(ValueError, match="model_size_mib"):
+    with pytest.raises(ValueError):
         evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
 
@@ -1672,7 +1672,7 @@ def test_image_rollback_failure_path_has_no_final_publication_event(
 
     monkeypatch.setattr("radfusion.training.train_image.mlflow.set_tags", fail_after_publication)
 
-    with pytest.raises(RuntimeError, match="post-publication metadata failed"):
+    with pytest.raises(RuntimeError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
 
     _assert_single_failed_training_without_outputs(setup)

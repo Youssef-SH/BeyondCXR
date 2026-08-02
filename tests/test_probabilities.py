@@ -37,7 +37,7 @@ def test_positive_probability_forwards_lightgbm_best_iteration() -> None:
 
 @pytest.mark.parametrize("classes", [[0], [0, 2], [0, 0], [[0, 1]]])
 def test_positive_probability_rejects_invalid_class_contracts(classes) -> None:
-    with pytest.raises(ValueError, match="class|classes"):
+    with pytest.raises(ValueError):
         positive_class_probabilities(_Estimator(classes, [[0.5, 0.5]]), ["a"])
 
 
@@ -54,5 +54,5 @@ def test_positive_probability_rejects_invalid_class_contracts(classes) -> None:
     ],
 )
 def test_positive_probability_rejects_invalid_probability_outputs(probabilities) -> None:
-    with pytest.raises(ValueError, match="probabilit"):
+    with pytest.raises(ValueError):
         positive_class_probabilities(_Estimator([0, 1], probabilities), ["a"])

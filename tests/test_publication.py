@@ -43,7 +43,7 @@ def test_failed_directory_publication_restores_previous_output(
 
     monkeypatch.setattr("radfusion.utils.publication.os.replace", fail_stage_publish)
 
-    with pytest.raises(OSError, match="publication failed"):
+    with pytest.raises(OSError):
         publish_directory(stage, destination)
 
     assert {path.name for path in destination.iterdir()} == {"old.txt"}

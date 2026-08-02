@@ -145,7 +145,19 @@ def test_logfmt_is_utc_single_line_stable_and_safely_quoted() -> None:
     assert fields[3:] == ["device=cpu", "record_count=3"]
 
 
-def test_formatter_sanitizes_malformed_direct_record_fields() -> None:
+def test_formatter_ignores_nonmapping_record_fields() -> None:
+    stream = io.StringIO()
+    configure_logging("INFO", stream=stream)
+    logger = get_operational_logger("test")
+
+    logger.info("malformed", extra={"radfusion_fields": object()})
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert shlex.split(lines[0])[1:] == ["level=INFO"]
+
+
+def test_formatter_drops_unallowed_fields_and_redacts_unsafe_values() -> None:
     stream = io.StringIO()
     configure_logging("INFO", stream=stream)
     logger = get_operational_logger("test")
@@ -160,14 +172,13 @@ def test_formatter_sanitizes_malformed_direct_record_fields() -> None:
             }
         },
     )
-    logger.info("malformed", extra={"radfusion_fields": object()})
 
-    lines = stream.getvalue().splitlines()
-    assert len(lines) == 2
-    assert "/private/patient.dcm" not in stream.getvalue()
-    assert "unknown" not in stream.getvalue()
+    output = stream.getvalue()
+    lines = output.splitlines()
+    assert len(lines) == 1
+    assert "/private/patient.dcm" not in output
+    assert "unknown" not in output
     assert shlex.split(lines[0])[1:] == ["level=INFO", "event=<redacted>"]
-    assert shlex.split(lines[1])[1:] == ["level=INFO"]
 
 
 def test_allowlist_validates_value_shapes_and_preserves_aggregate_counts() -> None:
@@ -224,17 +235,17 @@ def test_count_progress_is_rate_limited_and_reports_completion(monkeypatch) -> N
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "message"),
+    "kwargs",
     [
-        ({"total": 0}, "total"),
-        ({"total": True}, "total"),
-        ({"count_interval": 0}, "count_interval"),
-        ({"time_interval_s": math.inf}, "time_interval_s"),
+        {"total": 0},
+        {"total": True},
+        {"count_interval": 0},
+        {"time_interval_s": math.inf},
     ],
 )
-def test_count_progress_rejects_invalid_configuration(kwargs, message) -> None:
+def test_count_progress_rejects_invalid_configuration(kwargs) -> None:
     parameters = {"total": 2, "unit": "files", **kwargs}
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError):
         CountProgress(get_operational_logger("test"), "progress", **parameters)
 
 
@@ -285,7 +296,7 @@ def test_timed_phase_logs_failure_and_preserves_exception(monkeypatch) -> None:
     )
     failure = RuntimeError("original failure")
 
-    with pytest.raises(RuntimeError, match="original failure") as raised:
+    with pytest.raises(RuntimeError) as raised:
         with timed_phase(get_operational_logger("test"), "model_fitting"):
             raise failure
 

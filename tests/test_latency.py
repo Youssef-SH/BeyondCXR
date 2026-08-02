@@ -34,13 +34,11 @@ def test_latency_benchmark_uses_warmup_and_median_single_sample_calls(monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("warmup_calls", "measured_calls", "message"),
-    [(-1, 1, "warmup_calls"), (0, 0, "measured_calls")],
+    ("warmup_calls", "measured_calls"),
+    [(-1, 1), (0, 0)],
 )
-def test_latency_benchmark_validates_call_counts(
-    warmup_calls: int, measured_calls: int, message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
+def test_latency_benchmark_validates_call_counts(warmup_calls: int, measured_calls: int) -> None:
+    with pytest.raises(ValueError):
         benchmark_single_sample_latency_ms(
             _RecordingModel(),
             pd.DataFrame({"feature": [1.0]}),

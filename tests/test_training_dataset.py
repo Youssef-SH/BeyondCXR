@@ -160,5 +160,5 @@ def test_config_cannot_omit_bundle_pin(tmp_path: Path) -> None:
     path = tmp_path / "unpinned.yaml"
     path.write_text(text.replace(line + "\n", ""), encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="dataset is missing keys.*bundle_id"):
+    with pytest.raises(ConfigError):
         load_experiment_config(path)

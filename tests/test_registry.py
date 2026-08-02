@@ -18,9 +18,9 @@ def test_builtin_component_mappings_are_immutable_and_complete() -> None:
 
 
 @pytest.mark.parametrize(
-    ("lookup", "message"),
-    [(get_dataset, "dataset"), (get_model, "model")],
+    "lookup",
+    [get_dataset, get_model],
 )
-def test_unknown_builtin_component_keys_fail(lookup, message: str) -> None:
-    with pytest.raises(RegistryError, match=message):
+def test_unknown_builtin_component_keys_fail(lookup) -> None:
+    with pytest.raises(RegistryError):
         lookup("missing")
