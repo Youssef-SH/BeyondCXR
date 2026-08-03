@@ -2,8 +2,8 @@
 
 RadFusion-Clinical is a reproducible machine-learning benchmark and experimentation framework for
 radiographic pneumonia prediction, centered on the RSNA Pneumonia Detection Challenge. It provides
-deterministic data preparation, patient-disjoint evaluation, and reproducible metadata and image
-baselines.
+deterministic data preparation, patient-disjoint evaluation, and reproducible metadata, image, and
+image-metadata fusion models.
 
 > This is a research and educational prototype. It is not a medical device and must not be used for clinical decision-making.
 
@@ -20,7 +20,9 @@ baselines.
 - Partition-scoped authentication of external DICOM bytes before image access
 - Observed bundle-manifest SHA-256 lineage for image training and linked evaluation
 - Separate validation and explicit test-evaluation runs with MLflow lineage
-- Explicit RSNA image three-seed summaries with individual, mean, and sample-SD results
+- Explicit RSNA image and fusion three-seed summaries with individual, mean, and sample-SD results
+- Fixed image-metadata concat fusion with same-seed CXR package initialization
+- Post-training three-seed Grad-CAM localization against RSNA bounding boxes
 - Immutable run-qualified metadata and neural model packages
 - Ruff, pytest, pre-commit, and continuous-integration checks
 
@@ -48,8 +50,10 @@ make rsna-audit      # generate reports under reports/rsna/audit/<bundle-id>
 make train CONFIG=configs/metadata_logistic.yaml
 make train CONFIG=configs/metadata_lightgbm.yaml
 make train CONFIG=configs/image_densenet_seed42.yaml
+make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
 make evaluate RUN_ID=<training-run-id>
 make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
+make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
 make compare         # regenerate CSV and Markdown comparison views from MLflow
 make clean           # remove caches and interrupted-publication staging state
 make purge-generated # deliberately remove all reproducible generated outputs
@@ -69,15 +73,25 @@ examples.
 Every experiment is declared by a validated YAML file under `configs/`. See
 [`docs/training.md`](docs/training.md) for the training workflow.
 
-Image training executes one configured seed per invocation. It reads and authenticates only train
-and validation DICOMs, fingerprints the pretrained weight file immediately before and after model
-construction, and requires exact equality. It packages exact bundle and run lineage.
+Image and fusion training execute one configured seed per invocation. Image training reads and
+authenticates only train and validation DICOMs, fingerprints the pretrained weight file immediately
+before and after model construction, and requires exact equality. It packages exact bundle and run
+lineage.
 `make evaluate` verifies the selected immutable package before accessing test data and reconstructs
 the model without the pretrained-weight cache.
 
-The image configs lock seeds 17, 42, and 2026. Their linked test runs can be summarized only by
-supplying all three run IDs explicitly. The summary retains individual results and reports their
-mean and sample standard deviation without selecting a canonical seed or averaging models.
+Fusion training requires an explicit same-seed image training run at execution time. The committed
+fusion YAML remains a stable scientific definition; the resulting package records the exact source
+CXR package and embeds its train-fitted structured preprocessor.
+
+The image and fusion configs lock seeds 17, 42, and 2026. Linked test runs for one modality can be
+summarized only by supplying all three run IDs explicitly. The summary retains individual results
+and reports their mean and sample standard deviation without selecting a canonical seed or
+averaging models.
+
+Neural test evaluation writes aligned sample-level predictions only to the ignored `private/`
+workspace. Localization reports under `reports/` contain aggregate metrics and methodology;
+real-image Grad-CAM overlays and their traceability manifest remain under `private/`.
 
 ## Cleaning generated artifacts
 
@@ -107,9 +121,10 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 
 ## Limitations
 
-- Implemented scope covers the labeled RSNA Stage 2 training set and metadata and image baselines.
-- Image experiment code is complete; scientific image results require independent GPU runs and are
-  not reported here.
+- Implemented scope covers the labeled RSNA Stage 2 training set and metadata, image, and fixed
+  image-metadata fusion models.
+- Image, fusion, and localization implementations are complete; final scientific results require
+  the consolidated GPU executions and are not reported here.
 - The labels are derived from public radiology-labeling pipelines and are not equivalent to
   confirmed clinical diagnosis.
 

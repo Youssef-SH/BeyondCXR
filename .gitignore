@@ -49,3 +49,6 @@ credentials.json
 
 # Generated reports
 /reports/
+
+# Private patient-level analysis artifacts
+/private/

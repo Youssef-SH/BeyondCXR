@@ -65,8 +65,10 @@ make rsna-audit
 make train CONFIG=configs/metadata_logistic.yaml
 make train CONFIG=configs/metadata_lightgbm.yaml
 make train CONFIG=configs/image_densenet_seed42.yaml
+make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
 make evaluate RUN_ID=<training-run-id>
 make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
+make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
 make compare
 ```
 
@@ -113,6 +115,24 @@ Each training invocation runs one explicit seed. The RSNA image seed summarizer 
 explicit linked test runs for seeds 17, 42, and 2026, verifies their stored compatibility, and
 reports individual metrics with arithmetic means and sample standard deviations. Thresholds remain
 seed-specific, and no favorable seed is selected as canonical.
+
+The same summary contract applies to fusion runs and additionally verifies the fixed fusion and
+structured-preprocessing contracts and compatible same-seed source CXR families. Fusion source run
+IDs are supplied at execution time; exact source package and checkpoint identities are package
+lineage.
+
+RSNA localization reconstructs each of the three verified image packages, targets the final
+DenseNet spatial feature sequence, and maps bounding boxes through the evaluation center crop and
+resize. Pointing-game ties use row-major order. Activation energy is the fraction of nonnegative
+heatmap mass inside the union box mask; a zero heatmap receives zero for both metrics. Qualitative
+cases are the first SHA-256-ranked member of each TP, FN, FP, and TN stratum under the seed-specific
+validation Youden threshold. All positives contribute to quantitative localization; Grad-CAM is
+computed for only the selected negative examples. Aggregate output is public-safe, while real-image
+overlays remain in the ignored private workspace.
+
+Each image and fusion test evaluation also publishes an aligned, validated private prediction table
+under `private/predictions/`. The table supports later aligned analyses and is excluded from public
+reports and MLflow artifacts.
 
 ## Probability and operating-point metrics
 

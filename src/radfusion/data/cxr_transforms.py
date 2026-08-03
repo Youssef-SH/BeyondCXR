@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -11,6 +12,38 @@ import torchxrayvision as xrv
 from torchvision.transforms import ColorJitter, InterpolationMode, RandomAffine
 
 CXR_TRANSFORM_POLICY_VERSION = "torchxrayvision-densenet121-res224-v1"
+
+
+@dataclass(frozen=True)
+class CenterCropGeometry:
+    """Integer geometry of TorchXRayVision's center-square crop."""
+
+    source_rows: int
+    source_columns: int
+    crop_size: int
+    offset_x: int
+    offset_y: int
+
+
+def center_crop_geometry(rows: int, columns: int) -> CenterCropGeometry:
+    """Return the exact integer crop used by XRayCenterCrop."""
+    if (
+        isinstance(rows, bool)
+        or isinstance(columns, bool)
+        or not isinstance(rows, int)
+        or not isinstance(columns, int)
+        or rows <= 0
+        or columns <= 0
+    ):
+        raise ValueError("CXR source dimensions must be positive integers")
+    crop = min(rows, columns)
+    return CenterCropGeometry(
+        source_rows=rows,
+        source_columns=columns,
+        crop_size=crop,
+        offset_x=columns // 2 - crop // 2,
+        offset_y=rows // 2 - crop // 2,
+    )
 
 
 class StandardCxrTransform:

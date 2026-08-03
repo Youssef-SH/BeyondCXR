@@ -70,6 +70,7 @@ from radfusion.utils.neural_publication import (
     validate_published_neural_model,
 )
 from radfusion.utils.operational_logging import configure_logging
+from radfusion.utils.private_predictions import validate_private_neural_predictions
 
 
 class _TensorDataset(Dataset[dict[str, object]]):
@@ -1468,8 +1469,14 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert evaluation.training_run_id == training.run_id
     assert evaluation.run_id != training.run_id
     assert evaluation.artifact_directory.is_dir()
+    private_manifest = validate_private_neural_predictions(evaluation.private_prediction_directory)
+    assert private_manifest["training_run_id"] == training.run_id
+    assert private_manifest["test_evaluation_run_id"] == evaluation.run_id
+    assert private_manifest["model_package_id"] == training.model_package_id
+    assert not any(path.suffix == ".parquet" for path in evaluation.artifact_directory.rglob("*"))
     client = configure_mlflow(tracking_uri=setup.tracking_uri)
     evaluation_run = client.get_run(evaluation.run_id)
+    assert client.list_artifacts(evaluation.run_id) == []
     assert evaluation_run.data.tags["run_complete"] == "true"
     assert evaluation_run.data.tags["source_training_run_id"] == training.run_id
     assert evaluation_run.data.tags["model_package_id"] == training.model_package_id
@@ -1630,6 +1637,17 @@ def test_image_publication_failures_remain_incomplete(
         and run.data.tags.get("run_kind") == "test_evaluation"
         and run.data.tags.get("run_complete") == "false"
         for run in failed_runs
+    )
+    failed_evaluation_ids = {
+        run.info.run_id
+        for run in failed_runs
+        if run.info.status == "FAILED" and run.data.tags.get("run_kind") == "test_evaluation"
+    }
+    assert not any(
+        (
+            setup.config.training.report_directory.parent / "private/predictions/rsna" / run_id
+        ).exists()
+        for run_id in failed_evaluation_ids
     )
 
     monkeypatch.setattr("radfusion.training.train_image.write_run_reports", fail_publication)

@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from radfusion.training.config import ConfigError, load_experiment_config
 from radfusion.training.registry import RegistryError
+from radfusion.training.train_fusion import train_fusion_experiment
 from radfusion.training.train_image import train_image_experiment
 from radfusion.training.train_tabular import train_configured_experiment
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI
@@ -27,6 +28,10 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_TRACKING_URI,
         help="MLflow SQLite tracking URI",
     )
+    parser.add_argument(
+        "--source-training-run-id",
+        help="Explicit source CXR training run required by fusion experiments",
+    )
     add_logging_argument(parser)
     return parser
 
@@ -37,11 +42,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
     try:
         config = load_experiment_config(args.config)
-        result = (
-            train_image_experiment(config, tracking_uri=args.tracking_uri)
-            if config.model.modality == "image"
-            else train_configured_experiment(config, tracking_uri=args.tracking_uri)
-        )
+        if config.model.modality == "fusion":
+            if not args.source_training_run_id:
+                raise ValueError("Fusion training requires --source-training-run-id")
+            result = train_fusion_experiment(
+                config,
+                source_training_run_id=args.source_training_run_id,
+                tracking_uri=args.tracking_uri,
+            )
+        elif args.source_training_run_id:
+            raise ValueError("--source-training-run-id is accepted only for fusion training")
+        elif config.model.modality == "image":
+            result = train_image_experiment(config, tracking_uri=args.tracking_uri)
+        else:
+            result = train_configured_experiment(config, tracking_uri=args.tracking_uri)
     except (
         ConfigError,
         RegistryError,

@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import torchxrayvision as xrv
 
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.dicom_loader import DicomRecord
@@ -62,6 +63,19 @@ def test_validation_transform_is_deterministic_finite_and_serializable() -> None
         "interpolation": "bilinear",
         "fill": 0.0,
     }
+
+
+def test_validation_pixels_match_authoritative_torchxrayvision_pipeline() -> None:
+    image = np.arange(41 * 60, dtype=np.float32).reshape(41, 60)
+    image /= float(image.max())
+    expected = xrv.utils.normalize(
+        xrv.datasets.XRayResizer(224)(xrv.datasets.XRayCenterCrop()(image[None, :, :])),
+        maxval=1.0,
+    )
+
+    actual = StandardCxrTransform(training=False)(image)
+
+    assert np.array_equal(actual.numpy(), expected)
 
 
 @pytest.mark.parametrize(
