@@ -37,7 +37,8 @@ bundle ID. `training.seed` is the single randomness authority.
 
 All experiment configs use schema version 1. Metadata configs are `configs/metadata_logistic.yaml`
 and `configs/metadata_lightgbm.yaml`. Image configs are `configs/image_densenet_seed17.yaml`,
-`configs/image_densenet_seed42.yaml`, and `configs/image_densenet_seed2026.yaml`.
+`configs/image_densenet_seed42.yaml`, and `configs/image_densenet_seed2026.yaml`. Fusion configs use
+the corresponding `configs/fusion_concat_seed*.yaml` files.
 
 ## Feature boundary
 
@@ -62,8 +63,10 @@ semantics, and the policy version. The fitted preprocessing pipeline is embedded
 ```bash
 make train CONFIG=configs/metadata_logistic.yaml
 make train CONFIG=configs/image_densenet_seed42.yaml
+make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
 make evaluate RUN_ID=<training-run-id>
 make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
+make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
 make compare
 ```
 
@@ -81,7 +84,8 @@ packages from clean training commits and requires the evaluator to use the same 
 and dependency lock. It then reads only test and applies the verified choices unchanged.
 
 The built-in dataset and model adapters are held in immutable mappings. One tabular runner owns
-metadata training, one neural runner owns image training, and the explicit evaluator owns test
+metadata training, one shared neural core owns two-stage optimization, and narrow image and fusion
+orchestrators own their data and publication boundaries. The explicit evaluator owns test
 evaluation. Dispatch is determined by `model.modality`.
 
 ## Image training
@@ -177,6 +181,14 @@ models/rsna/runs/<training-run-id>/
 
 Image packages use the same hierarchy with `model.pt` in place of `model.skops`.
 
+Fusion packages add `structured_preprocessor.skops`. Fusion training receives an explicit
+same-seed image training-run ID at execution time, verifies that its clean Git revision and
+dependency lock match the fusion execution, initializes only the image encoder, and records the
+source package, checkpoint, semantic config, Git, and dependency-lock lineage. The runtime run ID
+is lineage rather than scientific YAML. The train-fitted structured preprocessor and its exact
+ordered feature contract are part of the package. Fusion evaluation reconstructs from that package
+and applies its frozen validation thresholds to test.
+
 The manifest records `model_package_schema_version` and a deterministic `model_package_id`. Image
 package identity includes the selected checkpoint and observed bundle-manifest SHA-256, making it
 an exact provenance identity. Runtime provenance, operational paths, and training-run ID remain
@@ -202,14 +214,24 @@ confusion_matrix_target_sensitivity.png
 
 Publication requires exactly this set after privacy validation. `make compare` deterministically
 regenerates `reports/model_comparison_table.csv` and `.md` from complete, finite MLflow records.
-Rows include modality, task, and model package identity. Image rows are published only for verified
-test-evaluation runs; failed, unfinished, and incomplete runs are excluded.
+Rows include modality, task, and model package identity. Image and fusion rows are published only
+for verified test-evaluation runs; failed, unfinished, and incomplete runs are excluded.
 
-`make summarize-seeds` accepts exactly three explicit compatible image test-run IDs for seeds 17,
-42, and 2026. It publishes deterministic JSON, CSV, and Markdown under
+`make summarize-seeds` accepts exactly three explicit compatible image or fusion test-run IDs for
+seeds 17, 42, and 2026. It publishes deterministic JSON, CSV, and Markdown under
 `reports/<dataset>/seed-summaries/<report-id>/`, preserving every seed-specific metric and reporting
 arithmetic means and sample standard deviations for applicable results. Thresholds remain
 seed-specific; the summary selects no canonical seed and creates no averaged model.
+
+`make localize` accepts the three explicit image test-run IDs and evaluates Grad-CAM against the
+union of RSNA boxes for every positive test sample. Public output contains per-seed and aggregate
+pointing-game and activation-energy results. Mechanically selected real-image overlays and their
+internal traceability manifest are published only under `private/localization/`.
+
+Image and fusion test evaluators publish one ordered Parquet table under
+`private/predictions/<dataset>/<test-run-id>/`. It binds each test row's sample and private patient
+keys, target, logit, probability, split, seed, training run, evaluation run, and model package.
+These patient-level tables are neither public reports nor MLflow artifacts.
 
 The training, evaluation, and comparison CLIs default to `sqlite:///mlflow.db` and accept
 `--tracking-uri` when an isolated local SQLite database is required.

@@ -28,3 +28,15 @@ under `reports/`. Comparison views are generated from aggregate MLflow metrics a
 
 Public examples and test fixtures use synthetic data. External transfer of raw or derived data
 requires the dataset terms and project data-handling policy to permit the destination and use.
+
+## Private analysis workspace
+
+The ignored `private/` directory stores patient-level neural prediction tables and real-image
+localization overlays. Prediction tables contain sample and private patient keys, targets, logits,
+probabilities, and exact run/package lineage. Localization manifests contain the internal sample
+identity needed to trace mechanically selected overlays.
+
+Only aggregate localization metrics, counts, and methodological text are published under
+`reports/`. Real images, overlays, sample identities, patient identities, row-level predictions,
+and private artifact paths are excluded from public reports and MLflow artifacts. Private outputs
+remain subject to the source dataset's access and transfer terms.

@@ -21,11 +21,13 @@ The lifecycle is: source dataset → build execution → immutable bundle → va
 | Bundle publisher | Publish immutable bundles and update `CURRENT` atomically |
 | Audit generator | Produce aggregate dataset reports from a validated bundle |
 | Dataset mapping | Resolve the built-in adapter for a pinned bundle |
-| Model mapping | Resolve a built-in metadata or image model adapter |
+| Model mapping | Resolve a built-in metadata, image, or fusion model adapter |
 | Tabular runner | Fit a metadata model and select operating thresholds on validation |
 | Neural runner | Authenticate source images, train one seed, and select one validation state |
 | Test evaluator | Verify a completed package before applying it to the test partition |
-| Seed summarizer | Validate three explicit linked RSNA image test runs and report aggregate statistics |
+| Seed summarizer | Validate three explicit compatible image or fusion test runs and report aggregate statistics |
+| Localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
+| Private analysis store | Retain aligned neural predictions and real-image localization overlays outside public outputs |
 | Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
 
 Dataset adapters isolate source-specific behavior. Training reads validated bundle records through
@@ -36,14 +38,17 @@ The manifest owns dataset, task, split, source, and artifact lineage. Parquet ta
 row-level facts, while audits contain derived descriptions. `CURRENT` selects a bundle for
 interactive commands; experiment configs pin an exact bundle ID.
 
-Image configs pin the semantic bundle ID. Validation computes the observed bundle-manifest SHA-256
-and verifies its physical, logical, semantic, split, and source contracts before partition reads.
-Training freezes that exact identity in the package; linked evaluation requires the same
-bundle-manifest SHA-256 before test access.
+Image and fusion experiment configs pin the semantic bundle ID. Validation computes the observed
+bundle-manifest SHA-256 and verifies its physical, logical, semantic, split, and source contracts
+before partition reads. Training freezes that exact identity in the package; linked evaluation
+requires the same bundle-manifest SHA-256 before test access.
 
 Model packages under `models/` and complete reports under `reports/` are the authoritative
 physical outputs. MLflow stores the run ledger and references to those outputs; see
 [`training.md`](training.md) for the experiment artifact contract.
+
+Patient-level neural predictions and real-image localization examples are written under the ignored
+`private/` workspace. Public reports contain aggregate results only; see [`privacy.md`](privacy.md).
 
 Operational records are transient and do not participate in scientific state, MLflow records,
 published artifacts, or semantic identities.
@@ -55,7 +60,7 @@ RSNA source files
     → dataset adapter
     → validated tables and manifest
     → immutable bundle
-    → audit, metadata or image training, or explicit test evaluation
+    → audit, metadata, image, or fusion training, or explicit test evaluation
     → bundle-qualified audits or run-qualified experiment outputs
 ```
 
