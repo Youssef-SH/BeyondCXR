@@ -14,6 +14,7 @@ import mlflow
 import numpy as np
 from torch import nn
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.evaluation.metrics import (
     OperatingPointMetrics,
@@ -25,12 +26,20 @@ from radfusion.evaluation.metrics import (
 )
 from radfusion.models.cxr_baseline import fingerprint_pretrained_weights
 from radfusion.training.config import ExperimentConfig, image_semantic_config_sha256
-from radfusion.training.datasets import ImageRunData, RsnaImageDataset
+from radfusion.training.datasets import (
+    ImageRunData,
+    RsnaCachedImageDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
 from radfusion.training.device import resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
 from radfusion.training.interfaces import ImageModelImplementation
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
     EpochRecord,
+    EpochThroughput,
     NeuralFitResult,
     build_image_loaders,
     deterministic_inference,
@@ -97,6 +106,8 @@ def train_image_experiment(
     config: ExperimentConfig,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
+    cache: ValidatedCxrCache | None = None,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> ImageModelResult:
     """Train on image train/validation partitions and publish one selected package."""
     if config.model.modality != "image" or config.image is None:
@@ -145,13 +156,10 @@ def train_image_experiment(
         dataset_adapter = get_dataset(config.dataset.registry_key)
         with timed_phase(_LOGGER, "dataset_loading", **context):
             image_data = dataset_adapter.load_image_train_validation(config.dataset)
-        authentication = image_data.authentication
         mlflow.set_tags(
             {
                 "split_assignment_id": image_data.lineage.split_assignment_id,
                 "label_policy_version": image_data.lineage.label_policy_version,
-                "source_authentication_success": "true",
-                "source_authentication_policy": image_data.authentication.policy_version,
             }
         )
         mlflow.log_param("bundle_manifest_sha256", image_data.bundle_manifest_sha256)
@@ -159,17 +167,32 @@ def train_image_experiment(
             seed_neural_runtime(config.training.seed)
             train_transform = _transform(config, training=True)
             evaluation_transform = _transform(config, training=False)
-            train_dataset = RsnaImageDataset(
+            resolved_cache = cache or prepare_rsna_cxr_cache(
+                cast(RsnaDataset, dataset_adapter), config.dataset, evaluation_transform
+            )
+            expected_cache_identity = expected_rsna_cxr_cache_identity(
+                lineage=image_data.lineage,
+                bundle_manifest_sha256=image_data.bundle_manifest_sha256,
+                source_inventory=image_data.source_inventory,
+                transform=evaluation_transform,
+            )
+            authentication = resolved_cache.source_authentication.as_dict()
+            mlflow.set_tag("source_authentication_policy", authentication["policy_version"])
+            train_dataset = RsnaCachedImageDataset(
                 image_data.train,
-                dataset_root=_required_dataset_root(config),
+                cache=resolved_cache,
+                expected_cache_identity=expected_cache_identity,
                 partition="train",
                 transform=train_transform,
+                training_seed=config.training.seed,
             )
-            validation_dataset = RsnaImageDataset(
+            validation_dataset = RsnaCachedImageDataset(
                 image_data.validation,
-                dataset_root=_required_dataset_root(config),
+                cache=resolved_cache,
+                expected_cache_identity=expected_cache_identity,
                 partition="validation",
                 transform=evaluation_transform,
+                training_seed=config.training.seed,
             )
             runtime = resolve_device(
                 config.image.device,
@@ -177,15 +200,27 @@ def train_image_experiment(
                 pin_memory_policy=config.image.pin_memory_policy,
             )
             log_event(_LOGGER, "device_resolved", device=runtime.device.type, **context)
+            loader_execution = execution or configured_loader_policy(
+                num_workers=config.image.num_workers,
+                pin_memory=runtime.pin_memory_effective,
+            )
             loaders = build_image_loaders(
                 train_dataset,
                 validation_dataset,
                 config=config.image,
                 runtime=runtime,
                 seed=config.training.seed,
+                execution=loader_execution,
             )
             train_targets = image_data.train["target"].to_numpy(dtype=np.int8)
             positive_count, negative_count, pos_weight = training_class_weight(train_targets)
+            mlflow.log_params(
+                {
+                    f"loader_{key}": value if value is not None else "not_applicable"
+                    for key, value in loader_execution.provenance().items()
+                    if not isinstance(value, dict)
+                }
+            )
         model_builder = cast(ImageModelImplementation, get_model(config.model.registry_key))
         with timed_phase(_LOGGER, "model_construction", **context):
             weight_identity = fingerprint_pretrained_weights(
@@ -258,6 +293,21 @@ def train_image_experiment(
                     **context,
                 )
 
+        def epoch_throughput(record: EpochRecord, throughput: EpochThroughput) -> None:
+            log_event(
+                _LOGGER,
+                "epoch_throughput",
+                stage=record.stage,
+                global_epoch=record.global_epoch,
+                training_elapsed_s=throughput.training_elapsed_s,
+                validation_elapsed_s=throughput.validation_elapsed_s,
+                training_batches_per_second=throughput.training_batches_per_second,
+                validation_batches_per_second=throughput.validation_batches_per_second,
+                training_samples_per_second=throughput.training_samples_per_second,
+                validation_samples_per_second=throughput.validation_samples_per_second,
+                **context,
+            )
+
         operation_progress: dict[tuple[str, str, int], CountProgress] = {}
 
         def neural_progress(
@@ -298,6 +348,7 @@ def train_image_experiment(
                 epoch_started_callback=epoch_started,
                 stage_callback=stage_started,
                 progress_callback=neural_progress,
+                throughput_callback=epoch_throughput,
             )
         log_event(
             _LOGGER,
@@ -381,7 +432,7 @@ def train_image_experiment(
                 "task": image_data.lineage.task_id,
                 "label_policy_version": image_data.lineage.label_policy_version,
             },
-            "source_authentication": image_data.authentication.as_dict(),
+            "source_authentication": authentication,
             "model_identity": {
                 "registry_key": config.model.registry_key,
                 "modality": config.model.modality,
@@ -437,11 +488,16 @@ def train_image_experiment(
             manifest = _manifest(
                 config=config,
                 image_data=image_data,
+                source_authentication=authentication,
                 commit=commit,
                 dirty=dirty,
                 lock_hash=lock_hash,
                 environment=environment,
-                runtime=runtime.provenance(),
+                runtime={
+                    **runtime.provenance(),
+                    "loader_execution": loader_execution.provenance(),
+                    "cxr_cache_id": resolved_cache.identity.cache_id,
+                },
                 weight_identity=weight_identity.as_dict(),
                 train_transform=train_transform.contract(),
                 evaluation_transform=evaluation_transform.contract(),
@@ -488,9 +544,11 @@ def train_image_experiment(
                     "train_negative_count": negative_count,
                     "pos_weight": pos_weight,
                     "class_weight_policy": CLASS_WEIGHT_POLICY_VERSION,
-                    "source_inventory_file_sha256": authentication.source_inventory_file_sha256,
-                    "source_inventory_arrow_sha256": authentication.source_inventory_arrow_sha256,
-                    "source_authentication_policy_version": authentication.policy_version,
+                    "source_inventory_file_sha256": authentication["source_inventory_file_sha256"],
+                    "source_inventory_arrow_sha256": authentication[
+                        "source_inventory_arrow_sha256"
+                    ],
+                    "source_authentication_policy_version": authentication["policy_version"],
                     "selected_epoch": fit.selected_epoch,
                     "selected_stage": fit.selected_stage,
                     **{f"runtime_{key}": value for key, value in runtime.provenance().items()},
@@ -560,16 +618,11 @@ def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransf
     )
 
 
-def _required_dataset_root(config: ExperimentConfig) -> Path:
-    if config.dataset.dataset_root is None:
-        raise ValueError("Image experiment requires dataset.dataset_root")
-    return config.dataset.dataset_root
-
-
 def _manifest(
     *,
     config: ExperimentConfig,
     image_data: ImageRunData,
+    source_authentication: dict[str, object],
     commit: str,
     dirty: bool,
     lock_hash: str,
@@ -671,6 +724,6 @@ def _manifest(
             "threshold_policy_version": NEURAL_THRESHOLD_POLICY_VERSION,
             "sensitivity_target": config.evaluation.sensitivity_target,
         },
-        "source_authentication": image_data.authentication.as_dict(),
+        "source_authentication": source_authentication,
         "runtime_provenance": runtime,
     }

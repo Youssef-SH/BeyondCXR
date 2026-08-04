@@ -19,6 +19,7 @@ data/raw/**
 data/interim/**
 data/processed/**
 data/manifests/**
+/data/cache/
 !data/README.md
 !data/**/.gitkeep
 

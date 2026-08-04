@@ -73,7 +73,7 @@ class DatasetImplementation(Protocol):
         """Load only the test partition and its pinned lineage."""
 
     def load_image_train_validation(self, config: DatasetConfig) -> Any:
-        """Load and authenticate image train and validation rows."""
+        """Load source-inventory-bound image train and validation rows."""
 
     def load_image_test(
         self,
@@ -81,10 +81,10 @@ class DatasetImplementation(Protocol):
         *,
         expected_manifest_sha256: str,
     ) -> Any:
-        """Load and authenticate image test rows."""
+        """Load source-inventory-bound image test rows."""
 
     def load_fusion_train_validation(self, config: DatasetConfig) -> Any:
-        """Load and authenticate aligned fusion train and validation rows."""
+        """Load source-inventory-bound aligned fusion train and validation rows."""
 
     def load_fusion_test(
         self,
@@ -92,7 +92,7 @@ class DatasetImplementation(Protocol):
         *,
         expected_manifest_sha256: str,
     ) -> Any:
-        """Load and authenticate aligned fusion test rows."""
+        """Load source-inventory-bound aligned fusion test rows."""
 
 
 class ModelImplementation(Protocol):

@@ -151,12 +151,10 @@ def _manifest(
         },
         "source_authentication": {
             "policy_version": "test",
-            "partitions": ["train", "validation"],
+            "partitions": ["train", "validation", "test"],
             "file_count": 100,
             "source_inventory_arrow_sha256": "2" * 64,
             "source_inventory_file_sha256": "3" * 64,
-            "authenticated_rows_sha256": "4" * 64,
-            "success": True,
         },
     }
 

@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.evaluation.gradcam import gradcam_heatmaps, standard_cxr_gradcam_target
 from radfusion.evaluation.localization import (
@@ -36,7 +37,12 @@ from radfusion.training.config import (
     image_seed_compatibility_sha256,
     load_experiment_config,
 )
-from radfusion.training.datasets import RsnaDataset, RsnaImageDataset
+from radfusion.training.datasets import (
+    RsnaCachedImageDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate_image import verify_image_training_package
 from radfusion.training.neural import seed_neural_runtime
@@ -70,6 +76,7 @@ def generate_localization_report(
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     output_directory: str | Path = "reports",
+    cache: ValidatedCxrCache | None = None,
 ) -> Path:
     """Verify three explicit image test runs and publish localization results."""
     run_ids = tuple(test_run_ids)
@@ -110,6 +117,24 @@ def generate_localization_report(
     compatibility = {image_seed_compatibility_sha256(value[4]) for value in members}
     if len(compatibility) != 1:
         raise ValueError("Localization image runs are not scientifically compatible")
+    reference_config = members[0][4]
+    reference_image = reference_config.image
+    if reference_image is None:
+        raise ValueError("Localization package configuration is incomplete")
+    reference_dataset = _rsna_localization_dataset(reference_config.dataset)
+    reference_transform = StandardCxrTransform(
+        training=False,
+        image_size=int(reference_config.model.parameters["image_size"]),
+        rotation_degrees=reference_image.rotation_degrees,
+        translation_fraction=reference_image.translation_fraction,
+        brightness_jitter=reference_image.brightness_jitter,
+        contrast_jitter=reference_image.contrast_jitter,
+    )
+    resolved_cache = cache or prepare_rsna_cxr_cache(
+        reference_dataset,
+        reference_config.dataset,
+        reference_transform,
+    )
     ordered_run_ids = tuple(value[0].run_id for value in members)
     report_id = "localization-" + hashlib.sha256("\0".join(ordered_run_ids).encode()).hexdigest()
     destination = Path(output_directory) / "rsna" / "localization" / report_id
@@ -130,6 +155,7 @@ def generate_localization_report(
                 manifest,
                 config,
                 examples=examples,
+                cache=resolved_cache,
             )
             for test, training, package, manifest, config in members
         ]
@@ -178,7 +204,9 @@ def generate_localization_report(
     return destination
 
 
-def _evaluate_member(test, training, package, manifest, config, *, examples: Path):
+def _evaluate_member(
+    test, training, package, manifest, config, *, examples: Path, cache: ValidatedCxrCache
+):
     checkpoint = load_validated_neural_checkpoint(package, manifest)
     builder = cast(ImageDenseNetModel, get_model(config.model.registry_key))
     model = builder.build_architecture(config.model)
@@ -206,11 +234,23 @@ def _evaluate_member(test, training, package, manifest, config, *, examples: Pat
         brightness_jitter=image.brightness_jitter,
         contrast_jitter=image.contrast_jitter,
     )
-    dataset = RsnaImageDataset(
+    expected_cache_identity = expected_rsna_cxr_cache_identity(
+        lineage=localization.images.lineage,
+        bundle_manifest_sha256=localization.images.bundle_manifest_sha256,
+        source_inventory=localization.images.source_inventory,
+        transform=transform,
+    )
+    if cache.source_authentication.as_dict() != manifest["source_authentication"]:
+        raise ValueError("Validated cache source authentication differs from image package")
+    if manifest["runtime_provenance"]["cxr_cache_id"] != cache.identity.cache_id:
+        raise ValueError("Validated cache identity differs from the image package")
+    dataset = RsnaCachedImageDataset(
         localization.images.test,
-        dataset_root=config.dataset.dataset_root,
+        cache=cache,
+        expected_cache_identity=expected_cache_identity,
         partition="test",
         transform=transform,
+        training_seed=config.training.seed,
     )
     seed_neural_runtime(config.training.seed)
     model.eval()

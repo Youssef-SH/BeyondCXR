@@ -60,14 +60,12 @@ class ConcatFusionHead(nn.Module):
             )
         if not image_embedding.is_floating_point() or not structured.is_floating_point():
             raise ValueError("Fusion inputs must contain floating-point values")
-        if not torch.isfinite(image_embedding).all() or not torch.isfinite(structured).all():
-            raise ValueError("Fusion inputs must contain finite values")
         combined = torch.cat(
             (self.image_projection(image_embedding), self.structured_projection(structured)),
             dim=1,
         )
         logits = self.output(combined).squeeze(1)
-        if logits.shape != (len(image_embedding),) or not torch.isfinite(logits).all():
+        if logits.shape != (len(image_embedding),):
             raise ValueError("Fusion model produced invalid logits")
         return logits
 

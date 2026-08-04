@@ -1,30 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
+import random
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
 import torchxrayvision as xrv
+from torchvision.transforms import ColorJitter, InterpolationMode, RandomAffine
 
 from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.dicom_loader import DicomRecord
-from radfusion.data.rsna_source import ManifestBuildError
-from radfusion.training.datasets import RsnaImageDataset
 from radfusion.training.neural import seed_neural_runtime
-
-_COLUMNS = ("sample_id", "patient_id", "image_path", "split_name", "target")
-
-
-def _frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            ("rsna:a", "patient-a", "stage_2_train_images/a.dcm", "train", 0),
-            ("rsna:b", "patient-b", "stage_2_train_images/b.dcm", "train", 1),
-        ],
-        columns=_COLUMNS,
-    )
 
 
 def test_validation_transform_is_deterministic_finite_and_serializable() -> None:
@@ -127,171 +112,83 @@ def test_training_transform_is_seeded_and_never_flips() -> None:
     )
 
 
-def test_image_dataset_validates_without_decoding_and_decodes_lazily(tmp_path: Path) -> None:
-    calls: list[Path] = []
-    transformed: list[np.ndarray] = []
-
-    def decoder(path: str | Path) -> tuple[np.ndarray, DicomRecord]:
-        calls.append(Path(path))
-        pixels = np.ones((8, 8), dtype=np.float32)
-        return pixels, DicomRecord(
-            path=str(path),
-            patient_id=f"patient-{Path(path).stem}",
-            patient_age=None,
-            patient_sex=None,
-            view_position=None,
-            rows=8,
-            columns=8,
-            photometric_interpretation="MONOCHROME2",
-        )
-
-    def transform(image: np.ndarray) -> torch.Tensor:
-        transformed.append(image)
-        return torch.ones((1, 224, 224), dtype=torch.float32)
-
-    dataset = RsnaImageDataset(
-        _frame(),
-        dataset_root=tmp_path,
-        partition="train",
-        transform=transform,
-        decoder=decoder,
-    )
-
-    assert len(dataset) == 2
-    assert calls == []
-    sample = dataset[0]
-    assert calls == [tmp_path / "stage_2_train_images/a.dcm"]
-    assert len(transformed) == 1
-    assert sample["sample_id"] == "rsna:a"
-    assert sample["patient_id"] == "patient-a"
-    assert sample["target"].dtype == torch.float32
-    assert sample["target"].shape == ()
-    assert sample["image"].shape == (1, 224, 224)
-    second = dataset[1]
-    assert calls == [
-        tmp_path / "stage_2_train_images/a.dcm",
-        tmp_path / "stage_2_train_images/b.dcm",
-    ]
-    assert len(transformed) == 2
-    assert second["sample_id"] == "rsna:b"
-    assert second["patient_id"] == "patient-b"
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda frame: frame.drop(columns="image_path"),
-        lambda frame: frame.assign(unexpected=1),
-        lambda frame: frame.loc[:, list(reversed(_COLUMNS))],
-        lambda frame: frame.iloc[0:0],
-        lambda frame: frame.assign(sample_id=[1, "rsna:b"]),
-        lambda frame: frame.assign(sample_id=["", "rsna:b"]),
-        lambda frame: frame.iloc[::-1].reset_index(drop=True),
-        lambda frame: frame.assign(sample_id=["rsna:a", "rsna:a"]),
-        lambda frame: frame.assign(target=[0, 2]),
-        lambda frame: frame.assign(target=[False, 1]),
-        lambda frame: frame.assign(target=[1.0, 1]),
-        lambda frame: frame.assign(target=[0.0, 1]),
-        lambda frame: frame.assign(target=[0.5, 1]),
-        lambda frame: frame.assign(patient_id=["patient-a", ""]),
-        lambda frame: frame.assign(patient_id=["patient-a", 2]),
-        lambda frame: frame.assign(image_path=["../a.dcm", "b.dcm"]),
-        lambda frame: frame.assign(image_path=["/a.dcm", "b.dcm"]),
-        lambda frame: frame.assign(image_path=[r"images\a.dcm", "b.dcm"]),
-        lambda frame: frame.assign(image_path=["images/./a.dcm", "b.dcm"]),
-        lambda frame: frame.assign(image_path=["images//a.dcm", "b.dcm"]),
-        lambda frame: frame.assign(split_name=["train", "test"]),
-    ],
-)
-def test_image_dataset_rejects_invalid_rows_before_pixel_access(
-    tmp_path: Path,
-    mutation,
+@pytest.mark.parametrize("seed", [0, 17, 42, 2026])
+def test_deterministic_augmentation_matches_torchvision_reference_within_float_quantum(
+    seed: int,
 ) -> None:
-    calls = 0
-
-    def decoder(path):
-        nonlocal calls
-        calls += 1
-        raise AssertionError(path)
-
-    with pytest.raises(ManifestBuildError):
-        RsnaImageDataset(
-            mutation(_frame()),
-            dataset_root=tmp_path,
-            partition="train",
-            transform=lambda image: torch.from_numpy(image),
-            decoder=decoder,
+    transform = StandardCxrTransform(training=True)
+    bases = (
+        torch.linspace(0.0, 1.0, 224 * 224, dtype=torch.float32).reshape(1, 224, 224),
+        torch.arange(224 * 224, dtype=torch.float32).remainder(97).div(96).reshape(1, 224, 224),
+    )
+    for base in bases:
+        torch.manual_seed(seed)
+        augmented = ColorJitter(brightness=0.05, contrast=0.05)(
+            RandomAffine(
+                degrees=7.0,
+                translate=(0.05, 0.05),
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.0,
+            )(base)
         )
-    assert calls == 0
+        expected = torch.from_numpy(
+            np.ascontiguousarray(xrv.utils.normalize(augmented.numpy(), maxval=1.0))
+        ).to(dtype=torch.float32)
+
+        actual = transform.from_deterministic_base(base, augmentation_seed=seed)
+
+        # Deterministic contrast stays within one XRV-scale float quantum of torchvision.
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=2**-14)
 
 
-def test_image_dataset_rejects_unknown_partition_before_rows(tmp_path: Path) -> None:
-    with pytest.raises(ManifestBuildError):
-        RsnaImageDataset(
-            _frame(),
-            dataset_root=tmp_path,
-            partition="holdout",
-            transform=lambda image: torch.from_numpy(image),
-        )
+def test_zero_augmentation_boundary_preserves_exact_normalization() -> None:
+    base = torch.linspace(0.0, 1.0, 224 * 224, dtype=torch.float32).reshape(1, 224, 224)
+    transform = StandardCxrTransform(
+        training=True,
+        rotation_degrees=0.0,
+        translation_fraction=0.0,
+        brightness_jitter=0.0,
+        contrast_jitter=0.0,
+    )
+    expected = torch.from_numpy(
+        np.ascontiguousarray(xrv.utils.normalize(base.numpy(), maxval=1.0))
+    ).to(dtype=torch.float32)
+
+    assert torch.equal(transform.from_deterministic_base(base, augmentation_seed=0), expected)
 
 
-def test_image_dataset_rejects_decoded_patient_mismatch(tmp_path: Path) -> None:
-    def decoder(path: str | Path) -> tuple[np.ndarray, DicomRecord]:
-        return np.ones((8, 8), dtype=np.float32), DicomRecord(
-            path=str(path),
-            patient_id="different-patient",
-            patient_age=None,
-            patient_sex=None,
-            view_position=None,
-            rows=8,
-            columns=8,
-            photometric_interpretation="MONOCHROME2",
-        )
-
-    dataset = RsnaImageDataset(
-        _frame(),
-        dataset_root=tmp_path,
-        partition="train",
-        transform=lambda _: torch.zeros((1, 224, 224), dtype=torch.float32),
-        decoder=decoder,
+def test_explicit_augmentation_is_isolated_from_all_caller_rng(monkeypatch) -> None:
+    transform = StandardCxrTransform(training=True)
+    base = torch.linspace(0.0, 1.0, 224 * 224, dtype=torch.float32).reshape(1, 224, 224)
+    random.seed(9)
+    np.random.seed(9)
+    torch.manual_seed(9)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state().clone()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    monkeypatch.setattr(
+        torch,
+        "manual_seed",
+        lambda seed: (_ for _ in ()).throw(AssertionError("global seed mutation")),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "manual_seed_all",
+        lambda seed: (_ for _ in ()).throw(AssertionError("CUDA seed mutation")),
     )
 
-    with pytest.raises(ManifestBuildError):
-        dataset[0]
+    first = transform.from_validated_cache_base(base, augmentation_seed=17)
+    second = transform.from_validated_cache_base(base, augmentation_seed=17)
 
-
-@pytest.mark.parametrize(
-    "transformed",
-    [
-        np.zeros((1, 224, 224), dtype=np.float32),
-        torch.zeros((1, 224, 224), dtype=torch.float64),
-        torch.zeros((224, 224), dtype=torch.float32),
-        torch.full((1, 224, 224), float("inf"), dtype=torch.float32),
-    ],
-)
-def test_image_dataset_rejects_invalid_transform_output(
-    tmp_path: Path,
-    transformed: object,
-) -> None:
-    def decoder(path: str | Path) -> tuple[np.ndarray, DicomRecord]:
-        return np.ones((8, 8), dtype=np.float32), DicomRecord(
-            path=str(path),
-            patient_id="patient-a",
-            patient_age=None,
-            patient_sex=None,
-            view_position=None,
-            rows=8,
-            columns=8,
-            photometric_interpretation="MONOCHROME2",
+    assert torch.equal(first, second)
+    assert random.getstate() == python_state
+    assert np.random.get_state()[0] == numpy_state[0]
+    np.testing.assert_array_equal(np.random.get_state()[1], numpy_state[1])
+    assert np.random.get_state()[2:] == numpy_state[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+    if cuda_state is not None:
+        assert all(
+            torch.equal(before, after)
+            for before, after in zip(cuda_state, torch.cuda.get_rng_state_all(), strict=True)
         )
-
-    dataset = RsnaImageDataset(
-        _frame().iloc[[0]].copy(),
-        dataset_root=tmp_path,
-        partition="train",
-        transform=lambda _: transformed,  # type: ignore[return-value]
-        decoder=decoder,
-    )
-
-    with pytest.raises(ManifestBuildError):
-        dataset[0]

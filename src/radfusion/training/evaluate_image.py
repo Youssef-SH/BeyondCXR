@@ -11,6 +11,7 @@ from typing import Any, cast
 import mlflow
 from torch import nn
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.evaluation.metrics import evaluate_operating_point, evaluate_probabilities
 from radfusion.models.cxr_baseline import ImageDenseNetModel
@@ -19,8 +20,14 @@ from radfusion.training.config import (
     image_semantic_config_sha256,
     load_experiment_config,
 )
-from radfusion.training.datasets import RsnaImageDataset
+from radfusion.training.datasets import (
+    RsnaCachedImageDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
 from radfusion.training.device import resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
 from radfusion.training.neural import (
     build_evaluation_loader,
     deterministic_inference,
@@ -76,6 +83,8 @@ def evaluate_image_training_run(
     training_run_id: str,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
+    cache: ValidatedCxrCache | None = None,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> ImageTestEvaluationResult:
     """Verify one explicit image package before accessing its test partition."""
     client = configure_mlflow(tracking_uri=tracking_uri)
@@ -146,7 +155,6 @@ def evaluate_image_training_run(
                 config.dataset,
                 expected_manifest_sha256=manifest["bundle_manifest_sha256"],
             )
-        authentication = image_data.authentication
         if (
             image_data.lineage.bundle_id != manifest["bundle_id"]
             or image_data.lineage.split_assignment_id != manifest["split_assignment_id"]
@@ -155,7 +163,6 @@ def evaluate_image_training_run(
             or image_data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
         ):
             raise ValueError("Test bundle lineage differs from the neural package")
-        _verify_source_authentication(image_data.authentication.as_dict(), manifest)
         image = config.image
         if image is None or config.dataset.dataset_root is None:
             raise ValueError("Verified image package has an incomplete configuration")
@@ -169,21 +176,41 @@ def evaluate_image_training_run(
         )
         if evaluation_transform.contract() != manifest["evaluation_transform_contract"]:
             raise ValueError("Evaluation transform differs from the neural package")
-        test_dataset = RsnaImageDataset(
+        resolved_cache = cache or prepare_rsna_cxr_cache(
+            cast(RsnaDataset, dataset_adapter), config.dataset, evaluation_transform
+        )
+        expected_cache_identity = expected_rsna_cxr_cache_identity(
+            lineage=image_data.lineage,
+            bundle_manifest_sha256=image_data.bundle_manifest_sha256,
+            source_inventory=image_data.source_inventory,
+            transform=evaluation_transform,
+        )
+        authentication = resolved_cache.source_authentication.as_dict()
+        _verify_source_authentication(authentication, manifest)
+        if manifest["runtime_provenance"]["cxr_cache_id"] != resolved_cache.identity.cache_id:
+            raise ValueError("Validated cache identity differs from the image package")
+        test_dataset = RsnaCachedImageDataset(
             image_data.test,
-            dataset_root=config.dataset.dataset_root,
+            cache=resolved_cache,
+            expected_cache_identity=expected_cache_identity,
             partition="test",
             transform=evaluation_transform,
+            training_seed=config.training.seed,
         )
         runtime = resolve_device(
             image.device,
             mixed_precision=image.mixed_precision,
             pin_memory_policy=image.pin_memory_policy,
         )
+        loader_execution = execution or configured_loader_policy(
+            num_workers=image.num_workers,
+            pin_memory=runtime.pin_memory_effective,
+        )
         test_loader = build_evaluation_loader(
             test_dataset,
             config=image,
             runtime=runtime,
+            execution=loader_execution,
         )
         model.to(runtime.device)
         with timed_phase(_LOGGER, "test_inference", **context):
@@ -245,7 +272,7 @@ def evaluate_image_training_run(
             "label_policy_version": manifest["label_policy_version"],
             "partition": "test",
             "thresholds_frozen_from": "validation",
-            "source_authentication": image_data.authentication.as_dict(),
+            "source_authentication": authentication,
             "runtime": runtime.provenance(),
             "test_counts": {
                 "sample_count": len(inference.targets),
@@ -311,12 +338,22 @@ def evaluate_image_training_run(
             mlflow.log_params(
                 {
                     "bundle_manifest_sha256": image_data.bundle_manifest_sha256,
-                    "source_inventory_file_sha256": authentication.source_inventory_file_sha256,
-                    "source_inventory_arrow_sha256": authentication.source_inventory_arrow_sha256,
-                    "source_authentication_policy_version": authentication.policy_version,
+                    "source_inventory_file_sha256": authentication["source_inventory_file_sha256"],
+                    "source_inventory_arrow_sha256": authentication[
+                        "source_inventory_arrow_sha256"
+                    ],
+                    "source_authentication_policy_version": authentication["policy_version"],
                     **{
                         f"evaluation_runtime_{key}": value
                         for key, value in runtime.provenance().items()
+                    },
+                    "evaluation_cxr_cache_id": resolved_cache.identity.cache_id,
+                    **{
+                        f"evaluation_loader_{key}": (
+                            value if value is not None else "not_applicable"
+                        )
+                        for key, value in loader_execution.provenance().items()
+                        if not isinstance(value, dict)
                     },
                 }
             )
@@ -327,8 +364,7 @@ def evaluate_image_training_run(
                 {
                     "split_assignment_id": manifest["split_assignment_id"],
                     "label_policy_version": manifest["label_policy_version"],
-                    "source_authentication_success": "true",
-                    "source_authentication_policy": image_data.authentication.policy_version,
+                    "source_authentication_policy": authentication["policy_version"],
                     "model_package_id": manifest["model_package_id"],
                     "checkpoint_sha256": manifest["checkpoint_sha256"],
                     "local_model_sha256": manifest["checkpoint_sha256"],
@@ -441,10 +477,5 @@ def verify_image_training_package(
 
 def _verify_source_authentication(observed: dict[str, object], manifest: dict[str, Any]) -> None:
     expected = manifest["source_authentication"]
-    common_fields = (
-        "policy_version",
-        "source_inventory_file_sha256",
-        "source_inventory_arrow_sha256",
-    )
-    if any(observed.get(field) != expected.get(field) for field in common_fields):
-        raise ValueError("Test source inventory identity differs from the neural package")
+    if observed != expected:
+        raise ValueError("Validated cache source authentication differs from the neural package")

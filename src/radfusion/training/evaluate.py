@@ -15,6 +15,7 @@ import mlflow
 from mlflow.exceptions import MlflowException
 from sqlalchemy.exc import SQLAlchemyError
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.hashing import sha256_file
 from radfusion.data.tabular_preprocess import validate_metadata_pipeline
 from radfusion.evaluation.latency import benchmark_single_sample_latency_ms
@@ -29,6 +30,7 @@ from radfusion.training.evaluate_image import (
     ImageTestEvaluationResult,
     evaluate_image_training_run,
 )
+from radfusion.training.execution import LoaderExecutionPolicy
 from radfusion.training.registry import RegistryError, get_dataset
 from radfusion.training.train_tabular import (
     metrics_document,
@@ -72,15 +74,27 @@ def evaluate_training_run(
     training_run_id: str,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
+    cache: ValidatedCxrCache | None = None,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> TestEvaluationResult | ImageTestEvaluationResult | FusionTestEvaluationResult:
     """Apply a completed training run's model and thresholds to test data."""
     client = configure_mlflow(tracking_uri=tracking_uri)
     source_run = client.get_run(training_run_id)
     source_modality = source_run.data.tags.get("modality")
     if source_modality == "image":
-        return evaluate_image_training_run(training_run_id, tracking_uri=tracking_uri)
+        return evaluate_image_training_run(
+            training_run_id,
+            tracking_uri=tracking_uri,
+            cache=cache,
+            execution=execution,
+        )
     if source_modality == "fusion":
-        return evaluate_fusion_training_run(training_run_id, tracking_uri=tracking_uri)
+        return evaluate_fusion_training_run(
+            training_run_id,
+            tracking_uri=tracking_uri,
+            cache=cache,
+            execution=execution,
+        )
     if source_modality != "metadata":
         raise ValueError("Source training run has no valid modality")
     if (

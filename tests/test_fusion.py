@@ -11,10 +11,14 @@ import yaml
 from torch import nn
 from torch.utils.data import Dataset
 
+from radfusion.data.cxr_cache import (
+    SOURCE_AUTHENTICATION_POLICY_VERSION,
+    CxrCacheIdentity,
+    CxrCacheSourceAuthentication,
+    preprocessing_identity,
+)
 from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.dicom_loader import DicomRecord
 from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.data.tabular_preprocess import (
     SOURCE_FEATURES,
     build_rsna_preprocessor,
@@ -36,11 +40,9 @@ from radfusion.training.config import (
     load_experiment_config,
 )
 from radfusion.training.datasets import (
-    SOURCE_AUTHENTICATION_POLICY_VERSION,
     FusionRunData,
     FusionTestData,
-    RsnaFusionDataset,
-    SourceAuthentication,
+    SourceInventoryIdentity,
 )
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
@@ -67,6 +69,8 @@ from radfusion.utils.neural_publication import (
     validate_published_neural_model,
 )
 from radfusion.utils.private_predictions import validate_private_neural_predictions
+
+_SYNTHETIC_BUNDLE_ID = "build-" + "a" * 64
 
 
 class _TinyEncoder(nn.Module):
@@ -185,65 +189,6 @@ def test_fusion_encoder_initialization_loads_only_exact_source_encoder_state() -
         assert torch.equal(destination.encoder.state_dict()[key], value)
 
 
-def test_rsna_fusion_dataset_requires_exact_alignment_and_float32_conversion(
-    tmp_path: Path,
-) -> None:
-    frame = pd.DataFrame(
-        [
-            {
-                "sample_id": "rsna:a",
-                "patient_id": "a",
-                "image_path": "images/a.dcm",
-                "age_years": 50.0,
-                "age_is_implausible": False,
-                "sex": "F",
-                "view_position": "PA",
-                "pixel_spacing_row_mm": 0.2,
-                "pixel_spacing_col_mm": 0.2,
-                "split_name": "train",
-                "target": 1,
-            }
-        ]
-    )
-
-    def decoder(_: Path):
-        return np.ones((2, 2), dtype=np.float32), DicomRecord(
-            path="unused",
-            patient_id="a",
-            patient_age=None,
-            patient_sex=None,
-            view_position=None,
-            rows=2,
-            columns=2,
-            photometric_interpretation="MONOCHROME2",
-        )
-
-    dataset = RsnaFusionDataset(
-        frame,
-        np.asarray([[1.0, 2.0]], dtype=np.float64),
-        structured_sample_ids=("rsna:a",),
-        dataset_root=tmp_path,
-        partition="train",
-        transform=lambda _: torch.zeros((1, 224, 224), dtype=torch.float32),
-        decoder=decoder,
-    )
-    assert dataset[0]["structured"].dtype == torch.float32
-    assert dataset[0]["structured"].is_contiguous()
-
-    with pytest.raises(ManifestBuildError):
-        RsnaFusionDataset(
-            frame,
-            np.asarray([[1.0, 2.0]]),
-            structured_sample_ids=("rsna:wrong",),
-            dataset_root=tmp_path,
-            partition="train",
-            transform=lambda _: torch.zeros((1, 224, 224)),
-            decoder=decoder,
-        )
-
-    assert tuple(frame.loc[:, SOURCE_FEATURES].columns) == SOURCE_FEATURES
-
-
 def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
     tmp_path: Path,
 ) -> None:
@@ -269,14 +214,17 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         validation_average_precision=0.7,
     )
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "model.pt")
-    authentication = SourceAuthentication(
-        policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
-        partitions=("train", "validation"),
-        file_count=4,
+    source_inventory = SourceInventoryIdentity(
         source_inventory_arrow_sha256="1" * 64,
         source_inventory_file_sha256="2" * 64,
-        authenticated_rows_sha256="3" * 64,
     )
+    source_authentication = {
+        "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
+        "partitions": ["train", "validation", "test"],
+        "file_count": 4,
+        "source_inventory_arrow_sha256": "1" * 64,
+        "source_inventory_file_sha256": "2" * 64,
+    }
     data = FusionRunData(
         train=features,
         validation=features,
@@ -287,7 +235,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
             task_id="pneumonia",
         ),
         bundle_manifest_sha256="4" * 64,
-        authentication=authentication,
+        source_inventory=source_inventory,
     )
     image = config.image
     assert image is not None
@@ -301,13 +249,25 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
     manifest = _manifest(
         config=config,
         data=data,
+        source_authentication=source_authentication,
         commit="commit-test",
         dirty=False,
         lock_hash="5" * 64,
         environment={"environment_python_version": "3.13"},
-        runtime=resolve_device(
-            "cpu", mixed_precision=False, pin_memory_policy="disabled"
-        ).provenance(),
+        runtime={
+            **resolve_device(
+                "cpu", mixed_precision=False, pin_memory_policy="disabled"
+            ).provenance(),
+            "cxr_cache_id": "cache-" + "0" * 64,
+            "loader_execution": {
+                "effective_cpu_capacity": 1.0,
+                "num_workers": 0,
+                "persistent_workers": False,
+                "prefetch_factor": None,
+                "pin_memory": False,
+                "candidate_throughput_batches_per_second": {},
+            },
+        },
         source_lineage=SourceCxrLineage(
             training_run_id="source-run",
             model_package_id="source-package",
@@ -570,10 +530,11 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("radfusion.training.execution.effective_cpu_capacity", lambda: 12.5)
     document = _document()
     document["dataset"].update(
         {
-            "bundle_id": "build-synthetic",
+            "bundle_id": _SYNTHETIC_BUNDLE_ID,
             "dataset_root": str(tmp_path / "raw"),
             "manifest_directory": str(tmp_path / "manifests"),
         }
@@ -598,7 +559,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     config_path = _write(tmp_path, document)
     config = load_experiment_config(config_path)
     lineage = DatasetLineage(
-        bundle_id="build-synthetic",
+        bundle_id=_SYNTHETIC_BUNDLE_ID,
         split_assignment_id="split-synthetic",
         label_policy_version="label-v1",
         task_id="pneumonia",
@@ -634,21 +595,9 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
             ),
         ]
 
-    authentication = SourceAuthentication(
-        policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
-        partitions=("train", "validation"),
-        file_count=8,
+    source_inventory = SourceInventoryIdentity(
         source_inventory_arrow_sha256="1" * 64,
         source_inventory_file_sha256="2" * 64,
-        authenticated_rows_sha256="3" * 64,
-    )
-    test_authentication = SourceAuthentication(
-        policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
-        partitions=("test",),
-        file_count=4,
-        source_inventory_arrow_sha256="1" * 64,
-        source_inventory_file_sha256="2" * 64,
-        authenticated_rows_sha256="4" * 64,
     )
 
     class Adapter:
@@ -660,13 +609,13 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
                 frame("validation"),
                 lineage,
                 "5" * 64,
-                authentication,
+                source_inventory,
             )
 
         def load_fusion_test(self, dataset_config, *, expected_manifest_sha256):
             assert expected_manifest_sha256 == "5" * 64
             self.test_calls += 1
-            return FusionTestData(frame("test"), lineage, "5" * 64, test_authentication)
+            return FusionTestData(frame("test"), lineage, "5" * 64, source_inventory)
 
     source_model = RsnaConcatFusionModel(
         _TinyEncoder(),
@@ -683,7 +632,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     source = VerifiedSourceCxr(
         source_lineage,
         {
-            "bundle_id": "build-synthetic",
+            "bundle_id": _SYNTHETIC_BUNDLE_ID,
             "bundle_manifest_sha256": "5" * 64,
             "split_assignment_id": "split-synthetic",
             "task": "pneumonia",
@@ -718,7 +667,30 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     for module in ("radfusion.training.train_fusion", "radfusion.training.evaluate_fusion"):
         monkeypatch.setattr(f"{module}.get_dataset", lambda key: adapter)
         monkeypatch.setattr(f"{module}.get_model", lambda key: builder)
-        monkeypatch.setattr(f"{module}.RsnaFusionDataset", synthetic_dataset)
+        monkeypatch.setattr(f"{module}.RsnaCachedFusionDataset", synthetic_dataset)
+
+        def prepared_cache(*args, **kwargs):
+            del kwargs
+            transform = args[2]
+            identity = CxrCacheIdentity(
+                bundle_id=_SYNTHETIC_BUNDLE_ID,
+                bundle_manifest_sha256="5" * 64,
+                source_inventory_file_sha256="2" * 64,
+                source_inventory_arrow_sha256="1" * 64,
+                preprocessing_sha256=preprocessing_identity(transform),
+            )
+            return SimpleNamespace(
+                identity=identity,
+                source_authentication=CxrCacheSourceAuthentication(
+                    policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
+                    partitions=("train", "validation", "test"),
+                    file_count=12,
+                    source_inventory_arrow_sha256="1" * 64,
+                    source_inventory_file_sha256="2" * 64,
+                ),
+            )
+
+        monkeypatch.setattr(f"{module}.prepare_rsna_cxr_cache", prepared_cache)
         monkeypatch.setattr(f"{module}.git_revision", lambda: ("fusion-commit", False))
         monkeypatch.setattr(f"{module}.uv_lock_sha256", lambda: "8" * 64)
         monkeypatch.setattr(
@@ -734,6 +706,14 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert adapter.test_calls == 0
     package = validate_published_neural_model(training.model_path.parent)
     assert package["source_cxr_lineage"] == source_lineage.as_dict()
+    assert package["runtime_provenance"]["loader_execution"] == {
+        "effective_cpu_capacity": 12.5,
+        "num_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": None,
+        "pin_memory": False,
+        "candidate_throughput_batches_per_second": {},
+    }
     assert (training.model_path.parent / "structured_preprocessor.skops").is_file()
 
     manifest_path = training.model_path.parent / "model_manifest.json"
@@ -758,6 +738,9 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert configure_mlflow(tracking_uri=tracking_uri).list_artifacts(evaluation.run_id) == []
     assert recorded.data.tags["run_complete"] == "true"
     assert recorded.data.tags["source_cxr_checkpoint_sha256"] == "6" * 64
+    assert recorded.data.params["evaluation_loader_num_workers"] == "0"
+    assert recorded.data.params["evaluation_loader_prefetch_factor"] == "not_applicable"
+    assert recorded.data.params["evaluation_cxr_cache_id"].startswith("cache-")
     assert float(recorded.data.tags["threshold_youden_j"]) == package["thresholds"]["youden_j"]
     comparison_path, _, rows = regenerate_comparison(
         tracking_uri=tracking_uri,

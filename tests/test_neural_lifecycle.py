@@ -6,22 +6,26 @@ import json
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mlflow
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import torch
 import yaml
 from torch import nn
 from torch.utils.data import Dataset
 
+from radfusion.data.cxr_cache import (
+    SOURCE_AUTHENTICATION_POLICY_VERSION,
+    CxrCacheIdentity,
+    CxrCacheSourceAuthentication,
+    preprocessing_identity,
+)
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_artifacts import SOURCE_INVENTORY_FILENAME
 from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.models.cxr_baseline import PretrainedWeightIdentity
 from radfusion.training.compare import regenerate_comparison
@@ -31,19 +35,18 @@ from radfusion.training.config import (
     load_experiment_config,
 )
 from radfusion.training.datasets import (
-    SOURCE_AUTHENTICATION_POLICY_VERSION,
     ImageRunData,
     ImageTestData,
-    SourceAuthentication,
-    _authenticate_source_rows,
-    _PinnedBundlePaths,
+    SourceInventoryIdentity,
 )
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
+from radfusion.training.execution import LoaderExecutionPolicy
 from radfusion.training.interfaces import DatasetLineage
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
     NeuralTrainingError,
+    build_evaluation_loader,
     build_image_loaders,
     candidate_is_improvement,
     deterministic_inference,
@@ -71,6 +74,8 @@ from radfusion.utils.neural_publication import (
 )
 from radfusion.utils.operational_logging import configure_logging
 from radfusion.utils.private_predictions import validate_private_neural_predictions
+
+_SYNTHETIC_BUNDLE_ID = "build-" + "a" * 64
 
 
 class _TensorDataset(Dataset[dict[str, object]]):
@@ -228,6 +233,30 @@ def test_deterministic_loaders_class_weight_and_two_stage_training() -> None:
     assert fit.selected_stage in {"warmup", "fine_tune"}
     assert fit.selected_epoch >= 1
     assert all(tensor.device.type == "cpu" for tensor in fit.selected_state_dict.values())
+
+
+def test_loaders_reject_pin_memory_policy_that_differs_from_runtime() -> None:
+    dataset = _TensorDataset([0, 1])
+    runtime = _runtime()
+    assert runtime.pin_memory_effective is False
+    execution = LoaderExecutionPolicy(1.0, 0, False, None, True)
+
+    with pytest.raises(ValueError):
+        build_image_loaders(
+            dataset,
+            dataset,
+            config=_image_config(),
+            runtime=runtime,
+            seed=42,
+            execution=execution,
+        )
+    with pytest.raises(ValueError):
+        build_evaluation_loader(
+            dataset,
+            config=_image_config(),
+            runtime=runtime,
+            execution=execution,
+        )
 
 
 def test_repeated_tiny_training_is_deterministic() -> None:
@@ -586,6 +615,34 @@ def test_cpu_training_avoids_amp_and_rejects_nonfinite_loss(monkeypatch) -> None
         )
 
 
+def test_epoch_loss_is_sample_weighted_for_partial_final_batch() -> None:
+    model = _TinyImageModel()
+    config = replace(_image_config(), batch_size=2)
+    loader = build_image_loaders(
+        _TensorDataset([0, 1, 0, 1, 0]),
+        _TensorDataset([0, 1]),
+        config=config,
+        runtime=_runtime(),
+        seed=42,
+    ).train
+
+    class BatchSizeLoss(nn.Module):
+        def forward(self, logits, targets):
+            return logits.sum() * 0.0 + len(targets)
+
+    loss = train_one_epoch(
+        model,
+        loader,
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        loss_function=BatchSizeLoss(),
+        runtime=_runtime(),
+        gradient_clip_norm=1.0,
+        warmup=True,
+    )
+
+    assert loss == pytest.approx((2 * 2 + 2 * 2 + 1 * 1) / 5)
+
+
 def test_injected_amp_path_unscales_before_clipping(monkeypatch) -> None:
     import radfusion.training.neural as neural_module
 
@@ -770,139 +827,6 @@ def test_inference_rejects_identifier_length_mismatch() -> None:
         deterministic_inference(_TinyImageModel(), [batch], runtime=_runtime())
 
 
-def test_partition_source_authentication_is_exact_and_deterministic(tmp_path: Path) -> None:
-    log_stream = io.StringIO()
-    configure_logging("INFO", stream=log_stream)
-    config = load_experiment_config("configs/image_densenet_seed42.yaml").dataset
-    root = tmp_path / "raw"
-    image_directory = root / "images"
-    image_directory.mkdir(parents=True)
-    rows = []
-    frame_rows = []
-    for index, partition in enumerate(("train", "validation")):
-        path = image_directory / f"{partition}.dcm"
-        path.write_bytes(f"dicom-{partition}".encode())
-        sample_id = f"rsna:{partition}"
-        relative = f"images/{partition}.dcm"
-        rows.append(
-            {
-                "sample_id": sample_id,
-                "relative_path": relative,
-                "byte_size": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-        )
-        frame_rows.append(
-            (sample_id, f"patient-{index}", relative, partition, index),
-        )
-    inventory_path = tmp_path / SOURCE_INVENTORY_FILENAME
-    pq.write_table(pa.Table.from_pylist(rows), inventory_path)
-    metadata_path = tmp_path / "rsna_manifest_metadata.json"
-    metadata_path.write_text("{}", encoding="utf-8")
-    bundle = _PinnedBundlePaths(
-        tmp_path / "samples",
-        tmp_path / "labels",
-        tmp_path / "splits",
-        inventory_path,
-        metadata_path,
-    )
-    inventory_hash = "a" * 64
-    metadata = {
-        "generated_artifact_hashes": {
-            SOURCE_INVENTORY_FILENAME: {
-                "arrow_ipc_sha256": inventory_hash,
-                "file_sha256": sha256_file(inventory_path),
-            }
-        }
-    }
-    frame = pd.DataFrame(
-        frame_rows,
-        columns=("sample_id", "patient_id", "image_path", "split_name", "target"),
-    )
-    configured = replace(config, dataset_root=root)
-
-    first = _authenticate_source_rows(
-        configured,
-        bundle,
-        metadata,
-        frame,
-        partitions=("train", "validation"),
-    )
-    second = _authenticate_source_rows(
-        configured,
-        bundle,
-        metadata,
-        frame,
-        partitions=("train", "validation"),
-    )
-
-    assert first == second
-    assert first.policy_version == SOURCE_AUTHENTICATION_POLICY_VERSION
-    assert first.file_count == 2
-    assert first.success is True
-    assert first.source_inventory_arrow_sha256 == inventory_hash
-    log_output = log_stream.getvalue()
-    assert "event=source_authentication_progress" in log_output
-    assert not any(value in log_output for value in frame["sample_id"])
-    assert not any(value in log_output for value in frame["patient_id"])
-    assert not any(value in log_output for value in frame["image_path"])
-
-    train_path = image_directory / "train.dcm"
-    original_bytes = train_path.read_bytes()
-    train_path.write_bytes(b"x" * len(original_bytes))
-    with pytest.raises(ManifestBuildError):
-        _authenticate_source_rows(
-            configured,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
-    train_path.write_bytes(original_bytes)
-    train_path.write_bytes(original_bytes + b"changed-size")
-    with pytest.raises(ManifestBuildError):
-        _authenticate_source_rows(
-            configured,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
-    train_path.write_bytes(original_bytes)
-
-    pq.write_table(pa.Table.from_pylist(rows[:1]), inventory_path)
-    with pytest.raises(ManifestBuildError):
-        _authenticate_source_rows(
-            configured,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
-
-    unsafe_rows = [dict(rows[0]), dict(rows[1])]
-    unsafe_rows[0]["relative_path"] = "../train.dcm"
-    pq.write_table(pa.Table.from_pylist(unsafe_rows), inventory_path)
-    with pytest.raises(ManifestBuildError):
-        _authenticate_source_rows(
-            configured,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
-
-    pq.write_table(pa.Table.from_pylist([rows[0], rows[0], rows[1]]), inventory_path)
-    with pytest.raises(ManifestBuildError):
-        _authenticate_source_rows(
-            configured,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
-
-
 def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, object]:
     config_path = Path("configs/image_densenet_seed42.yaml")
     config = load_experiment_config(config_path)
@@ -1002,15 +926,24 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
             "sensitivity_target": 0.9,
         },
         "source_authentication": {
-            "policy_version": "partition-inventory-sha256-v1",
-            "partitions": ["train", "validation"],
-            "file_count": 2,
+            "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
+            "partitions": ["train", "validation", "test"],
+            "file_count": 3,
             "source_inventory_arrow_sha256": "4" * 64,
             "source_inventory_file_sha256": "5" * 64,
-            "authenticated_rows_sha256": "6" * 64,
-            "success": True,
         },
-        "runtime_provenance": _runtime().provenance(),
+        "runtime_provenance": {
+            **_runtime().provenance(),
+            "cxr_cache_id": "cache-" + "7" * 64,
+            "loader_execution": {
+                "effective_cpu_capacity": 1.0,
+                "num_workers": 0,
+                "persistent_workers": False,
+                "prefetch_factor": None,
+                "pin_memory": False,
+                "candidate_throughput_batches_per_second": {},
+            },
+        },
     }
 
 
@@ -1067,6 +1000,9 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
             {"enabled": False}
         ),
         lambda document: document["runtime_provenance"].update({"hostname": "private"}),
+        lambda document: document["runtime_provenance"]["loader_execution"][
+            "candidate_throughput_batches_per_second"
+        ].update({"2": 0.0}),
     ],
 )
 def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutation) -> None:
@@ -1181,7 +1117,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         lambda value: value["training_policy"]["early_stopping"].update({"patience": 6}),
         lambda value: value["metrics_policy"].update({"calibration_bins": 10}),
         lambda value: value["source_authentication"].update(
-            {"authenticated_rows_sha256": "7" * 64}
+            {"source_inventory_file_sha256": "7" * 64}
         ),
     )
     for mutation in mutations:
@@ -1205,7 +1141,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
     assert neural_model_package_id(with_source_path_change) == baseline
 
 
-def test_source_authentication_failure_precedes_model_construction(
+def test_dataset_loading_failure_precedes_model_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     document = yaml.safe_load(
@@ -1222,7 +1158,7 @@ def test_source_authentication_failure_precedes_model_construction(
     class FailingAdapter:
         def load_image_train_validation(self, dataset_config):
             del dataset_config
-            raise ManifestBuildError("source authentication failed")
+            raise ManifestBuildError("dataset loading failed")
 
     monkeypatch.setattr("radfusion.training.train_image.get_dataset", lambda key: FailingAdapter())
     monkeypatch.setattr(
@@ -1266,7 +1202,7 @@ def _synthetic_image_lifecycle(
     )
     document["dataset"].update(
         {
-            "bundle_id": "build-synthetic",
+            "bundle_id": _SYNTHETIC_BUNDLE_ID,
             "dataset_root": str(tmp_path / "raw"),
             "manifest_directory": str(tmp_path / "manifests"),
         }
@@ -1292,7 +1228,7 @@ def _synthetic_image_lifecycle(
     config_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     config = load_experiment_config(config_path)
     lineage = DatasetLineage(
-        bundle_id="build-synthetic",
+        bundle_id=_SYNTHETIC_BUNDLE_ID,
         split_assignment_id="split-synthetic",
         label_policy_version="label-v1",
         task_id="pneumonia",
@@ -1309,27 +1245,22 @@ def _synthetic_image_lifecycle(
             columns=("sample_id", "patient_id", "image_path", "split_name", "target"),
         )
 
-    def authentication(partitions: tuple[str, ...]) -> SourceAuthentication:
-        return SourceAuthentication(
-            policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
-            partitions=partitions,
-            file_count=4 if partitions == ("test",) else 8,
-            source_inventory_arrow_sha256="a" * 64,
-            source_inventory_file_sha256="b" * 64,
-            authenticated_rows_sha256=("c" if partitions == ("test",) else "d") * 64,
-        )
+    source_inventory = SourceInventoryIdentity(
+        source_inventory_arrow_sha256="a" * 64,
+        source_inventory_file_sha256="b" * 64,
+    )
 
     class Adapter:
         test_calls = 0
 
         def load_image_train_validation(self, dataset_config):
-            assert dataset_config.bundle_id == "build-synthetic"
+            assert dataset_config.bundle_id == _SYNTHETIC_BUNDLE_ID
             return ImageRunData(
                 train=frame("train"),
                 validation=frame("validation"),
                 lineage=lineage,
                 bundle_manifest_sha256="e" * 64,
-                authentication=authentication(("train", "validation")),
+                source_inventory=source_inventory,
             )
 
         def load_image_test(self, dataset_config, *, expected_manifest_sha256):
@@ -1339,7 +1270,7 @@ def _synthetic_image_lifecycle(
                 test=frame("test"),
                 lineage=lineage,
                 bundle_manifest_sha256="e" * 64,
-                authentication=authentication(("test",)),
+                source_inventory=source_inventory,
             )
 
     build_calls = []
@@ -1371,7 +1302,30 @@ def _synthetic_image_lifecycle(
     for module in ("radfusion.training.train_image", "radfusion.training.evaluate_image"):
         monkeypatch.setattr(f"{module}.get_dataset", lambda key: adapter)
         monkeypatch.setattr(f"{module}.get_model", lambda key: Builder())
-        monkeypatch.setattr(f"{module}.RsnaImageDataset", synthetic_dataset)
+        monkeypatch.setattr(f"{module}.RsnaCachedImageDataset", synthetic_dataset)
+
+        def prepared_cache(*args, **kwargs):
+            del kwargs
+            transform = args[2]
+            identity = CxrCacheIdentity(
+                bundle_id=_SYNTHETIC_BUNDLE_ID,
+                bundle_manifest_sha256="e" * 64,
+                source_inventory_file_sha256="b" * 64,
+                source_inventory_arrow_sha256="a" * 64,
+                preprocessing_sha256=preprocessing_identity(transform),
+            )
+            return SimpleNamespace(
+                identity=identity,
+                source_authentication=CxrCacheSourceAuthentication(
+                    policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
+                    partitions=("train", "validation", "test"),
+                    file_count=12,
+                    source_inventory_arrow_sha256="a" * 64,
+                    source_inventory_file_sha256="b" * 64,
+                ),
+            )
+
+        monkeypatch.setattr(f"{module}.prepare_rsna_cxr_cache", prepared_cache)
         monkeypatch.setattr(f"{module}.git_revision", lambda: ("commit-test", False))
         monkeypatch.setattr(f"{module}.uv_lock_sha256", lambda: "9" * 64)
 
@@ -1419,6 +1373,21 @@ def _assert_single_failed_training_without_outputs(setup: _SyntheticImageLifecyc
     ).exists()
 
 
+def test_cache_failure_precedes_neural_model_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "radfusion.training.train_image.prepare_rsna_cxr_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ManifestBuildError("cache invalid")),
+    )
+
+    with pytest.raises(ManifestBuildError):
+        train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
+
+    assert setup.build_calls == []
+
+
 def test_image_training_progress_accepts_unsized_validation_loader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1447,6 +1416,7 @@ def test_image_training_progress_accepts_unsized_validation_loader(
 def test_synthetic_image_training_package_and_separate_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("radfusion.training.execution.effective_cpu_capacity", lambda: 12.5)
     setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
     training = train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
@@ -1458,10 +1428,19 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert package_manifest["model_package_schema_version"] == 1
     assert package_manifest["modality"] == "image"
     assert package_manifest["bundle_manifest_sha256"] == "e" * 64
+    assert package_manifest["runtime_provenance"]["loader_execution"] == {
+        "effective_cpu_capacity": 12.5,
+        "num_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": None,
+        "pin_memory": False,
+        "candidate_throughput_batches_per_second": {},
+    }
     recorded_training = configure_mlflow(tracking_uri=setup.tracking_uri).get_run(training.run_id)
     assert recorded_training.data.tags["run_complete"] == "true"
     assert "bundle_manifest_sha256" not in recorded_training.data.tags
     assert recorded_training.data.params["bundle_manifest_sha256"] == "e" * 64
+    assert recorded_training.data.params["loader_prefetch_factor"] == "not_applicable"
 
     evaluation = evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 1
@@ -1483,6 +1462,9 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert "bundle_manifest_sha256" not in evaluation_run.data.tags
     assert evaluation_run.data.params["bundle_manifest_sha256"] == "e" * 64
     assert evaluation_run.data.params["evaluation_runtime_resolved_device"] == "cpu"
+    assert evaluation_run.data.params["evaluation_loader_num_workers"] == "0"
+    assert evaluation_run.data.params["evaluation_loader_prefetch_factor"] == "not_applicable"
+    assert evaluation_run.data.params["evaluation_cxr_cache_id"].startswith("cache-")
 
     csv_path, _, rows = regenerate_comparison(
         tracking_uri=setup.tracking_uri,
@@ -1550,6 +1532,24 @@ def test_pretrained_weight_mutation_cleans_outputs_and_leaves_run_incomplete(
     with pytest.raises(RuntimeError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     _assert_single_failed_training_without_outputs(setup)
+
+
+def test_image_evaluation_rejects_package_cache_identity_before_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
+    training = train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
+    manifest_path = training.model_path.parent / "model_manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["runtime_provenance"]["cxr_cache_id"] = "cache-" + "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        "radfusion.training.evaluate_image.deterministic_inference",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError((args, kwargs))),
+    )
+
+    with pytest.raises(ValueError):
+        evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
 
 
 def test_image_evaluation_rejects_package_and_source_lineage_before_test_access(

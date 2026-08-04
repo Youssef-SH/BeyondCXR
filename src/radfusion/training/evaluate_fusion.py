@@ -11,6 +11,7 @@ from typing import cast
 import mlflow
 import numpy as np
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.tabular_preprocess import SOURCE_FEATURES, transform_rsna_metadata
 from radfusion.evaluation.metrics import evaluate_operating_point, evaluate_probabilities
@@ -20,8 +21,14 @@ from radfusion.training.config import (
     fusion_structured_input_conversion_contract,
     load_experiment_config,
 )
-from radfusion.training.datasets import RsnaFusionDataset
+from radfusion.training.datasets import (
+    RsnaCachedFusionDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
 from radfusion.training.device import resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
 from radfusion.training.fusion_source import resolve_source_cxr_training_run
 from radfusion.training.neural import build_evaluation_loader, deterministic_inference
 from radfusion.training.registry import get_dataset, get_model
@@ -72,6 +79,8 @@ def evaluate_fusion_training_run(
     training_run_id: str,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
+    cache: ValidatedCxrCache | None = None,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> FusionTestEvaluationResult:
     """Verify one explicit fusion package before accessing its test partition."""
     client = configure_mlflow(tracking_uri=tracking_uri)
@@ -187,20 +196,41 @@ def evaluate_fusion_training_run(
         )
         if transform.contract() != manifest["evaluation_transform_contract"]:
             raise ValueError("Fusion evaluation transform differs from the package")
-        test_dataset = RsnaFusionDataset(
+        resolved_cache = cache or prepare_rsna_cxr_cache(
+            cast(RsnaDataset, dataset), config.dataset, transform
+        )
+        expected_cache_identity = expected_rsna_cxr_cache_identity(
+            lineage=data.lineage,
+            bundle_manifest_sha256=data.bundle_manifest_sha256,
+            source_inventory=data.source_inventory,
+            transform=transform,
+        )
+        if resolved_cache.source_authentication.as_dict() != manifest["source_authentication"]:
+            raise ValueError("Validated cache source authentication differs from fusion package")
+        if manifest["runtime_provenance"]["cxr_cache_id"] != resolved_cache.identity.cache_id:
+            raise ValueError("Validated cache identity differs from the fusion package")
+        test_dataset = RsnaCachedFusionDataset(
             data.test,
             matrix,
             structured_sample_ids=tuple(data.test["sample_id"].astype(str)),
-            dataset_root=config.dataset.dataset_root,
+            cache=resolved_cache,
+            expected_cache_identity=expected_cache_identity,
             partition="test",
             transform=transform,
+            training_seed=config.training.seed,
         )
         runtime = resolve_device(
             image.device,
             mixed_precision=image.mixed_precision,
             pin_memory_policy=image.pin_memory_policy,
         )
-        loader = build_evaluation_loader(test_dataset, config=image, runtime=runtime)
+        loader_execution = execution or configured_loader_policy(
+            num_workers=image.num_workers,
+            pin_memory=runtime.pin_memory_effective,
+        )
+        loader = build_evaluation_loader(
+            test_dataset, config=image, runtime=runtime, execution=loader_execution
+        )
         model.to(runtime.device)
         inference = deterministic_inference(
             model,
@@ -285,7 +315,23 @@ def evaluate_fusion_training_run(
                     model_size_mib=model_path.stat().st_size / (1024.0 * 1024.0),
                 )
             )
-            mlflow.log_param("bundle_manifest_sha256", data.bundle_manifest_sha256)
+            mlflow.log_params(
+                {
+                    "bundle_manifest_sha256": data.bundle_manifest_sha256,
+                    "evaluation_cxr_cache_id": resolved_cache.identity.cache_id,
+                    **{
+                        f"evaluation_runtime_{key}": value
+                        for key, value in runtime.provenance().items()
+                    },
+                    **{
+                        f"evaluation_loader_{key}": (
+                            value if value is not None else "not_applicable"
+                        )
+                        for key, value in loader_execution.provenance().items()
+                        if not isinstance(value, dict)
+                    },
+                }
+            )
             publish_directory(stage, report_directory)
             published = True
             mlflow.set_tags(
