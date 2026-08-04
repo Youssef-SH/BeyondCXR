@@ -50,8 +50,10 @@ def test_make_purge_generated_removes_sqlite_state_and_preserves_raw_data(tmp_pa
         "mlflow.db-wal",
         "mlflow.db-shm",
         "mlartifacts/run/artifact.txt",
+        "data/cache/rsna/cache-test/images.npy",
         "data/manifests/rsna/builds/build-test/artifact",
         "data/manifests/rsna/CURRENT",
+        "outbox/results.tar.gz",
     ):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,5 +76,7 @@ def test_make_purge_generated_removes_sqlite_state_and_preserves_raw_data(tmp_pa
     assert not (tmp_path / "mlflow.db-wal").exists()
     assert not (tmp_path / "mlflow.db-shm").exists()
     assert not (tmp_path / "mlartifacts").exists()
+    assert not (tmp_path / "data/cache").exists()
+    assert not (tmp_path / "outbox").exists()
     assert not (tmp_path / "data/manifests/rsna/CURRENT").exists()
     assert not (tmp_path / "data/manifests/rsna/builds/build-test").exists()

@@ -1,5 +1,5 @@
 .PHONY: sync lock-check lint format format-check test check inspect rsna-manifest rsna-audit \
-	train evaluate compare summarize-seeds localize pre-commit clean purge-generated
+	train evaluate compare summarize-seeds localize rsna-gpu pre-commit clean purge-generated
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -56,6 +56,9 @@ localize:
 		(echo 'TEST_RUN_IDS="<test17> <test42> <test2026>" is required'; exit 2)
 	uv run python -m radfusion.training.localize --test-run-ids $(TEST_RUN_IDS)
 
+rsna-gpu:
+	uv run --locked --no-dev python -m radfusion.training.rsna_gpu
+
 pre-commit:
 	uv run pre-commit run --all-files
 
@@ -87,7 +90,7 @@ clean:
 purge-generated: clean
 	@set -eu; \
 	output_count=0; \
-	for path in reports models private/predictions private/localization mlruns mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm; do \
+	for path in reports models private/predictions private/localization data/cache mlruns mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm outbox; do \
 		if [ -e "$$path" ]; then rm -rf -- "$$path"; output_count=$$((output_count + 1)); fi; \
 	done; \
 	bundle_count=0; current_count=0; \

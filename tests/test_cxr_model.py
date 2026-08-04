@@ -12,6 +12,7 @@ from radfusion.models.cxr_baseline import (
     CxrBinaryClassifier,
     ImageDenseNetModel,
     StandardCxrEncoder,
+    ensure_pretrained_weights,
     fingerprint_pretrained_weights,
 )
 from radfusion.training.config import load_experiment_config
@@ -143,6 +144,32 @@ def test_pretrained_weight_identity_fingerprints_materialized_file_bytes(
         fingerprint_pretrained_weights("synthetic-weights")
 
 
+def test_pretrained_weight_readiness_uses_the_supported_xrv_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filename = "weight.pt"
+    monkeypatch.setattr(xrv.utils, "get_cache_dir", lambda: str(tmp_path))
+    monkeypatch.setitem(
+        xrv.models.model_urls,
+        "synthetic-weights",
+        {"weights_url": f"https://example.invalid/{filename}"},
+    )
+    requested: list[str] = []
+
+    def acquire(*, weights: str):
+        requested.append(weights)
+        (tmp_path / filename).write_bytes(b"materialized")
+        return object()
+
+    monkeypatch.setattr(xrv.models, "DenseNet", acquire)
+
+    identity = ensure_pretrained_weights("synthetic-weights")
+
+    assert requested == ["synthetic-weights"]
+    assert identity.declared_name == "synthetic-weights"
+    assert identity.byte_size == len(b"materialized")
+
+
 def test_pretrained_weight_identity_rejects_unknown_and_unnamed_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,7 +256,7 @@ def test_cached_standard_encoder_is_offline(monkeypatch: pytest.MonkeyPatch) -> 
         pytest.skip(f"TorchXRayVision weights are not cached at {cache_path}")
 
     def reject_download(*_: object, **__: object) -> None:
-        raise AssertionError("Cached encoder smoke test attempted a network download")
+        raise AssertionError("Cached encoder offline check attempted a network download")
 
     monkeypatch.setattr(xrv.utils, "download", reject_download)
     encoder = StandardCxrEncoder().eval()
