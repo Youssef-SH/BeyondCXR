@@ -19,6 +19,7 @@ data/raw/**
 data/interim/**
 data/processed/**
 data/manifests/**
+/data/cache/
 !data/README.md
 !data/**/.gitkeep
 
@@ -52,3 +53,6 @@ credentials.json
 
 # Private patient-level analysis artifacts
 /private/
+
+# Portable generated campaign exports
+/outbox/

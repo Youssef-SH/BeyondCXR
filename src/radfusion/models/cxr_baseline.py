@@ -198,6 +198,19 @@ def fingerprint_pretrained_weights(
     )
 
 
+def ensure_pretrained_weights(
+    weights: str = "densenet121-res224-chex",
+) -> PretrainedWeightIdentity:
+    """Materialize weights through TorchXRayVision and return strict local identity."""
+    try:
+        return fingerprint_pretrained_weights(weights)
+    except FileNotFoundError:
+        import torchxrayvision as xrv
+
+        xrv.models.DenseNet(weights=weights)
+    return fingerprint_pretrained_weights(weights)
+
+
 def _validate_images(images: object, image_size: int) -> None:
     if not isinstance(images, torch.Tensor):
         raise TypeError("CXR model input must be a torch.Tensor")

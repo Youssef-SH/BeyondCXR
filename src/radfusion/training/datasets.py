@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TypedDict
 
 import numpy as np
@@ -15,8 +13,14 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-from radfusion.data.dicom_loader import DicomRecord, read_dicom
-from radfusion.data.hashing import sha256_file
+from radfusion.data.cxr_cache import (
+    CXR_CACHE_FRAME_COLUMNS,
+    CxrCacheIdentity,
+    ValidatedCxrCache,
+    build_cxr_cache,
+    preprocessing_identity,
+)
+from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.rsna_artifacts import (
     ANNOTATIONS_FILENAME,
     BUNDLES_DIRECTORY,
@@ -28,12 +32,11 @@ from radfusion.data.rsna_artifacts import (
     validate_bundle_directory,
     validate_bundle_reference,
 )
-from radfusion.data.rsna_source import ManifestBuildError, resolve_image_path
+from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.data.tabular_preprocess import SOURCE_FEATURES
 from radfusion.evaluation.metrics import validated_binary_targets
 from radfusion.training.config import DatasetConfig
 from radfusion.training.interfaces import DatasetLineage, DatasetPartition, DatasetRunData
-from radfusion.utils.operational_logging import CountProgress, get_operational_logger, log_event
 
 _IMAGE_FRAME_COLUMNS = ("sample_id", "patient_id", "image_path", "split_name", "target")
 _FUSION_FRAME_COLUMNS = (
@@ -44,12 +47,10 @@ _FUSION_FRAME_COLUMNS = (
     "split_name",
     "target",
 )
-SOURCE_AUTHENTICATION_POLICY_VERSION = "partition-inventory-sha256-v1"
-_LOGGER = get_operational_logger(__name__)
 
 
 class ImageSample(TypedDict):
-    """One lazily decoded image example."""
+    """One cache-backed image example."""
 
     image: torch.Tensor
     target: torch.Tensor
@@ -58,173 +59,204 @@ class ImageSample(TypedDict):
 
 
 class FusionSample(ImageSample):
-    """One lazily decoded image aligned with one transformed metadata row."""
+    """One cached image aligned with one transformed metadata row."""
 
     structured: torch.Tensor
 
 
-@dataclass(frozen=True)
-class _ImageRow:
+class CalibrationSample(TypedDict):
+    """One task-label-free cached image used for loader calibration."""
+
+    image: torch.Tensor
     sample_id: str
-    patient_id: str
-    image_path: PurePosixPath
-    target: int
 
 
 @dataclass(frozen=True)
-class SourceAuthentication:
-    """Deterministic proof that permitted source bytes match the bundle inventory."""
+class SourceInventoryIdentity:
+    """Exact bundle source-inventory identity used by a cache-backed consumer."""
 
-    policy_version: str
-    partitions: tuple[str, ...]
-    file_count: int
     source_inventory_arrow_sha256: str
     source_inventory_file_sha256: str
-    authenticated_rows_sha256: str
-    success: bool = True
-
-    def as_dict(self) -> dict[str, object]:
-        """Return serializable source-authentication provenance."""
-        return {
-            "policy_version": self.policy_version,
-            "partitions": list(self.partitions),
-            "file_count": self.file_count,
-            "source_inventory_arrow_sha256": self.source_inventory_arrow_sha256,
-            "source_inventory_file_sha256": self.source_inventory_file_sha256,
-            "authenticated_rows_sha256": self.authenticated_rows_sha256,
-            "success": self.success,
-        }
 
 
 @dataclass(frozen=True)
 class ImageRunData:
-    """Authenticated train and validation rows for one image-training run."""
+    """Train and validation rows for one cache-backed image-training run."""
 
     train: pd.DataFrame
     validation: pd.DataFrame
     lineage: DatasetLineage
     bundle_manifest_sha256: str
-    authentication: SourceAuthentication
+    source_inventory: SourceInventoryIdentity
 
 
 @dataclass(frozen=True)
 class ImageTestData:
-    """Authenticated test rows for one explicit image-evaluation run."""
+    """Test rows for one explicit cache-backed image-evaluation run."""
 
     test: pd.DataFrame
     lineage: DatasetLineage
     bundle_manifest_sha256: str
-    authentication: SourceAuthentication
+    source_inventory: SourceInventoryIdentity
+
+
+@dataclass(frozen=True)
+class ImageCacheData:
+    """Source-inventory-bound rows for one complete deterministic image cache."""
+
+    frame: pd.DataFrame
+    lineage: DatasetLineage
+    bundle_manifest_sha256: str
+    source_inventory: SourceInventoryIdentity
 
 
 @dataclass(frozen=True)
 class FusionRunData:
-    """Authenticated aligned train and validation rows for fusion training."""
+    """Aligned train and validation rows for cache-backed fusion training."""
 
     train: pd.DataFrame
     validation: pd.DataFrame
     lineage: DatasetLineage
     bundle_manifest_sha256: str
-    authentication: SourceAuthentication
+    source_inventory: SourceInventoryIdentity
 
 
 @dataclass(frozen=True)
 class FusionTestData:
-    """Authenticated aligned test rows for explicit fusion evaluation."""
+    """Aligned test rows for explicit cache-backed fusion evaluation."""
 
     test: pd.DataFrame
     lineage: DatasetLineage
     bundle_manifest_sha256: str
-    authentication: SourceAuthentication
+    source_inventory: SourceInventoryIdentity
 
 
 @dataclass(frozen=True)
 class LocalizationTestData:
-    """Authenticated image test rows with positive-case box geometry."""
+    """Cache-backed image test rows with positive-case box geometry."""
 
     images: ImageTestData
     dimensions: pd.DataFrame
     annotations: pd.DataFrame
 
 
-class RsnaImageDataset(Dataset[ImageSample]):
-    """Lazily decode a validated, deterministically ordered RSNA partition."""
+class RsnaCachedImageDataset(Dataset[ImageSample]):
+    """Load deterministic RSNA bases from cache and apply live transforms."""
+
+    epoch_tagged_requests = True
 
     def __init__(
         self,
         frame: pd.DataFrame,
         *,
-        dataset_root: str | Path,
+        cache: ValidatedCxrCache,
+        expected_cache_identity: CxrCacheIdentity,
         partition: str,
-        transform: Callable[[np.ndarray], torch.Tensor],
-        decoder: Callable[[str | Path], tuple[np.ndarray, DicomRecord]] = read_dicom,
+        transform: StandardCxrTransform,
+        training_seed: int,
     ) -> None:
-        if tuple(frame.columns) != _IMAGE_FRAME_COLUMNS:
-            raise ManifestBuildError(
-                f"RSNA image frame columns must be exactly {_IMAGE_FRAME_COLUMNS}"
-            )
+        if tuple(frame.columns) != _IMAGE_FRAME_COLUMNS or frame.empty:
+            raise ManifestBuildError("RSNA cached image frame has an invalid contract")
         if partition not in {"train", "validation", "test"}:
             raise ManifestBuildError(f"Unsupported RSNA image partition: {partition!r}")
-        if frame.empty:
-            raise ManifestBuildError(f"RSNA image partition {partition!r} is empty")
-
-        self._dataset_root = Path(dataset_root)
-        self._transform = transform
-        self._decoder = decoder
-        rows: list[_ImageRow] = []
-        for row in frame.to_dict(orient="records"):
-            sample_id = _nonempty_text(row["sample_id"], "sample_id")
-            patient_id = _nonempty_text(row["patient_id"], "patient_id")
-            if row["split_name"] != partition:
-                raise ManifestBuildError("RSNA image frame does not match the requested partition")
-            relative_path = _validated_image_path(row["image_path"])
-            resolve_image_path(self._dataset_root, relative_path)
-            target = row["target"]
+        rows: list[tuple[str, str, int]] = []
+        for row in frame.itertuples(index=False):
+            sample_id = _nonempty_text(row.sample_id, "sample_id")
+            patient_id = _nonempty_text(row.patient_id, "patient_id")
+            target = row.target
             if (
                 isinstance(target, bool)
                 or not isinstance(target, int | np.integer)
                 or target not in {0, 1}
             ):
                 raise ManifestBuildError(f"Invalid binary target for sample {sample_id!r}")
-            rows.append(_ImageRow(sample_id, patient_id, relative_path, int(target)))
-        sample_ids = [row.sample_id for row in rows]
-        if len(sample_ids) != len(set(sample_ids)):
-            raise ManifestBuildError("RSNA image sample_id values must be unique")
-        if sample_ids != sorted(sample_ids):
-            raise ManifestBuildError("RSNA image samples must be ordered by sample_id")
+            if (
+                row.split_name != partition
+                or sample_id not in cache.sample_rows
+                or cache.sample_partitions[sample_id] != partition
+            ):
+                raise ManifestBuildError(
+                    "RSNA cached image frame does not match its partition/cache"
+                )
+            rows.append((sample_id, patient_id, int(target)))
+        sample_ids = tuple(value[0] for value in rows)
+        if sample_ids != tuple(sorted(sample_ids)) or len(sample_ids) != len(set(sample_ids)):
+            raise ManifestBuildError("RSNA cached image samples must be unique and ordered")
+        _validate_training_seed(training_seed)
+        if cache.identity != expected_cache_identity:
+            raise ManifestBuildError("CXR cache identity does not match the consuming experiment")
         self._rows = tuple(rows)
+        self._cache = cache
+        self._transform = transform
+        self._training_seed = training_seed
 
     def __len__(self) -> int:
         return len(self._rows)
 
-    def __getitem__(self, index: int) -> ImageSample:
-        row = self._rows[index]
-        path = resolve_image_path(self._dataset_root, row.image_path)
-        pixels, record = self._decoder(path)
-        if record.patient_id != row.patient_id:
-            raise ManifestBuildError(
-                f"Decoded DICOM patient does not match sample {row.sample_id!r}"
-            )
-        image = self._transform(pixels)
-        if (
-            not isinstance(image, torch.Tensor)
-            or image.dtype != torch.float32
-            or image.shape != (1, 224, 224)
-            or not torch.isfinite(image).all()
-        ):
-            raise ManifestBuildError(
-                f"Image transform returned an invalid tensor for sample {row.sample_id!r}"
-            )
+    def __getitem__(self, request: int | tuple[int, int]) -> ImageSample:
+        epoch, index = request if isinstance(request, tuple) else (0, request)
+        sample_id, patient_id, target = self._rows[index]
+        seed = (
+            _stable_augmentation_seed(self._training_seed, epoch, sample_id)
+            if self._transform.training
+            else None
+        )
+        image = self._transform.from_validated_cache_base(
+            self._cache.image(sample_id), augmentation_seed=seed
+        )
         return {
             "image": image,
-            "target": torch.tensor(float(row.target), dtype=torch.float32),
-            "sample_id": row.sample_id,
-            "patient_id": row.patient_id,
+            "target": torch.tensor(float(target), dtype=torch.float32),
+            "sample_id": sample_id,
+            "patient_id": patient_id,
         }
 
 
-class RsnaFusionDataset(Dataset[FusionSample]):
-    """Expose aligned RSNA images and eagerly transformed metadata tensors."""
+class RsnaCachedCalibrationDataset(Dataset[CalibrationSample]):
+    """Apply the real training transform to cached train images without task data."""
+
+    epoch_tagged_requests = True
+
+    def __init__(
+        self,
+        sample_ids: tuple[str, ...],
+        *,
+        cache: ValidatedCxrCache,
+        transform: StandardCxrTransform,
+        training_seed: int,
+    ) -> None:
+        if (
+            not sample_ids
+            or sample_ids != tuple(sorted(sample_ids))
+            or len(sample_ids) != len(set(sample_ids))
+            or any(cache.sample_partitions.get(sample_id) != "train" for sample_id in sample_ids)
+        ):
+            raise ManifestBuildError("CXR loader calibration requires ordered train cache samples")
+        if not isinstance(transform, StandardCxrTransform) or not transform.training:
+            raise ManifestBuildError("CXR loader calibration requires the training transform")
+        _validate_training_seed(training_seed)
+        self._sample_ids = sample_ids
+        self._cache = cache
+        self._transform = transform
+        self._training_seed = training_seed
+
+    def __len__(self) -> int:
+        return len(self._sample_ids)
+
+    def __getitem__(self, request: int | tuple[int, int]) -> CalibrationSample:
+        epoch, index = request if isinstance(request, tuple) else (0, request)
+        sample_id = self._sample_ids[index]
+        image = self._transform.from_validated_cache_base(
+            self._cache.image(sample_id),
+            augmentation_seed=_stable_augmentation_seed(self._training_seed, epoch, sample_id),
+        )
+        return {"image": image, "sample_id": sample_id}
+
+
+class RsnaCachedFusionDataset(Dataset[FusionSample]):
+    """Expose cached RSNA images aligned with transformed metadata."""
+
+    epoch_tagged_requests = True
 
     def __init__(
         self,
@@ -232,22 +264,21 @@ class RsnaFusionDataset(Dataset[FusionSample]):
         structured: np.ndarray,
         *,
         structured_sample_ids: tuple[str, ...],
-        dataset_root: str | Path,
+        cache: ValidatedCxrCache,
+        expected_cache_identity: CxrCacheIdentity,
         partition: str,
-        transform: Callable[[np.ndarray], torch.Tensor],
-        decoder: Callable[[str | Path], tuple[np.ndarray, DicomRecord]] = read_dicom,
+        transform: StandardCxrTransform,
+        training_seed: int,
     ) -> None:
         if tuple(frame.columns) != _FUSION_FRAME_COLUMNS:
-            raise ManifestBuildError(
-                f"RSNA fusion frame columns must be exactly {_FUSION_FRAME_COLUMNS}"
-            )
+            raise ManifestBuildError("RSNA cached fusion frame has an invalid contract")
         sample_ids = tuple(frame["sample_id"].astype(str))
         if sample_ids != structured_sample_ids:
             raise ManifestBuildError("Structured rows are not aligned with fusion sample IDs")
         try:
             matrix = np.asarray(structured, dtype=np.float32)
         except (TypeError, ValueError) as exc:
-            raise ManifestBuildError("Fusion structured values are not numeric") from exc
+            raise ManifestBuildError("Fusion structured matrix must be float-compatible") from exc
         if (
             matrix.ndim != 2
             or matrix.shape[0] != len(frame)
@@ -255,21 +286,22 @@ class RsnaFusionDataset(Dataset[FusionSample]):
             or not np.isfinite(matrix).all()
         ):
             raise ManifestBuildError("Fusion structured matrix must be finite N x D data")
-        self._structured = torch.from_numpy(np.ascontiguousarray(matrix)).contiguous()
-        self._images = RsnaImageDataset(
+        self._structured = torch.from_numpy(np.ascontiguousarray(matrix))
+        self._images = RsnaCachedImageDataset(
             frame.loc[:, _IMAGE_FRAME_COLUMNS],
-            dataset_root=dataset_root,
+            cache=cache,
+            expected_cache_identity=expected_cache_identity,
             partition=partition,
             transform=transform,
-            decoder=decoder,
+            training_seed=training_seed,
         )
 
     def __len__(self) -> int:
         return len(self._images)
 
-    def __getitem__(self, index: int) -> FusionSample:
-        image = self._images[index]
-        return {**image, "structured": self._structured[index]}
+    def __getitem__(self, request: int | tuple[int, int]) -> FusionSample:
+        index = request[1] if isinstance(request, tuple) else request
+        return {**self._images[request], "structured": self._structured[index]}
 
 
 class RsnaDataset:
@@ -317,7 +349,7 @@ class RsnaDataset:
         return frame.loc[:, _IMAGE_FRAME_COLUMNS].copy(), _lineage(config, metadata)
 
     def load_image_train_validation(self, config: DatasetConfig) -> ImageRunData:
-        """Load and authenticate train and validation image rows only."""
+        """Load train and validation rows bound to the pinned source inventory."""
         bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
         frame = _task_frame(
             bundle,
@@ -325,20 +357,24 @@ class RsnaDataset:
             partitions=("train", "validation"),
             feature_columns=("image_path",),
         )
-        authentication = _authenticate_source_rows(
-            config,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
         manifest_sha256 = _required_manifest_sha256(bundle)
         return ImageRunData(
             train=_image_partition(frame, "train"),
             validation=_image_partition(frame, "validation"),
             lineage=_lineage(config, metadata),
             bundle_manifest_sha256=manifest_sha256,
-            authentication=authentication,
+            source_inventory=_source_inventory_identity(metadata),
+        )
+
+    def load_image_cache(self, config: DatasetConfig) -> ImageCacheData:
+        """Load every inventory-bound image row required by the shared cache."""
+        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
+        frame = _image_cache_frame(bundle)
+        return ImageCacheData(
+            frame=frame,
+            lineage=_lineage(config, metadata),
+            bundle_manifest_sha256=_required_manifest_sha256(bundle),
+            source_inventory=_source_inventory_identity(metadata),
         )
 
     def load_image_test(
@@ -347,7 +383,7 @@ class RsnaDataset:
         *,
         expected_manifest_sha256: str,
     ) -> ImageTestData:
-        """Load and authenticate test image rows only."""
+        """Load test image rows bound to the pinned source inventory."""
         bundle, metadata = _load_pinned_bundle(
             config,
             materialize_all_rows=False,
@@ -359,23 +395,16 @@ class RsnaDataset:
             partitions=("test",),
             feature_columns=("image_path",),
         )
-        authentication = _authenticate_source_rows(
-            config,
-            bundle,
-            metadata,
-            frame,
-            partitions=("test",),
-        )
         manifest_sha256 = _required_manifest_sha256(bundle)
         return ImageTestData(
             test=_image_partition(frame, "test"),
             lineage=_lineage(config, metadata),
             bundle_manifest_sha256=manifest_sha256,
-            authentication=authentication,
+            source_inventory=_source_inventory_identity(metadata),
         )
 
     def load_fusion_train_validation(self, config: DatasetConfig) -> FusionRunData:
-        """Load and authenticate aligned train and validation fusion rows."""
+        """Load aligned train and validation rows bound to the source inventory."""
         bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
         frame = _task_frame(
             bundle,
@@ -383,19 +412,12 @@ class RsnaDataset:
             partitions=("train", "validation"),
             feature_columns=("image_path", *SOURCE_FEATURES),
         )
-        authentication = _authenticate_source_rows(
-            config,
-            bundle,
-            metadata,
-            frame,
-            partitions=("train", "validation"),
-        )
         return FusionRunData(
             train=_fusion_partition(frame, "train"),
             validation=_fusion_partition(frame, "validation"),
             lineage=_lineage(config, metadata),
             bundle_manifest_sha256=_required_manifest_sha256(bundle),
-            authentication=authentication,
+            source_inventory=_source_inventory_identity(metadata),
         )
 
     def load_fusion_test(
@@ -404,7 +426,7 @@ class RsnaDataset:
         *,
         expected_manifest_sha256: str,
     ) -> FusionTestData:
-        """Load and authenticate aligned test fusion rows."""
+        """Load aligned test fusion rows bound to the source inventory."""
         bundle, metadata = _load_pinned_bundle(
             config,
             materialize_all_rows=False,
@@ -416,18 +438,11 @@ class RsnaDataset:
             partitions=("test",),
             feature_columns=("image_path", *SOURCE_FEATURES),
         )
-        authentication = _authenticate_source_rows(
-            config,
-            bundle,
-            metadata,
-            frame,
-            partitions=("test",),
-        )
         return FusionTestData(
             test=_fusion_partition(frame, "test"),
             lineage=_lineage(config, metadata),
             bundle_manifest_sha256=_required_manifest_sha256(bundle),
-            authentication=authentication,
+            source_inventory=_source_inventory_identity(metadata),
         )
 
     def load_localization_test(
@@ -436,7 +451,7 @@ class RsnaDataset:
         *,
         expected_manifest_sha256: str,
     ) -> LocalizationTestData:
-        """Load authenticated test images and validated positive-box geometry."""
+        """Load cache-backed test images and validated positive-box geometry."""
         images = self.load_image_test(
             config,
             expected_manifest_sha256=expected_manifest_sha256,
@@ -468,6 +483,50 @@ class RsnaDataset:
         if set(annotations["sample_id"].astype(str)) != positive_ids:
             raise ManifestBuildError("Localization boxes do not cover every positive test sample")
         return LocalizationTestData(images, dimensions, annotations)
+
+
+def prepare_rsna_cxr_cache(
+    dataset: RsnaDataset,
+    config: DatasetConfig,
+    transform: StandardCxrTransform,
+    *,
+    cache_root: str | Path = "data/cache/rsna",
+) -> ValidatedCxrCache:
+    """Build or validate the one cache pinned by an RSNA dataset configuration."""
+    data = dataset.load_image_cache(config)
+    identity = CxrCacheIdentity(
+        bundle_id=data.lineage.bundle_id,
+        bundle_manifest_sha256=data.bundle_manifest_sha256,
+        source_inventory_file_sha256=data.source_inventory.source_inventory_file_sha256,
+        source_inventory_arrow_sha256=data.source_inventory.source_inventory_arrow_sha256,
+        preprocessing_sha256=preprocessing_identity(transform),
+    )
+    if config.dataset_root is None:
+        raise ValueError("RSNA image cache requires dataset.dataset_root")
+    return build_cxr_cache(
+        data.frame,
+        dataset_root=config.dataset_root,
+        cache_root=cache_root,
+        identity=identity,
+        transform=transform,
+    )
+
+
+def expected_rsna_cxr_cache_identity(
+    *,
+    lineage: DatasetLineage,
+    bundle_manifest_sha256: str,
+    source_inventory: SourceInventoryIdentity,
+    transform: StandardCxrTransform,
+) -> CxrCacheIdentity:
+    """Return the exact cache identity expected by one RSNA consumer."""
+    return CxrCacheIdentity(
+        bundle_id=lineage.bundle_id,
+        bundle_manifest_sha256=bundle_manifest_sha256,
+        source_inventory_file_sha256=source_inventory.source_inventory_file_sha256,
+        source_inventory_arrow_sha256=source_inventory.source_inventory_arrow_sha256,
+        preprocessing_sha256=preprocessing_identity(transform),
+    )
 
 
 @dataclass(frozen=True)
@@ -560,6 +619,38 @@ def _task_frame(
     )
 
 
+def _image_cache_frame(bundle: _PinnedBundlePaths) -> pd.DataFrame:
+    """Load deterministic image source rows without opening task labels."""
+    assignments = pq.read_table(
+        bundle.splits_path,
+        columns=["sample_id", "split_name"],
+    ).to_pandas()
+    samples = pq.read_table(
+        bundle.samples_path,
+        columns=["sample_id", "patient_id", "image_path"],
+    ).to_pandas()
+    inventory = pq.read_table(
+        bundle.source_inventory_path,
+        columns=["sample_id", "relative_path", "byte_size", "sha256"],
+    ).to_pandas()
+    frame = (
+        samples.merge(assignments, on="sample_id", validate="one_to_one")
+        .merge(inventory, on="sample_id", validate="one_to_one")
+        .sort_values("sample_id", kind="stable")
+        .reset_index(drop=True)
+    )
+    if not frame["relative_path"].equals(frame["image_path"]):
+        raise ManifestBuildError("RSNA source inventory paths differ from sample image paths")
+    frame = frame.drop(columns="relative_path")
+    if tuple(frame.columns) != CXR_CACHE_FRAME_COLUMNS or set(frame["split_name"]) != {
+        "train",
+        "validation",
+        "test",
+    }:
+        raise ManifestBuildError("RSNA cache source rows have an invalid partition contract")
+    return frame
+
+
 def _partition(frame: pd.DataFrame, name: str) -> DatasetPartition:
     selected = frame.loc[frame["split_name"] == name]
     if selected.empty:
@@ -603,80 +694,8 @@ def _fusion_partition(frame: pd.DataFrame, name: str) -> pd.DataFrame:
     return selected.reset_index(drop=True)
 
 
-def _authenticate_source_rows(
-    config: DatasetConfig,
-    bundle: _PinnedBundlePaths,
-    metadata: dict[str, object],
-    frame: pd.DataFrame,
-    *,
-    partitions: tuple[str, ...],
-) -> SourceAuthentication:
-    if config.dataset_root is None:
-        raise ManifestBuildError("Image source authentication requires dataset.dataset_root")
-    actual_partitions = tuple(dict.fromkeys(frame["split_name"].astype(str)))
-    if set(actual_partitions) != set(partitions):
-        raise ManifestBuildError("Image rows do not match the permitted source partitions")
-    sample_ids = frame["sample_id"].astype(str).tolist()
-    inventory = pq.read_table(
-        bundle.source_inventory_path,
-        columns=["sample_id", "relative_path", "byte_size", "sha256"],
-        filters=[("sample_id", "in", sample_ids)],
-    ).to_pandas()
-    inventory_ids = inventory["sample_id"].astype(str).tolist()
-    if (
-        len(inventory_ids) != len(set(inventory_ids))
-        or len(inventory_ids) != len(sample_ids)
-        or set(inventory_ids) != set(sample_ids)
-    ):
-        raise ManifestBuildError("Source inventory does not provide one row per permitted image")
-    rows = inventory.sort_values("sample_id", kind="stable").to_dict(orient="records")
-    log_event(
-        _LOGGER,
-        "source_authentication_started",
-        partition_count=len(partitions),
-        total=len(rows),
-        unit="files",
-    )
-    progress = (
-        CountProgress(
-            _LOGGER,
-            "source_authentication_progress",
-            total=len(rows),
-            unit="files",
-        )
-        if rows
-        else None
-    )
-    expected_paths = dict(zip(frame["sample_id"], frame["image_path"], strict=True))
-    canonical_rows: list[dict[str, object]] = []
-    for completed, row in enumerate(rows, start=1):
-        relative = _validated_image_path(row["relative_path"])
-        if relative.as_posix() != expected_paths[row["sample_id"]]:
-            raise ManifestBuildError("Source inventory path differs from the permitted image row")
-        byte_size = row["byte_size"]
-        digest = row["sha256"]
-        if (
-            isinstance(byte_size, bool)
-            or not isinstance(byte_size, int)
-            or byte_size <= 0
-            or not _is_sha256(digest)
-        ):
-            raise ManifestBuildError("Source inventory contains an invalid size or SHA-256")
-        source_path = resolve_image_path(config.dataset_root, relative)
-        if not source_path.is_file() or source_path.stat().st_size != byte_size:
-            raise ManifestBuildError(f"Source DICOM size authentication failed: {relative}")
-        if sha256_file(source_path) != digest:
-            raise ManifestBuildError(f"Source DICOM SHA-256 authentication failed: {relative}")
-        canonical_rows.append(
-            {
-                "sample_id": row["sample_id"],
-                "relative_path": relative.as_posix(),
-                "byte_size": byte_size,
-                "sha256": digest,
-            }
-        )
-        if progress is not None:
-            progress.update(completed)
+def _source_inventory_identity(metadata: dict[str, object]) -> SourceInventoryIdentity:
+    """Read the exact source-inventory artifact identity from bundle metadata."""
     hashes = metadata.get("generated_artifact_hashes")
     declared = hashes.get(SOURCE_INVENTORY_FILENAME) if isinstance(hashes, dict) else None
     if not isinstance(declared, dict):
@@ -685,28 +704,10 @@ def _authenticate_source_rows(
     file_hash = declared.get("file_sha256")
     if not _is_sha256(arrow_hash) or not _is_sha256(file_hash):
         raise ManifestBuildError("Bundle metadata source-inventory hashes are invalid")
-    encoded = json.dumps(
-        canonical_rows,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    result = SourceAuthentication(
-        policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
-        partitions=partitions,
-        file_count=len(canonical_rows),
+    return SourceInventoryIdentity(
         source_inventory_arrow_sha256=arrow_hash,
         source_inventory_file_sha256=file_hash,
-        authenticated_rows_sha256=hashlib.sha256(encoded).hexdigest(),
     )
-    log_event(
-        _LOGGER,
-        "source_authentication_completed",
-        partition_count=len(partitions),
-        total=result.file_count,
-        unit="files",
-    )
-    return result
 
 
 def _lineage(
@@ -729,17 +730,17 @@ def _nonempty_text(value: object, field: str) -> str:
     return value
 
 
-def _validated_image_path(value: object) -> PurePosixPath:
-    text = _nonempty_text(value, "image_path")
-    path = PurePosixPath(text)
-    if (
-        path.is_absolute()
-        or path.as_posix() != text
-        or any(part in {"", ".", ".."} for part in path.parts)
-        or "\\" in text
-    ):
-        raise ManifestBuildError(f"Invalid normalized relative image path: {text!r}")
-    return path
+def _validate_training_seed(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ManifestBuildError("RSNA cached dataset training seed must be nonnegative")
+
+
+def _stable_augmentation_seed(training_seed: int, epoch: int, sample_id: str) -> int:
+    """Derive worker-independent augmentation randomness for one sample request."""
+    if epoch < 0:
+        raise ManifestBuildError("Image epoch must be nonnegative")
+    payload = f"radfusion-rsna-augmentation\0{training_seed}\0{epoch}\0{sample_id}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63)
 
 
 def _is_sha256(value: object) -> bool:

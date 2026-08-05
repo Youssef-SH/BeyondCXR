@@ -23,6 +23,7 @@ _COUNT_FIELDS = frozenset(
         "epoch",
         "file_count",
         "global_epoch",
+        "num_workers",
         "no_improvement_count",
         "partition_count",
         "patience",
@@ -33,6 +34,7 @@ _COUNT_FIELDS = frozenset(
         "seed",
         "selected_epoch",
         "stage_epoch",
+        "prefetch_factor",
         "total",
         "train_count",
         "validation_count",
@@ -42,12 +44,26 @@ _BOUNDED_NUMERIC_FIELDS = frozenset(
     {"average_precision", "brier_score", "roc_auc", "validation_average_precision"}
 )
 _NONNEGATIVE_NUMERIC_FIELDS = frozenset(
-    {"elapsed_s", "encoder_learning_rate", "head_learning_rate", "training_loss"}
+    {
+        "batches_per_second",
+        "effective_cpu_capacity",
+        "elapsed_s",
+        "encoder_learning_rate",
+        "head_learning_rate",
+        "training_elapsed_s",
+        "training_batches_per_second",
+        "training_loss",
+        "training_samples_per_second",
+        "validation_elapsed_s",
+        "validation_batches_per_second",
+        "validation_samples_per_second",
+    }
 )
 _BOOLEAN_FIELDS = frozenset({"selected_best"})
 _TOKEN_FIELDS = frozenset(
     {
         "artifact",
+        "campaign_id",
         "dataset",
         "device",
         "error_type",

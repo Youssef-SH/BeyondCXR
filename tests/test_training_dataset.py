@@ -2,19 +2,21 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
 
 from radfusion.data.tabular_preprocess import SOURCE_FEATURES
 from radfusion.training.config import ConfigError, load_experiment_config
-from radfusion.training.datasets import RsnaDataset
+from radfusion.training.datasets import RsnaDataset, _image_cache_frame
 
 
 def _tables() -> dict[str, pa.Table]:
     samples = []
     labels = []
     splits = []
+    inventory = []
     for split in ("train", "validation", "test"):
         for index, target in enumerate((0, 1)):
             sample_id = f"rsna:{split}-{index}"
@@ -42,10 +44,19 @@ def _tables() -> dict[str, pa.Table]:
                 }
             )
             splits.append({"sample_id": sample_id, "split_name": split})
+            inventory.append(
+                {
+                    "sample_id": sample_id,
+                    "relative_path": f"images/{split}-{index}.dcm",
+                    "byte_size": 100 + index,
+                    "sha256": str(index) * 64,
+                }
+            )
     return {
         "rsna_samples.parquet": pa.Table.from_pylist(samples),
         "rsna_labels.parquet": pa.Table.from_pylist(labels),
         "rsna_splits.parquet": pa.Table.from_pylist(splits),
+        "rsna_source_inventory.parquet": pa.Table.from_pylist(inventory),
     }
 
 
@@ -162,3 +173,39 @@ def test_config_cannot_omit_bundle_pin(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError):
         load_experiment_config(path)
+
+
+def test_cache_source_frame_reads_samples_and_splits_without_task_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tables = _tables()
+    reads: list[str] = []
+
+    def read_table(path, *, columns):
+        filename = Path(path).name
+        reads.append(filename)
+        rows = tables[filename].to_pylist()
+        return pa.Table.from_pylist([{column: row[column] for column in columns} for row in rows])
+
+    monkeypatch.setattr("radfusion.training.datasets.pq.read_table", read_table)
+    frame = _image_cache_frame(
+        SimpleNamespace(
+            splits_path=Path("rsna_splits.parquet"),
+            samples_path=Path("rsna_samples.parquet"),
+            source_inventory_path=Path("rsna_source_inventory.parquet"),
+        )
+    )
+
+    assert reads == [
+        "rsna_splits.parquet",
+        "rsna_samples.parquet",
+        "rsna_source_inventory.parquet",
+    ]
+    assert tuple(frame.columns) == (
+        "sample_id",
+        "patient_id",
+        "image_path",
+        "split_name",
+        "byte_size",
+        "sha256",
+    )

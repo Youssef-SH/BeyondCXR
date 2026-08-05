@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -14,10 +16,11 @@ from sklearn.metrics import average_precision_score
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from radfusion.training.config import ImageConfig
 from radfusion.training.device import ResolvedDevice
+from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
 
 CLASS_WEIGHT_POLICY_VERSION = "training-label-prevalence-pos-weight-v1"
 
@@ -62,6 +65,18 @@ class EpochRecord:
 
 
 @dataclass(frozen=True)
+class EpochThroughput:
+    """Operational train/validation timing for one completed epoch."""
+
+    training_elapsed_s: float
+    validation_elapsed_s: float
+    training_batches_per_second: float
+    validation_batches_per_second: float
+    training_samples_per_second: float
+    validation_samples_per_second: float
+
+
+@dataclass(frozen=True)
 class InferenceResult:
     """Deterministically ordered binary targets, logits, probabilities, and identifiers."""
 
@@ -93,10 +108,35 @@ class ImageLoaders:
 
 
 EpochCallback = Callable[[EpochRecord], None]
+EpochThroughputCallback = Callable[[EpochRecord, EpochThroughput], None]
 EpochStartedCallback = Callable[[str, int, int], None]
 StageCallback = Callable[[str, int], None]
 BatchProgressCallback = Callable[[int, int], None]
 NeuralProgressCallback = Callable[[str, str, int, int, int], None]
+
+
+class EpochPermutationSampler(Sampler[tuple[int, int]]):
+    """Emit deterministic epoch-tagged requests independent of worker topology."""
+
+    def __init__(self, dataset: Dataset[Any], *, seed: int, epoch: int = 0) -> None:
+        _validate_seed(seed)
+        if epoch < 0:
+            raise ValueError("Sampler epoch must be nonnegative")
+        self._dataset = dataset
+        self._seed = seed
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __iter__(self):
+        epoch = self._epoch
+        payload = f"radfusion-rsna-order\0{self._seed}\0{epoch}".encode()
+        permutation_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+        generator = torch.Generator().manual_seed(permutation_seed)
+        order = torch.randperm(len(self._dataset), generator=generator).tolist()
+        self._epoch += 1
+        return iter((epoch, index) for index in order)
 
 
 def seed_neural_runtime(seed: int) -> None:
@@ -119,14 +159,6 @@ def dataloader_generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
-def seed_dataloader_worker(worker_id: int) -> None:
-    """Seed one worker from its PyTorch-assigned initial seed."""
-    del worker_id
-    worker_seed = torch.initial_seed() % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-
-
 def build_image_loaders(
     train_dataset: Dataset[Any],
     validation_dataset: Dataset[Any],
@@ -134,24 +166,38 @@ def build_image_loaders(
     config: ImageConfig,
     runtime: ResolvedDevice,
     seed: int,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> ImageLoaders:
     """Construct deterministic training and validation loaders."""
+    policy = execution or configured_loader_policy(
+        num_workers=config.num_workers, pin_memory=runtime.pin_memory_effective
+    )
+    if policy.pin_memory != runtime.pin_memory_effective:
+        raise ValueError("DataLoader pin-memory policy differs from the resolved runtime")
     common = {
         "batch_size": config.batch_size,
-        "num_workers": config.num_workers,
-        "pin_memory": runtime.pin_memory_effective,
+        "num_workers": policy.num_workers,
+        "pin_memory": policy.pin_memory,
         "drop_last": False,
-        "worker_init_fn": seed_dataloader_worker,
-        "persistent_workers": False,
+        "persistent_workers": policy.persistent_workers,
     }
+    if policy.num_workers > 0:
+        common["prefetch_factor"] = policy.prefetch_factor
+        common["multiprocessing_context"] = "spawn"
+    train_arguments: dict[str, Any] = dict(common)
+    train_arguments["generator"] = dataloader_generator(seed)
+    if getattr(train_dataset, "epoch_tagged_requests", False):
+        train_arguments["sampler"] = EpochPermutationSampler(train_dataset, seed=seed)
+    else:
+        train_arguments["shuffle"] = True
     return ImageLoaders(
-        train=DataLoader(
-            train_dataset,
-            shuffle=True,
-            generator=dataloader_generator(seed),
+        train=DataLoader(train_dataset, **train_arguments),
+        validation=DataLoader(
+            validation_dataset,
+            shuffle=False,
+            generator=dataloader_generator((seed + 1) % (2**31)),
             **common,
         ),
-        validation=DataLoader(validation_dataset, shuffle=False, **common),
     )
 
 
@@ -160,18 +206,28 @@ def build_evaluation_loader(
     *,
     config: ImageConfig,
     runtime: ResolvedDevice,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> DataLoader[Any]:
     """Construct one deterministic, ordered image-evaluation loader."""
-    return DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=config.num_workers,
-        pin_memory=runtime.pin_memory_effective,
-        worker_init_fn=seed_dataloader_worker,
-        persistent_workers=False,
+    policy = execution or configured_loader_policy(
+        num_workers=config.num_workers, pin_memory=runtime.pin_memory_effective
     )
+    if policy.pin_memory != runtime.pin_memory_effective:
+        raise ValueError("DataLoader pin-memory policy differs from the resolved runtime")
+    arguments: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": config.batch_size,
+        "shuffle": False,
+        "drop_last": False,
+        "num_workers": policy.num_workers,
+        "pin_memory": policy.pin_memory,
+        "persistent_workers": policy.persistent_workers,
+        "generator": dataloader_generator(0),
+    }
+    if policy.num_workers > 0:
+        arguments["prefetch_factor"] = policy.prefetch_factor
+        arguments["multiprocessing_context"] = "spawn"
+    return DataLoader(**arguments)
 
 
 def training_class_weight(targets: np.ndarray) -> tuple[int, int, float]:
@@ -227,7 +283,8 @@ def train_one_epoch(
     model.train()
     if warmup:
         model.encoder.eval()
-    total_loss = 0.0
+    batch_losses: list[torch.Tensor] = []
+    batch_sizes: list[int] = []
     total_samples = 0
     effective_scaler = scaler if runtime.mixed_precision_effective else None
     total_batches = _progress_total(loader) if progress_callback is not None else None
@@ -241,9 +298,9 @@ def train_one_epoch(
         )
         with context:
             logits = model(*inputs)
-            _require_finite_logits(logits, len(targets))
+            _require_valid_logits_structure(logits, len(targets))
             loss = loss_function(logits, targets)
-        if loss.ndim != 0 or not torch.isfinite(loss):
+        if loss.ndim != 0 or not bool(torch.isfinite(loss)):
             raise NeuralTrainingError("Training produced a non-finite batch loss")
         if effective_scaler is not None:
             effective_scaler.scale(loss).backward()
@@ -256,12 +313,15 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
             optimizer.step()
         batch_size = len(targets)
-        total_loss += float(loss.detach().cpu()) * batch_size
+        batch_losses.append(loss.detach())
+        batch_sizes.append(batch_size)
         total_samples += batch_size
         if total_batches is not None:
             _best_effort_callback(progress_callback, completed_batches, total_batches)
     if total_samples == 0:
         raise NeuralTrainingError("Training DataLoader produced no samples")
+    loss_values = torch.stack(batch_losses).cpu().tolist()
+    total_loss = sum(value * size for value, size in zip(loss_values, batch_sizes, strict=True))
     mean_loss = total_loss / total_samples
     if not np.isfinite(mean_loss):
         raise NeuralTrainingError("Training produced a non-finite epoch loss")
@@ -278,8 +338,8 @@ def deterministic_inference(
 ) -> InferenceResult:
     """Run one ordered inference pass and calculate finite validation AP."""
     model.eval()
-    targets: list[np.ndarray] = []
-    logits: list[np.ndarray] = []
+    targets: list[torch.Tensor] = []
+    logits: list[torch.Tensor] = []
     sample_ids: list[str] = []
     patient_ids: list[str] = []
     with torch.inference_mode():
@@ -293,17 +353,17 @@ def deterministic_inference(
             )
             with context:
                 batch_logits = model(*inputs)
-            _require_finite_logits(batch_logits, len(batch_targets))
-            targets.append(batch_targets.detach().cpu().numpy().astype(np.int8))
-            logits.append(batch_logits.detach().float().cpu().numpy())
+            _require_valid_logits_structure(batch_logits, len(batch_targets))
+            targets.append(batch_targets.detach())
+            logits.append(batch_logits.detach().float())
             sample_ids.extend(str(value) for value in batch["sample_id"])
             patient_ids.extend(str(value) for value in batch["patient_id"])
             if total_batches is not None:
                 _best_effort_callback(progress_callback, completed_batches, total_batches)
     if not targets:
         raise NeuralTrainingError("Evaluation DataLoader produced no samples")
-    target_array = np.concatenate(targets)
-    logit_array = np.concatenate(logits).astype(np.float64)
+    target_array = torch.cat(targets).cpu().numpy().astype(np.int8)
+    logit_array = torch.cat(logits).cpu().numpy().astype(np.float64)
     if set(np.unique(target_array).tolist()) != {0, 1}:
         raise NeuralTrainingError("Inference targets must contain both binary classes")
     if not np.isfinite(logit_array).all():
@@ -348,6 +408,7 @@ def fit_image_model(
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
     progress_callback: NeuralProgressCallback | None = None,
+    throughput_callback: EpochThroughputCallback | None = None,
 ) -> NeuralFitResult:
     """Run head warm-up and full fine-tuning with validation checkpoint selection."""
     return fit_two_stage_binary_model(
@@ -362,6 +423,7 @@ def fit_image_model(
         epoch_started_callback=epoch_started_callback,
         stage_callback=stage_callback,
         progress_callback=progress_callback,
+        throughput_callback=throughput_callback,
     )
 
 
@@ -378,6 +440,7 @@ def fit_two_stage_binary_model(
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
     progress_callback: NeuralProgressCallback | None = None,
+    throughput_callback: EpochThroughputCallback | None = None,
 ) -> NeuralFitResult:
     """Run the fixed two-stage binary lifecycle over ordered tensor inputs."""
     _validate_input_keys(input_keys)
@@ -407,6 +470,7 @@ def fit_two_stage_binary_model(
     for stage_epoch in range(1, config.warmup_epochs + 1):
         global_epoch += 1
         _best_effort_callback(epoch_started_callback, "warmup", global_epoch, stage_epoch)
+        training_started = time.perf_counter()
         loss = train_one_epoch(
             neural_model,
             train_loader,
@@ -421,6 +485,8 @@ def fit_two_stage_binary_model(
                 progress_callback, "training", "warmup", global_epoch
             ),
         )
+        training_elapsed = time.perf_counter() - training_started
+        validation_started = time.perf_counter()
         validation = deterministic_inference(
             model,
             validation_loader,
@@ -430,6 +496,7 @@ def fit_two_stage_binary_model(
                 progress_callback, "validation", "warmup", global_epoch
             ),
         )
+        validation_elapsed = time.perf_counter() - validation_started
         selected = candidate_is_improvement(
             validation.average_precision,
             best_ap,
@@ -454,6 +521,18 @@ def fit_two_stage_binary_model(
         )
         history.append(record)
         _best_effort_callback(epoch_callback, record)
+        _best_effort_callback(
+            throughput_callback,
+            record,
+            EpochThroughput(
+                training_elapsed,
+                validation_elapsed,
+                _batches_per_second(train_loader, training_elapsed),
+                _batches_per_second(validation_loader, validation_elapsed),
+                _samples_per_second(train_loader, training_elapsed),
+                _samples_per_second(validation_loader, validation_elapsed),
+            ),
+        )
 
     neural_model.unfreeze_encoder()
     _best_effort_callback(stage_callback, "fine_tune", config.fine_tune_epochs)
@@ -485,6 +564,7 @@ def fit_two_stage_binary_model(
         _best_effort_callback(epoch_started_callback, "fine_tune", global_epoch, stage_epoch)
         encoder_learning_rate_used = float(fine_optimizer.param_groups[0]["lr"])
         head_learning_rate_used = float(fine_optimizer.param_groups[1]["lr"])
+        training_started = time.perf_counter()
         loss = train_one_epoch(
             neural_model,
             train_loader,
@@ -499,6 +579,8 @@ def fit_two_stage_binary_model(
                 progress_callback, "training", "fine_tune", global_epoch
             ),
         )
+        training_elapsed = time.perf_counter() - training_started
+        validation_started = time.perf_counter()
         validation = deterministic_inference(
             model,
             validation_loader,
@@ -508,6 +590,7 @@ def fit_two_stage_binary_model(
                 progress_callback, "validation", "fine_tune", global_epoch
             ),
         )
+        validation_elapsed = time.perf_counter() - validation_started
         selected = candidate_is_improvement(
             validation.average_precision,
             best_ap,
@@ -536,6 +619,18 @@ def fit_two_stage_binary_model(
         )
         history.append(record)
         _best_effort_callback(epoch_callback, record)
+        _best_effort_callback(
+            throughput_callback,
+            record,
+            EpochThroughput(
+                training_elapsed,
+                validation_elapsed,
+                _batches_per_second(train_loader, training_elapsed),
+                _batches_per_second(validation_loader, validation_elapsed),
+                _samples_per_second(train_loader, training_elapsed),
+                _samples_per_second(validation_loader, validation_elapsed),
+            ),
+        )
         if not selected and no_improvement >= config.early_stopping_patience:
             break
     if best_state is None or selected_stage not in {"warmup", "fine_tune"}:
@@ -547,6 +642,27 @@ def fit_two_stage_binary_model(
         selected_validation_average_precision=best_ap,
         history=tuple(history),
     )
+
+
+def _samples_per_second(loader: DataLoader[Any], elapsed_s: float) -> float:
+    if elapsed_s <= 0.0:
+        return 0.0
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return 0.0
+    try:
+        return float(len(dataset) / elapsed_s)
+    except TypeError:
+        return 0.0
+
+
+def _batches_per_second(loader: DataLoader[Any], elapsed_s: float) -> float:
+    if elapsed_s <= 0.0:
+        return 0.0
+    try:
+        return float(len(loader) / elapsed_s)
+    except TypeError:
+        return 0.0
 
 
 def _device_batch(
@@ -627,14 +743,13 @@ def _progress_total(loader: object) -> int | None:
     return total if isinstance(total, int) and not isinstance(total, bool) and total > 0 else None
 
 
-def _require_finite_logits(logits: object, batch_size: int) -> None:
+def _require_valid_logits_structure(logits: object, batch_size: int) -> None:
     if (
         not isinstance(logits, torch.Tensor)
         or logits.shape != (batch_size,)
         or not logits.is_floating_point()
-        or not torch.isfinite(logits).all()
     ):
-        raise NeuralTrainingError("Model produced invalid or non-finite binary logits")
+        raise NeuralTrainingError("Model produced invalid binary logits")
 
 
 def _validate_seed(seed: object) -> None:

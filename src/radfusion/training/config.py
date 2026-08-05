@@ -215,6 +215,9 @@ def _neural_semantic_config(
 ) -> dict[str, Any]:
     if config.model.modality != modality or config.image is None:
         raise ConfigError(f"Semantic {modality} configuration requires {modality} modality")
+    image = asdict(config.image)
+    del image["num_workers"]
+    del image["pin_memory_policy"]
     return {
         "config_version": config.config_version,
         "dataset": {
@@ -233,7 +236,7 @@ def _neural_semantic_config(
             "sensitivity_target": config.evaluation.sensitivity_target,
             "calibration_bins": config.evaluation.calibration_bins,
         },
-        "image": asdict(config.image),
+        "image": image,
     }
 
 

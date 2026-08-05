@@ -60,17 +60,25 @@ semantics, and the policy version. The fitted preprocessing pipeline is embedded
 
 ## Execution
 
+Contributor setup uses `uv sync --locked --group dev`; a paid GPU campaign host uses
+`uv sync --locked --no-dev`.
+
 ```bash
-make train CONFIG=configs/metadata_logistic.yaml
-make train CONFIG=configs/image_densenet_seed42.yaml
-make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
-make evaluate RUN_ID=<training-run-id>
-make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
-make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
-make compare
+make rsna-gpu
 ```
 
-`<training-run-id>` denotes the run ID printed by `make train`.
+This is the authoritative full RSNA workflow. It prepares the configured pretrained weight,
+publishes and audits the bundle, builds the deterministic image cache, calibrates the loader,
+completes all eight training packages before test access, evaluates all eight packages, runs seed
+summaries, localization, and comparison, validates the output surface, and publishes a portable
+archive with a checksum. Producer results pass exact run IDs directly to
+dependent consumers in memory. The command requires a fresh generated-output surface and preserves
+partial outputs on failure; `make purge-generated` is the explicit destructive reset.
+
+The lower-level `make train`, `make evaluate`, `make summarize-seeds`, `make localize`, and
+`make compare` commands remain available for targeted inspection and debugging of immutable runs.
+Within `make rsna-gpu`, held-out evaluation begins only after all eight training packages have
+frozen; lower-level explicit evaluation verifies only the selected immutable run and package.
 
 Training validates the complete pinned bundle, then performs projected and filtered reads for
 train and validation only. It fits preprocessing and the estimator on train, uses validation for
@@ -91,36 +99,52 @@ evaluation. Dispatch is determined by `model.modality`.
 ## Image training
 
 The image configuration defines one seed, the fixed TorchXRayVision DenseNet121 encoder, source
-dataset root, deterministic loading policy, augmentation, optimization stages, and runtime policy.
+dataset root, augmentation, optimization stages, and device policy.
 Each invocation trains one seed. Training validates the pinned bundle, loads only train and
-validation rows, and authenticates their DICOM size and SHA-256 against the source inventory before
-constructing datasets or the model.
+validation rows, and verifies their coverage by the validated deterministic CXR cache before
+constructing the model.
 
 The image configuration pins the immutable semantic bundle ID. Bundle validation computes the
 observed bundle-manifest SHA-256 and verifies its physical, logical, semantic, split, and source
 contracts. Training freezes that exact identity in the model package and copies it to an MLflow
 parameter; linked evaluation requires the same bundle-manifest SHA-256 before test access.
-Authorized train/validation and test source-authentication proofs retain distinct row digests.
+Cache derivation identity and source-authentication provenance are package-bound. Mapping and
+image-content hashes validate the disposable cache locally and do not participate in model
+semantic identity or the model package ID.
 
 ### Pretrained weight file and provenance
 
-TorchXRayVision normally obtains `densenet121-res224-chex` under
-`~/.torchxrayvision/models_data/`; offline runs must prepare the URL-derived cache file there.
-Image training requires that entry to be a regular non-symlink file, fingerprints it immediately
-before and after model construction, and requires exact equality. This establishes local run
-provenance but does not independently authenticate the file against an official upstream digest.
-Test evaluation reconstructs with `weights=None` and loads only the packaged trained state.
+The campaign materializes `densenet121-res224-chex` through TorchXRayVision's supported acquisition
+path. Image training requires the URL-derived cache entry to be a regular non-symlink file,
+fingerprints it immediately before and after model construction, and requires exact equality. This
+establishes local run provenance but does not independently authenticate the file against an
+official upstream digest. Test evaluation reconstructs with `weights=None` and loads only the
+packaged trained state.
 
 Training performs head-only warm-up followed by full fine-tuning. Validation Average Precision
 selects the retained state across both stages and controls fine-tuning scheduling and early
 stopping. Final deterministic validation inference freezes the Youden-J and target-sensitivity
-thresholds. Test rows, labels, files, and pixels remain outside the training lifecycle.
+thresholds. Campaign preparation may authenticate and deterministically cache image bytes from all
+partitions without reading task labels, fitting statistics, selecting thresholds, or fitting a
+model. Official training consumes only train and validation task rows; held-out labels and test
+evaluation remain unavailable inside the canonical campaign until all eight training packages are
+frozen.
 Epoch history records the learning rates used during each epoch, before scheduling the next epoch.
 
-Runtime selection supports CPU and CUDA. Mixed precision and pinned-memory transfer become
-effective only on CUDA when requested. DataLoader shuffle, worker randomness, model initialization,
-and augmentation derive from `training.seed`. CUDA runtime, cuDNN, GPU device, and compute
-capability are recorded as non-semantic runtime provenance.
+The deterministic CXR cache stores float32 `[1, 224, 224]` images after DICOM decoding,
+MONOCHROME handling, center crop, and resize, immediately before stochastic augmentation. Training
+sample order is a stable function of seed and epoch. Augmentation is a stable function of seed,
+epoch, and sample ID, so worker count, worker lifetime, and prefetch timing do not change the
+scientific realization.
+
+The campaign derives effective CPU capacity from Linux affinity (or CPU count when affinity is
+unavailable) and, when available, cgroup-v2 quota. It benchmarks a single-process baseline plus
+bounded multiprocessing candidates using eight warm-up and 64 measured batches and selects the
+smallest near-best worker count. Multiprocessing loaders persist workers and use prefetch factor 2;
+single-process loaders use neither persistence nor prefetch. The exact selected policy configures
+the loaders and is recorded as runtime provenance outside semantic experiment compatibility. Batch
+size, augmentation, optimization, AMP, and all other numerical policies remain scientific
+configuration.
 
 Image packages contain:
 
@@ -133,27 +157,21 @@ models/rsna/runs/<training-run-id>/
 
 `model.pt` is a validated CPU tensor state dictionary with selection metadata. The package manifest
 binds the checkpoint, path-independent experiment meaning, archived configuration, dataset and
-split lineage, source authentication, pretrained-weight byte identity, transform contracts,
-training policy, selected validation state, and frozen thresholds. The evaluator validates this
-package, reconstructs the DenseNet architecture without loading the original TorchXRayVision
-cache, and strictly loads the complete state before reading or authenticating test data.
+split lineage, cache-construction source authentication, pretrained-weight byte identity,
+transform contracts, training policy, selected validation state, and frozen thresholds. The
+evaluator validates this package, reconstructs the DenseNet architecture without loading the
+original TorchXRayVision cache, and strictly loads the complete state before reading test rows.
 
 ## Tracking and outputs
 
 ### Operational progress
 
 Instrumented entrypoints emit lifecycle records and rate-limited aggregate progress to stderr;
-their final machine-readable result remains on stdout. A narrow field allowlist and bounded value
-validation limit operational content. Use `--log-level` to control detail. Operational logs are
-transient; MLflow remains the durable experiment ledger.
-
-```bash
-# Combined transcript
-command 2>&1 | tee run.log
-
-# Bash: retain stderr logs while preserving clean stdout
-command 2> >(tee run.log >&2)
-```
+their final machine-readable result remains on stdout. The full campaign also writes the same
+records to `reports/rsna/campaigns/<campaign-id>/execution.log`. `epoch_throughput` operational
+records include separate training and validation elapsed time, batches per second, and samples per
+second. The bookkeeping uses host clocks and aggregate counters without per-batch logging or extra
+CUDA synchronization.
 
 Model packages under `models/` and complete reports under `reports/` are the authoritative
 physical outputs. MLflow stores the run ledger, status, parameters, scalar metrics, provenance,
@@ -164,6 +182,9 @@ configuration. Run metadata lives in `mlflow.db`; training configuration artifac
 ```bash
 uv run mlflow server --backend-store-uri sqlite:///mlflow.db
 ```
+
+Evaluation reports contain scientific results and device/software facts. The actual cache identity
+and loader execution policy are durable MLflow run parameters.
 
 A training run logs the exact loaded YAML before dataset access and records resolved split and
 label-policy lineage before fitting. Training and test-evaluation runs become complete only after

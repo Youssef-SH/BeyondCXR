@@ -16,8 +16,8 @@ image-metadata fusion models.
 - Content-addressed immutable bundles with exact schemas and integrity validation
 - Metadata preprocessing fitted on the training split and fixed Logistic Regression and LightGBM
   baselines
-- A TorchXRayVision DenseNet121 image baseline with deterministic single-seed training
-- Partition-scoped authentication of external DICOM bytes before image access
+- A TorchXRayVision DenseNet121 image baseline with deterministic per-seed training
+- Same-byte raw-DICOM authentication and decoding during deterministic cache construction
 - Observed bundle-manifest SHA-256 lineage for image training and linked evaluation
 - Separate validation and explicit test-evaluation runs with MLflow lineage
 - Explicit RSNA image and fusion three-seed summaries with individual, mean, and sample-SD results
@@ -32,8 +32,14 @@ The project requires Python 3.13 and [uv](https://docs.astral.sh/uv/). Data-acqu
 available through the optional `acquisition` dependency group.
 
 ```bash
-uv sync --locked
+uv sync --locked --group dev
 uv run pre-commit install
+```
+
+On a paid GPU host, install only the locked runtime dependencies required by the campaign:
+
+```bash
+uv sync --locked --no-dev
 ```
 
 ## Data prerequisite
@@ -45,26 +51,36 @@ to `data/raw/rsna/extracted/`. The required filenames and directory layout are d
 ## Commands
 
 ```bash
+make rsna-gpu        # run and export the complete authoritative RSNA campaign
+
+# Lower-level inspection and debugging commands
 make rsna-manifest   # publish an RSNA bundle
 make rsna-audit      # generate reports under reports/rsna/audit/<bundle-id>
 make train CONFIG=configs/metadata_logistic.yaml
-make train CONFIG=configs/metadata_lightgbm.yaml
 make train CONFIG=configs/image_densenet_seed42.yaml
-make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
 make evaluate RUN_ID=<training-run-id>
-make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
-make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
 make compare         # regenerate CSV and Markdown comparison views from MLflow
-make clean           # remove caches and interrupted-publication staging state
+make clean           # remove tool caches and interrupted-publication staging state
 make purge-generated # deliberately remove all reproducible generated outputs
 make check           # lock consistency, Ruff checks, and unit/contract tests
 make pre-commit      # run repository hooks against all tracked files
 make inspect FILE=path/to/image.dcm
 ```
 
-`<training-run-id>` denotes the run ID printed by `make train`. Model packages are stored under
-`models/`, generated reports under `reports/`, MLflow metadata in `mlflow.db`, and small MLflow
-training-configuration artifacts under `mlartifacts/`.
+After the raw dataset is in place, `make rsna-gpu` owns pretrained-weight readiness, bundle and
+audit generation, deterministic image caching, loader calibration, all eight
+training runs, all eight linked evaluations, both seed summaries, localization, comparison, final
+validation, and export. It requires no operator-supplied run IDs. The campaign log is written to
+`reports/rsna/campaigns/<campaign-id>/execution.log`; the portable archive and checksum are written
+to `outbox/rsna-results-<campaign-id>.tar.gz` and `.tar.gz.sha256`.
+
+Deterministic cache preparation authenticates and preprocesses image bytes for the complete pinned
+bundle without reading task labels or fitting population statistics. Training consumes only train
+and validation task rows. Within the canonical campaign, held-out evaluation begins only after all
+eight packages are frozen.
+
+Model packages are stored under `models/`, generated reports under `reports/`, MLflow metadata in
+`mlflow.db`, and small MLflow training-configuration artifacts under `mlartifacts/`.
 
 Instrumented manifest, audit, training, evaluation, and comparison commands emit operational
 records to stderr while preserving machine-readable stdout; see the training guide for capture
@@ -73,10 +89,12 @@ examples.
 Every experiment is declared by a validated YAML file under `configs/`. See
 [`docs/training.md`](docs/training.md) for the training workflow.
 
-Image and fusion training execute one configured seed per invocation. Image training reads and
-authenticates only train and validation DICOMs, fingerprints the pretrained weight file immediately
-before and after model construction, and requires exact equality. It packages exact bundle and run
-lineage.
+Image and fusion training execute one configured seed per invocation. Cache preparation
+materializes each source DICOM's bytes once, authenticates them, and decodes the same in-memory
+bytes. Neural consumers use a validated cache whose validation proves its identity, exact
+sample-to-partition mapping, and content integrity without reopening raw DICOMs. Image training
+fingerprints the pretrained weight file immediately before and after model construction and
+requires exact equality.
 `make evaluate` verifies the selected immutable package before accessing test data and reconstructs
 the model without the pretrained-weight cache.
 
@@ -95,10 +113,10 @@ real-image Grad-CAM overlays and their traceability manifest remain under `priva
 
 ## Cleaning generated artifacts
 
-Run `make clean` for disposable caches and temporary publication state. It preserves completed
-bundles, reports, model packages, and experiment history. Run `make purge-generated` to remove
-those reproducible outputs deliberately. Both commands preserve raw source datasets under
-`data/raw/`.
+Run `make clean` for development caches and temporary publication state. It preserves completed
+bundles, derived CXR caches, reports, model packages, and experiment history. Run
+`make purge-generated` to remove reproducible outputs, including the derived image cache. Both
+commands preserve raw source datasets under `data/raw/`.
 
 ## Repository layout
 
@@ -111,6 +129,7 @@ configs/                   experiment definitions
 tests/                     unit, contract, and local integration tests
 docs/                      architecture, data contracts, privacy, and reproducibility
 data/                      ignored local inputs and generated artifacts
+outbox/                    portable campaign archives and checksums
 scripts/                   small inspection utilities
 ```
 

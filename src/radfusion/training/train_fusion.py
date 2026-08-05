@@ -13,6 +13,7 @@ import mlflow
 import numpy as np
 from sklearn.pipeline import Pipeline
 
+from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
 from radfusion.data.tabular_preprocess import (
@@ -43,8 +44,15 @@ from radfusion.training.config import (
     fusion_semantic_config_sha256,
     fusion_structured_input_conversion_contract,
 )
-from radfusion.training.datasets import FusionRunData, RsnaFusionDataset
+from radfusion.training.datasets import (
+    FusionRunData,
+    RsnaCachedFusionDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
 from radfusion.training.device import resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
 from radfusion.training.fusion_source import (
     SourceCxrLineage,
     resolve_source_cxr_training_run,
@@ -52,6 +60,8 @@ from radfusion.training.fusion_source import (
 )
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
+    EpochRecord,
+    EpochThroughput,
     build_image_loaders,
     deterministic_inference,
     fit_two_stage_binary_model,
@@ -115,6 +125,8 @@ def train_fusion_experiment(
     *,
     source_training_run_id: str,
     tracking_uri: str = DEFAULT_TRACKING_URI,
+    cache: ValidatedCxrCache | None = None,
+    execution: LoaderExecutionPolicy | None = None,
 ) -> FusionModelResult:
     """Train fusion from one explicit verified same-seed CXR package."""
     if config.model.modality != "fusion" or config.image is None:
@@ -180,8 +192,6 @@ def train_fusion_experiment(
             {
                 "split_assignment_id": data.lineage.split_assignment_id,
                 "label_policy_version": data.lineage.label_policy_version,
-                "source_authentication_success": "true",
-                "source_authentication_policy": data.authentication.policy_version,
             }
         )
         mlflow.log_param("bundle_manifest_sha256", data.bundle_manifest_sha256)
@@ -190,26 +200,45 @@ def train_fusion_experiment(
             preprocessor, contract, train_matrix, validation_matrix = _fit_structured(data)
             train_transform = _transform(config, training=True)
             evaluation_transform = _transform(config, training=False)
-            train_dataset = RsnaFusionDataset(
+            resolved_cache = cache or prepare_rsna_cxr_cache(
+                cast(RsnaDataset, dataset_adapter), config.dataset, evaluation_transform
+            )
+            expected_cache_identity = expected_rsna_cxr_cache_identity(
+                lineage=data.lineage,
+                bundle_manifest_sha256=data.bundle_manifest_sha256,
+                source_inventory=data.source_inventory,
+                transform=evaluation_transform,
+            )
+            source_authentication = resolved_cache.source_authentication.as_dict()
+            mlflow.set_tag("source_authentication_policy", source_authentication["policy_version"])
+            train_dataset = RsnaCachedFusionDataset(
                 data.train,
                 train_matrix,
                 structured_sample_ids=tuple(data.train["sample_id"].astype(str)),
-                dataset_root=_required_dataset_root(config),
+                cache=resolved_cache,
+                expected_cache_identity=expected_cache_identity,
                 partition="train",
                 transform=train_transform,
+                training_seed=config.training.seed,
             )
-            validation_dataset = RsnaFusionDataset(
+            validation_dataset = RsnaCachedFusionDataset(
                 data.validation,
                 validation_matrix,
                 structured_sample_ids=tuple(data.validation["sample_id"].astype(str)),
-                dataset_root=_required_dataset_root(config),
+                cache=resolved_cache,
+                expected_cache_identity=expected_cache_identity,
                 partition="validation",
                 transform=evaluation_transform,
+                training_seed=config.training.seed,
             )
             runtime = resolve_device(
                 config.image.device,
                 mixed_precision=config.image.mixed_precision,
                 pin_memory_policy=config.image.pin_memory_policy,
+            )
+            loader_execution = execution or configured_loader_policy(
+                num_workers=config.image.num_workers,
+                pin_memory=runtime.pin_memory_effective,
             )
             loaders = build_image_loaders(
                 train_dataset,
@@ -217,6 +246,14 @@ def train_fusion_experiment(
                 config=config.image,
                 runtime=runtime,
                 seed=config.training.seed,
+                execution=loader_execution,
+            )
+            mlflow.log_params(
+                {
+                    f"loader_{key}": value if value is not None else "not_applicable"
+                    for key, value in loader_execution.provenance().items()
+                    if not isinstance(value, dict)
+                }
             )
             positive_count, negative_count, pos_weight = training_class_weight(
                 data.train["target"].to_numpy(dtype=np.int8)
@@ -231,6 +268,36 @@ def train_fusion_experiment(
             raise TypeError("Registered fusion builder returned an invalid model")
         initialize_fusion_encoder(model, source_encoder_state(source))
         model.to(runtime.device)
+
+        def epoch_completed(record: EpochRecord) -> None:
+            log_event(
+                _LOGGER,
+                "epoch_completed",
+                stage=record.stage,
+                global_epoch=record.global_epoch,
+                stage_epoch=record.stage_epoch,
+                training_loss=record.training_loss,
+                validation_average_precision=record.validation_average_precision,
+                selected_best=record.selected_best,
+                no_improvement_count=record.no_improvement_count,
+                **context,
+            )
+
+        def epoch_throughput(record: EpochRecord, throughput: EpochThroughput) -> None:
+            log_event(
+                _LOGGER,
+                "epoch_throughput",
+                stage=record.stage,
+                global_epoch=record.global_epoch,
+                training_elapsed_s=throughput.training_elapsed_s,
+                validation_elapsed_s=throughput.validation_elapsed_s,
+                training_batches_per_second=throughput.training_batches_per_second,
+                validation_batches_per_second=throughput.validation_batches_per_second,
+                training_samples_per_second=throughput.training_samples_per_second,
+                validation_samples_per_second=throughput.validation_samples_per_second,
+                **context,
+            )
+
         with timed_phase(_LOGGER, "fusion_training", **context):
             fit = fit_two_stage_binary_model(
                 model,
@@ -240,6 +307,8 @@ def train_fusion_experiment(
                 config=config.image,
                 runtime=runtime,
                 pos_weight=pos_weight,
+                epoch_callback=epoch_completed,
+                throughput_callback=epoch_throughput,
             )
         loaded = checkpoint_document(
             fit.selected_state_dict,
@@ -304,11 +373,16 @@ def train_fusion_experiment(
             manifest = _manifest(
                 config=config,
                 data=data,
+                source_authentication=source_authentication,
                 commit=commit,
                 dirty=dirty,
                 lock_hash=lock_hash,
                 environment=environment,
-                runtime=runtime.provenance(),
+                runtime={
+                    **runtime.provenance(),
+                    "loader_execution": loader_execution.provenance(),
+                    "cxr_cache_id": resolved_cache.identity.cache_id,
+                },
                 source_lineage=source_lineage,
                 source_pretrained_weight=dict(
                     source.manifest["model_identity"]["pretrained_weight"]
@@ -464,16 +538,11 @@ def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransf
     )
 
 
-def _required_dataset_root(config: ExperimentConfig) -> Path:
-    if config.dataset.dataset_root is None:
-        raise ValueError("Fusion experiment requires dataset.dataset_root")
-    return config.dataset.dataset_root
-
-
 def _manifest(
     *,
     config: ExperimentConfig,
     data: FusionRunData,
+    source_authentication: dict[str, object],
     commit: str,
     dirty: bool,
     lock_hash: str,
@@ -585,6 +654,6 @@ def _manifest(
             "threshold_policy_version": NEURAL_THRESHOLD_POLICY_VERSION,
             "sensitivity_target": config.evaluation.sensitivity_target,
         },
-        "source_authentication": data.authentication.as_dict(),
+        "source_authentication": source_authentication,
         "runtime_provenance": runtime,
     }

@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 
+from radfusion.data.cxr_cache import CxrCacheSourceAuthentication
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
 from radfusion.training.config import (
@@ -26,6 +27,7 @@ from radfusion.training.config import (
     image_semantic_config_sha256,
     load_experiment_config,
 )
+from radfusion.training.execution import LoaderExecutionPolicy
 from radfusion.utils.model_publication import threshold_contract
 
 NEURAL_MODEL_FILENAME = "model.pt"
@@ -453,32 +455,10 @@ def _validate_manifest_metadata(
     if contract != threshold_contract(sensitivity_target=float(sensitivity_target)):
         raise ValueError("Neural package threshold contract is unsupported")
     authentication = document["source_authentication"]
-    if not isinstance(authentication, dict) or set(authentication) != {
-        "policy_version",
-        "partitions",
-        "file_count",
-        "source_inventory_arrow_sha256",
-        "source_inventory_file_sha256",
-        "authenticated_rows_sha256",
-        "success",
-    }:
-        raise ValueError("Neural package source-authentication contract is invalid")
-    if authentication["partitions"] != ["train", "validation"]:
-        raise ValueError("Neural package training partitions are invalid")
-    file_count = authentication["file_count"]
-    if isinstance(file_count, bool) or not isinstance(file_count, int) or file_count <= 0:
-        raise ValueError("Neural package authenticated file count is invalid")
-    if authentication["success"] is not True or any(
-        not _is_sha256(authentication[field])
-        for field in (
-            "source_inventory_arrow_sha256",
-            "source_inventory_file_sha256",
-            "authenticated_rows_sha256",
-        )
-    ):
-        raise ValueError("Neural package source-authentication proof is invalid")
-    if authentication["policy_version"] != "partition-inventory-sha256-v1":
-        raise ValueError("Neural package source-authentication policy is invalid")
+    try:
+        CxrCacheSourceAuthentication.from_dict(authentication)
+    except ValueError as exc:
+        raise ValueError("Neural package source-authentication contract is invalid") from exc
     training_policy = document["training_policy"]
     if not isinstance(training_policy, dict):
         raise ValueError("Neural package training policy is invalid")
@@ -768,11 +748,24 @@ def _validate_runtime_provenance(value: object) -> None:
             "gpu_device_name",
             "gpu_device_index",
             "gpu_compute_capability",
+            "loader_execution",
+            "cxr_cache_id",
         },
         "runtime provenance",
     )
     if runtime["resolved_device"] not in {"cpu", "cuda"}:
         raise ValueError("Neural package runtime device is invalid")
+    if (
+        not isinstance(runtime["cxr_cache_id"], str)
+        or not runtime["cxr_cache_id"].startswith("cache-")
+        or not _is_sha256(runtime["cxr_cache_id"][6:])
+    ):
+        raise ValueError("Neural package CXR cache identity is invalid")
+    try:
+        LoaderExecutionPolicy.from_provenance(runtime["loader_execution"])
+    except ValueError as exc:
+        raise ValueError("Neural package loader execution provenance is invalid") from exc
+
     if (
         runtime["requested_device"] not in {"auto", "cpu", "cuda"}
         or runtime["pin_memory_requested"] not in {"auto", "enabled", "disabled"}

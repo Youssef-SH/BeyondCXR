@@ -1,6 +1,8 @@
 """Load and normalize DICOM images with selected metadata."""
 
+import hashlib
 from dataclasses import asdict, dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +25,29 @@ class DicomRecord:
     photometric_interpretation: str | None
 
 
-def read_dicom(path: str | Path) -> tuple[np.ndarray, DicomRecord]:
-    """Read a DICOM image and selected metadata."""
+def read_dicom(
+    path: str | Path,
+    *,
+    expected_byte_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[np.ndarray, DicomRecord]:
+    """Read a DICOM image, optionally authenticating the same file bytes."""
     dicom_path = Path(path)
 
     if not dicom_path.is_file():
         raise FileNotFoundError(f"DICOM file does not exist: {dicom_path}")
 
-    dataset: FileDataset = pydicom.dcmread(dicom_path)
+    if expected_byte_size is None and expected_sha256 is None:
+        dataset: FileDataset = pydicom.dcmread(dicom_path)
+    else:
+        if expected_byte_size is None or expected_sha256 is None:
+            raise ValueError("DICOM byte size and SHA-256 must be supplied together")
+        encoded = dicom_path.read_bytes()
+        if len(encoded) != expected_byte_size:
+            raise ValueError(f"DICOM byte size does not match: {dicom_path}")
+        if hashlib.sha256(encoded).hexdigest() != expected_sha256:
+            raise ValueError(f"DICOM SHA-256 does not match: {dicom_path}")
+        dataset = pydicom.dcmread(BytesIO(encoded))
 
     try:
         pixels = dataset.pixel_array.astype(np.float32)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,12 +19,14 @@ from radfusion.evaluation.localization import (
 )
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
 from radfusion.training.config import load_experiment_config
+from radfusion.training.datasets import RsnaDataset
 from radfusion.training.localize import (
     _gradcam_indices,
     _markdown,
     _positive_localization_metrics,
     _rsna_localization_dataset,
     _validate_localization_output_boundaries,
+    generate_localization_report,
 )
 
 
@@ -50,6 +53,96 @@ def test_localization_rejects_non_rsna_before_dataset_access(
 
     with pytest.raises(ValueError):
         _rsna_localization_dataset(dataset)
+
+
+def test_standalone_localization_resolves_one_shared_cache(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeds = (17, 42, 2026)
+    configs = {
+        seed: load_experiment_config(f"configs/image_densenet_seed{seed}.yaml") for seed in seeds
+    }
+    runs = {}
+    for seed in seeds:
+        training_id = f"training-{seed}"
+        runs[f"test-{seed}"] = SimpleNamespace(
+            run_id=f"test-{seed}",
+            source_training_run_id=training_id,
+            modality="image",
+            run_kind="test_evaluation",
+            evaluation_scope="test",
+            integer_seed=lambda seed=seed: seed,
+        )
+        runs[training_id] = SimpleNamespace(
+            run_id=training_id,
+            local_model_path=str(tmp_path / f"seed-{seed}" / "model.pt"),
+        )
+    monkeypatch.setattr(
+        "radfusion.training.localize.configure_mlflow",
+        lambda **kwargs: SimpleNamespace(get_run=runs.__getitem__),
+    )
+    monkeypatch.setattr("radfusion.training.localize.require_completed_run", lambda run: run)
+    monkeypatch.setattr(
+        "radfusion.training.localize.has_matching_training_parent", lambda *args: True
+    )
+    monkeypatch.setattr("radfusion.training.localize.git_revision", lambda: ("commit", False))
+    monkeypatch.setattr("radfusion.training.localize.uv_lock_sha256", lambda: "a" * 64)
+    monkeypatch.setattr(
+        "radfusion.training.localize.validate_neural_package_metadata", lambda package: {}
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.load_experiment_config",
+        lambda path: configs[int(path.parent.name.removeprefix("seed-"))],
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.verify_image_training_package", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.image_seed_compatibility_sha256", lambda config: "compatible"
+    )
+    monkeypatch.setattr("radfusion.training.localize.get_dataset", lambda key: RsnaDataset())
+    prepared: list[object] = []
+    shared_cache = object()
+
+    def prepare(*args, **kwargs):
+        prepared.append((args, kwargs))
+        return shared_cache
+
+    monkeypatch.setattr("radfusion.training.localize.prepare_rsna_cxr_cache", prepare)
+    observed_caches: list[object] = []
+
+    def evaluate(test, training, package, manifest, config, *, examples, cache):
+        del test, training, package, manifest, examples
+        observed_caches.append(cache)
+        return {
+            "public": {
+                "seed": config.training.seed,
+                "positive_test_sample_count": 1,
+                "localization_evaluated_count": 1,
+                "zero_heatmap_count": 0,
+                "pointing_game_accuracy": 1.0,
+                "mean_activation_energy_inside_union": 0.5,
+                "qualitative_strata_present": {
+                    "TP": True,
+                    "FN": False,
+                    "FP": False,
+                    "TN": True,
+                },
+            },
+            "private_examples": [],
+            "forbidden_source_values": set(),
+        }
+
+    monkeypatch.setattr("radfusion.training.localize._evaluate_member", evaluate)
+
+    result = generate_localization_report(
+        [f"test-{seed}" for seed in seeds],
+        output_directory=tmp_path / "reports",
+    )
+
+    assert result.is_dir()
+    assert len(prepared) == 1
+    assert observed_caches == [shared_cache, shared_cache, shared_cache]
 
 
 def test_gradcam_is_finite_deterministic_cleans_hooks_and_preserves_state() -> None:

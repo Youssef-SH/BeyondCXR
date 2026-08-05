@@ -9,7 +9,6 @@ import torch
 from radfusion.training.device import resolve_device
 from radfusion.training.neural import (
     dataloader_generator,
-    seed_dataloader_worker,
     seed_neural_runtime,
 )
 
@@ -114,12 +113,3 @@ def test_neural_seed_contract_accepts_boundaries(seed: int, monkeypatch) -> None
 
     assert dataloader_generator(seed).initial_seed() == seed
     assert deterministic_calls == [(True, True)]
-
-
-def test_worker_seeding_uses_pytorch_initial_seed(monkeypatch) -> None:
-    monkeypatch.setattr(torch, "initial_seed", lambda: 2**32 + 123)
-    seed_dataloader_worker(7)
-    observed = (random.random(), np.random.random())
-    random.seed(123)
-    np.random.seed(123)
-    assert observed == (random.random(), np.random.random())
