@@ -30,6 +30,12 @@ data/
           rsna_splits.parquet
           rsna_source_inventory.parquet
           rsna_manifest_metadata.json
+  cache/
+    rsna/
+      cache-<sha256>/
+        images.npy
+        index.parquet
+        metadata.json
 ```
 
 Bundle construction requires `stage_2_train_labels.csv`,
@@ -44,5 +50,7 @@ archive can be downloaded with the command in
 make rsna-manifest
 ```
 
-Keep raw images, source CSVs, generated bundle artifacts, and credentials outside version control.
-These files contain patient-level information even when public identifiers are deidentified.
+The CXR cache is a disposable memory-mapped deterministic derivative used by neural workflows.
+Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
+control. These files contain patient-level information even when public identifiers are
+deidentified.

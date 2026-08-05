@@ -11,6 +11,7 @@ Keep these materials outside version control:
 - DICOM images and other medical images;
 - source tables containing patient-level rows;
 - generated bundles and source inventories;
+- derived image caches;
 - model and experiment artifacts;
 - clinical-note or laboratory rows;
 - credentials, access tokens, and private keys;
@@ -40,3 +41,7 @@ Only aggregate localization metrics, counts, and methodological text are publish
 `reports/`. Real images, overlays, sample identities, patient identities, row-level predictions,
 and private artifact paths are excluded from public reports and MLflow artifacts. Private outputs
 remain subject to the source dataset's access and transfer terms.
+
+Campaign archives under the ignored `outbox/` directory contain private prediction and localization
+outputs as well as aggregate outputs and provenance. They remain controlled research artifacts and
+may be transferred only to destinations permitted by the source dataset terms and project policy.

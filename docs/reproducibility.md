@@ -2,10 +2,18 @@
 
 ## Environment
 
-The project targets Python 3.13. `uv.lock` defines the dependency environment.
+The project targets Python 3.13. `uv.lock` defines the dependency environment. A paid GPU campaign
+host installs the locked runtime environment:
 
 ```bash
-uv sync --locked
+uv sync --locked --no-dev
+```
+
+Contributors install the development group before running quality gates:
+
+```bash
+uv sync --locked --group dev
+uv run pre-commit install
 ```
 
 Each training run records the lock-file SHA-256, Python version, operating system, CPU architecture
@@ -61,18 +69,12 @@ identity and acceptance rules are defined in [`data_contract.md`](data_contract.
 ## Generate audits and experiments
 
 ```bash
-make rsna-audit
-make train CONFIG=configs/metadata_logistic.yaml
-make train CONFIG=configs/metadata_lightgbm.yaml
-make train CONFIG=configs/image_densenet_seed42.yaml
-make train CONFIG=configs/fusion_concat_seed42.yaml SOURCE_TRAINING_RUN_ID=<image-training-run-id>
-make evaluate RUN_ID=<training-run-id>
-make summarize-seeds TEST_RUN_IDS="<test17> <test42> <test2026>"
-make localize TEST_RUN_IDS="<image-test17> <image-test42> <image-test2026>"
-make compare
+make rsna-gpu
 ```
 
-`<training-run-id>` denotes the run ID printed by training.
+The command runs the complete ordered RSNA campaign and transfers exact run identities directly
+between training, evaluation, summary, and localization functions. It crosses the test boundary
+only after both metadata packages and all six neural packages have frozen.
 
 Audits are published under `reports/rsna/audit/<bundle-id>/`. Rebuilding one audit replaces only
 that bundle-qualified audit directory.
@@ -85,7 +87,7 @@ test in a separate linked run.
 Image experiment configurations pin the semantic bundle ID. Validation computes the observed
 bundle-manifest SHA-256 and verifies the manifest's physical, logical, semantic, split, and source
 contracts. Training records the hash in its package and an MLflow parameter; linked test evaluation
-requires the same bundle-manifest SHA-256 while authenticating only its authorized partition.
+requires the same bundle-manifest SHA-256 and accesses only its authorized task-bearing partition.
 
 Training runs record the Git commit and dirty status, exact configuration bytes and hash,
 dependency-lock hash, environment, dataset identity, and model lineage. Formal test evaluation
@@ -93,14 +95,44 @@ requires a package produced from the evaluator's clean Git commit and matching d
 Test-evaluation runs record their own code and lock provenance and link the verified model package
 to its source training run.
 
-Image training authenticates only train and validation DICOMs against the bundle source inventory.
-It seeds Python, NumPy, PyTorch, DataLoader shuffling, workers, and deterministic kernels once per
-run. Image training fingerprints the materialized pretrained weight file immediately before and
-after model construction and requires exact equality. The selected CPU checkpoint may come from
+The campaign materializes each source DICOM's bytes once, authenticates them against the bundle
+inventory, and decodes the same in-memory bytes while building an identity-addressed deterministic
+CXR cache. Cache identity binds the bundle, manifest, source inventory, preprocessing, and
+authentication policy. Validation separately proves the exact sample-to-partition mapping and
+cached image-content digest. Cache-backed training, evaluation, fusion, and localization verify
+those contracts without reopening raw DICOMs. The memory-mapped float32 cache is derived and
+disposable.
+
+Cache derivation identity and source-authentication provenance are package-bound. Mapping and
+image-content hashes provide local cache-integrity checks and remain outside model semantic identity
+and the model package ID.
+
+Cache preparation may read authenticated image bytes from every partition, but reads no task
+labels and fits no statistics, thresholds, or models. Official training reads only train and
+validation task rows. Within the canonical campaign, test labels become available to experiment
+consumers only after all eight training packages freeze.
+
+Training permutations derive from SHA-256 of a fixed namespace, training seed, and epoch.
+Augmentation seeds derive from a separate namespace, training seed, epoch, and sample ID. Epoch is
+carried in sampler requests, so worker startup, persistence, assignment, and prefetch timing cannot
+change ordering or augmentation. The cache stores the resized canonical image before stochastic
+augmentation and XRV intensity normalization, preserving the established operation order.
+
+Image training fingerprints the materialized pretrained weight file immediately before and after
+model construction and requires exact equality. The selected CPU checkpoint may come from
 head-only warm-up or full fine-tuning. Explicit test evaluation verifies the package, checkpoint,
-code, lock, and model structure before loading test rows, then authenticates only test DICOMs and
-applies the validation thresholds unchanged. It reconstructs the architecture without reading or
-downloading the original pretrained cache.
+code, lock, and model structure before loading test rows and applies the validation thresholds
+unchanged. It reconstructs the architecture without reading or downloading the original
+pretrained cache.
+
+Before official neural training, the campaign benchmarks a single-process baseline and bounded
+positive-worker candidates on the actual cache-backed training loader using eight warm-up and 64
+measured batches, then selects the smallest candidate within 95% of best throughput. It uses Linux
+CPU affinity (or CPU count when affinity is unavailable) and, when available, cgroup-v2 quota.
+Positive-worker loaders persist workers and use prefetch factor 2; the zero-worker loader uses
+neither. Training and evaluation receive the same selected policy.
+Loader topology and benchmark measurements are runtime provenance rather than semantic
+compatibility inputs.
 
 Epoch records contain the learning rates used for that epoch. CUDA runtime, cuDNN, GPU identity,
 device index, and compute capability are recorded as runtime provenance and excluded from the model
@@ -191,11 +223,22 @@ Operational logs describe the current execution and may contain environment-depe
 times and heartbeat timing. They are not inputs to reproducibility, provenance, MLflow lineage,
 bundle identity, or model package identity.
 
+The full campaign log is stored under `reports/rsna/campaigns/<campaign-id>/execution.log`. After
+final output completeness and lineage validation plus an MLflow database integrity check, the
+campaign writes `outbox/rsna-results-<campaign-id>.tar.gz` and its `.sha256` checksum. The archive
+contains the campaign's exact bundle, finished scientific/provenance outputs, and selected private
+prediction and localization outputs. Raw data, unrelated bundles, the derived CXR cache,
+environments, and temporary files are excluded.
+
+The archived copy of the execution log ends at `campaign_ready_for_export`. The live project-owned
+log then records archive creation and `campaign_succeeded`; the checksum verifies archive integrity
+captured at the ready-for-export boundary.
+
 ## Quality gates
 
 ```bash
 uv lock --check
-uv sync --locked
+uv sync --locked --group dev
 make check
 make pre-commit
 git diff --check
