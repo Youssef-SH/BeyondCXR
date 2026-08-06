@@ -762,9 +762,11 @@ def _validate_runtime_provenance(value: object) -> None:
     ):
         raise ValueError("Neural package CXR cache identity is invalid")
     try:
-        LoaderExecutionPolicy.from_provenance(runtime["loader_execution"])
+        loader_execution = LoaderExecutionPolicy.from_provenance(runtime["loader_execution"])
     except ValueError as exc:
         raise ValueError("Neural package loader execution provenance is invalid") from exc
+    if loader_execution.lifecycle != "reused":
+        raise ValueError("Neural package loader execution provenance is not epoch-reused")
 
     if (
         runtime["requested_device"] not in {"auto", "cpu", "cuda"}

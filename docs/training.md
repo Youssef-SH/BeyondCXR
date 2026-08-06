@@ -68,7 +68,7 @@ make rsna-gpu
 ```
 
 This is the authoritative full RSNA workflow. It prepares the configured pretrained weight,
-publishes and audits the bundle, builds the deterministic image cache, calibrates the loader,
+publishes and audits the bundle, builds the deterministic image cache,
 completes all eight training packages before test access, evaluates all eight packages, runs seed
 summaries, localization, and comparison, validates the output surface, and publishes a portable
 archive with a checksum. Producer results pass exact run IDs directly to
@@ -137,14 +137,12 @@ sample order is a stable function of seed and epoch. Augmentation is a stable fu
 epoch, and sample ID, so worker count, worker lifetime, and prefetch timing do not change the
 scientific realization.
 
-The campaign derives effective CPU capacity from Linux affinity (or CPU count when affinity is
-unavailable) and, when available, cgroup-v2 quota. It benchmarks a single-process baseline plus
-bounded multiprocessing candidates using eight warm-up and 64 measured batches and selects the
-smallest near-best worker count. Multiprocessing loaders persist workers and use prefetch factor 2;
-single-process loaders use neither persistence nor prefetch. The exact selected policy configures
-the loaders and is recorded as runtime provenance outside semantic experiment compatibility. Batch
-size, augmentation, optimization, AMP, and all other numerical policies remain scientific
-configuration.
+Train and validation loaders use the configured reused-loader worker count, which is 2 in the
+canonical RSNA configurations. Positive-worker loaders use `spawn`, persistent workers, and
+prefetch factor 2. One-shot test inference is synchronous and uses no worker processes,
+persistence, prefetch, or multiprocessing context. The actual lifecycle-specific policy is
+recorded as runtime provenance outside semantic experiment compatibility. Batch size, augmentation,
+optimization, AMP, and all other numerical policies remain scientific configuration.
 
 Image packages contain:
 
@@ -171,7 +169,8 @@ their final machine-readable result remains on stdout. The full campaign also wr
 records to `reports/rsna/campaigns/<campaign-id>/execution.log`. `epoch_throughput` operational
 records include separate training and validation elapsed time, batches per second, and samples per
 second. The bookkeeping uses host clocks and aggregate counters without per-batch logging or extra
-CUDA synchronization.
+CUDA synchronization. Localization emits one timed phase and bounded aggregate prediction and
+Grad-CAM progress per seed without sample identifiers.
 
 Model packages under `models/` and complete reports under `reports/` are the authoritative
 physical outputs. MLflow stores the run ledger, status, parameters, scalar metrics, provenance,

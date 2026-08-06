@@ -23,7 +23,6 @@ _COUNT_FIELDS = frozenset(
         "epoch",
         "file_count",
         "global_epoch",
-        "num_workers",
         "no_improvement_count",
         "partition_count",
         "patience",
@@ -34,7 +33,6 @@ _COUNT_FIELDS = frozenset(
         "seed",
         "selected_epoch",
         "stage_epoch",
-        "prefetch_factor",
         "total",
         "train_count",
         "validation_count",
@@ -45,8 +43,6 @@ _BOUNDED_NUMERIC_FIELDS = frozenset(
 )
 _NONNEGATIVE_NUMERIC_FIELDS = frozenset(
     {
-        "batches_per_second",
-        "effective_cpu_capacity",
         "elapsed_s",
         "encoder_learning_rate",
         "head_learning_rate",

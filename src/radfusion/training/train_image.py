@@ -34,7 +34,7 @@ from radfusion.training.datasets import (
     prepare_rsna_cxr_cache,
 )
 from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
+from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from radfusion.training.interfaces import ImageModelImplementation
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
@@ -200,7 +200,7 @@ def train_image_experiment(
                 pin_memory_policy=config.image.pin_memory_policy,
             )
             log_event(_LOGGER, "device_resolved", device=runtime.device.type, **context)
-            loader_execution = execution or configured_loader_policy(
+            loader_execution = execution or reused_loader_policy(
                 num_workers=config.image.num_workers,
                 pin_memory=runtime.pin_memory_effective,
             )

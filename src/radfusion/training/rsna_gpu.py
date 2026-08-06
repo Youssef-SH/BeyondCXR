@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gc
 import hashlib
 import json
 import os
@@ -20,7 +19,7 @@ from typing import Any, TextIO, cast
 
 import torch
 
-from radfusion.data.cxr_cache import ValidatedCxrCache, preprocessing_identity
+from radfusion.data.cxr_cache import preprocessing_identity
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.rsna_artifacts import (
     BUNDLES_DIRECTORY,
@@ -36,20 +35,15 @@ from radfusion.training.config import (
     image_seed_compatibility_sha256,
     load_experiment_config,
 )
-from radfusion.training.datasets import (
-    RsnaCachedCalibrationDataset,
-    RsnaDataset,
-    prepare_rsna_cxr_cache,
-)
+from radfusion.training.datasets import RsnaDataset, prepare_rsna_cxr_cache
 from radfusion.training.device import ResolvedDevice, resolve_device
 from radfusion.training.evaluate import evaluate_training_run
 from radfusion.training.execution import (
     LoaderExecutionPolicy,
-    calibrate_loader_policy,
-    effective_cpu_capacity,
+    one_shot_loader_policy,
+    reused_loader_policy,
 )
 from radfusion.training.localize import generate_localization_report
-from radfusion.training.neural import build_image_loaders
 from radfusion.training.registry import get_dataset
 from radfusion.training.summarize_seeds import summarize_seed_runs
 from radfusion.training.train_fusion import train_fusion_experiment
@@ -72,8 +66,6 @@ CACHE_ROOT = Path("data/cache/rsna")
 REPORT_ROOT = Path("reports")
 OUTBOX_ROOT = Path("outbox")
 _MINIMUM_FREE_BYTES = 16 * 1024**3
-_LOADER_WARMUP_BATCHES = 8
-_LOADER_MEASURED_BATCHES = 64
 _LOGGER = get_operational_logger(__name__)
 
 
@@ -157,16 +149,15 @@ def run_rsna_gpu_campaign() -> CampaignResult:
                     dataset, image_reference.dataset, transform, cache_root=CACHE_ROOT
                 )
             runtime = _required_cuda_runtime(image_reference)
-            with timed_phase(_LOGGER, "loader_calibration"):
-                execution = _calibrate_execution(image_reference, cache, runtime)
-                _log_execution_policy(execution)
+            training_execution = _training_execution_policy(image_reference, runtime)
+            evaluation_execution = one_shot_loader_policy(pin_memory=runtime.pin_memory_effective)
             metadata_training = _train_metadata(configs)
             image_training = tuple(
                 train_image_experiment(
                     config,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
-                    execution=execution,
+                    execution=training_execution,
                 )
                 for config in configs.images
             )
@@ -176,7 +167,7 @@ def run_rsna_gpu_campaign() -> CampaignResult:
                     source_training_run_id=source.run_id,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
-                    execution=execution,
+                    execution=training_execution,
                 )
                 for config, source in zip(configs.fusions, image_training, strict=True)
             )
@@ -189,7 +180,7 @@ def run_rsna_gpu_campaign() -> CampaignResult:
                     result.run_id,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
-                    execution=execution,
+                    execution=evaluation_execution,
                 )
                 for result in training_results
             )
@@ -344,6 +335,7 @@ def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
     execution_contracts = {
         (
             image.batch_size,
+            image.num_workers,
             image.device,
             image.mixed_precision,
             image.pin_memory_policy,
@@ -394,82 +386,16 @@ def _required_cuda_runtime(config: ExperimentConfig) -> ResolvedDevice:
     return runtime
 
 
-def _calibrate_execution(
-    config: ExperimentConfig,
-    cache: ValidatedCxrCache,
-    runtime: ResolvedDevice,
+def _training_execution_policy(
+    config: ExperimentConfig, runtime: ResolvedDevice
 ) -> LoaderExecutionPolicy:
+    """Resolve the reviewed persistent policy for epoch-reused loaders."""
     image = config.image
     if image is None:
         raise ValueError("RSNA image configuration is incomplete")
-    calibration_batches = _LOADER_WARMUP_BATCHES + _LOADER_MEASURED_BATCHES
-    train_ids = tuple(
-        sample_id
-        for sample_id in cache.sample_rows
-        if cache.sample_partitions[sample_id] == "train"
-    )
-    sample_count = min(len(train_ids), image.batch_size * calibration_batches)
-    sample_ids = train_ids[:sample_count]
-    transform = _transform(config, training=True)
-    capacity = effective_cpu_capacity()
-
-    def benchmark(workers: int) -> float:
-        train_dataset = RsnaCachedCalibrationDataset(
-            sample_ids,
-            cache=cache,
-            transform=transform,
-            training_seed=config.training.seed,
-        )
-        policy = LoaderExecutionPolicy(
-            effective_cpu_capacity=capacity,
-            num_workers=workers,
-            persistent_workers=workers > 0,
-            prefetch_factor=2 if workers > 0 else None,
-            pin_memory=runtime.pin_memory_effective,
-        )
-        loader = build_image_loaders(
-            train_dataset,
-            train_dataset,
-            config=image,
-            runtime=runtime,
-            seed=config.training.seed,
-            execution=policy,
-        ).train
-        iterator = iter(loader)
-        for _ in range(_LOADER_WARMUP_BATCHES):
-            next(iterator)
-        started = time.perf_counter()
-        measured = 0
-        for _ in range(_LOADER_MEASURED_BATCHES):
-            next(iterator)
-            measured += 1
-        elapsed = time.perf_counter() - started
-        del iterator, loader
-        gc.collect()
-        return measured / elapsed
-
-    return calibrate_loader_policy(
-        benchmark,
+    return reused_loader_policy(
+        num_workers=image.num_workers,
         pin_memory=runtime.pin_memory_effective,
-        capacity=capacity,
-    )
-
-
-def _log_execution_policy(policy: LoaderExecutionPolicy) -> None:
-    for workers, throughput in policy.candidate_throughput:
-        log_event(
-            _LOGGER,
-            "loader_calibration_measurement",
-            num_workers=workers,
-            prefetch_factor=2 if workers > 0 else None,
-            batches_per_second=throughput,
-        )
-    log_event(
-        _LOGGER,
-        "loader_policy_selected",
-        effective_cpu_capacity=policy.effective_cpu_capacity,
-        num_workers=policy.num_workers,
-        prefetch_factor=policy.prefetch_factor,
     )
 
 
@@ -699,7 +625,3 @@ def main() -> int:
         )
     )
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -57,7 +57,7 @@ localize:
 	uv run python -m radfusion.training.localize --test-run-ids $(TEST_RUN_IDS)
 
 rsna-gpu:
-	uv run --locked --no-dev python -m radfusion.training.rsna_gpu
+	uv run --locked --no-dev python -m radfusion.training.rsna_gpu_cli
 
 pre-commit:
 	uv run pre-commit run --all-files

@@ -60,7 +60,13 @@ from radfusion.utils.neural_publication import (
     strict_load_checkpoint,
     validate_neural_package_metadata,
 )
-from radfusion.utils.operational_logging import add_logging_argument, configure_logging
+from radfusion.utils.operational_logging import (
+    CountProgress,
+    add_logging_argument,
+    configure_logging,
+    get_operational_logger,
+    timed_phase,
+)
 from radfusion.utils.privacy import validate_public_reports
 from radfusion.utils.private_predictions import private_root_for_reports
 from radfusion.utils.publication import publish_directory, staging_directory
@@ -69,6 +75,7 @@ LOCALIZATION_POLICY_VERSION = "rsna-gradcam-union-box-v1"
 QUALITATIVE_POLICY_VERSION = "sha256-stratum-order-v1"
 LOCALIZATION_FILENAMES = frozenset({"summary.json", "summary.md"})
 PRIVATE_LOCALIZATION_FILENAMES = frozenset({"qualitative_manifest.json", "examples"})
+_LOGGER = get_operational_logger(__name__)
 
 
 def generate_localization_report(
@@ -145,53 +152,54 @@ def generate_localization_report(
     private_stage = staging_directory(private_destination)
     private_published = False
     try:
-        examples = private_stage / "examples"
-        examples.mkdir(parents=True)
-        results = [
-            _evaluate_member(
-                test,
-                training,
-                package,
-                manifest,
-                config,
-                examples=examples,
-                cache=resolved_cache,
+        with timed_phase(_LOGGER, "localization"):
+            examples = private_stage / "examples"
+            examples.mkdir(parents=True)
+            results = [
+                _evaluate_member(
+                    test,
+                    training,
+                    package,
+                    manifest,
+                    config,
+                    examples=examples,
+                    cache=resolved_cache,
+                )
+                for test, training, package, manifest, config in members
+            ]
+            document = _report_document(report_id, [result["public"] for result in results])
+            (stage / "summary.json").write_text(
+                json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
             )
-            for test, training, package, manifest, config in members
-        ]
-        document = _report_document(report_id, [result["public"] for result in results])
-        (stage / "summary.json").write_text(
-            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        (stage / "summary.md").write_text(_markdown(document), encoding="utf-8")
-        private_members = [item for result in results for item in result["private_examples"]]
-        (private_stage / "qualitative_manifest.json").write_text(
-            json.dumps(
-                {
-                    "private_localization_schema_version": 1,
-                    "report_id": report_id,
-                    "selection_policy": QUALITATIVE_POLICY_VERSION,
-                    "examples": private_members,
+            (stage / "summary.md").write_text(_markdown(document), encoding="utf-8")
+            private_members = [item for result in results for item in result["private_examples"]]
+            (private_stage / "qualitative_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "private_localization_schema_version": 1,
+                        "report_id": report_id,
+                        "selection_policy": QUALITATIVE_POLICY_VERSION,
+                        "examples": private_members,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _validate_localization_output_boundaries(
+                stage,
+                private_stage,
+                private_members=private_members,
+                forbidden_source_values={
+                    value for result in results for value in result["forbidden_source_values"]
                 },
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        _validate_localization_output_boundaries(
-            stage,
-            private_stage,
-            private_members=private_members,
-            forbidden_source_values={
-                value for result in results for value in result["forbidden_source_values"]
-            },
-        )
-        publish_directory(private_stage, private_destination)
-        private_published = True
-        publish_directory(stage, destination)
+            publish_directory(private_stage, private_destination)
+            private_published = True
+            publish_directory(stage, destination)
     except BaseException:
         if private_published and private_destination.exists():
             shutil.rmtree(private_destination)
@@ -263,6 +271,14 @@ def _evaluate_member(
     }
     prediction_rows: list[dict[str, object]] = []
     forbidden_source_values: set[str] = set()
+    prediction_progress = CountProgress(
+        _LOGGER,
+        "operation_progress",
+        total=len(dataset),
+        unit="samples",
+        count_interval=250,
+        fields={"seed": config.training.seed, "operation": "prediction"},
+    )
     for index in range(len(dataset)):
         sample = dataset[index]
         forbidden_source_values.update((sample["sample_id"], sample["patient_id"]))
@@ -282,6 +298,7 @@ def _evaluate_member(
                 "stratum": stratum,
             }
         )
+        prediction_progress.update(index + 1)
     selected = deterministic_qualitative_selection(
         prediction_rows,
         policy_version=QUALITATIVE_POLICY_VERSION,
@@ -295,7 +312,15 @@ def _evaluate_member(
     selected_by_sample = {
         str(row["sample_id"]): stratum for stratum, row in selected.items() if row is not None
     }
-    for index in required_indices:
+    gradcam_progress = CountProgress(
+        _LOGGER,
+        "operation_progress",
+        total=len(required_indices),
+        unit="samples",
+        count_interval=50,
+        fields={"seed": config.training.seed, "operation": "gradcam"},
+    )
+    for completed, index in enumerate(required_indices, start=1):
         sample = dataset[index]
         image_tensor = sample["image"].unsqueeze(0).to(runtime.device)
         heatmap = gradcam_heatmaps(model, image_tensor, target_module=target)[0].cpu()
@@ -326,6 +351,7 @@ def _evaluate_member(
                     "filename": filename,
                 }
             )
+        gradcam_progress.update(completed)
     localization_evaluated_count = len(positive_pointing)
     if positive_test_sample_count != localization_evaluated_count:
         raise ValueError("Localization did not account for every positive test sample")

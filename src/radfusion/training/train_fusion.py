@@ -52,7 +52,7 @@ from radfusion.training.datasets import (
     prepare_rsna_cxr_cache,
 )
 from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
+from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from radfusion.training.fusion_source import (
     SourceCxrLineage,
     resolve_source_cxr_training_run,
@@ -236,7 +236,7 @@ def train_fusion_experiment(
                 mixed_precision=config.image.mixed_precision,
                 pin_memory_policy=config.image.pin_memory_policy,
             )
-            loader_execution = execution or configured_loader_policy(
+            loader_execution = execution or reused_loader_policy(
                 num_workers=config.image.num_workers,
                 pin_memory=runtime.pin_memory_effective,
             )

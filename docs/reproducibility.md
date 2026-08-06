@@ -125,14 +125,11 @@ code, lock, and model structure before loading test rows and applies the validat
 unchanged. It reconstructs the architecture without reading or downloading the original
 pretrained cache.
 
-Before official neural training, the campaign benchmarks a single-process baseline and bounded
-positive-worker candidates on the actual cache-backed training loader using eight warm-up and 64
-measured batches, then selects the smallest candidate within 95% of best throughput. It uses Linux
-CPU affinity (or CPU count when affinity is unavailable) and, when available, cgroup-v2 quota.
-Positive-worker loaders persist workers and use prefetch factor 2; the zero-worker loader uses
-neither. Training and evaluation receive the same selected policy.
-Loader topology and benchmark measurements are runtime provenance rather than semantic
-compatibility inputs.
+Train and validation loaders use the configured reused-loader worker count, which is 2 in the
+canonical RSNA configurations. Positive-worker loaders use `spawn`, persistent workers, and
+prefetch factor 2. One-shot test inference is synchronous and uses no worker processes,
+persistence, prefetch, or multiprocessing context. The actual lifecycle-specific loader policy is
+runtime provenance rather than a semantic compatibility input.
 
 Epoch records contain the learning rates used for that epoch. CUDA runtime, cuDNN, GPU identity,
 device index, and compute capability are recorded as runtime provenance and excluded from the model

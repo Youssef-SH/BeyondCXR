@@ -25,7 +25,6 @@ from radfusion.data.hashing import sha256_file
 from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.training.config import load_experiment_config
 from radfusion.training.datasets import (
-    RsnaCachedCalibrationDataset,
     RsnaCachedFusionDataset,
     RsnaCachedImageDataset,
 )
@@ -389,7 +388,8 @@ def test_cache_build_rejects_unsafe_paths_and_decoded_patient_mismatch(
 
 
 def _policy(workers: int, persistent: bool) -> LoaderExecutionPolicy:
-    return LoaderExecutionPolicy(8.0, workers, persistent, 2 if workers > 0 else None, False)
+    assert persistent is (workers > 0)
+    return LoaderExecutionPolicy("reused", workers, False)
 
 
 def _dataset_and_loader(cache, workers: int, persistent: bool, seed: int = 42):
@@ -499,13 +499,6 @@ def test_cached_training_datasets_share_the_nonnegative_integer_seed_contract(ca
             cache=built,
             expected_cache_identity=built.identity,
             partition="train",
-            transform=StandardCxrTransform(training=True),
-            training_seed=seed,
-        )
-    with pytest.raises(ManifestBuildError):
-        RsnaCachedCalibrationDataset(
-            tuple(_image_frame()["sample_id"]),
-            cache=built,
             transform=StandardCxrTransform(training=True),
             training_seed=seed,
         )

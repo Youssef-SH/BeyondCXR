@@ -64,13 +64,6 @@ class FusionSample(ImageSample):
     structured: torch.Tensor
 
 
-class CalibrationSample(TypedDict):
-    """One task-label-free cached image used for loader calibration."""
-
-    image: torch.Tensor
-    sample_id: str
-
-
 @dataclass(frozen=True)
 class SourceInventoryIdentity:
     """Exact bundle source-inventory identity used by a cache-backed consumer."""
@@ -210,47 +203,6 @@ class RsnaCachedImageDataset(Dataset[ImageSample]):
             "sample_id": sample_id,
             "patient_id": patient_id,
         }
-
-
-class RsnaCachedCalibrationDataset(Dataset[CalibrationSample]):
-    """Apply the real training transform to cached train images without task data."""
-
-    epoch_tagged_requests = True
-
-    def __init__(
-        self,
-        sample_ids: tuple[str, ...],
-        *,
-        cache: ValidatedCxrCache,
-        transform: StandardCxrTransform,
-        training_seed: int,
-    ) -> None:
-        if (
-            not sample_ids
-            or sample_ids != tuple(sorted(sample_ids))
-            or len(sample_ids) != len(set(sample_ids))
-            or any(cache.sample_partitions.get(sample_id) != "train" for sample_id in sample_ids)
-        ):
-            raise ManifestBuildError("CXR loader calibration requires ordered train cache samples")
-        if not isinstance(transform, StandardCxrTransform) or not transform.training:
-            raise ManifestBuildError("CXR loader calibration requires the training transform")
-        _validate_training_seed(training_seed)
-        self._sample_ids = sample_ids
-        self._cache = cache
-        self._transform = transform
-        self._training_seed = training_seed
-
-    def __len__(self) -> int:
-        return len(self._sample_ids)
-
-    def __getitem__(self, request: int | tuple[int, int]) -> CalibrationSample:
-        epoch, index = request if isinstance(request, tuple) else (0, request)
-        sample_id = self._sample_ids[index]
-        image = self._transform.from_validated_cache_base(
-            self._cache.image(sample_id),
-            augmentation_seed=_stable_augmentation_seed(self._training_seed, epoch, sample_id),
-        )
-        return {"image": image, "sample_id": sample_id}
 
 
 class RsnaCachedFusionDataset(Dataset[FusionSample]):

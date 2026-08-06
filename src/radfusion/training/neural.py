@@ -20,7 +20,11 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from radfusion.training.config import ImageConfig
 from radfusion.training.device import ResolvedDevice
-from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
+from radfusion.training.execution import (
+    LoaderExecutionPolicy,
+    one_shot_loader_policy,
+    reused_loader_policy,
+)
 
 CLASS_WEIGHT_POLICY_VERSION = "training-label-prevalence-pos-weight-v1"
 
@@ -169,9 +173,11 @@ def build_image_loaders(
     execution: LoaderExecutionPolicy | None = None,
 ) -> ImageLoaders:
     """Construct deterministic training and validation loaders."""
-    policy = execution or configured_loader_policy(
+    policy = execution or reused_loader_policy(
         num_workers=config.num_workers, pin_memory=runtime.pin_memory_effective
     )
+    if policy.lifecycle != "reused":
+        raise ValueError("Training requires a reused DataLoader execution policy")
     if policy.pin_memory != runtime.pin_memory_effective:
         raise ValueError("DataLoader pin-memory policy differs from the resolved runtime")
     common = {
@@ -209,9 +215,9 @@ def build_evaluation_loader(
     execution: LoaderExecutionPolicy | None = None,
 ) -> DataLoader[Any]:
     """Construct one deterministic, ordered image-evaluation loader."""
-    policy = execution or configured_loader_policy(
-        num_workers=config.num_workers, pin_memory=runtime.pin_memory_effective
-    )
+    policy = execution or one_shot_loader_policy(pin_memory=runtime.pin_memory_effective)
+    if policy.lifecycle != "one_shot":
+        raise ValueError("Evaluation requires a one-shot DataLoader execution policy")
     if policy.pin_memory != runtime.pin_memory_effective:
         raise ValueError("DataLoader pin-memory policy differs from the resolved runtime")
     arguments: dict[str, Any] = {

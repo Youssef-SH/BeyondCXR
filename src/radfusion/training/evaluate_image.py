@@ -27,7 +27,7 @@ from radfusion.training.datasets import (
     prepare_rsna_cxr_cache,
 )
 from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy, configured_loader_policy
+from radfusion.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
 from radfusion.training.neural import (
     build_evaluation_loader,
     deterministic_inference,
@@ -202,9 +202,8 @@ def evaluate_image_training_run(
             mixed_precision=image.mixed_precision,
             pin_memory_policy=image.pin_memory_policy,
         )
-        loader_execution = execution or configured_loader_policy(
-            num_workers=image.num_workers,
-            pin_memory=runtime.pin_memory_effective,
+        loader_execution = execution or one_shot_loader_policy(
+            pin_memory=runtime.pin_memory_effective
         )
         test_loader = build_evaluation_loader(
             test_dataset,

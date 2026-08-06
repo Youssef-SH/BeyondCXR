@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
+import shlex
 from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import torchxrayvision as xrv
@@ -21,6 +24,7 @@ from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncode
 from radfusion.training.config import load_experiment_config
 from radfusion.training.datasets import RsnaDataset
 from radfusion.training.localize import (
+    _evaluate_member,
     _gradcam_indices,
     _markdown,
     _positive_localization_metrics,
@@ -28,6 +32,7 @@ from radfusion.training.localize import (
     _validate_localization_output_boundaries,
     generate_localization_report,
 )
+from radfusion.utils.operational_logging import configure_logging
 
 
 class _GradCamModel(nn.Module):
@@ -134,6 +139,8 @@ def test_standalone_localization_resolves_one_shared_cache(
         }
 
     monkeypatch.setattr("radfusion.training.localize._evaluate_member", evaluate)
+    log_stream = io.StringIO()
+    configure_logging("INFO", stream=log_stream)
 
     result = generate_localization_report(
         [f"test-{seed}" for seed in seeds],
@@ -143,6 +150,143 @@ def test_standalone_localization_resolves_one_shared_cache(
     assert result.is_dir()
     assert len(prepared) == 1
     assert observed_caches == [shared_cache, shared_cache, shared_cache]
+    assert "event=phase_started phase=localization" in log_stream.getvalue()
+    assert "event=phase_completed" in log_stream.getvalue()
+
+
+def test_localization_member_emits_generic_operation_completion(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_experiment_config("configs/image_densenet_seed42.yaml")
+    assert config.image is not None
+    config = replace(
+        config,
+        image=replace(config.image, device="cpu", pin_memory_policy="disabled"),
+    )
+    samples = (
+        {
+            "image": torch.zeros((1, 224, 224), dtype=torch.float32),
+            "target": torch.tensor(1.0),
+            "sample_id": "positive",
+            "patient_id": "patient-positive",
+        },
+        {
+            "image": torch.zeros((1, 224, 224), dtype=torch.float32),
+            "target": torch.tensor(0.0),
+            "sample_id": "negative",
+            "patient_id": "patient-negative",
+        },
+    )
+
+    class ControlledDataset:
+        def __len__(self) -> int:
+            return len(samples)
+
+        def __getitem__(self, index: int):
+            return samples[index]
+
+    class ConstantModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = nn.Identity()
+
+        def forward(self, image: torch.Tensor) -> torch.Tensor:
+            return torch.ones(len(image), device=image.device)
+
+    model = ConstantModel()
+    adapter = RsnaDataset()
+    localization = SimpleNamespace(
+        images=SimpleNamespace(
+            lineage=object(),
+            bundle_manifest_sha256="b" * 64,
+            source_inventory=object(),
+            test=object(),
+        ),
+        dimensions=pd.DataFrame(
+            [
+                {"sample_id": "positive", "image_rows": 224, "image_columns": 224},
+                {"sample_id": "negative", "image_rows": 224, "image_columns": 224},
+            ]
+        ),
+        annotations=pd.DataFrame(
+            [
+                {
+                    "sample_id": "positive",
+                    "x": 0.0,
+                    "y": 0.0,
+                    "width": 224.0,
+                    "height": 224.0,
+                }
+            ]
+        ),
+    )
+    adapter.load_localization_test = lambda *args, **kwargs: localization  # type: ignore[method-assign]
+    monkeypatch.setattr("radfusion.training.localize.get_dataset", lambda key: adapter)
+    monkeypatch.setattr(
+        "radfusion.training.localize.load_validated_neural_checkpoint", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.get_model",
+        lambda key: SimpleNamespace(build_architecture=lambda model_config: model),
+    )
+    monkeypatch.setattr("radfusion.training.localize.strict_load_checkpoint", lambda *args: None)
+    monkeypatch.setattr(
+        "radfusion.training.localize.standard_cxr_gradcam_target", lambda value: value.encoder
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.expected_rsna_cxr_cache_identity", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.RsnaCachedImageDataset",
+        lambda *args, **kwargs: ControlledDataset(),
+    )
+    monkeypatch.setattr(
+        "radfusion.training.localize.gradcam_heatmaps",
+        lambda *args, **kwargs: torch.ones((1, 224, 224)),
+    )
+    monkeypatch.setattr("radfusion.training.localize._write_overlay", lambda *args: None)
+    authentication = {"policy_version": "test"}
+    cache = SimpleNamespace(
+        source_authentication=SimpleNamespace(as_dict=lambda: authentication),
+        identity=SimpleNamespace(cache_id="cache-" + "c" * 64),
+    )
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    stream = io.StringIO()
+    configure_logging("INFO", stream=stream)
+
+    _evaluate_member(
+        SimpleNamespace(run_id="test-run"),
+        SimpleNamespace(run_id="training-run"),
+        tmp_path,
+        {
+            "bundle_manifest_sha256": "b" * 64,
+            "source_authentication": authentication,
+            "runtime_provenance": {"cxr_cache_id": cache.identity.cache_id},
+            "thresholds": {"youden_j": 0.5},
+        },
+        config,
+        examples=examples,
+        cache=cache,
+    )
+
+    progress = [
+        set(shlex.split(line))
+        for line in stream.getvalue().splitlines()
+        if "event=operation_progress" in line
+    ]
+    for operation in ("prediction", "gradcam"):
+        assert any(
+            {
+                f"operation={operation}",
+                "seed=42",
+                "completed=2",
+                "total=2",
+                "unit=samples",
+            }
+            <= record
+            for record in progress
+        )
 
 
 def test_gradcam_is_finite_deterministic_cleans_hooks_and_preserves_state() -> None:

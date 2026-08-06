@@ -239,7 +239,8 @@ def test_loaders_reject_pin_memory_policy_that_differs_from_runtime() -> None:
     dataset = _TensorDataset([0, 1])
     runtime = _runtime()
     assert runtime.pin_memory_effective is False
-    execution = LoaderExecutionPolicy(1.0, 0, False, None, True)
+    training_execution = LoaderExecutionPolicy("reused", 0, True)
+    evaluation_execution = LoaderExecutionPolicy("one_shot", 0, True)
 
     with pytest.raises(ValueError):
         build_image_loaders(
@@ -248,14 +249,14 @@ def test_loaders_reject_pin_memory_policy_that_differs_from_runtime() -> None:
             config=_image_config(),
             runtime=runtime,
             seed=42,
-            execution=execution,
+            execution=training_execution,
         )
     with pytest.raises(ValueError):
         build_evaluation_loader(
             dataset,
             config=_image_config(),
             runtime=runtime,
-            execution=execution,
+            execution=evaluation_execution,
         )
 
 
@@ -936,12 +937,9 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
             **_runtime().provenance(),
             "cxr_cache_id": "cache-" + "7" * 64,
             "loader_execution": {
-                "effective_cpu_capacity": 1.0,
+                "lifecycle": "reused",
                 "num_workers": 0,
-                "persistent_workers": False,
-                "prefetch_factor": None,
                 "pin_memory": False,
-                "candidate_throughput_batches_per_second": {},
             },
         },
     }
@@ -1000,9 +998,9 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
             {"enabled": False}
         ),
         lambda document: document["runtime_provenance"].update({"hostname": "private"}),
-        lambda document: document["runtime_provenance"]["loader_execution"][
-            "candidate_throughput_batches_per_second"
-        ].update({"2": 0.0}),
+        lambda document: document["runtime_provenance"]["loader_execution"].update(
+            {"prefetch_factor": 2}
+        ),
     ],
 )
 def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutation) -> None:
@@ -1416,7 +1414,6 @@ def test_image_training_progress_accepts_unsized_validation_loader(
 def test_synthetic_image_training_package_and_separate_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("radfusion.training.execution.effective_cpu_capacity", lambda: 12.5)
     setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
     training = train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
@@ -1429,18 +1426,14 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert package_manifest["modality"] == "image"
     assert package_manifest["bundle_manifest_sha256"] == "e" * 64
     assert package_manifest["runtime_provenance"]["loader_execution"] == {
-        "effective_cpu_capacity": 12.5,
+        "lifecycle": "reused",
         "num_workers": 0,
-        "persistent_workers": False,
-        "prefetch_factor": None,
         "pin_memory": False,
-        "candidate_throughput_batches_per_second": {},
     }
     recorded_training = configure_mlflow(tracking_uri=setup.tracking_uri).get_run(training.run_id)
     assert recorded_training.data.tags["run_complete"] == "true"
     assert "bundle_manifest_sha256" not in recorded_training.data.tags
     assert recorded_training.data.params["bundle_manifest_sha256"] == "e" * 64
-    assert recorded_training.data.params["loader_prefetch_factor"] == "not_applicable"
 
     evaluation = evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 1
@@ -1463,7 +1456,6 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert evaluation_run.data.params["bundle_manifest_sha256"] == "e" * 64
     assert evaluation_run.data.params["evaluation_runtime_resolved_device"] == "cpu"
     assert evaluation_run.data.params["evaluation_loader_num_workers"] == "0"
-    assert evaluation_run.data.params["evaluation_loader_prefetch_factor"] == "not_applicable"
     assert evaluation_run.data.params["evaluation_cxr_cache_id"].startswith("cache-")
 
     csv_path, _, rows = regenerate_comparison(

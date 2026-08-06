@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import shutil
 import sqlite3
 import tarfile
@@ -10,23 +9,13 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import mlflow
-import numpy as np
-import pandas as pd
 import pytest
-import torch
 from mlflow.tracking import MlflowClient
 
-from radfusion.data.cxr_cache import CxrCacheIdentity, build_cxr_cache, preprocessing_identity
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.dicom_loader import DicomRecord
 from radfusion.training.config import load_experiment_config
-from radfusion.training.datasets import RsnaCachedCalibrationDataset, RsnaDataset
-from radfusion.training.execution import LoaderExecutionPolicy
+from radfusion.training.datasets import RsnaDataset
 from radfusion.training.rsna_gpu import (
-    _LOADER_MEASURED_BATCHES,
-    _LOADER_WARMUP_BATCHES,
     CampaignConfigs,
-    _calibrate_execution,
     _validate_neural_campaign_configs,
     _validate_outputs,
     _write_archive,
@@ -53,6 +42,8 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
     configs = _configs()
     monkeypatch.chdir(tmp_path)
     events: list[tuple[str, object]] = []
+    training_policies = []
+    evaluation_policies = []
     monkeypatch.setattr(
         "radfusion.training.rsna_gpu._validate_prerequisites",
         lambda: events.append(("prerequisites", None)) or configs,
@@ -89,12 +80,8 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
         lambda *args, **kwargs: events.append(("cache", None)) or cache,
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_gpu._required_cuda_runtime", lambda config: object()
-    )
-    policy = LoaderExecutionPolicy(8.0, 4, True, 2, True)
-    monkeypatch.setattr(
-        "radfusion.training.rsna_gpu._calibrate_execution",
-        lambda *args: events.append(("calibrate", None)) or policy,
+        "radfusion.training.rsna_gpu._required_cuda_runtime",
+        lambda config: SimpleNamespace(pin_memory_effective=True),
     )
 
     def result(run_id: str):
@@ -112,14 +99,17 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
         ),
     )
     image_ids = iter(("cxr-17", "cxr-42", "cxr-2026"))
-    monkeypatch.setattr(
-        "radfusion.training.rsna_gpu.train_image_experiment",
-        lambda *args, **kwargs: (
-            events.append(("train", run_id := next(image_ids))) or result(run_id)
-        ),
-    )
+
+    def train_image(*args, **kwargs):
+        training_policies.append(kwargs["execution"])
+        run_id = next(image_ids)
+        events.append(("train", run_id))
+        return result(run_id)
+
+    monkeypatch.setattr("radfusion.training.rsna_gpu.train_image_experiment", train_image)
 
     def train_fusion(config, *, source_training_run_id, **kwargs):
+        training_policies.append(kwargs["execution"])
         run_id = f"fusion-{config.training.seed}"
         events.append(("fusion_source", (run_id, source_training_run_id)))
         events.append(("train", run_id))
@@ -128,6 +118,7 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
     monkeypatch.setattr("radfusion.training.rsna_gpu.train_fusion_experiment", train_fusion)
 
     def evaluate(run_id, **kwargs):
+        evaluation_policies.append(kwargs["execution"])
         events.append(("evaluate", run_id))
         return SimpleNamespace(run_id=f"test-{run_id}", artifact_directory=tmp_path / run_id)
 
@@ -186,14 +177,17 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
     assert len(training_positions) == 8
     assert len(evaluation_positions) == 8
     assert max(training_positions) < min(evaluation_positions)
-    assert [kind for kind, _ in events[:7]] == [
+    assert len(training_policies) == 6
+    assert all(policy.lifecycle == "reused" for policy in training_policies)
+    assert len(evaluation_policies) == 8
+    assert all(policy.lifecycle == "one_shot" for policy in evaluation_policies)
+    assert [kind for kind, _ in events[:6]] == [
         "prerequisites",
         "weights",
         "manifest_build",
         "manifest_validation",
         "audit",
         "cache",
-        "calibrate",
     ]
     assert [value for kind, value in events if kind == "summary"] == [
         ("test-cxr-17", "test-cxr-42", "test-cxr-2026"),
@@ -204,7 +198,6 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
     assert campaign.campaign_log_path.is_file()
     campaign_log = campaign.campaign_log_path.read_text(encoding="utf-8")
     assert "event=campaign_started" in campaign_log
-    assert "event=loader_policy_selected" in campaign_log
     assert "event=campaign_succeeded" in campaign_log
     assert [kind for kind, _ in events][-3:] == ["compare", "validate", "archive"]
 
@@ -236,11 +229,8 @@ def test_training_failure_never_crosses_test_boundary(
         lambda *args, **kwargs: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_gpu._required_cuda_runtime", lambda config: object()
-    )
-    monkeypatch.setattr(
-        "radfusion.training.rsna_gpu._calibrate_execution",
-        lambda *args: LoaderExecutionPolicy(1.0, 0, False, None, False),
+        "radfusion.training.rsna_gpu._required_cuda_runtime",
+        lambda config: SimpleNamespace(pin_memory_effective=False),
     )
     monkeypatch.setattr(
         "radfusion.training.rsna_gpu.train_configured_experiment",
@@ -371,108 +361,7 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
         )
 
 
-def test_loader_calibration_uses_8_warmup_and_64_measured_batches() -> None:
-    assert _LOADER_WARMUP_BATCHES == 8
-    assert _LOADER_MEASURED_BATCHES == 64
-
-
-def test_loader_calibration_preserves_caller_rng_and_uses_only_train_cache_samples(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    rows = pd.DataFrame(
-        [
-            (
-                f"rsna:{index:03d}",
-                f"patient-{index:03d}",
-                f"images/{index:03d}.dcm",
-                "train" if index < 4 else ("validation" if index == 4 else "test"),
-                1,
-                f"{index + 1:x}" * 64,
-            )
-            for index in range(6)
-        ],
-        columns=("sample_id", "patient_id", "image_path", "split_name", "byte_size", "sha256"),
-    )
-    pixels = np.linspace(0.0, 1.0, 64, dtype=np.float32).reshape(8, 8)
-
-    def decode(path: Path, **_authentication):
-        index = int(path.stem)
-        return pixels, DicomRecord(
-            path=str(path),
-            patient_id=f"patient-{index:03d}",
-            patient_age=None,
-            patient_sex=None,
-            view_position=None,
-            rows=8,
-            columns=8,
-            photometric_interpretation="MONOCHROME2",
-        )
-
-    monkeypatch.setattr("radfusion.data.cxr_cache.read_dicom", decode)
-    transform = StandardCxrTransform(training=False)
-    cache = build_cxr_cache(
-        rows,
-        dataset_root=tmp_path / "raw",
-        cache_root=tmp_path / "cache",
-        identity=CxrCacheIdentity(
-            bundle_id="build-" + "0" * 64,
-            bundle_manifest_sha256="1" * 64,
-            source_inventory_file_sha256="2" * 64,
-            source_inventory_arrow_sha256="3" * 64,
-            preprocessing_sha256=preprocessing_identity(transform),
-        ),
-        transform=transform,
-    )
-    monkeypatch.setattr("radfusion.training.rsna_gpu._LOADER_WARMUP_BATCHES", 0)
-    monkeypatch.setattr("radfusion.training.rsna_gpu._LOADER_MEASURED_BATCHES", 1)
-    monkeypatch.setattr("radfusion.training.rsna_gpu.effective_cpu_capacity", lambda: 2.0)
-    monkeypatch.setattr(
-        "radfusion.training.rsna_gpu.calibrate_loader_policy",
-        lambda benchmark, **kwargs: LoaderExecutionPolicy(
-            2.0, 0, False, None, False, ((0, benchmark(0)),)
-        ),
-    )
-    observed_ids: list[tuple[str, ...]] = []
-
-    def record_dataset(sample_ids, **kwargs):
-        observed_ids.append(sample_ids)
-        return RsnaCachedCalibrationDataset(sample_ids, **kwargs)
-
-    monkeypatch.setattr("radfusion.training.rsna_gpu.RsnaCachedCalibrationDataset", record_dataset)
-
-    python_before = random.getstate()
-    numpy_before = np.random.get_state()
-    torch_before = torch.random.get_rng_state().clone()
-    cuda_before = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    deterministic_before = torch.are_deterministic_algorithms_enabled()
-    warn_only_before = torch.is_deterministic_algorithms_warn_only_enabled()
-    cudnn_before = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
-
-    _calibrate_execution(
-        config,
-        cache,
-        SimpleNamespace(pin_memory_effective=False),
-    )
-
-    assert random.getstate() == python_before
-    numpy_after = np.random.get_state()
-    assert numpy_after[0] == numpy_before[0]
-    assert np.array_equal(numpy_after[1], numpy_before[1])
-    assert numpy_after[2:] == numpy_before[2:]
-    assert torch.equal(torch.random.get_rng_state(), torch_before)
-    if cuda_before is not None:
-        assert all(
-            torch.equal(left, right)
-            for left, right in zip(torch.cuda.get_rng_state_all(), cuda_before, strict=True)
-        )
-    assert torch.are_deterministic_algorithms_enabled() is deterministic_before
-    assert torch.is_deterministic_algorithms_warn_only_enabled() is warn_only_before
-    assert (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark) == cudnn_before
-    assert observed_ids == [("rsna:000", "rsna:001", "rsna:002", "rsna:003")]
-
-
-@pytest.mark.parametrize("mismatch", ["preprocessing", "device", "batch_size", "seed"])
+@pytest.mark.parametrize("mismatch", ["preprocessing", "device", "batch_size", "workers", "seed"])
 def test_campaign_rejects_neural_config_contract_mismatch(mismatch: str) -> None:
     configs = _configs()
     if mismatch == "preprocessing":
@@ -499,9 +388,14 @@ def test_campaign_rejects_neural_config_contract_mismatch(mismatch: str) -> None
             ),
             *configs.fusions[1:],
         )
-    else:
+    elif mismatch == "batch_size":
         fusions = tuple(
             replace(config, image=replace(config.image, batch_size=16))
+            for config in configs.fusions
+        )
+    else:
+        fusions = tuple(
+            replace(config, image=replace(config.image, num_workers=4))
             for config in configs.fusions
         )
 

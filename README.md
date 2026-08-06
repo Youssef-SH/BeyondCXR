@@ -68,7 +68,7 @@ make inspect FILE=path/to/image.dcm
 ```
 
 After the raw dataset is in place, `make rsna-gpu` owns pretrained-weight readiness, bundle and
-audit generation, deterministic image caching, loader calibration, all eight
+audit generation, deterministic image caching, all eight
 training runs, all eight linked evaluations, both seed summaries, localization, comparison, final
 validation, and export. It requires no operator-supplied run IDs. The campaign log is written to
 `reports/rsna/campaigns/<campaign-id>/execution.log`; the portable archive and checksum are written

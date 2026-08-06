@@ -260,12 +260,9 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
             ).provenance(),
             "cxr_cache_id": "cache-" + "0" * 64,
             "loader_execution": {
-                "effective_cpu_capacity": 1.0,
+                "lifecycle": "reused",
                 "num_workers": 0,
-                "persistent_workers": False,
-                "prefetch_factor": None,
                 "pin_memory": False,
-                "candidate_throughput_batches_per_second": {},
             },
         },
         source_lineage=SourceCxrLineage(
@@ -530,7 +527,6 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("radfusion.training.execution.effective_cpu_capacity", lambda: 12.5)
     document = _document()
     document["dataset"].update(
         {
@@ -707,12 +703,9 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     package = validate_published_neural_model(training.model_path.parent)
     assert package["source_cxr_lineage"] == source_lineage.as_dict()
     assert package["runtime_provenance"]["loader_execution"] == {
-        "effective_cpu_capacity": 12.5,
+        "lifecycle": "reused",
         "num_workers": 0,
-        "persistent_workers": False,
-        "prefetch_factor": None,
         "pin_memory": False,
-        "candidate_throughput_batches_per_second": {},
     }
     assert (training.model_path.parent / "structured_preprocessor.skops").is_file()
 
@@ -739,7 +732,6 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert recorded.data.tags["run_complete"] == "true"
     assert recorded.data.tags["source_cxr_checkpoint_sha256"] == "6" * 64
     assert recorded.data.params["evaluation_loader_num_workers"] == "0"
-    assert recorded.data.params["evaluation_loader_prefetch_factor"] == "not_applicable"
     assert recorded.data.params["evaluation_cxr_cache_id"].startswith("cache-")
     assert float(recorded.data.tags["threshold_youden_j"]) == package["thresholds"]["youden_j"]
     comparison_path, _, rows = regenerate_comparison(
