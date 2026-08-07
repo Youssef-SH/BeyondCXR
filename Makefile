@@ -1,5 +1,6 @@
 .PHONY: sync lock-check lint format format-check test check inspect rsna-manifest rsna-audit \
-	train evaluate compare summarize-seeds localize rsna-gpu pre-commit clean purge-generated
+	symile-manifest symile-audit symile-cv train evaluate compare summarize-seeds localize \
+	rsna-gpu pre-commit clean purge-generated
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -32,6 +33,18 @@ rsna-manifest:
 
 rsna-audit:
 	uv run python -m radfusion.data.rsna_audit
+
+symile-manifest:
+	uv run python -m radfusion.data.symile_manifest \
+		$(if $(SOURCE_ROOT),--source-root "$(SOURCE_ROOT)")
+
+symile-audit:
+	uv run python -m radfusion.data.symile_audit \
+		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
+
+symile-cv:
+	uv run python -m radfusion.data.symile_cv \
+		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
 
 train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
@@ -93,13 +106,15 @@ purge-generated: clean
 	for path in reports models private/predictions private/localization data/cache mlruns mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm outbox; do \
 		if [ -e "$$path" ]; then rm -rf -- "$$path"; output_count=$$((output_count + 1)); fi; \
 	done; \
-	bundle_count=0; current_count=0; \
+	artifact_count=0; current_count=0; \
 	if [ -d data/manifests ]; then \
-		bundle_count=$$(find data/manifests -type d -name 'build-*' -print | wc -l); \
-		find data/manifests -type d -name 'build-*' -prune -exec rm -rf -- {} +; \
+		artifact_count=$$(find data/manifests -type d \
+			\( -name 'build-*' -o -name 'cv-assignment-*' \) -print | wc -l); \
+		find data/manifests -type d \
+			\( -name 'build-*' -o -name 'cv-assignment-*' \) -prune -exec rm -rf -- {} +; \
 		current_count=$$(find data/manifests \( -type f -o -type l \) -name CURRENT -print | wc -l); \
 		find data/manifests \( -type f -o -type l \) -name CURRENT -exec rm -f -- {} +; \
 		find data/manifests -depth -type d -empty ! -path data/manifests -exec rmdir -- {} \;; \
 	fi; \
-	printf 'Purged %s generated output paths, %s bundles, and %s CURRENT pointers.\n' \
-		"$$output_count" "$$bundle_count" "$$current_count"
+	printf 'Purged %s generated output paths, %s manifest artifacts, and %s CURRENT pointers.\n' \
+		"$$output_count" "$$artifact_count" "$$current_count"

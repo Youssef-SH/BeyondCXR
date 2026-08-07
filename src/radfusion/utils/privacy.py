@@ -9,6 +9,7 @@ from pathlib import Path
 _UUID_PATTERN = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _DICOM_UID_PATTERN = re.compile(r"(?<![\d.])(?:\d+\.){4,}\d+(?![\d.])")
 _RSNA_SAMPLE_ID_PATTERN = re.compile(r"(?<![\w:])rsna:[^\s,}\]]+")
+_SYMILE_SAMPLE_ID_PATTERN = re.compile(r"(?<![\w:])symile:\d+")
 _DICOM_PATH_PATTERN = re.compile(r"(?<!\S)[^\s,}\]]+\.dcm\b", re.IGNORECASE)
 
 
@@ -31,5 +32,7 @@ def validate_public_reports(
             raise ValueError(f"Public report contains a DICOM UID-shaped value: {path}")
         if _RSNA_SAMPLE_ID_PATTERN.search(text):
             raise ValueError(f"Public report contains an RSNA sample identifier: {path}")
+        if _SYMILE_SAMPLE_ID_PATTERN.search(text):
+            raise ValueError(f"Public report contains a Symile sample identifier: {path}")
         if _DICOM_PATH_PATTERN.search(text):
             raise ValueError(f"Public report contains a DICOM path: {path}")
