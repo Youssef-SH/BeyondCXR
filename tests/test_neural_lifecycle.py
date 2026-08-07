@@ -25,8 +25,8 @@ from radfusion.data.cxr_cache import (
     preprocessing_identity,
 )
 from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.models.cxr_baseline import PretrainedWeightIdentity
 from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (

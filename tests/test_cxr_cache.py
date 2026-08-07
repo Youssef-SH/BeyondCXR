@@ -21,8 +21,8 @@ from radfusion.data.cxr_cache import (
 )
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.dicom_loader import DicomRecord
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.training.config import load_experiment_config
 from radfusion.training.datasets import (
     RsnaCachedFusionDataset,

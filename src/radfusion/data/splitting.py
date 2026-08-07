@@ -12,7 +12,7 @@ from typing import Any
 import pyarrow as pa
 
 from radfusion.data.artifact_validation import pneumonia_targets
-from radfusion.data.rsna_source import ManifestBuildError
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.schemas import PNEUMONIA_TASK_ID, RSNA_SPLIT_SCHEMA, require_exact_schema
 
 SPLIT_NAMES = ("train", "validation", "test")

@@ -16,7 +16,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from radfusion.data.rsna_source import ManifestBuildError
+from radfusion.data.errors import ManifestBuildError
 from radfusion.utils.skops_io import load_skops, save_skops
 
 CONTINUOUS_FEATURES = (

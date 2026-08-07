@@ -15,6 +15,26 @@ def staging_directory(destination: str | Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f".{target.name}-staging-", dir=target.parent))
 
 
+def update_current_marker(current_path: str | Path, immutable_id: str) -> None:
+    """Atomically replace a text pointer to one immutable artifact identity."""
+    target = Path(current_path)
+    if not immutable_id or Path(immutable_id).name != immutable_id:
+        raise ValueError("Immutable artifact identity is invalid")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}-", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(immutable_id + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def publish_directory(stage: str | Path, destination: str | Path) -> None:
     """Publish a complete staged directory, restoring the previous version on failure."""
     staged = Path(stage)

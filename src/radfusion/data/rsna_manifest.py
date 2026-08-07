@@ -8,8 +8,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_artifacts import build_rsna_artifacts, write_bundle
-from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.data.splitting import SplitConfig
 from radfusion.utils.operational_logging import (
     add_logging_argument,

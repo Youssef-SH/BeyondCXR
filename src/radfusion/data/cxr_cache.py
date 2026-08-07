@@ -19,8 +19,9 @@ import torch
 
 from radfusion.data.cxr_transforms import STANDARD_CXR_IMAGE_SIZE, StandardCxrTransform
 from radfusion.data.dicom_loader import read_dicom
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_source import ManifestBuildError, resolve_image_path
+from radfusion.data.rsna_source import resolve_image_path
 from radfusion.utils.operational_logging import CountProgress, get_operational_logger, log_event
 from radfusion.utils.publication import publish_directory, staging_directory
 

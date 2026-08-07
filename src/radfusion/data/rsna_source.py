@@ -8,6 +8,8 @@ from pathlib import Path, PurePosixPath
 
 import pandas as pd
 
+from radfusion.data.errors import ManifestBuildError
+
 LABEL_COLUMNS = ("patientId", "x", "y", "width", "height", "Target")
 CLASS_COLUMNS = ("patientId", "class")
 ALLOWED_CLASSES = {"Normal", "No Lung Opacity / Not Normal", "Lung Opacity"}
@@ -16,10 +18,6 @@ RSNA_CLASS_VALUES = {
     "No Lung Opacity / Not Normal": 1,
     "Lung Opacity": 2,
 }
-
-
-class ManifestBuildError(ValueError):
-    """Raised when RSNA inputs or generated artifacts violate their contracts."""
 
 
 @dataclass(frozen=True)
