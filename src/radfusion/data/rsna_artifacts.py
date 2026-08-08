@@ -26,12 +26,12 @@ from radfusion.data.artifact_validation import (
     validate_label_table,
     validate_sample_table,
 )
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.rsna_dicom import AuditAccumulator, read_dicom_metadata
 from radfusion.data.rsna_source import (
     RSNA_CLASS_VALUES,
     BoundingBox,
-    ManifestBuildError,
     RsnaPaths,
     canonical_image_path,
     discover_dicoms,
@@ -74,6 +74,7 @@ from radfusion.data.splitting import (
     validate_split_table,
 )
 from radfusion.utils.operational_logging import CountProgress, get_operational_logger
+from radfusion.utils.publication import update_current_marker
 
 DATASET_VERSION = "rsna-pneumonia-detection-challenge-stage-2"
 _LOGGER = get_operational_logger(__name__)
@@ -352,7 +353,7 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
         else:
             os.replace(stage_directory, final_directory)
         final_paths = _bundle_paths(bundle_id, final_directory, current_path)
-        _update_current_marker(current_path, bundle_id)
+        update_current_marker(current_path, bundle_id)
     finally:
         if stage_directory.exists():
             shutil.rmtree(stage_directory)
@@ -812,21 +813,6 @@ def _sha256_text(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
-
-
-def _update_current_marker(current_path: Path, bundle_id: str) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".CURRENT-", suffix=".tmp", dir=current_path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(bundle_id + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, current_path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _label_sort_key(record: LabelRecord) -> tuple[str, str]:

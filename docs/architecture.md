@@ -5,8 +5,9 @@
 - **Dataset:** an external source collection with a stable logical identity.
 - **Build:** one execution of bundle construction. A successful build publishes one bundle.
 - **Bundle:** an immutable, validated set of typed artifacts stored under `build-<sha256>`.
-- **Manifest:** `rsna_manifest_metadata.json`, the bundle document that declares identity,
-  contents, hashes, policies, and provenance. The `rsna-manifest` command runs a build.
+- **Manifest:** a bundle document such as `rsna_manifest_metadata.json` or
+  `symile_manifest_metadata.json` that declares identity, contents, hashes, policies, and
+  provenance.
 
 The lifecycle is: source dataset → build execution → immutable bundle → validated consumers.
 `CURRENT` selects the active bundle; published bundles remain immutable.
@@ -83,6 +84,6 @@ RSNA source files
     → validated portable campaign archive
 ```
 
-Artifact schemas are defined in [`data_contract.md`](data_contract.md). Experiment composition is
+RSNA artifact schemas are defined in [`data_contract.md`](data_contract.md). Experiment composition is
 defined in [`training.md`](training.md). Reconstruction and evaluation protocols are defined in
 [`reproducibility.md`](reproducibility.md).

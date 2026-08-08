@@ -13,7 +13,7 @@ import pydicom
 from pydicom.errors import InvalidDicomError
 
 from radfusion.data.age import AgeParseResult, parse_dicom_age
-from radfusion.data.rsna_source import ManifestBuildError
+from radfusion.data.errors import ManifestBuildError
 
 ALLOWED_SEX = {"F", "M"}
 ALLOWED_VIEW_POSITIONS = {"AP", "PA"}

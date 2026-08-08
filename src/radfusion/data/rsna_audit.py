@@ -12,8 +12,9 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_artifacts import load_current_bundle
-from radfusion.data.rsna_source import RSNA_CLASS_VALUES, ManifestBuildError
+from radfusion.data.rsna_source import RSNA_CLASS_VALUES
 from radfusion.data.splitting import SPLIT_NAMES
 from radfusion.utils.operational_logging import (
     add_logging_argument,

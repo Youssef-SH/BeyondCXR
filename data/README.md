@@ -3,7 +3,9 @@
 This directory holds local source data and generated patient-level artifacts. Git tracks this file
 and directory placeholders; local data content is ignored.
 
-Expected RSNA layout:
+## RSNA source and artifact layout
+
+The RSNA source and generated artifacts use this layout:
 
 ```text
 data/
@@ -51,6 +53,30 @@ make rsna-manifest
 ```
 
 The CXR cache is a disposable memory-mapped deterministic derivative used by neural workflows.
+
+## Symile-MIMIC source and artifact layout
+
+The Symile-MIMIC source and generated artifacts use this layout:
+
+```text
+data/
+  raw/symile/extracted/             # official restricted Symile-MIMIC 1.0.0 release
+  manifests/symile/
+    CURRENT
+    builds/build-<sha256>/
+      symile_samples.parquet
+      symile_labs.parquet
+      symile_manifest_metadata.json
+    cv_assignments/cv-assignment-<sha256>/
+      symile_cv_assignments.parquet
+      symile_cv_manifest.json
+```
+
+Run `make symile-manifest`, `make symile-audit`, and `make symile-cv` in that order. `CURRENT` is
+an interactive bundle selector. Durable consumers pin immutable bundle and CV assignment
+identities. Official CXR, ECG, lab-percentile, missingness, and identifier NPY arrays remain
+external restricted source assets authenticated through the bundle-bound release checksum manifest.
+
 Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
 control. These files contain patient-level information even when public identifiers are
 deidentified.

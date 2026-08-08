@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 import pyarrow as pa
 
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_dicom import (
     ALLOWED_SEX,
     ALLOWED_VIEW_POSITIONS,
@@ -15,7 +16,6 @@ from radfusion.data.rsna_dicom import (
 )
 from radfusion.data.rsna_source import (
     RSNA_CLASS_VALUES,
-    ManifestBuildError,
     canonical_image_path,
     resolve_image_path,
 )

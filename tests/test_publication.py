@@ -5,7 +5,20 @@ from pathlib import Path
 
 import pytest
 
-from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.utils.publication import (
+    publish_directory,
+    staging_directory,
+    update_current_marker,
+)
+
+
+def test_current_marker_is_replaced_atomically(tmp_path: Path) -> None:
+    current = tmp_path / "CURRENT"
+    update_current_marker(current, "build-first")
+    update_current_marker(current, "build-second")
+
+    assert current.read_text(encoding="utf-8") == "build-second\n"
+    assert not list(tmp_path.glob(".CURRENT-*.tmp"))
 
 
 def test_successful_directory_publication_replaces_complete_previous_output(

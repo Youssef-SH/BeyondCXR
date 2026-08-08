@@ -21,6 +21,7 @@ from radfusion.data.cxr_cache import (
     preprocessing_identity,
 )
 from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_artifacts import (
     ANNOTATIONS_FILENAME,
     BUNDLES_DIRECTORY,
@@ -32,7 +33,6 @@ from radfusion.data.rsna_artifacts import (
     validate_bundle_directory,
     validate_bundle_reference,
 )
-from radfusion.data.rsna_source import ManifestBuildError
 from radfusion.data.tabular_preprocess import SOURCE_FEATURES
 from radfusion.evaluation.metrics import validated_binary_targets
 from radfusion.training.config import DatasetConfig

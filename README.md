@@ -1,11 +1,11 @@
 # RadFusion-Clinical
 
 RadFusion-Clinical is a reproducible machine-learning benchmark and experimentation framework for
-radiographic pneumonia prediction, centered on the RSNA Pneumonia Detection Challenge. It provides
-deterministic data preparation, patient-disjoint evaluation, and reproducible metadata, image, and
-image-metadata fusion models.
+prediction of report-derived Pneumonia findings from chest radiographs and admission physiology.
+It contains the completed RSNA imaging benchmark and an authenticated Symile-MIMIC multimodal data
+layer.
 
-> This is a research and educational prototype. It is not a medical device and must not be used for clinical decision-making.
+> Research and educational prototype. Clinical decision-making lies outside its intended use.
 
 ## Implemented capabilities
 
@@ -14,6 +14,8 @@ image-metadata fusion models.
 - Typed samples, labels, bounding-box annotations, and patient-disjoint splits
 - SHA-256 source inventory for every labeled DICOM
 - Content-addressed immutable bundles with exact schemas and integrity validation
+- Authenticated Symile-MIMIC 1.0.0 source qualification, two-table bundle, aggregate audit, and
+  immutable repeated-CV assignments
 - Metadata preprocessing fitted on the training split and fixed Logistic Regression and LightGBM
   baselines
 - A TorchXRayVision DenseNet121 image baseline with deterministic per-seed training
@@ -48,10 +50,20 @@ Obtain the RSNA Pneumonia Detection Challenge data under its original access ter
 to `data/raw/rsna/extracted/`. The required filenames and directory layout are documented in
 [`data/README.md`](data/README.md).
 
+Symile data commands require the credentialed Symile-MIMIC 1.0.0 release under
+`data/raw/symile/extracted/`. Restricted source and generated patient-level bundles remain local.
+
+Current Symile capabilities cover authenticated source qualification, immutable bundle publication,
+aggregate auditing, and repeated patient-grouped CV assignments. Supervised modeling is the next
+experimental phase.
+
 ## Commands
 
 ```bash
 make rsna-gpu        # run and export the complete authoritative RSNA campaign
+make symile-manifest # authenticate Symile-MIMIC and publish its immutable bundle
+make symile-audit    # publish the bundle-qualified aggregate Symile audit
+make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
 
 # Lower-level inspection and debugging commands
 make rsna-manifest   # publish an RSNA bundle
@@ -66,6 +78,10 @@ make check           # lock consistency, Ruff checks, and unit/contract tests
 make pre-commit      # run repository hooks against all tracked files
 make inspect FILE=path/to/image.dcm
 ```
+
+`symile-audit` and `symile-cv` resolve `data/manifests/symile/CURRENT` once for interactive use.
+Pass `BUNDLE_ID=build-...` to select an immutable bundle explicitly. Published CV artifacts bind
+the resolved immutable bundle ID. Later scientific configurations pin both immutable identities.
 
 After the raw dataset is in place, `make rsna-gpu` owns pretrained-weight readiness, bundle and
 audit generation, deterministic image caching, all eight
@@ -140,14 +156,13 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 
 ## Limitations
 
-- Implemented scope covers the labeled RSNA Stage 2 training set and metadata, image, and fixed
-  image-metadata fusion models.
-- Image, fusion, and localization implementations are complete; final scientific results require
-  the consolidated GPU executions and are not reported here.
-- The labels are derived from public radiology-labeling pipelines and are not equivalent to
-  confirmed clinical diagnosis.
+- Implemented scope covers the completed RSNA Stage 2 metadata, image, fusion, and localization
+  campaign plus the authenticated Symile-MIMIC data layer. Supervised Symile modeling begins in
+  the next experimental phase.
+- Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
+  endpoint definition.
 
 See [`docs/architecture.md`](docs/architecture.md) for system structure,
-[`docs/data_contract.md`](docs/data_contract.md) for artifact contracts, and
+[`docs/data_contract.md`](docs/data_contract.md) for the RSNA artifact contract, and
 [`docs/reproducibility.md`](docs/reproducibility.md) for reconstruction details. RSNA-specific
 facts are documented in [`docs/datasets/rsna.md`](docs/datasets/rsna.md).

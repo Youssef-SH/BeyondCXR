@@ -17,6 +17,7 @@ from radfusion.data.artifact_validation import (
     validate_label_table,
     validate_sample_table,
 )
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.rsna_artifacts import (
     ANNOTATIONS_FILENAME,
@@ -35,7 +36,7 @@ from radfusion.data.rsna_artifacts import (
 )
 from radfusion.data.rsna_audit import REPORT_FILENAMES, generate_rsna_audit
 from radfusion.data.rsna_manifest import main
-from radfusion.data.rsna_source import ManifestBuildError, aggregate_labels
+from radfusion.data.rsna_source import aggregate_labels
 from radfusion.data.schemas import (
     PNEUMONIA_TASK_ID,
     RSNA_ANNOTATION_SCHEMA,
