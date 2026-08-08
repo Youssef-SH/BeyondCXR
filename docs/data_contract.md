@@ -1,6 +1,6 @@
-# Data contract
+# RSNA data contract
 
-Manifest schema version `0.1.0` defines the current development contract. Version changes require
+RSNA manifest schema version `0.1.0` defines the current development contract. Version changes require
 an explicit contract decision. Bundle IDs and declared hashes identify exact content.
 
 An RSNA bundle contains five Parquet artifacts and one JSON manifest. Column order, Arrow types,
