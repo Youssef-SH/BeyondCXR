@@ -15,6 +15,7 @@ TRUSTED_MODEL_TYPES = frozenset(
         "lightgbm.basic.Booster",
         "lightgbm.sklearn.LGBMClassifier",
         "numpy.dtype",
+        "radfusion.data.symile_preprocess.SymileLabEcdfTransformer",
         "radfusion.data.tabular_preprocess.RsnaMetadataFeatures",
     }
 )
