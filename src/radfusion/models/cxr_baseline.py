@@ -13,6 +13,8 @@ from torch import nn
 from radfusion.data.hashing import sha256_file
 from radfusion.training.config import ModelConfig
 
+CXR_TRAINABILITY_SCOPES = frozenset({"frozen", "terminal", "all"})
+
 
 @dataclass(frozen=True)
 class PretrainedWeightIdentity:
@@ -64,6 +66,46 @@ class StandardCxrEncoder(nn.Module):
         return self.encode(images)
 
 
+def set_cxr_encoder_trainability(encoder: nn.Module, scope: str) -> None:
+    """Apply the frozen, terminal-block, or full DenseNet trainability contract."""
+    if not isinstance(encoder, nn.Module) or scope not in CXR_TRAINABILITY_SCOPES:
+        raise ValueError("CXR encoder trainability scope is invalid")
+    selected = 0
+    for name, parameter in encoder.named_parameters():
+        trainable = scope == "all" or (
+            scope == "terminal"
+            and (
+                name.startswith("backbone.features.denseblock4.")
+                or name.startswith("backbone.features.norm5.")
+            )
+        )
+        parameter.requires_grad = trainable
+        selected += int(trainable)
+    if scope != "frozen" and selected == 0:
+        raise ValueError("CXR encoder trainability scope selected no parameters")
+
+
+def set_cxr_encoder_training_mode(encoder: nn.Module, scope: str) -> None:
+    """Keep frozen DenseNet modules in evaluation mode during terminal fine-tuning."""
+    if scope == "all":
+        encoder.train()
+        return
+    if scope == "frozen":
+        encoder.eval()
+        return
+    if scope != "terminal":
+        raise ValueError("CXR encoder training-mode scope is invalid")
+    modules = dict(encoder.named_modules())
+    try:
+        denseblock4 = modules["backbone.features.denseblock4"]
+        norm5 = modules["backbone.features.norm5"]
+    except KeyError as exc:
+        raise ValueError("CXR encoder does not expose the terminal DenseNet modules") from exc
+    encoder.eval()
+    denseblock4.train()
+    norm5.train()
+
+
 class CxrBinaryClassifier(nn.Module):
     """Combine a reusable CXR encoder with a separate one-logit head."""
 
@@ -102,13 +144,11 @@ class CxrBinaryClassifier(nn.Module):
 
     def freeze_encoder(self) -> None:
         """Freeze encoder parameters for head-only warm-up."""
-        for parameter in self.encoder.parameters():
-            parameter.requires_grad = False
+        set_cxr_encoder_trainability(self.encoder, "frozen")
 
     def unfreeze_encoder(self) -> None:
         """Restore encoder parameter trainability."""
-        for parameter in self.encoder.parameters():
-            parameter.requires_grad = True
+        set_cxr_encoder_trainability(self.encoder, "all")
 
 
 class ImageDenseNetModel:
