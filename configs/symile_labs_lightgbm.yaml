@@ -1,0 +1,35 @@
+config_version: 1
+name: symile_labs_lightgbm
+family: labs_lightgbm
+
+dataset:
+  manifest_directory: data/manifests
+  bundle_id: build-a75d6c209a207440f24051a1f9038c18103f5936007c7e9e7e20a0a99e0e4826
+  bundle_manifest_sha256: eb8fd39108720a4b101c6965fb50d10effe01833f88afa8ba8e06e9f527552e5
+  official_split_assignment_id: split-assignment-917a594754a779f0774b690d9f988e29d8773d6a5f619fef379a263a7b700f27
+  cv_assignment_id: cv-assignment-db3f94a74694566ae3ce874a11eb8dd716cbbe9d5a739a4c3848faee61b41163
+  task_id: pneumonia_strict
+
+preprocessing:
+  lab_policy: symile-outer-training-right-ecdf-v1
+
+model:
+  objective: binary
+  n_estimators: 500
+  learning_rate: 0.03
+  num_leaves: 31
+  min_child_samples: 20
+  subsample: 0.9
+  subsample_freq: 1
+  colsample_bytree: 0.9
+  reg_lambda: 1.0
+  class_weight: null
+  early_stopping_rounds: 50
+
+training:
+  model_directory: models/symile/development
+  report_directory: reports/symile/development
+  selection_metric: roc_auc
+
+mlflow:
+  experiment_name: radfusion-symile-development

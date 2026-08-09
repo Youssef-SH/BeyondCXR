@@ -176,6 +176,58 @@ class ExperimentConfig:
     source_sha256: str
 
 
+@dataclass(frozen=True)
+class SymileDevelopmentDatasetConfig:
+    """Frozen M4 identities and development-only source location."""
+
+    manifest_directory: Path
+    source_root: Path | None
+    bundle_id: str
+    bundle_manifest_sha256: str
+    official_split_assignment_id: str
+    cv_assignment_id: str
+    task_id: str
+
+
+@dataclass(frozen=True)
+class SymileDevelopmentConfig:
+    """One fixed M5 family configuration executed over the frozen outer CV."""
+
+    config_version: int
+    name: str
+    family: str
+    dataset: SymileDevelopmentDatasetConfig
+    preprocessing: MappingProxyType[str, Any]
+    model: MappingProxyType[str, Any]
+    training: MappingProxyType[str, Any]
+    mlflow: MLflowConfig
+    image: ImageConfig | None
+    source_path: Path
+    source_bytes: bytes
+    source_sha256: str
+
+
+SYMILE_M5_FAMILIES = (
+    "labs_logistic",
+    "labs_lightgbm",
+    "cxr",
+    "concat",
+    "gated",
+    "gated_no_observedness",
+)
+_SYMILE_FUSION_FAMILIES = frozenset({"concat", "gated", "gated_no_observedness"})
+_SYMILE_NEURAL_FAMILIES = frozenset({"cxr", *_SYMILE_FUSION_FAMILIES})
+_SYMILE_LAB_FAMILIES = frozenset({"labs_logistic", "labs_lightgbm", *_SYMILE_FUSION_FAMILIES})
+_SYMILE_BUNDLE_ID = "build-a75d6c209a207440f24051a1f9038c18103f5936007c7e9e7e20a0a99e0e4826"
+_SYMILE_BUNDLE_MANIFEST_SHA256 = "eb8fd39108720a4b101c6965fb50d10effe01833f88afa8ba8e06e9f527552e5"
+_SYMILE_SPLIT_ASSIGNMENT_ID = (
+    "split-assignment-917a594754a779f0774b690d9f988e29d8773d6a5f619fef379a263a7b700f27"
+)
+_SYMILE_CV_ASSIGNMENT_ID = (
+    "cv-assignment-db3f94a74694566ae3ce874a11eb8dd716cbbe9d5a739a4c3848faee61b41163"
+)
+
+
 def image_semantic_config_sha256(config: ExperimentConfig) -> str:
     """Hash the meaning-bearing, path-independent image experiment configuration."""
     return _canonical_sha256(_image_semantic_config(config))
@@ -310,6 +362,242 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         source_bytes=source_bytes,
         source_sha256=hashlib.sha256(source_bytes).hexdigest(),
     )
+
+
+def load_symile_development_config(path: str | Path) -> SymileDevelopmentConfig:
+    """Load one strict family-level M5 development configuration."""
+    source = Path(path)
+    try:
+        source_bytes = source.read_bytes()
+        document = yaml.load(source_bytes.decode("utf-8"), Loader=_StrictSafeLoader)
+    except OSError as exc:
+        raise ConfigError(f"Symile development config is unreadable: {source}") from exc
+    except UnicodeError as exc:
+        raise ConfigError(f"Symile development config is not valid UTF-8: {source}") from exc
+    except yaml.YAMLError as exc:
+        detail = getattr(exc, "problem", None) or str(exc)
+        raise ConfigError(f"Symile development config is invalid YAML: {source}: {detail}") from exc
+    root = _mapping(document, "config")
+    _keys(
+        root,
+        required={
+            "config_version",
+            "name",
+            "family",
+            "dataset",
+            "preprocessing",
+            "model",
+            "training",
+            "mlflow",
+        },
+        optional={"image"},
+        context="config",
+    )
+    version = _integer(root["config_version"], "config_version")
+    if version != 1:
+        raise ConfigError(f"Unsupported Symile development config_version: {version}")
+    family = _choice(root["family"], set(SYMILE_M5_FAMILIES), "family")
+    dataset = _symile_development_dataset(root["dataset"], family)
+    preprocessing = _mapping(root["preprocessing"], "preprocessing")
+    _keys(preprocessing, required={"lab_policy"}, context="preprocessing")
+    expected_policy = (
+        "symile-outer-training-right-ecdf-v1" if family in _SYMILE_LAB_FAMILIES else "none"
+    )
+    if _text(preprocessing["lab_policy"], "preprocessing.lab_policy") != expected_policy:
+        raise ConfigError(f"Symile family {family!r} requires lab_policy={expected_policy!r}")
+    model = _mapping(root["model"], "model")
+    if model != _symile_model_contract(family):
+        raise ConfigError(f"Symile family {family!r} model contract is not frozen exactly")
+    training = _mapping(root["training"], "training")
+    _keys(
+        training,
+        required={"model_directory", "report_directory", "selection_metric"},
+        context="training",
+    )
+    expected_metric = "none" if family == "labs_logistic" else "roc_auc"
+    if _text(training["selection_metric"], "training.selection_metric") != expected_metric:
+        raise ConfigError(f"Symile family {family!r} requires selection_metric={expected_metric!r}")
+    normalized_training = {
+        "model_directory": Path(_text(training["model_directory"], "training.model_directory")),
+        "report_directory": Path(_text(training["report_directory"], "training.report_directory")),
+        "selection_metric": expected_metric,
+    }
+    image = _image_config(root["image"]) if "image" in root else None
+    if family in _SYMILE_NEURAL_FAMILIES:
+        if image is None or asdict(image) != _symile_image_contract():
+            raise ConfigError("Symile neural image training contract is not frozen exactly")
+    elif image is not None:
+        raise ConfigError("Symile laboratory-only families do not accept image configuration")
+    return SymileDevelopmentConfig(
+        config_version=version,
+        name=_text(root["name"], "name"),
+        family=family,
+        dataset=dataset,
+        preprocessing=MappingProxyType(dict(preprocessing)),
+        model=MappingProxyType(dict(model)),
+        training=MappingProxyType(normalized_training),
+        mlflow=_mlflow_config(root["mlflow"]),
+        image=image,
+        source_path=source,
+        source_bytes=source_bytes,
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+    )
+
+
+def symile_development_semantic_sha256(config: SymileDevelopmentConfig) -> str:
+    """Hash the path-independent scientific M5 family configuration."""
+    payload: dict[str, Any] = {
+        "config_version": config.config_version,
+        "family": config.family,
+        "dataset": {
+            "bundle_id": config.dataset.bundle_id,
+            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
+            "official_split_assignment_id": config.dataset.official_split_assignment_id,
+            "cv_assignment_id": config.dataset.cv_assignment_id,
+            "task_id": config.dataset.task_id,
+        },
+        "preprocessing": dict(config.preprocessing),
+        "model": dict(config.model),
+        "selection_metric": config.training["selection_metric"],
+        "image": asdict(config.image) if config.image is not None else None,
+    }
+    return _canonical_sha256(payload)
+
+
+def _symile_development_dataset(value: object, family: str) -> SymileDevelopmentDatasetConfig:
+    data = _mapping(value, "dataset")
+    _keys(
+        data,
+        required={
+            "manifest_directory",
+            "bundle_id",
+            "bundle_manifest_sha256",
+            "official_split_assignment_id",
+            "cv_assignment_id",
+            "task_id",
+        },
+        optional={"source_root"},
+        context="dataset",
+    )
+    source_root = (
+        Path(_text(data["source_root"], "dataset.source_root")) if "source_root" in data else None
+    )
+    if family in _SYMILE_NEURAL_FAMILIES and source_root is None:
+        raise ConfigError("Symile neural families require dataset.source_root")
+    if family not in _SYMILE_NEURAL_FAMILIES and source_root is not None:
+        raise ConfigError("Symile laboratory-only families do not accept dataset.source_root")
+    expected = {
+        "bundle_id": _SYMILE_BUNDLE_ID,
+        "bundle_manifest_sha256": _SYMILE_BUNDLE_MANIFEST_SHA256,
+        "official_split_assignment_id": _SYMILE_SPLIT_ASSIGNMENT_ID,
+        "cv_assignment_id": _SYMILE_CV_ASSIGNMENT_ID,
+        "task_id": "pneumonia_strict",
+    }
+    for field, required in expected.items():
+        if _text(data[field], f"dataset.{field}") != required:
+            raise ConfigError(f"Symile M5 requires the frozen dataset.{field}")
+    return SymileDevelopmentDatasetConfig(
+        manifest_directory=Path(_text(data["manifest_directory"], "dataset.manifest_directory")),
+        source_root=source_root,
+        bundle_id=expected["bundle_id"],
+        bundle_manifest_sha256=expected["bundle_manifest_sha256"],
+        official_split_assignment_id=expected["official_split_assignment_id"],
+        cv_assignment_id=expected["cv_assignment_id"],
+        task_id=expected["task_id"],
+    )
+
+
+def _symile_model_contract(family: str) -> dict[str, Any]:
+    contracts: dict[str, dict[str, Any]] = {
+        "labs_logistic": {
+            "l1_ratio": 0.0,
+            "solver": "liblinear",
+            "C": 1.0,
+            "max_iter": 2000,
+            "class_weight": None,
+        },
+        "labs_lightgbm": {
+            "objective": "binary",
+            "n_estimators": 500,
+            "learning_rate": 0.03,
+            "num_leaves": 31,
+            "min_child_samples": 20,
+            "subsample": 0.9,
+            "subsample_freq": 1,
+            "colsample_bytree": 0.9,
+            "reg_lambda": 1.0,
+            "class_weight": None,
+            "early_stopping_rounds": 50,
+        },
+        "cxr": _symile_cxr_contract(),
+        "concat": {
+            **_symile_cxr_contract(),
+            "lab_input_dimension": 100,
+            "image_projection_dimension": 256,
+            "lab_hidden_dimension": 128,
+            "lab_projection_dimension": 64,
+            "fusion_hidden_dimension": 128,
+            "dropout": 0.2,
+        },
+        "gated": _symile_gated_contract(True),
+        "gated_no_observedness": _symile_gated_contract(False),
+    }
+    return contracts[family]
+
+
+def _symile_cxr_contract() -> dict[str, Any]:
+    return {
+        "encoder_name": "densenet121",
+        "weights": "densenet121-res224-chex",
+        "image_size": 224,
+        "embedding_dimension": 1024,
+        "pos_weight": 1.0,
+        "fine_tune_scope": "terminal",
+    }
+
+
+def _symile_gated_contract(use_observedness: bool) -> dict[str, Any]:
+    return {
+        **_symile_cxr_contract(),
+        "lab_input_dimension": 100,
+        "image_projection_dimension": 256,
+        "lab_hidden_dimension": 128,
+        "lab_core_dimension": 64,
+        "latent_dimension": 256,
+        "observedness_dimension": 50,
+        "gate_hidden_dimension": 128,
+        "classifier_hidden_dimension": 128,
+        "modalities": 2,
+        "dropout": 0.2,
+        "use_observedness": use_observedness,
+    }
+
+
+def _symile_image_contract() -> dict[str, Any]:
+    return {
+        "batch_size": 32,
+        "num_workers": 2,
+        "pin_memory_policy": "enabled",
+        "device": "cuda",
+        "mixed_precision": True,
+        "rotation_degrees": 7.0,
+        "translation_fraction": 0.05,
+        "brightness_jitter": 0.05,
+        "contrast_jitter": 0.05,
+        "optimizer": "adamw",
+        "warmup_epochs": 2,
+        "fine_tune_epochs": 28,
+        "warmup_head_learning_rate": 0.001,
+        "encoder_learning_rate": 0.00001,
+        "head_learning_rate": 0.0001,
+        "weight_decay": 0.0001,
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 2,
+        "scheduler_min_learning_rate": 0.0000001,
+        "gradient_clip_norm": 1.0,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.0001,
+    }
 
 
 def _dataset_config(value: object) -> DatasetConfig:
