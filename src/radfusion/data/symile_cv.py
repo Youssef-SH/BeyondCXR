@@ -10,6 +10,7 @@ import platform
 import shutil
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,15 @@ CV_ASSIGNMENTS_FILENAME = "symile_cv_assignments.parquet"
 CV_MANIFEST_FILENAME = "symile_cv_manifest.json"
 _EXPECTED_FILES = {CV_ASSIGNMENTS_FILENAME, CV_MANIFEST_FILENAME}
 _LOGGER = get_operational_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ValidatedSymileCvReference:
+    """Validated CV declaration and assignments without bundle sample access."""
+
+    manifest: dict[str, Any]
+    manifest_sha256: str
+    assignments: pa.Table
 
 
 def generate_cv_assignments(samples: pd.DataFrame) -> pa.Table:
@@ -169,19 +179,43 @@ def validate_symile_cv(
     enforce_directory_name: bool = True,
 ) -> dict[str, Any]:
     """Validate an immutable CV artifact against its exact source bundle."""
+    reference = validate_symile_cv_reference(
+        directory,
+        bundle_id=bundle.bundle_id,
+        expected_assignment_id=expected_assignment_id,
+        enforce_directory_name=enforce_directory_name,
+    )
+    samples = read_symile_samples(bundle)
+    validate_cv_table(reference.assignments, samples)
+    return reference.manifest
+
+
+def validate_symile_cv_reference(
+    directory: str | Path,
+    *,
+    bundle_id: str,
+    expected_assignment_id: str | None = None,
+    expected_manifest_sha256: str | None = None,
+    enforce_directory_name: bool = True,
+) -> ValidatedSymileCvReference:
+    """Validate one immutable CV artifact without reading bundle sample rows."""
     root = Path(directory)
     _require_exact_files(root)
     try:
-        manifest = json.loads((root / CV_MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        manifest_bytes = (root / CV_MANIFEST_FILENAME).read_bytes()
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ManifestBuildError("Symile CV manifest is unreadable") from exc
+    if expected_manifest_sha256 is not None and manifest_sha256 != expected_manifest_sha256:
+        raise ManifestBuildError("Symile CV manifest SHA-256 differs from expected identity")
     _validate_cv_manifest(manifest)
     assignment_id = manifest["cv_assignment_id"]
     if expected_assignment_id is not None and assignment_id != expected_assignment_id:
         raise ManifestBuildError("Symile CV identity differs from expected identity")
     if enforce_directory_name and root.name != assignment_id:
         raise ManifestBuildError("Symile CV directory differs from its identity")
-    if manifest["bundle_id"] != bundle.bundle_id:
+    if manifest["bundle_id"] != bundle_id:
         raise ManifestBuildError("Symile CV artifact is bound to a different bundle")
     artifact = manifest["artifact"]
     path = root / CV_ASSIGNMENTS_FILENAME
@@ -193,12 +227,10 @@ def validate_symile_cv(
     logical_hash = arrow_ipc_sha256(assignments)
     if (
         logical_hash != artifact["logical_arrow_sha256"]
-        or cv_assignment_id(bundle.bundle_id, logical_hash) != assignment_id
+        or cv_assignment_id(bundle_id, logical_hash) != assignment_id
     ):
         raise ManifestBuildError("Symile CV semantic identity is invalid")
-    samples = read_symile_samples(bundle)
-    validate_cv_table(assignments, samples)
-    return manifest
+    return ValidatedSymileCvReference(dict(manifest), manifest_sha256, assignments)
 
 
 def resolve_symile_cv(
