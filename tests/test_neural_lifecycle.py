@@ -51,6 +51,7 @@ from radfusion.training.neural import (
     candidate_is_improvement,
     deterministic_inference,
     fit_image_model,
+    fit_selected_two_stage_binary_model,
     fit_two_stage_binary_model,
     seed_neural_runtime,
     train_one_epoch,
@@ -444,6 +445,73 @@ def test_fine_tune_history_records_learning_rate_used(
     assert result.history[2].encoder_learning_rate == pytest.approx(
         config.encoder_learning_rate * config.scheduler_factor
     )
+
+
+def test_selected_metric_lifecycle_uses_auroc_without_changing_rsna_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import radfusion.training.neural as neural_module
+
+    dataset = _TensorDataset([0, 1, 0, 1])
+    config = replace(
+        _image_config(),
+        warmup_epochs=1,
+        fine_tune_epochs=2,
+        early_stopping_patience=1,
+    )
+    monkeypatch.setattr(neural_module, "train_one_epoch", lambda *args, **kwargs: 1.0)
+    scheduler_metrics: list[float] = []
+
+    class _Scheduler:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.last_epoch = 0
+
+        def step(self, metric: float) -> None:
+            scheduler_metrics.append(metric)
+            self.last_epoch += 1
+
+    monkeypatch.setattr(neural_module, "ReduceLROnPlateau", _Scheduler)
+    scores = iter(
+        (
+            ([0.4, 0.1, 0.9, 0.6], 0.9),
+            ([0.1, 0.2, 0.8, 0.9], 0.8),
+            ([0.4, 0.1, 0.9, 0.6], 0.7),
+        )
+    )
+
+    def inference(*args: object, **kwargs: object):
+        del args, kwargs
+        probabilities, average_precision = next(scores)
+        return type(
+            "Result",
+            (),
+            {
+                "targets": np.array([0, 1, 0, 1], dtype=np.int8),
+                "probabilities": np.asarray(probabilities, dtype=np.float64),
+                "average_precision": average_precision,
+            },
+        )()
+
+    monkeypatch.setattr(neural_module, "deterministic_inference", inference)
+    loaders = build_image_loaders(dataset, dataset, config=config, runtime=_runtime(), seed=42)
+    result = fit_selected_two_stage_binary_model(
+        _TinyImageModel(),
+        loaders.train,
+        loaders.validation,
+        input_keys=("image",),
+        config=config,
+        runtime=_runtime(),
+        pos_weight=1.0,
+        selection_metric="roc_auc",
+        fine_tune_scope="all",
+    )
+
+    assert result.selection_metric == "roc_auc"
+    assert result.selected_epoch == 2
+    assert len(result.history) == 3
+    assert result.history[-1].no_improvement_count == 1
+    assert scheduler_metrics == [0.75, 0.25]
 
 
 def test_cpu_and_cuda_runtime_provenance(monkeypatch: pytest.MonkeyPatch) -> None:

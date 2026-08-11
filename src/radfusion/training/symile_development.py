@@ -1,0 +1,692 @@
+"""Execute one frozen six-family Symile M5 repeated-CV development lifecycle."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+import mlflow
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+
+from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.errors import ManifestBuildError
+from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS, SymileLabEcdfTransformer
+from radfusion.data.symile_schemas import REPEAT_SEEDS
+from radfusion.models.cxr_baseline import (
+    CxrBinaryClassifier,
+    StandardCxrEncoder,
+    fingerprint_pretrained_weights,
+)
+from radfusion.models.fusion_concat import initialize_fusion_encoder
+from radfusion.models.symile_fusion import build_symile_concat_model, build_symile_gated_model
+from radfusion.models.symile_tabular import (
+    fit_symile_labs_lightgbm,
+    fit_symile_labs_logistic,
+    symile_tabular_logits,
+)
+from radfusion.training.config import (
+    ConfigError,
+    SymileDevelopmentConfig,
+    load_symile_development_config,
+    symile_development_semantic_sha256,
+)
+from radfusion.training.device import ResolvedDevice, resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
+from radfusion.training.neural import (
+    FineTuneScope,
+    SelectionMetricName,
+    build_evaluation_loader,
+    build_image_loaders,
+    deterministic_inference,
+    fit_selected_two_stage_binary_model,
+    seed_neural_runtime,
+)
+from radfusion.training.symile_data import (
+    SymileCxrStore,
+    SymileDevelopmentData,
+    SymileInnerSplit,
+    SymileNeuralDataset,
+    SymileOuterFold,
+    derive_inner_split,
+    load_symile_development,
+    materialize_outer_fold,
+)
+from radfusion.utils.mlflow_utils import (
+    DEFAULT_TRACKING_URI,
+    configure_mlflow,
+    environment_provenance,
+    git_revision,
+    log_source_config,
+    tracked_run,
+    uv_lock_sha256,
+)
+from radfusion.utils.operational_logging import add_logging_argument, configure_logging
+from radfusion.utils.symile_publication import (
+    NEURAL_MODEL_FILENAME,
+    ValidatedDevelopmentResult,
+    ValidatedFoldPackage,
+    build_oof_table,
+    load_symile_neural_checkpoint,
+    neural_checkpoint_document,
+    publish_development_result,
+    publish_fold_package,
+    validate_development_result,
+    validate_fold_package,
+)
+
+FUSION_FAMILIES = frozenset({"concat", "gated", "gated_no_observedness"})
+NEURAL_FAMILIES = frozenset({"cxr", *FUSION_FAMILIES})
+
+
+@dataclass(frozen=True)
+class SymileFoldExecutionContext:
+    """Reusable validated state for one family invocation."""
+
+    data: SymileDevelopmentData
+    cxr_store: SymileCxrStore | None
+    runtime: ResolvedDevice | None
+    loader_execution: LoaderExecutionPolicy | None
+    git_commit: str
+    dependency_lock_sha256: str
+    source_cxr_folds: Mapping[tuple[int, int], ValidatedFoldPackage]
+    source_cxr_development_id: str | None
+
+
+def run_symile_development(
+    config: SymileDevelopmentConfig,
+    *,
+    source_cxr_development_id: str | None = None,
+    tracking_uri: str = DEFAULT_TRACKING_URI,
+    execution: LoaderExecutionPolicy | None = None,
+) -> ValidatedDevelopmentResult:
+    """Execute exactly 3 x 5 folds and publish one complete family authority."""
+    _validate_source_argument(config.family, source_cxr_development_id)
+    configure_mlflow(experiment_name=config.mlflow.experiment_name, tracking_uri=tracking_uri)
+    commit, dirty = git_revision()
+    if dirty:
+        raise ValueError("Formal Symile development requires a clean Git worktree")
+    lock_hash = uv_lock_sha256()
+    data = load_symile_development(config)
+    runtime = None
+    loader_execution = None
+    cxr_store = None
+    if config.family in NEURAL_FAMILIES:
+        if config.image is None or config.dataset.source_root is None:
+            raise ConfigError("Symile neural development configuration is incomplete")
+        runtime = resolve_device(
+            config.image.device,
+            mixed_precision=config.image.mixed_precision,
+            pin_memory_policy=config.image.pin_memory_policy,
+        )
+        loader_execution = execution or reused_loader_policy(
+            num_workers=config.image.num_workers,
+            pin_memory=runtime.pin_memory_effective,
+        )
+        cxr_store = SymileCxrStore(data.bundle, config.dataset.source_root)
+    source_folds: Mapping[tuple[int, int], ValidatedFoldPackage] = {}
+    if source_cxr_development_id is not None:
+        source_folds = _resolve_source_cxr_folds(
+            config,
+            source_cxr_development_id,
+            git_commit=commit,
+            dependency_lock_sha256=lock_hash,
+        )
+    context = SymileFoldExecutionContext(
+        data,
+        cxr_store,
+        runtime,
+        loader_execution,
+        commit,
+        lock_hash,
+        source_folds,
+        source_cxr_development_id,
+    )
+    folds = [
+        execute_symile_outer_fold(config, context, repeat_seed=seed, outer_fold=fold)
+        for seed in REPEAT_SEEDS
+        for fold in range(5)
+    ]
+    metrics, selected, budget = aggregate_family_folds(
+        config.family,
+        folds,
+        expected_sample_ids=set(data.frame["sample_id"].astype(str)),
+    )
+    return publish_development_result(
+        report_root=config.training["report_directory"],
+        model_root=config.training["model_directory"],
+        family=config.family,
+        semantic_config_sha256=symile_development_semantic_sha256(config),
+        folds=folds,
+        repeat_metrics=metrics,
+        selected_values=selected,
+        median_m6_budget=budget,
+    )
+
+
+def execute_symile_outer_fold(
+    config: SymileDevelopmentConfig,
+    context: SymileFoldExecutionContext,
+    *,
+    repeat_seed: int,
+    outer_fold: int,
+) -> ValidatedFoldPackage:
+    """Fit, select, infer once, and publish one immutable outer-fold package."""
+    outer = materialize_outer_fold(context.data, repeat_seed=repeat_seed, outer_fold=outer_fold)
+    inner = derive_inner_split(outer)
+    semantic_hash = symile_development_semantic_sha256(config)
+    source = context.source_cxr_folds.get((repeat_seed, outer_fold))
+    if (
+        source is not None
+        and source.manifest["inner_split"]["inner_split_id"] != inner.inner_split_id
+    ):
+        raise ManifestBuildError("Source CXR fold uses a different inner split")
+    source_lineage = _source_cxr_lineage(context.source_cxr_development_id, source)
+    tags = {
+        "run_kind": "training",
+        "evaluation_scope": "oof",
+        "config_name": config.name,
+        "dataset": "symile",
+        "family": config.family,
+        "model": config.family,
+        "task": config.dataset.task_id,
+        "dataset_bundle_id": config.dataset.bundle_id,
+        "cv_assignment_id": config.dataset.cv_assignment_id,
+        "repeat_seed": str(repeat_seed),
+        "outer_fold": str(outer_fold),
+        "inner_split_id": inner.inner_split_id,
+        "source_config_sha256": config.source_sha256,
+        "semantic_config_sha256": semantic_hash,
+        "git_commit": context.git_commit,
+        "git_dirty": "false",
+        "dependency_lock_sha256": context.dependency_lock_sha256,
+        "run_complete": "false",
+    }
+    if source_lineage is not None:
+        tags["source_cxr_development_id"] = source_lineage["development_id"]
+        tags["source_cxr_fold_package_id"] = source_lineage["fold_package_id"]
+    before = _existing_fold_ids(config)
+    published: ValidatedFoldPackage | None = None
+    with tracked_run(
+        run_name=f"{config.name}-r{repeat_seed}-f{outer_fold}",
+        tags=tags,
+        parameters={
+            "repeat_seed": repeat_seed,
+            "outer_fold": outer_fold,
+            "inner_seed": inner.inner_seed,
+            **environment_provenance(),
+        },
+    ) as run_id:
+        try:
+            log_source_config(config)
+            fit = _fit_outer_fold(config, context, outer, inner, source)
+            oof = build_oof_table(
+                outer.holdout["sample_id"].astype(str).tolist(),
+                outer.holdout["target"].to_numpy(dtype=np.int8),
+                fit["logits"],
+            )
+            lineage = _fold_lineage(config, context, fit.get("pretrained_weight"))
+            operational = {
+                "mlflow_run_id": run_id,
+                "runtime_provenance": (
+                    context.runtime.provenance() if context.runtime is not None else None
+                ),
+            }
+            published = publish_fold_package(
+                model_root=config.training["model_directory"],
+                family=config.family,
+                repeat_seed=repeat_seed,
+                outer_fold=outer_fold,
+                config_bytes=config.source_bytes,
+                config_sha256=config.source_sha256,
+                semantic_config_sha256=semantic_hash,
+                lineage=lineage,
+                inner_split={
+                    "inner_split_id": inner.inner_split_id,
+                    "inner_seed": inner.inner_seed,
+                    "policy": inner.policy,
+                },
+                selection=fit["selection"],
+                oof=oof,
+                model=fit["model"],
+                lab_preprocessor=fit.get("lab_preprocessor"),
+                training_history=fit.get("training_history"),
+                source_cxr=source_lineage,
+                operational=operational,
+            )
+            probabilities = oof["probability"].to_numpy()
+            targets = oof["target"].to_numpy()
+            metrics = _probability_metrics(targets, probabilities)
+            mlflow.log_metrics(metrics)
+            mlflow.set_tags(
+                {
+                    "fold_package_id": published.manifest["fold_package_id"],
+                    "selected_epoch": fit["selection"].get("selected_epoch", "not_applicable"),
+                    "best_iteration": fit["selection"].get("best_iteration", "not_applicable"),
+                }
+            )
+            mlflow.set_tag("run_complete", "true")
+        except BaseException:
+            if published is not None and published.manifest["fold_package_id"] not in before:
+                shutil.rmtree(published.directory, ignore_errors=True)
+            raise
+    if published is None:
+        raise RuntimeError("Symile fold lifecycle completed without a package")
+    return published
+
+
+def aggregate_family_folds(
+    family: str,
+    folds: Sequence[ValidatedFoldPackage],
+    *,
+    expected_sample_ids: set[str],
+) -> tuple[dict[str, dict[str, float]], list[int] | None, int | None]:
+    """Prove repeat coverage and derive metrics and the frozen median budget."""
+    metrics: dict[str, dict[str, float]] = {}
+    for seed in REPEAT_SEEDS:
+        scoped = sorted(
+            (item for item in folds if item.manifest["repeat_seed"] == seed),
+            key=lambda item: item.manifest["outer_fold"],
+        )
+        if len(scoped) != 5:
+            raise ManifestBuildError("Symile family repeat does not contain five folds")
+        frame = pd.concat([item.oof.to_pandas() for item in scoped], ignore_index=True)
+        if (
+            len(frame) != len(expected_sample_ids)
+            or frame["sample_id"].duplicated().any()
+            or set(frame["sample_id"]) != expected_sample_ids
+        ):
+            raise ManifestBuildError("Symile family repeat OOF coverage is invalid")
+        metrics[str(seed)] = _probability_metrics(frame["target"], frame["probability"])
+    selected: list[int] | None
+    if family == "labs_logistic":
+        selected = None
+    else:
+        field = "best_iteration" if family == "labs_lightgbm" else "selected_epoch"
+        selected = [int(item.manifest["selection"][field]) for item in folds]
+    budget = int(np.median(np.asarray(selected, dtype=np.int64))) if selected is not None else None
+    return metrics, selected, budget
+
+
+def _fit_outer_fold(
+    config: SymileDevelopmentConfig,
+    context: SymileFoldExecutionContext,
+    outer: SymileOuterFold,
+    inner: SymileInnerSplit,
+    source: ValidatedFoldPackage | None,
+) -> dict[str, Any]:
+    lab_columns = list(LAB_FEATURE_COLUMNS)
+    targets = outer.training["target"].to_numpy(dtype=np.int8)
+    if config.family == "labs_logistic":
+        fit = fit_symile_labs_logistic(
+            outer.training[lab_columns],
+            targets,
+            parameters=config.model,
+            repeat_seed=outer.repeat_seed,
+        )
+        return {
+            "model": fit.pipeline,
+            "logits": symile_tabular_logits(fit.pipeline, outer.holdout[lab_columns]),
+            "selection": {"metric": "none", "selected_epoch": None, "best_iteration": None},
+        }
+    if config.family == "labs_lightgbm":
+        fit = fit_symile_labs_lightgbm(
+            outer.training[lab_columns],
+            targets,
+            parameters=config.model,
+            inner_training_indices=inner.training_indices,
+            inner_validation_indices=inner.validation_indices,
+            repeat_seed=outer.repeat_seed,
+        )
+        return {
+            "model": fit.pipeline,
+            "logits": symile_tabular_logits(fit.pipeline, outer.holdout[lab_columns]),
+            "selection": {
+                "metric": "roc_auc",
+                "selected_epoch": None,
+                "best_iteration": fit.best_iteration,
+            },
+        }
+    return _fit_neural_outer_fold(config, context, outer, inner, source)
+
+
+def _fit_neural_outer_fold(
+    config: SymileDevelopmentConfig,
+    context: SymileFoldExecutionContext,
+    outer: SymileOuterFold,
+    inner: SymileInnerSplit,
+    source: ValidatedFoldPackage | None,
+) -> dict[str, Any]:
+    if config.image is None or context.cxr_store is None or context.runtime is None:
+        raise ConfigError("Symile neural fold context is incomplete")
+    seed_neural_runtime(outer.repeat_seed)
+    lab_preprocessor = None
+    transformed_training = None
+    transformed_holdout = None
+    if config.family in FUSION_FAMILIES:
+        lab_preprocessor = SymileLabEcdfTransformer().fit(outer.training[list(LAB_FEATURE_COLUMNS)])
+        transformed_training = lab_preprocessor.transform(outer.training[list(LAB_FEATURE_COLUMNS)])
+        transformed_holdout = lab_preprocessor.transform(outer.holdout[list(LAB_FEATURE_COLUMNS)])
+    training_transform = _transform(config, training=True)
+    evaluation_transform = _transform(config, training=False)
+    inner_training = outer.training.iloc[inner.training_indices].reset_index(drop=True)
+    inner_validation = outer.training.iloc[inner.validation_indices].reset_index(drop=True)
+    train_labs = (
+        transformed_training[inner.training_indices] if transformed_training is not None else None
+    )
+    validation_labs = (
+        transformed_training[inner.validation_indices] if transformed_training is not None else None
+    )
+    train_dataset = SymileNeuralDataset(
+        inner_training,
+        cxr_store=context.cxr_store,
+        transform=training_transform,
+        repeat_seed=outer.repeat_seed,
+        labs=train_labs,
+    )
+    validation_dataset = SymileNeuralDataset(
+        inner_validation,
+        cxr_store=context.cxr_store,
+        transform=evaluation_transform,
+        repeat_seed=outer.repeat_seed,
+        labs=validation_labs,
+    )
+    loaders = build_image_loaders(
+        train_dataset,
+        validation_dataset,
+        config=config.image,
+        runtime=context.runtime,
+        seed=outer.repeat_seed,
+        execution=context.loader_execution,
+    )
+    model, pretrained = _build_neural_model(config, source)
+    model.to(context.runtime.device)
+    input_keys = ("image",) if config.family == "cxr" else ("image", "structured")
+    fit = fit_selected_two_stage_binary_model(
+        model,
+        loaders.train,
+        loaders.validation,
+        input_keys=input_keys,
+        config=config.image,
+        runtime=context.runtime,
+        pos_weight=float(config.model["pos_weight"]),
+        selection_metric=cast(SelectionMetricName, config.training["selection_metric"]),
+        fine_tune_scope=cast(FineTuneScope, config.model["fine_tune_scope"]),
+    )
+    incompatible = model.load_state_dict(fit.selected_state_dict, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise ValueError("Selected Symile state did not restore strictly")
+    restored_validation = deterministic_inference(
+        model,
+        loaders.validation,
+        runtime=context.runtime,
+        input_keys=input_keys,
+    )
+    restored_roc_auc = float(
+        roc_auc_score(restored_validation.targets, restored_validation.probabilities)
+    )
+    if not np.isclose(restored_roc_auc, fit.selected_validation_metric, rtol=0.0, atol=1e-12):
+        raise ValueError("Restored Symile checkpoint does not reproduce selected AUROC")
+    holdout_dataset = SymileNeuralDataset(
+        outer.holdout,
+        cxr_store=context.cxr_store,
+        transform=evaluation_transform,
+        repeat_seed=outer.repeat_seed,
+        labs=transformed_holdout,
+    )
+    holdout_loader = build_evaluation_loader(
+        holdout_dataset,
+        config=config.image,
+        runtime=context.runtime,
+    )
+    inference = deterministic_inference(
+        model,
+        holdout_loader,
+        runtime=context.runtime,
+        input_keys=input_keys,
+    )
+    if inference.sample_ids != tuple(outer.holdout["sample_id"].astype(str)):
+        raise ManifestBuildError("Symile neural OOF inference order is invalid")
+    checkpoint = neural_checkpoint_document(
+        fit.selected_state_dict,
+        selected_epoch=fit.selected_epoch,
+        selected_stage=fit.selected_stage,
+        selected_validation_roc_auc=fit.selected_validation_metric,
+    )
+    return {
+        "model": checkpoint,
+        "lab_preprocessor": lab_preprocessor,
+        "training_history": [
+            {
+                "epoch": record.global_epoch,
+                "stage": record.stage,
+                "training_loss": record.training_loss,
+                "validation_metric": record.validation_metric,
+                "encoder_learning_rate": record.encoder_learning_rate,
+                "head_learning_rate": record.head_learning_rate,
+            }
+            for record in fit.history
+        ],
+        "logits": inference.logits,
+        "selection": {
+            "metric": "roc_auc",
+            "selected_epoch": fit.selected_epoch,
+            "selected_stage": fit.selected_stage,
+            "selected_validation_metric": fit.selected_validation_metric,
+            "best_iteration": None,
+        },
+        "pretrained_weight": pretrained,
+    }
+
+
+def _build_neural_model(
+    config: SymileDevelopmentConfig,
+    source: ValidatedFoldPackage | None,
+) -> tuple[torch.nn.Module, Mapping[str, object] | None]:
+    if config.family == "cxr":
+        weights = str(config.model["weights"])
+        before = fingerprint_pretrained_weights(weights)
+        model = CxrBinaryClassifier(
+            StandardCxrEncoder(
+                weights=str(config.model["weights"]),
+                expected_embedding_dimension=int(config.model["embedding_dimension"]),
+                image_size=int(config.model["image_size"]),
+            ),
+            embedding_dimension=int(config.model["embedding_dimension"]),
+            image_size=int(config.model["image_size"]),
+        )
+        after = fingerprint_pretrained_weights(weights)
+        if before != after:
+            raise ValueError("Pretrained CXR weight bytes changed during model construction")
+        return model, before.as_dict()
+    if source is None:
+        raise ManifestBuildError("Symile fusion requires its matching CXR fold package")
+    if config.family == "concat":
+        model = build_symile_concat_model(config.model, weights=None)
+    else:
+        model = build_symile_gated_model(config.model, weights=None)
+    checkpoint = load_symile_neural_checkpoint(source.directory / NEURAL_MODEL_FILENAME)
+    state = checkpoint["model_state_dict"]
+    if not isinstance(state, Mapping):
+        raise ManifestBuildError("Source CXR checkpoint state is invalid")
+    initialize_fusion_encoder(model, state)
+    return model, None
+
+
+def _resolve_source_cxr_folds(
+    config: SymileDevelopmentConfig,
+    development_id: str,
+    *,
+    git_commit: str,
+    dependency_lock_sha256: str,
+) -> dict[tuple[int, int], ValidatedFoldPackage]:
+    directory = Path(config.training["report_directory"]) / "families" / development_id
+    development = validate_development_result(
+        directory,
+        model_root=config.training["model_directory"],
+        expected_development_id=development_id,
+    )
+    if development.manifest["family"] != "cxr":
+        raise ManifestBuildError("Fusion source development result is not CXR-only")
+    result: dict[tuple[int, int], ValidatedFoldPackage] = {}
+    folds_root = Path(config.training["model_directory"]) / "folds"
+    for reference in development.manifest["fold_packages"]:
+        package = validate_fold_package(
+            folds_root / reference["fold_package_id"],
+            expected_fold_package_id=reference["fold_package_id"],
+        )
+        if package.manifest_sha256 != reference["fold_manifest_sha256"]:
+            raise ManifestBuildError("Source CXR fold manifest hash differs from family authority")
+        lineage = package.manifest["lineage"]
+        required = {
+            "bundle_id": config.dataset.bundle_id,
+            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
+            "official_split_assignment_id": config.dataset.official_split_assignment_id,
+            "cv_assignment_id": config.dataset.cv_assignment_id,
+            "task_id": config.dataset.task_id,
+            "git_commit": git_commit,
+            "dependency_lock_sha256": dependency_lock_sha256,
+            "encoder_identity": _encoder_identity(config),
+            "transform_contract": _transform(config, training=False).contract(),
+        }
+        if any(lineage.get(key) != value for key, value in required.items()):
+            raise ManifestBuildError("Source CXR fold is incompatible with fusion development")
+        coordinate = (package.manifest["repeat_seed"], package.manifest["outer_fold"])
+        result[coordinate] = package
+    if set(result) != {(seed, fold) for seed in REPEAT_SEEDS for fold in range(5)}:
+        raise ManifestBuildError("Source CXR development lacks one or more exact folds")
+    return result
+
+
+def _source_cxr_lineage(
+    development_id: str | None,
+    source: ValidatedFoldPackage | None,
+) -> dict[str, object] | None:
+    if development_id is None and source is None:
+        return None
+    if development_id is None or source is None:
+        raise ManifestBuildError("Source CXR lineage is incomplete")
+    return {
+        "development_id": development_id,
+        "fold_package_id": source.manifest["fold_package_id"],
+        "fold_manifest_sha256": source.manifest_sha256,
+    }
+
+
+def _fold_lineage(
+    config: SymileDevelopmentConfig,
+    context: SymileFoldExecutionContext,
+    pretrained_weight: Mapping[str, object] | None,
+) -> dict[str, object]:
+    return {
+        "bundle_id": config.dataset.bundle_id,
+        "bundle_manifest_sha256": context.data.bundle_manifest_sha256,
+        "official_split_assignment_id": config.dataset.official_split_assignment_id,
+        "cv_assignment_id": config.dataset.cv_assignment_id,
+        "cv_manifest_sha256": context.data.cv_reference.manifest_sha256,
+        "task_id": config.dataset.task_id,
+        "git_commit": context.git_commit,
+        "dependency_lock_sha256": context.dependency_lock_sha256,
+        "encoder_identity": _encoder_identity(config) if config.family in NEURAL_FAMILIES else None,
+        "transform_contract": (
+            _transform(config, training=False).contract()
+            if config.family in NEURAL_FAMILIES
+            else None
+        ),
+        "pretrained_weight": dict(pretrained_weight) if pretrained_weight is not None else None,
+    }
+
+
+def _transform(config: SymileDevelopmentConfig, *, training: bool) -> StandardCxrTransform:
+    if config.image is None:
+        raise ConfigError("Symile neural transform requires image configuration")
+    return StandardCxrTransform(
+        training=training,
+        image_size=int(config.model["image_size"]),
+        rotation_degrees=config.image.rotation_degrees,
+        translation_fraction=config.image.translation_fraction,
+        brightness_jitter=config.image.brightness_jitter,
+        contrast_jitter=config.image.contrast_jitter,
+    )
+
+
+def _encoder_identity(config: SymileDevelopmentConfig) -> dict[str, object]:
+    return {
+        "library": "torchxrayvision",
+        "architecture": str(config.model["encoder_name"]),
+        "weights": str(config.model["weights"]),
+        "embedding_dimension": int(config.model["embedding_dimension"]),
+    }
+
+
+def _probability_metrics(targets: object, probabilities: object) -> dict[str, float]:
+    truth = np.asarray(targets, dtype=np.int8)
+    scores = np.asarray(probabilities, dtype=np.float64)
+    if truth.shape != scores.shape or truth.ndim != 1 or set(truth.tolist()) != {0, 1}:
+        raise ManifestBuildError("Symile metric inputs are invalid")
+    return {
+        "roc_auc": float(roc_auc_score(truth, scores)),
+        "average_precision": float(average_precision_score(truth, scores)),
+        "brier_score": float(brier_score_loss(truth, scores)),
+    }
+
+
+def _existing_fold_ids(config: SymileDevelopmentConfig) -> set[str]:
+    root = Path(config.training["model_directory"]) / "folds"
+    return {path.name for path in root.glob("fold-package-*") if path.is_dir()}
+
+
+def _validate_source_argument(family: str, development_id: str | None) -> None:
+    if family in FUSION_FAMILIES:
+        if development_id is None:
+            raise ConfigError("Symile fusion development requires a source CXR development ID")
+    elif development_id is not None:
+        raise ConfigError("This Symile family does not accept a source CXR development ID")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--source-cxr-development-id", default=None)
+    parser.add_argument("--tracking-uri", default=DEFAULT_TRACKING_URI)
+    add_logging_argument(parser)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    configure_logging(args.log_level)
+    try:
+        config = load_symile_development_config(args.config)
+        result = run_symile_development(
+            config,
+            source_cxr_development_id=args.source_cxr_development_id,
+            tracking_uri=args.tracking_uri,
+        )
+    except (ConfigError, ManifestBuildError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Symile development failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "family": result.manifest["family"],
+                "development_id": result.manifest["development_id"],
+                "development_manifest_sha256": result.manifest_sha256,
+                "report_directory": result.directory.as_posix(),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
