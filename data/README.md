@@ -77,6 +77,11 @@ an interactive bundle selector. Durable consumers pin immutable bundle and CV as
 identities. Official CXR, ECG, lab-percentile, missingness, and identifier NPY arrays remain
 external restricted source assets authenticated through the bundle-bound release checksum manifest.
 
+Supervised development reads only strict-pneumonia rows from official train and validation and
+consumes the immutable CV assignment without regenerating it. Its patient-level OOF tables are
+stored in ignored model packages rather than in `data/manifests/`. The official test rows are not
+available through the development data layer.
+
 Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
 control. These files contain patient-level information even when public identifiers are
 deidentified.

@@ -160,6 +160,79 @@ transform contracts, training policy, selected validation state, and frozen thre
 evaluator validates this package, reconstructs the DenseNet architecture without loading the
 original TorchXRayVision cache, and strictly loads the complete state before reading test rows.
 
+## Symile development-only repeated cross-validation
+
+Six strict family configs define the implemented Symile development surface:
+
+```text
+configs/symile_labs_logistic.yaml
+configs/symile_labs_lightgbm.yaml
+configs/symile_cxr.yaml
+configs/symile_concat.yaml
+configs/symile_gated.yaml
+configs/symile_gated_no_observedness.yaml
+```
+
+Every config pins the immutable Symile bundle, observed bundle-manifest hash, official split
+assignment, CV assignment, and strict-pneumonia task. One invocation executes all three repeats and
+five outer folds. Repeat seeds and folds come from the CV artifact and are not CLI controls.
+
+For each outer fold, the runner derives one deterministic patient-grouped inner split shared by all
+families. The 50 lab ECDFs and missing replacements are fitted on complete outer training and are
+applied unchanged to inner training, inner validation, and outer OOF. Logistic Regression fits on
+complete outer training without inner selection. LightGBM and neural families select on inner
+validation AUROC and are not refitted after selection. Neural fine-tuning exposes only DenseNet
+`denseblock4` and `norm5`; the existing RSNA full-unfreeze and Average Precision lifecycle remains
+unchanged.
+
+Fusion runs require the explicit complete CXR development authority. Each fusion fold loads only
+the selected CXR fold package with the same repeat, outer fold, inner split, data, transform, Git,
+and dependency-lock lineage, and initializes only its encoder. Both gated variants use the same
+architecture and initialization; the ablation replaces observedness inputs with zeros at the model
+boundary while preserving the 100-dimensional lab preprocessing contract.
+
+```bash
+make symile-develop CONFIG=configs/symile_cxr.yaml
+make symile-develop \
+  CONFIG=configs/symile_concat.yaml \
+  SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
+make symile-analyze \
+  DEVELOPMENT_IDS="<labs-lr> <labs-lgbm> <cxr> <concat> <gated> <gated-no-observedness>"
+```
+
+The analyzer validates the six families without trusting argument order. It reports per-repeat
+AUROC, Average Precision, and Brier score; the prespecified paired effects; and neural ensemble
+point estimates computed by aligning the three repeat logits, taking their arithmetic mean, and
+applying sigmoid once. Repeated folds are not treated as independent replicates and no pooled OOF
+bootstrap is performed.
+
+Artifacts have three levels:
+
+```text
+models/symile/development/folds/fold-package-<sha256>/
+  resolved_config.yaml
+  fold_manifest.json
+  oof_predictions.parquet
+  model.skops                         # lab families
+  model.pt                            # neural families
+  lab_preprocessor.skops              # fusion families
+  training_history.json               # neural families
+
+reports/symile/development/families/development-<sha256>/
+  development_manifest.json
+  summary.md
+
+reports/symile/development/analyses/analysis-<sha256>/
+  analysis_manifest.json
+  summary.md
+```
+
+The OOF Parquet is restricted patient-level evidence and remains ignored. Public summaries are
+aggregate and privacy validated. The development layer exposes only official train and validation;
+it implements no official-test, threshold, calibration, ECG, final-fit, or serving path. M6 owns
+ECG, the representation-transfer probe, final-development fitting, calibration, operating
+thresholds, the pre-test freeze, and the single held-out evaluation. M7 owns serving.
+
 ## Tracking and outputs
 
 ### Operational progress

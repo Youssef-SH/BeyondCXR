@@ -1,6 +1,6 @@
 .PHONY: sync lock-check lint format format-check test check inspect rsna-manifest rsna-audit \
-	symile-manifest symile-audit symile-cv train evaluate compare summarize-seeds localize \
-	rsna-gpu pre-commit clean purge-generated
+	symile-manifest symile-audit symile-cv symile-develop symile-analyze train evaluate compare \
+	summarize-seeds localize rsna-gpu pre-commit clean purge-generated
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -45,6 +45,17 @@ symile-audit:
 symile-cv:
 	uv run python -m radfusion.data.symile_cv \
 		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
+
+symile-develop:
+	@test -n "$(CONFIG)" || (echo "CONFIG=configs/symile_<family>.yaml is required"; exit 2)
+	@test -f "$(CONFIG)" || (echo "Symile development config not found: $(CONFIG)"; exit 2)
+	uv run python -m radfusion.training.symile_development --config "$(CONFIG)" \
+		$(if $(SOURCE_CXR_DEVELOPMENT_ID),--source-cxr-development-id "$(SOURCE_CXR_DEVELOPMENT_ID)")
+
+symile-analyze:
+	@test -n "$(DEVELOPMENT_IDS)" || \
+		(echo 'DEVELOPMENT_IDS="<six development IDs>" is required'; exit 2)
+	uv run python -m radfusion.training.symile_analysis --development-ids $(DEVELOPMENT_IDS)
 
 train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
