@@ -14,6 +14,8 @@ from radfusion.models.cxr_baseline import (
     StandardCxrEncoder,
     ensure_pretrained_weights,
     fingerprint_pretrained_weights,
+    set_cxr_encoder_trainability,
+    set_cxr_encoder_training_mode,
 )
 from radfusion.training.config import load_experiment_config
 from radfusion.training.registry import MODELS, get_model
@@ -53,6 +55,33 @@ def test_cxr_classifier_exposes_raw_logits_embeddings_and_freezing() -> None:
     assert all(parameter.requires_grad for parameter in model.classifier.parameters())
     model.unfreeze_encoder()
     assert all(parameter.requires_grad for parameter in model.encoder.parameters())
+
+
+def test_standard_encoder_terminal_trainability_is_exact() -> None:
+    encoder = StandardCxrEncoder(weights=None)
+
+    set_cxr_encoder_trainability(encoder, "terminal")
+
+    expected = {
+        name
+        for name, _ in encoder.named_parameters()
+        if (
+            name.startswith("backbone.features.denseblock4.")
+            or name.startswith("backbone.features.norm5.")
+        )
+    }
+    trainable = {name for name, parameter in encoder.named_parameters() if parameter.requires_grad}
+    assert trainable == expected
+    set_cxr_encoder_training_mode(encoder, "terminal")
+    modules = dict(encoder.named_modules())
+    assert modules["backbone.features.denseblock4"].training
+    assert modules["backbone.features.norm5"].training
+    assert not modules["backbone.features.denseblock3"].training
+    assert not modules["backbone.features.transition3"].training
+    set_cxr_encoder_trainability(encoder, "all")
+    set_cxr_encoder_training_mode(encoder, "all")
+    assert all(parameter.requires_grad for parameter in encoder.parameters())
+    assert all(module.training for module in encoder.modules())
 
 
 def test_image_registry_builds_with_injected_encoder_without_weights() -> None:

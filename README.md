@@ -16,6 +16,8 @@ layer.
 - Content-addressed immutable bundles with exact schemas and integrity validation
 - Authenticated Symile-MIMIC 1.0.0 source qualification, two-table bundle, aggregate audit, and
   immutable repeated-CV assignments
+- Development-only Symile repeated-CV execution for fixed labs, CXR, concat, gated, and
+  observedness-ablation families, with immutable OOF evidence and aggregate analysis
 - Metadata preprocessing fitted on the training split and fixed Logistic Regression and LightGBM
   baselines
 - A TorchXRayVision DenseNet121 image baseline with deterministic per-seed training
@@ -53,9 +55,10 @@ to `data/raw/rsna/extracted/`. The required filenames and directory layout are d
 Symile data commands require the credentialed Symile-MIMIC 1.0.0 release under
 `data/raw/symile/extracted/`. Restricted source and generated patient-level bundles remain local.
 
-Current Symile capabilities cover authenticated source qualification, immutable bundle publication,
-aggregate auditing, and repeated patient-grouped CV assignments. Supervised modeling is the next
-experimental phase.
+Symile supervised development is restricted to the frozen official train and validation cohorts.
+The implementation can execute six fixed families over the immutable 3-by-5 patient-grouped CV
+assignment and publish complete OOF evidence. The official Symile test remains closed to this
+development lifecycle.
 
 ## Commands
 
@@ -64,6 +67,8 @@ make rsna-gpu        # run and export the complete authoritative RSNA campaign
 make symile-manifest # authenticate Symile-MIMIC and publish its immutable bundle
 make symile-audit    # publish the bundle-qualified aggregate Symile audit
 make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
+make symile-develop CONFIG=configs/symile_cxr.yaml
+make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
 
 # Lower-level inspection and debugging commands
 make rsna-manifest   # publish an RSNA bundle
@@ -82,6 +87,12 @@ make inspect FILE=path/to/image.dcm
 `symile-audit` and `symile-cv` resolve `data/manifests/symile/CURRENT` once for interactive use.
 Pass `BUNDLE_ID=build-...` to select an immutable bundle explicitly. Published CV artifacts bind
 the resolved immutable bundle ID. Later scientific configurations pin both immutable identities.
+
+`symile-develop` runs one configured family across all 15 frozen outer folds; repeat and fold are
+not user controls. Concat and gated families additionally require
+`SOURCE_CXR_DEVELOPMENT_ID=development-...`. `symile-analyze` accepts exactly one explicit complete
+development ID for each of the six families and validates family membership independently of CLI
+ordering. Neither command exposes or evaluates the official Symile test.
 
 After the raw dataset is in place, `make rsna-gpu` owns pretrained-weight readiness, bundle and
 audit generation, deterministic image caching, all eight
@@ -157,8 +168,8 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 ## Limitations
 
 - Implemented scope covers the completed RSNA Stage 2 metadata, image, fusion, and localization
-  campaign plus the authenticated Symile-MIMIC data layer. Supervised Symile modeling begins in
-  the next experimental phase.
+  campaign plus the authenticated Symile-MIMIC data layer and development-only repeated-CV
+  lifecycle. No formal Symile development results or held-out-test results are reported here.
 - Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
   endpoint definition.
 

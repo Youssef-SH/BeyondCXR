@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from radfusion.training.config import ConfigError, load_experiment_config
+from radfusion.training.config import (
+    SYMILE_M5_FAMILIES,
+    ConfigError,
+    load_experiment_config,
+    load_symile_development_config,
+    symile_development_semantic_sha256,
+)
 
 
 def test_supported_configs_load_as_immutable_typed_values() -> None:
@@ -139,3 +145,37 @@ def test_model_randomness_controls_are_rejected_in_yaml(tmp_path: Path, seed_key
 
     with pytest.raises(ConfigError):
         load_experiment_config(path)
+
+
+def test_exact_six_symile_development_configs_are_strict() -> None:
+    paths = tuple(Path("configs") / f"symile_{family}.yaml" for family in SYMILE_M5_FAMILIES)
+    configs = tuple(load_symile_development_config(path) for path in paths)
+
+    assert tuple(config.family for config in configs) == SYMILE_M5_FAMILIES
+    assert all(config.dataset.task_id == "pneumonia_strict" for config in configs)
+    assert len({symile_development_semantic_sha256(config) for config in configs}) == 6
+
+
+def test_symile_gated_configs_differ_scientifically_only_by_observedness() -> None:
+    gated = yaml.safe_load(Path("configs/symile_gated.yaml").read_text(encoding="utf-8"))
+    ablation = yaml.safe_load(
+        Path("configs/symile_gated_no_observedness.yaml").read_text(encoding="utf-8")
+    )
+    del gated["name"], gated["family"]
+    del ablation["name"], ablation["family"]
+    observedness = gated["model"].pop("use_observedness")
+    ablated = ablation["model"].pop("use_observedness")
+
+    assert observedness is True
+    assert ablated is False
+    assert gated == ablation
+
+
+def test_symile_config_rejects_scientific_mutation(tmp_path: Path) -> None:
+    document = yaml.safe_load(Path("configs/symile_cxr.yaml").read_text(encoding="utf-8"))
+    document["image"]["warmup_epochs"] = 3
+    path = tmp_path / "changed.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_symile_development_config(path)

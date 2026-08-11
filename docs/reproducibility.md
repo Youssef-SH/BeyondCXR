@@ -163,6 +163,50 @@ Each image and fusion test evaluation also publishes an aligned, validated priva
 under `private/predictions/`. The table supports later aligned analyses and is excluded from public
 reports and MLflow artifacts.
 
+## Reproduce Symile development evidence
+
+The six Symile configs pin the frozen bundle and 3-by-5 patient-grouped CV assignment. Rebuilding
+the M4 artifacts is not part of development execution. Run each family explicitly; fusion families
+also receive the completed CXR development identity:
+
+```bash
+make symile-develop CONFIG=configs/symile_labs_logistic.yaml
+make symile-develop CONFIG=configs/symile_labs_lightgbm.yaml
+make symile-develop CONFIG=configs/symile_cxr.yaml
+make symile-develop CONFIG=configs/symile_concat.yaml \
+  SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
+make symile-develop CONFIG=configs/symile_gated.yaml \
+  SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
+make symile-develop CONFIG=configs/symile_gated_no_observedness.yaml \
+  SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
+```
+
+Each successful invocation produces 15 immutable fold packages and one complete family development
+authority. Every repeat must contain one OOF prediction for each of the 2,368 strict-pneumonia
+development admissions. Neural packages retain selected-epoch histories; LightGBM packages retain
+`best_iteration`. The family manifest records the ordered 15 values and their eighth ordered value
+as the frozen median final-training budget.
+
+After all six family identities exist, publish the aggregate analysis:
+
+```bash
+make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
+```
+
+Identity validation covers exact config bytes, semantic configuration, bundle and CV lineage,
+inner-split identity, reconstructable fitted state, fitted ECDF and feature contracts, validated
+neural history, OOF logical and physical hashes, and exact fold coverage. Family authorities
+recompute each repeat metric and median budget from their 15 folds. Cross-family authorities
+recompute paired effects and mean-logit ensemble metrics from the six families, and summary text
+must equal the deterministic manifest rendering.
+MLflow records one `training`/`oof` run per fold and sets `run_complete=true` only after immutable
+fold publication and ledger updates succeed. Paths, MLflow run IDs, timestamps, and runtime
+hardware remain outside semantic artifact identity.
+
+The development reader requests only official train and validation rows and authenticates only the
+corresponding CXR tensors. It has no official-test accessor. Development produces no thresholds,
+calibration, final full-development model, or held-out-test statistic.
+
 ## Probability and operating-point metrics
 
 Models expose class labels and probabilities. Evaluation locates the column labeled `1` and

@@ -30,6 +30,10 @@ The lifecycle is: source dataset → build execution → immutable bundle → va
 | Seed summarizer | Validate three explicit compatible image or fusion test runs and report aggregate statistics |
 | Localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
 | RSNA campaign | Execute the complete ordered GPU workflow and pass exact run identities in process |
+| Symile development data | Resolve the pinned bundle and CV reference, then expose only official train and validation rows and authenticated CXR tensors |
+| Symile fold runner | Execute one frozen outer fit with a deterministic patient-grouped inner split and publish private OOF evidence |
+| Symile development aggregator | Validate all 15 fold packages and publish repeat metrics and the median final-training budget |
+| Symile analysis | Align six explicit family authorities and publish paired and mean-logit ensemble development evidence |
 | Private analysis store | Retain aligned neural predictions and real-image localization overlays outside public outputs |
 | Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
 
@@ -87,3 +91,24 @@ RSNA source files
 RSNA artifact schemas are defined in [`data_contract.md`](data_contract.md). Experiment composition is
 defined in [`training.md`](training.md). Reconstruction and evaluation protocols are defined in
 [`reproducibility.md`](reproducibility.md).
+
+Symile development follows a separate dataset-specific path after its validated bundle. The data
+layer has no official-test accessor:
+
+```text
+pinned Symile bundle + pinned 3 x 5 CV assignment
+    → official train + validation strict-pneumonia rows
+    → deterministic inner split per repeat and outer fold
+    → immutable fold package with private OOF predictions
+    → complete family development authority
+    → explicit six-family aggregate analysis
+```
+
+Fold packages retain the minimal patient-level OOF fields (`sample_id`, target, logit, and
+probability) under ignored `models/`. Family and cross-family reports contain aggregate values
+only. Fold validation reconstructs the configured fitted estimator or neural architecture,
+strict-loads safe state, and checks preprocessing and selection witnesses. Family validation
+re-derives repeat metrics and final-budget witnesses from all 15 folds; cross-family validation
+re-derives paired and ensemble claims from the six family authorities. Each Markdown summary is a
+deterministic rendering of its manifest. Development performs no threshold selection, calibration,
+final full-development fitting, or official-test evaluation.

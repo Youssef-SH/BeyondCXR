@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol
 
 import lightgbm
 import mlflow
@@ -24,8 +24,13 @@ from mlflow.tracking import MlflowClient
 from radfusion.data.hashing import sha256_file
 from radfusion.utils.operational_logging import get_operational_logger, log_event
 
-if TYPE_CHECKING:
-    from radfusion.training.config import ExperimentConfig
+
+class SourceConfig(Protocol):
+    """Minimal exact-config artifact accepted by MLflow logging."""
+
+    source_path: Path
+    source_bytes: bytes
+
 
 DEFAULT_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_ARTIFACT_DIRECTORY = "mlartifacts"
@@ -137,7 +142,7 @@ def uv_lock_sha256(path: str | Path = "uv.lock") -> str:
     return sha256_file(lock)
 
 
-def log_source_config(config: ExperimentConfig) -> None:
+def log_source_config(config: SourceConfig) -> None:
     """Log the exact loaded experiment configuration for the active MLflow run."""
     with tempfile.TemporaryDirectory(prefix="radfusion-config-") as temporary_directory:
         path = Path(temporary_directory) / "resolved_config.yaml"

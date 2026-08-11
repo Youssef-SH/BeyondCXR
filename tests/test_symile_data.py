@@ -37,6 +37,7 @@ from radfusion.data.symile_cv import (
     generate_cv_assignments,
     publish_symile_cv,
     validate_symile_cv,
+    validate_symile_cv_reference,
 )
 from radfusion.data.symile_manifest import main as symile_manifest_main
 from radfusion.data.symile_schemas import (
@@ -679,6 +680,26 @@ def test_cv_validation_rejects_incorrect_declared_row_count(tmp_path: Path) -> N
             bundle=bundle,
             expected_assignment_id=assignment_id,
         )
+
+
+def test_cv_reference_validation_does_not_load_bundle_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, bundle = _published_synthetic_release(tmp_path)
+    assignment_id, directory = publish_symile_cv(bundle, manifest_directory=tmp_path / "manifests")
+
+    def reject_bundle_sample_access(*args: object, **kwargs: object) -> None:
+        raise AssertionError("reference validation accessed bundle samples")
+
+    monkeypatch.setattr("radfusion.data.symile_cv.read_symile_samples", reject_bundle_sample_access)
+    reference = validate_symile_cv_reference(
+        directory,
+        bundle_id=bundle.bundle_id,
+        expected_assignment_id=assignment_id,
+    )
+
+    assert reference.assignments.num_rows > 0
+    assert reference.manifest["task_id"] == "pneumonia_strict"
 
 
 @pytest.mark.parametrize(
