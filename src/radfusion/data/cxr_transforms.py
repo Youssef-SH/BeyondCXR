@@ -55,6 +55,7 @@ class StandardCxrTransform:
         self,
         *,
         training: bool,
+        policy_version: str = CXR_TRANSFORM_POLICY_VERSION,
         image_size: int = STANDARD_CXR_IMAGE_SIZE,
         rotation_degrees: float = 7.0,
         translation_fraction: float = 0.05,
@@ -63,6 +64,8 @@ class StandardCxrTransform:
     ) -> None:
         if not isinstance(training, bool):
             raise TypeError("training must be Boolean")
+        if policy_version != CXR_TRANSFORM_POLICY_VERSION:
+            raise ValueError("Standard CXR preprocessing policy is unsupported")
         if (
             isinstance(image_size, bool)
             or not isinstance(image_size, int)
