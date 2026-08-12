@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from radfusion.data.hashing import sha256_file
-from radfusion.training.config import ModelConfig
+from radfusion.training.config import FamilyConfig
 
 CXR_TRAINABILITY_SCOPES = frozenset({"frozen", "terminal", "all"})
 
@@ -160,26 +160,23 @@ class ImageDenseNetModel:
     ) -> None:
         self._encoder_factory = encoder_factory
 
-    def build(self, config: ModelConfig) -> CxrBinaryClassifier:
+    def build(self, config: FamilyConfig) -> CxrBinaryClassifier:
         """Build an unfitted classifier without selecting a runtime device."""
         return self._build(config, weights=str(config.parameters["weights"]))
 
-    def build_architecture(self, config: ModelConfig) -> CxrBinaryClassifier:
+    def build_architecture(self, config: FamilyConfig) -> CxrBinaryClassifier:
         """Build the package architecture without loading upstream pretrained bytes."""
         return self._build(config, weights=None)
 
-    def _build(self, config: ModelConfig, *, weights: str | None) -> CxrBinaryClassifier:
-        if config.modality != "image" or config.registry_key != "image_densenet":
+    def _build(self, config: FamilyConfig, *, weights: str | None) -> CxrBinaryClassifier:
+        if config.family_id != "cxr_densenet" or config.modalities != ("cxr",):
             raise ValueError("Image DenseNet requires the registered image model configuration")
-        if config.fit_parameters:
-            raise ValueError("Image DenseNet does not accept model.fit_parameters")
         parameters = dict(config.parameters)
         expected = {
             "encoder_name",
             "weights",
             "image_size",
             "embedding_dimension",
-            "class_weighting",
         }
         if set(parameters) != expected:
             raise ValueError(f"Image DenseNet parameters must be exactly {sorted(expected)}")
@@ -189,8 +186,6 @@ class ImageDenseNetModel:
             raise ValueError("Image DenseNet requires the fixed pretrained weights")
         if parameters["image_size"] != 224 or parameters["embedding_dimension"] != 1024:
             raise ValueError("Image DenseNet requires dimensions 224 and 1024")
-        if parameters["class_weighting"] != "train_pos_weight":
-            raise ValueError("Image DenseNet requires train_pos_weight class weighting")
         encoder = self._encoder_factory(
             weights=weights,
             expected_embedding_dimension=parameters["embedding_dimension"],

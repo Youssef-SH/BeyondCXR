@@ -14,10 +14,10 @@ from radfusion.utils.publication import (
 
 def test_current_marker_is_replaced_atomically(tmp_path: Path) -> None:
     current = tmp_path / "CURRENT"
-    update_current_marker(current, "build-first")
-    update_current_marker(current, "build-second")
+    update_current_marker(current, "artifact-first")
+    update_current_marker(current, "artifact-second")
 
-    assert current.read_text(encoding="utf-8") == "build-second\n"
+    assert current.read_text(encoding="utf-8") == "artifact-second\n"
     assert not list(tmp_path.glob(".CURRENT-*.tmp"))
 
 

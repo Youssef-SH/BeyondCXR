@@ -17,7 +17,7 @@ from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, ge
 
 from radfusion.data.rsna_artifacts import build_and_write
 from radfusion.data.tabular_preprocess import SOURCE_FEATURES
-from radfusion.training.config import load_experiment_config
+from radfusion.training.config import load_experiment_config, with_runtime
 from radfusion.training.datasets import RsnaDataset
 from radfusion.training.evaluate import (
     TestEvaluationResult as EvaluationResult,
@@ -68,21 +68,29 @@ def _partition(name: str) -> DatasetPartition:
 def _config(
     tmp_path: Path,
     *,
-    bundle_id: str = "build-synthetic",
+    bundle_id: str = "bundle-" + "a" * 64,
     manifest_directory: Path | None = None,
-    filename: str = "metadata_logistic.yaml",
+    filename: str = "rsna_metadata_logistic.yaml",
 ):
     document = yaml.safe_load((Path("configs") / filename).read_text(encoding="utf-8"))
     document["dataset"]["bundle_id"] = bundle_id
-    document["training"]["report_directory"] = str(tmp_path / "reports")
-    document["training"]["model_directory"] = str(tmp_path / "models" / "rsna")
-    document["evaluation"]["latency_warmup_calls"] = 1
-    document["evaluation"]["latency_measured_calls"] = 3
-    if manifest_directory is not None:
-        document["dataset"]["manifest_directory"] = str(manifest_directory)
     path = tmp_path / "experiment.yaml"
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-    return load_experiment_config(path)
+    return with_runtime(
+        load_experiment_config(path),
+        seed=42,
+        report_directory=tmp_path / "reports",
+        model_directory=tmp_path / "models" / "rsna",
+        manifest_directory=manifest_directory,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _small_operational_latency_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("radfusion.training.train_tabular.LATENCY_WARMUP_CALLS", 1)
+    monkeypatch.setattr("radfusion.training.train_tabular.LATENCY_MEASURED_CALLS", 3)
+    monkeypatch.setattr("radfusion.training.evaluate.LATENCY_WARMUP_CALLS", 1)
+    monkeypatch.setattr("radfusion.training.evaluate.LATENCY_MEASURED_CALLS", 3)
 
 
 def _tracking_uri(tmp_path: Path) -> str:
@@ -99,7 +107,7 @@ def _train(config, tmp_path: Path):
 
 def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, DatasetPartition]:
     lineage = DatasetLineage(
-        bundle_id="build-synthetic",
+        bundle_id="bundle-" + "a" * 64,
         split_assignment_id="assignment-synthetic",
         label_policy_version="label-synthetic",
         task_id="pneumonia",
@@ -141,7 +149,7 @@ def _fixed_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("radfusion.training.evaluate.uv_lock_sha256", lambda: _SHA256)
 
 
-@pytest.mark.parametrize("filename", ["metadata_logistic.yaml", "metadata_lightgbm.yaml"])
+@pytest.mark.parametrize("filename", ["rsna_metadata_logistic.yaml", "rsna_metadata_lightgbm.yaml"])
 def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -299,7 +307,7 @@ def test_fit_failure_leaves_failed_mlflow_run(
     with pytest.raises(RuntimeError):
         _train(config, tmp_path)
     runs = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id]
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id]
     )
     assert len(runs) == 1
     run = runs[0]
@@ -337,7 +345,7 @@ def test_run_start_precedes_post_creation_mlflow_metadata_failure(
         _train(config, tmp_path)
 
     runs = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id]
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id]
     )
     assert len(runs) == 1
     run_id = runs[0].info.run_id
@@ -370,7 +378,7 @@ def test_required_model_publication_failure_leaves_failed_mlflow_run(
     with pytest.raises(RuntimeError):
         _train(config, tmp_path)
     runs = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id]
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id]
     )
     assert len(runs) == 1
     assert runs[0].info.status == "FAILED"
@@ -396,7 +404,7 @@ def test_incomplete_report_set_fails_training_run(
         _train(config, tmp_path)
 
     run = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id]
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id]
     )[0]
     assert run.info.status == "FAILED"
     assert run.data.tags["run_complete"] != "true"
@@ -417,7 +425,7 @@ def test_training_report_publication_failure_does_not_complete_run(
         _train(config, tmp_path)
 
     run = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id]
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id]
     )[0]
     assert run.info.status == "FAILED"
     assert run.data.tags["run_complete"] != "true"
@@ -454,7 +462,8 @@ def test_training_archives_and_logs_loaded_config_bytes_after_source_mutation(
         "model",
         "seed",
         "git_commit",
-        "source_config_sha256",
+        "config_source_sha256",
+        "config_semantic_sha256",
         "dependency_lock_sha256",
         "local_model_sha256",
         "model_package_id",
@@ -468,18 +477,19 @@ def test_evaluator_rejects_each_training_lineage_tag_mismatch(
 ) -> None:
     config = _config(tmp_path)
     run_id = "training-run"
-    model_path = config.training.model_directory / "runs" / run_id / "model.skops"
+    model_path = config.runtime.model_directory / "runs" / run_id / "model.skops"
     model_path.parent.mkdir(parents=True)
     model_path.write_bytes(b"serialized-model")
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
     manifest = {
         "training_mlflow_run_id": run_id,
-        "source_config_sha256": config.source_sha256,
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "bundle_id": config.dataset.bundle_id,
         "split_assignment_id": "assignment-synthetic",
-        "task": config.dataset.task_id,
-        "model": config.model.registry_key,
-        "seed": config.training.seed,
+        "task": config.task.task_id,
+        "model": config.family.family_id,
+        "seed": config.runtime.seed,
         "git_commit": "commit-synthetic",
         "git_dirty": False,
         "dependency_lock_sha256": _SHA256,
@@ -494,11 +504,12 @@ def test_evaluator_rejects_each_training_lineage_tag_mismatch(
         "dataset_bundle_id": manifest["bundle_id"],
         "split_assignment_id": manifest["split_assignment_id"],
         "task": manifest["task"],
-        "model": config.model.registry_key,
+        "model": config.family.family_id,
         "seed": str(manifest["seed"]),
         "git_commit": manifest["git_commit"],
         "git_dirty": str(manifest["git_dirty"]).lower(),
-        "source_config_sha256": manifest["source_config_sha256"],
+        "config_source_sha256": manifest["config_source_sha256"],
+        "config_semantic_sha256": manifest["config_semantic_sha256"],
         "dependency_lock_sha256": manifest["dependency_lock_sha256"],
         "local_model_sha256": manifest["model_sha256"],
         "model_package_id": manifest["model_package_id"],
@@ -606,7 +617,7 @@ def test_evaluator_rejects_lightgbm_best_iteration_mismatch_before_test_loading(
 ) -> None:
     _install_dataset(monkeypatch)
     _fixed_provenance(monkeypatch)
-    config = _config(tmp_path, filename="metadata_lightgbm.yaml")
+    config = _config(tmp_path, filename="rsna_metadata_lightgbm.yaml")
     training = _train(config, tmp_path)
     manifest_path = training.model_path.parent / "model_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -648,7 +659,7 @@ def test_evaluation_report_publication_failure_does_not_complete_run(
         )
 
     runs = _client(tmp_path).search_runs(
-        [mlflow.get_experiment_by_name(config.mlflow.experiment_name).experiment_id],
+        [mlflow.get_experiment_by_name(config.runtime.experiment_name).experiment_id],
         filter_string="tags.run_kind = 'test_evaluation'",
     )
     assert len(runs) == 1
@@ -668,9 +679,15 @@ def test_evaluator_cli_serializes_completed_result(
         average_precision=0.75,
     )
 
-    def evaluate(run_id: str, *, tracking_uri: str) -> EvaluationResult:
+    def evaluate(
+        run_id: str,
+        *,
+        tracking_uri: str,
+        private_output_directory: Path | None,
+    ) -> EvaluationResult:
         assert run_id == "training-run"
         assert tracking_uri == "sqlite:///test.db"
+        assert private_output_directory is None
         return result
 
     monkeypatch.setattr("radfusion.training.evaluate.evaluate_training_run", evaluate)
@@ -692,7 +709,7 @@ def test_clean_and_purge_generated_have_distinct_scopes(tmp_path: Path) -> None:
         "mlartifacts/keep.txt",
         "mlruns/keep.txt",
         "mlflow.db",
-        "data/manifests/rsna/builds/build-test/bundle.txt",
+        "data/manifests/rsna/bundles/bundle-test/bundle.txt",
         "data/manifests/rsna/CURRENT",
         ".pytest_cache/cache.txt",
         "src/__pycache__/module.pyc",
@@ -720,7 +737,7 @@ def test_clean_and_purge_generated_have_distinct_scopes(tmp_path: Path) -> None:
         "mlartifacts/keep.txt",
         "mlruns/keep.txt",
         "mlflow.db",
-        "data/manifests/rsna/builds/build-test/bundle.txt",
+        "data/manifests/rsna/bundles/bundle-test/bundle.txt",
         "data/manifests/rsna/CURRENT",
         ".git/keep.txt",
         ".venv/__pycache__/keep.pyc",
@@ -745,7 +762,7 @@ def test_clean_and_purge_generated_have_distinct_scopes(tmp_path: Path) -> None:
     for path in ("reports", "models", "mlartifacts", "mlruns", "mlflow.db"):
         assert not (workspace / path).exists()
     assert not (workspace / "data/manifests/rsna/CURRENT").exists()
-    assert not (workspace / "data/manifests/rsna/builds/build-test").exists()
+    assert not (workspace / "data/manifests/rsna/bundles/bundle-test").exists()
     for path in (
         ".git/keep.txt",
         ".venv/__pycache__/keep.pyc",

@@ -28,9 +28,9 @@ from radfusion.training.completed_runs import (
 )
 from radfusion.training.config import (
     ExperimentConfig,
-    fusion_seed_compatibility_sha256,
-    image_seed_compatibility_sha256,
     load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
 )
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI, configure_mlflow
 from radfusion.utils.neural_publication import (
@@ -134,6 +134,14 @@ def _validate_membership_input(run_ids: tuple[str, ...]) -> None:
         raise ValueError("Seed summary test run IDs must be distinct")
 
 
+def _package_modality(config: ExperimentConfig) -> str:
+    if config.family.family_id == "cxr_densenet":
+        return "image"
+    if config.family.family_id == "cxr_metadata_concat":
+        return "fusion"
+    raise ValueError("Seed summary package has an unsupported family")
+
+
 def _load_member(client, test_run_id: str) -> _Member:
     test_run = client.get_run(test_run_id)
     test = require_completed_run(test_run)
@@ -153,7 +161,7 @@ def _load_member(client, test_run_id: str) -> _Member:
         raise ValueError(f"Training run {training.run_id} has an invalid neural model path")
     package_directory = model_path.parent
     manifest = validate_neural_package_metadata(package_directory)
-    config = load_experiment_config(package_directory / CONFIG_FILENAME)
+    config = with_runtime(load_experiment_config(package_directory / CONFIG_FILENAME), seed=seed)
     metrics = validated_neural_test_metrics(test)
     _validate_member_lineage(test_run, parent_run, test, training, config, manifest, seed)
     source_compatibility = _source_cxr_compatibility(client, test, training, manifest, seed)
@@ -177,9 +185,10 @@ def _validate_member_lineage(
     manifest: Mapping[str, Any],
     seed: int,
 ) -> None:
-    if config.model.modality not in {"image", "fusion"} or config.image is None:
+    if config.neural is None:
         raise ValueError("Seed summary package does not contain a neural config")
-    if config.model.modality != test.modality:
+    modality = _package_modality(config)
+    if modality != test.modality:
         raise ValueError("Seed summary package and completed-run modalities differ")
     if test.dataset == "" or training.dataset == "" or test.dataset != training.dataset:
         raise ValueError("Seed summary dataset lineage is missing or inconsistent")
@@ -206,8 +215,8 @@ def _validate_member_lineage(
         "bundle_id": training.bundle_id,
         "split_assignment_id": training.split_assignment_id,
         "label_policy_version": training.label_policy_version,
-        "source_config_sha256": training.source_config_sha256,
-        "semantic_config_sha256": training.semantic_config_sha256,
+        "config_source_sha256": training.config_source_sha256,
+        "config_semantic_sha256": training.config_semantic_sha256,
         "checkpoint_sha256": training.local_model_sha256,
         "model_package_id": training.model_package_id,
     }
@@ -223,13 +232,13 @@ def _validate_member_lineage(
         or source["dependency_lock_sha256"] != training.dependency_lock_sha256
     ):
         raise ValueError("Neural package source provenance disagrees with its training run")
-    if manifest["training_policy"].get("seed") != seed or config.training.seed != seed:
+    if manifest["training_policy"].get("seed") != seed or require_runtime_seed(config) != seed:
         raise ValueError("Neural package seed lineage is inconsistent")
     if (
-        config.dataset.registry_key != training.dataset
+        config.dataset.dataset_id != training.dataset
         or config.dataset.bundle_id != training.bundle_id
-        or config.dataset.task_id != training.task
-        or config.model.registry_key != training.model
+        or config.task.task_id != training.task
+        or config.family.family_id != training.model
     ):
         raise ValueError("Archived config disagrees with completed-run lineage")
     expected_bundle_manifest = manifest["bundle_manifest_sha256"]
@@ -275,11 +284,7 @@ def _compatibility_document(
     training_policy = dict(manifest["training_policy"])
     del training_policy["seed"]
     return {
-        "config_compatibility_sha256": (
-            image_seed_compatibility_sha256(config)
-            if config.model.modality == "image"
-            else fusion_seed_compatibility_sha256(config)
-        ),
+        "config_compatibility_sha256": config.config_semantic_sha256,
         "dataset": test.dataset,
         "task": manifest["task"],
         "label_policy_version": manifest["label_policy_version"],
@@ -310,7 +315,7 @@ def _compatibility_document(
                 "fusion_architecture": manifest["fusion_architecture"],
                 "source_cxr_compatibility": dict(source_cxr_compatibility),
             }
-            if config.model.modality == "fusion"
+            if _package_modality(config) == "fusion"
             else {}
         ),
     }
@@ -339,13 +344,13 @@ def _source_cxr_compatibility(
     source = require_completed_run(client.get_run(source_run_id))
     if (
         source.modality != "image"
-        or source.model != "image_densenet"
+        or source.model != "cxr_densenet"
         or source.run_kind != "training"
         or source.evaluation_scope != "validation"
         or source.integer_seed() != seed
         or source.model_package_id != lineage["model_package_id"]
         or source.checkpoint_sha256 != lineage["checkpoint_sha256"]
-        or source.semantic_config_sha256 != lineage["semantic_config_sha256"]
+        or source.config_semantic_sha256 != lineage["config_semantic_sha256"]
         or source.git_commit != lineage["git_commit"]
         or source.dependency_lock_sha256 != lineage["dependency_lock_sha256"]
     ):
@@ -356,7 +361,7 @@ def _source_cxr_compatibility(
     if source_manifest["model_package_id"] != lineage["model_package_id"]:
         raise ValueError("Fusion source CXR package identity is inconsistent")
     return {
-        "config_compatibility_sha256": image_seed_compatibility_sha256(source_config),
+        "config_compatibility_sha256": source_config.config_semantic_sha256,
         "dataset": source.dataset,
         "task": source.task,
         "bundle_id": source.bundle_id,
@@ -426,8 +431,8 @@ def _report_document(
                 "test_run_id": member.test.run_id,
                 "training_run_id": member.training.run_id,
                 "model_package_id": member.test.model_package_id,
-                "source_config_sha256": member.training.source_config_sha256,
-                "semantic_config_sha256": member.training.semantic_config_sha256,
+                "config_source_sha256": member.training.config_source_sha256,
+                "config_semantic_sha256": member.training.config_semantic_sha256,
                 "metrics": dict(member.metrics),
             }
             for member in members

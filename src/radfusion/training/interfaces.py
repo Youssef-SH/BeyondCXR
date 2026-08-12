@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 from torch import nn
 
-from radfusion.training.config import DatasetConfig, ModelConfig
+from radfusion.training.config import ExperimentConfig, FamilyConfig
 
 
 @dataclass(frozen=True)
@@ -63,32 +63,32 @@ class ModelFitResult:
 class DatasetImplementation(Protocol):
     """Dataset adapter used by the tabular runner and evaluator."""
 
-    def load_train_validation(self, config: DatasetConfig) -> DatasetRunData:
+    def load_train_validation(self, config: ExperimentConfig) -> DatasetRunData:
         """Load only train and validation partitions from a pinned bundle."""
 
-    def load_lineage(self, config: DatasetConfig) -> DatasetLineage:
+    def load_lineage(self, config: ExperimentConfig) -> DatasetLineage:
         """Validate a pinned bundle and return task lineage."""
 
-    def load_test(self, config: DatasetConfig) -> tuple[DatasetPartition, DatasetLineage]:
+    def load_test(self, config: ExperimentConfig) -> tuple[DatasetPartition, DatasetLineage]:
         """Load only the test partition and its pinned lineage."""
 
-    def load_image_train_validation(self, config: DatasetConfig) -> Any:
+    def load_image_train_validation(self, config: ExperimentConfig) -> Any:
         """Load source-inventory-bound image train and validation rows."""
 
     def load_image_test(
         self,
-        config: DatasetConfig,
+        config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
     ) -> Any:
         """Load source-inventory-bound image test rows."""
 
-    def load_fusion_train_validation(self, config: DatasetConfig) -> Any:
+    def load_fusion_train_validation(self, config: ExperimentConfig) -> Any:
         """Load source-inventory-bound aligned fusion train and validation rows."""
 
     def load_fusion_test(
         self,
-        config: DatasetConfig,
+        config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
     ) -> Any:
@@ -100,7 +100,7 @@ class ModelImplementation(Protocol):
 
     def fit(
         self,
-        config: ModelConfig,
+        config: ExperimentConfig,
         training_seed: int,
         train_features: pd.DataFrame,
         train_targets: np.ndarray,
@@ -113,7 +113,7 @@ class ModelImplementation(Protocol):
 class ImageModelImplementation(Protocol):
     """Registered image model builder used by the neural runner."""
 
-    def build(self, config: ModelConfig) -> nn.Module:
+    def build(self, config: FamilyConfig) -> nn.Module:
         """Build an unfitted image model."""
 
 
@@ -122,7 +122,7 @@ class FusionModelImplementation(Protocol):
 
     def build(
         self,
-        config: ModelConfig,
+        config: FamilyConfig,
         *,
         structured_dimension: int,
         weights: str | None = None,

@@ -108,8 +108,8 @@ class CompletedRunRecord:
     git_commit: str
     git_dirty: str
     dependency_lock_sha256: str
-    source_config_sha256: str
-    semantic_config_sha256: str
+    config_source_sha256: str
+    config_semantic_sha256: str
     local_model_path: str
     local_model_sha256: str
     checkpoint_sha256: str
@@ -189,8 +189,8 @@ def require_completed_run(run) -> CompletedRunRecord:
         git_commit=tags.get("git_commit", ""),
         git_dirty=tags.get("git_dirty", ""),
         dependency_lock_sha256=tags.get("dependency_lock_sha256", ""),
-        source_config_sha256=tags.get("source_config_sha256", ""),
-        semantic_config_sha256=tags.get("semantic_config_sha256", ""),
+        config_source_sha256=tags.get("config_source_sha256", ""),
+        config_semantic_sha256=tags.get("config_semantic_sha256", ""),
         local_model_path=tags.get("local_model_path", ""),
         local_model_sha256=tags.get("local_model_sha256", ""),
         checkpoint_sha256=tags.get("checkpoint_sha256", ""),

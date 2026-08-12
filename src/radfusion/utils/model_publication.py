@@ -33,7 +33,8 @@ REQUIRED_MANIFEST_FIELDS = frozenset(
         "task",
         "positive_class",
         "model",
-        "source_config_sha256",
+        "config_source_sha256",
+        "config_semantic_sha256",
         "seed",
         "git_commit",
         "git_dirty",
@@ -178,12 +179,17 @@ def _validate_manifest(
     for field in ("bundle_id", "split_assignment_id", "task", "model", "git_commit"):
         if not isinstance(document[field], str) or not document[field]:
             raise ValueError(f"Model manifest {field} must be a non-empty string")
-    for field in ("model_sha256", "source_config_sha256", "dependency_lock_sha256"):
+    for field in (
+        "model_sha256",
+        "config_source_sha256",
+        "config_semantic_sha256",
+        "dependency_lock_sha256",
+    ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Model manifest {field} must be a lowercase SHA-256")
     if document["model_sha256"] != sha256_file(model_path):
         raise ValueError("Model SHA-256 does not match model bytes")
-    if document["source_config_sha256"] != sha256_file(config_path):
+    if document["config_source_sha256"] != sha256_file(config_path):
         raise ValueError("Source config SHA-256 does not match archived config bytes")
     positive_class = document["positive_class"]
     if (

@@ -1,0 +1,38 @@
+config_version: 1
+
+dataset:
+  dataset_id: rsna
+  bundle_id: bundle-8a6af8b0b28c64d409722a55444461a0623aa8fa47e48dd88431890c5219c624
+  bundle_manifest_sha256: e3b974816dee63abbe9c1cd2df7f6c2a266ae6f5085d3a347e5bdf9bb3cc40b3
+  split_assignment_id: split-assignment-b36a1ab52e0a2310f3cf1631b40c9b96b027ce67cc65616cdc13c89787396bfd
+
+task:
+  task_id: pneumonia
+  label_policy_version: rsna-stage-2-target-v1
+
+family:
+  family_id: metadata_lightgbm
+  modalities: [metadata]
+  parameters:
+    objective: binary
+    num_leaves: 31
+    min_child_samples: 20
+
+preprocessing:
+  metadata_policy: rsna-metadata-input-v1
+
+training:
+  selection_metric: average_precision
+  parameters:
+    n_estimators: 500
+    learning_rate: 0.03
+    subsample: 0.90
+    subsample_freq: 1
+    colsample_bytree: 0.90
+    reg_lambda: 1.0
+    class_weighting: train_neg_pos_ratio
+    early_stopping_rounds: 50
+
+evaluation:
+  sensitivity_target: 0.90
+  calibration_bins: 15

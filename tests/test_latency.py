@@ -4,7 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from radfusion.evaluation.latency import benchmark_single_sample_latency_ms
+from radfusion.evaluation.latency import (
+    LATENCY_MEASURED_CALLS,
+    LATENCY_WARMUP_CALLS,
+    benchmark_single_sample_latency_ms,
+)
 
 
 class _RecordingModel:
@@ -15,6 +19,11 @@ class _RecordingModel:
     def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
         self.samples.append(str(features.index[0]))
         return np.asarray([[0.75, 0.25]], dtype=np.float64)
+
+
+def test_operational_latency_defaults_are_frozen() -> None:
+    assert LATENCY_WARMUP_CALLS == 100
+    assert LATENCY_MEASURED_CALLS == 1_000
 
 
 def test_latency_benchmark_uses_warmup_and_median_single_sample_calls(monkeypatch) -> None:

@@ -58,13 +58,13 @@ class SymileGatedFusionHead(nn.Module):
     def __init__(self, parameters: Mapping[str, object]) -> None:
         super().__init__()
         use_observedness = parameters["use_observedness"]
-        modalities = parameters["modalities"]
+        modality_count = parameters["modality_count"]
         if not isinstance(use_observedness, bool):
             raise TypeError("use_observedness must be Boolean")
-        if modalities != 2:
+        if modality_count != 2:
             raise ValueError("M5 gated fusion requires exactly CXR and laboratories")
         self.use_observedness = use_observedness
-        self.modalities = modalities
+        self.modality_count = modality_count
         self.lab_input_dimension = int(parameters["lab_input_dimension"])
         self.observedness_dimension = int(parameters["observedness_dimension"])
         self.latent_dimension = int(parameters["latent_dimension"])
@@ -90,12 +90,15 @@ class SymileGatedFusionHead(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        gate_input = modalities * self.latent_dimension + self.observedness_dimension
+        gate_input = modality_count * self.latent_dimension + self.observedness_dimension
         self.gate = nn.Sequential(
             nn.Linear(gate_input, int(parameters["gate_hidden_dimension"])),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(int(parameters["gate_hidden_dimension"]), modalities * self.latent_dimension),
+            nn.Linear(
+                int(parameters["gate_hidden_dimension"]),
+                modality_count * self.latent_dimension,
+            ),
         )
         self.output = nn.Sequential(
             nn.Linear(self.latent_dimension, int(parameters["classifier_hidden_dimension"])),
@@ -136,7 +139,7 @@ class SymileGatedFusionHead(nn.Module):
         ]
         gate_input = torch.cat((*representations, observedness), dim=1)
         weights = torch.softmax(
-            self.gate(gate_input).reshape(-1, self.modalities, self.latent_dimension),
+            self.gate(gate_input).reshape(-1, self.modality_count, self.latent_dimension),
             dim=1,
         )
         stacked = torch.stack(representations, dim=1)

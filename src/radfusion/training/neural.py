@@ -22,12 +22,11 @@ from radfusion.models.cxr_baseline import (
     set_cxr_encoder_trainability,
     set_cxr_encoder_training_mode,
 )
-from radfusion.training.config import ImageConfig
+from radfusion.training.config import NeuralConfig
 from radfusion.training.device import ResolvedDevice
 from radfusion.training.execution import (
     LoaderExecutionPolicy,
     one_shot_loader_policy,
-    reused_loader_policy,
 )
 
 CLASS_WEIGHT_POLICY_VERSION = "training-label-prevalence-pos-weight-v1"
@@ -205,15 +204,13 @@ def build_image_loaders(
     train_dataset: Dataset[Any],
     validation_dataset: Dataset[Any],
     *,
-    config: ImageConfig,
+    config: NeuralConfig,
     runtime: ResolvedDevice,
     seed: int,
-    execution: LoaderExecutionPolicy | None = None,
+    execution: LoaderExecutionPolicy,
 ) -> ImageLoaders:
     """Construct deterministic training and validation loaders."""
-    policy = execution or reused_loader_policy(
-        num_workers=config.num_workers, pin_memory=runtime.pin_memory_effective
-    )
+    policy = execution
     if policy.lifecycle != "reused":
         raise ValueError("Training requires a reused DataLoader execution policy")
     if policy.pin_memory != runtime.pin_memory_effective:
@@ -248,7 +245,7 @@ def build_image_loaders(
 def build_evaluation_loader(
     dataset: Dataset[Any],
     *,
-    config: ImageConfig,
+    config: NeuralConfig,
     runtime: ResolvedDevice,
     execution: LoaderExecutionPolicy | None = None,
 ) -> DataLoader[Any]:
@@ -448,9 +445,10 @@ def fit_image_model(
     model: nn.Module,
     loaders: ImageLoaders,
     *,
-    config: ImageConfig,
+    config: NeuralConfig,
     runtime: ResolvedDevice,
     pos_weight: float,
+    selection_metric: SelectionMetricName,
     epoch_callback: EpochCallback | None = None,
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
@@ -466,6 +464,7 @@ def fit_image_model(
         config=config,
         runtime=runtime,
         pos_weight=pos_weight,
+        selection_metric=selection_metric,
         epoch_callback=epoch_callback,
         epoch_started_callback=epoch_started_callback,
         stage_callback=stage_callback,
@@ -480,9 +479,10 @@ def fit_two_stage_binary_model(
     validation_loader: DataLoader[Any],
     *,
     input_keys: tuple[str, ...],
-    config: ImageConfig,
+    config: NeuralConfig,
     runtime: ResolvedDevice,
     pos_weight: float,
+    selection_metric: SelectionMetricName,
     epoch_callback: EpochCallback | None = None,
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
@@ -490,6 +490,8 @@ def fit_two_stage_binary_model(
     throughput_callback: EpochThroughputCallback | None = None,
 ) -> NeuralFitResult:
     """Run the frozen RSNA AP-selected two-stage binary lifecycle."""
+    if selection_metric != "average_precision":
+        raise NeuralTrainingError("RSNA neural adapter requires average_precision selection")
     selected_history: list[EpochRecord] = []
 
     def adapt_epoch(record: SelectedMetricEpochRecord) -> None:
@@ -522,7 +524,7 @@ def fit_two_stage_binary_model(
         config=config,
         runtime=runtime,
         pos_weight=pos_weight,
-        selection_metric="average_precision",
+        selection_metric=selection_metric,
         fine_tune_scope="all",
         epoch_callback=adapt_epoch,
         epoch_started_callback=epoch_started_callback,
@@ -545,7 +547,7 @@ def fit_selected_two_stage_binary_model(
     validation_loader: DataLoader[Any],
     *,
     input_keys: tuple[str, ...],
-    config: ImageConfig,
+    config: NeuralConfig,
     runtime: ResolvedDevice,
     pos_weight: float,
     selection_metric: SelectionMetricName,

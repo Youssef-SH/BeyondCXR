@@ -22,7 +22,8 @@ def test_training_entrypoint_invokes_runner_from_config(monkeypatch, capsys) -> 
 
     monkeypatch.setattr("radfusion.training.train.train_configured_experiment", fake_train)
 
-    assert main(["--config", "configs/metadata_logistic.yaml"]) == 0
-    assert captured["config"].model.registry_key == "metadata_logistic"
+    assert main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
+    assert captured["config"].family.family_id == "metadata_logistic"
+    assert captured["config"].runtime.seed == 42
     assert captured["tracking_uri"] == "sqlite:///mlflow.db"
-    assert '"config": "configs/metadata_logistic.yaml"' in capsys.readouterr().out
+    assert '"config": "configs/rsna_metadata_logistic.yaml"' in capsys.readouterr().out

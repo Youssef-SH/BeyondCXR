@@ -24,11 +24,16 @@ from radfusion.utils.symile_publication import (
     validate_fold_package,
 )
 
-NEURAL_ANALYSIS_FAMILIES = ("cxr", "concat", "gated", "gated_no_observedness")
+NEURAL_ANALYSIS_FAMILIES = (
+    "cxr_densenet",
+    "cxr_labs_concat",
+    "cxr_labs_gated",
+    "cxr_labs_gated_no_observedness",
+)
 PAIRED_COMPARISONS = {
-    "concat_minus_cxr": ("concat", "cxr"),
-    "gated_minus_cxr": ("gated", "cxr"),
-    "gated_minus_concat": ("gated", "concat"),
+    "concat_minus_cxr": ("cxr_labs_concat", "cxr_densenet"),
+    "gated_minus_cxr": ("cxr_labs_gated", "cxr_densenet"),
+    "gated_minus_concat": ("cxr_labs_gated", "cxr_labs_concat"),
 }
 ANALYSIS_POLICY = {
     "policy_version": "symile-m5-development-analysis-v1",
@@ -72,8 +77,12 @@ def analyze_symile_development(
         for family in NEURAL_ANALYSIS_FAMILIES
     }
     observedness_ablation = {
-        "repeat_effects": _paired_repeat_effects(frames["gated"], frames["gated_no_observedness"]),
-        "ensemble_effect": _ensemble_effect(frames["gated"], frames["gated_no_observedness"]),
+        "repeat_effects": _paired_repeat_effects(
+            frames["cxr_labs_gated"], frames["cxr_labs_gated_no_observedness"]
+        ),
+        "ensemble_effect": _ensemble_effect(
+            frames["cxr_labs_gated"], frames["cxr_labs_gated_no_observedness"]
+        ),
     }
     return publish_analysis_result(
         report_root=report_root,

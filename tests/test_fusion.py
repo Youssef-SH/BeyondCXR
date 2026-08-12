@@ -28,16 +28,14 @@ from radfusion.data.tabular_preprocess import (
 from radfusion.models.fusion_concat import (
     FusionConcatModel,
     RsnaConcatFusionModel,
+    fusion_architecture_contract,
     initialize_fusion_encoder,
 )
 from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (
     ConfigError,
-    fusion_architecture_contract,
-    fusion_seed_compatibility_sha256,
-    fusion_semantic_config_sha256,
-    image_semantic_config_sha256,
     load_experiment_config,
+    with_runtime,
 )
 from radfusion.training.datasets import (
     FusionRunData,
@@ -70,7 +68,7 @@ from radfusion.utils.neural_publication import (
 )
 from radfusion.utils.private_predictions import validate_private_neural_predictions
 
-_SYNTHETIC_BUNDLE_ID = "build-" + "a" * 64
+_SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64
 
 
 class _TinyEncoder(nn.Module):
@@ -83,7 +81,7 @@ class _TinyEncoder(nn.Module):
 
 
 def _document() -> dict[str, object]:
-    return yaml.safe_load(Path("configs/fusion_concat_seed42.yaml").read_text(encoding="utf-8"))
+    return yaml.safe_load(Path("configs/rsna_cxr_metadata_concat.yaml").read_text(encoding="utf-8"))
 
 
 def _write(tmp_path: Path, document: dict[str, object]) -> Path:
@@ -92,34 +90,27 @@ def _write(tmp_path: Path, document: dict[str, object]) -> Path:
     return path
 
 
-def test_locked_fusion_configs_are_strict_and_differ_only_by_seed() -> None:
-    paths = [
-        Path("configs/fusion_concat_seed17.yaml"),
-        Path("configs/fusion_concat_seed42.yaml"),
-        Path("configs/fusion_concat_seed2026.yaml"),
-    ]
+def test_locked_fusion_config_is_seed_free_and_runtime_compatible() -> None:
+    paths = [Path("configs/rsna_cxr_metadata_concat.yaml")] * 3
     documents = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in paths]
     configs = [load_experiment_config(path) for path in paths]
 
-    assert {config.training.seed for config in configs} == {17, 42, 2026}
-    assert {config.model.modality for config in configs} == {"fusion"}
-    assert {config.model.registry_key for config in configs} == {"fusion_concat"}
+    assert {config.runtime.seed for config in configs} == {None}
+    assert {config.family.modalities for config in configs} == {("cxr", "metadata")}
+    assert {config.family.family_id for config in configs} == {"cxr_metadata_concat"}
     assert all("source_training_run_id" not in str(document) for document in documents)
-    assert len({fusion_semantic_config_sha256(config) for config in configs}) == 3
-    assert len({fusion_seed_compatibility_sha256(config) for config in configs}) == 1
-    for document in documents:
-        del document["training"]["seed"]
+    assert len({config.config_semantic_sha256 for config in configs}) == 1
     assert documents[1:] == documents[:-1]
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda document: document["model"]["parameters"].update({"dropout": 0.3}),
-        lambda document: document["model"]["parameters"].update({"unknown": 1}),
-        lambda document: document["model"]["parameters"].pop("fusion_hidden_dimension"),
-        lambda document: document["model"].update({"modality": "image"}),
-        lambda document: document.pop("image"),
+        lambda document: document["family"]["parameters"].update({"unknown": 1}),
+        lambda document: document["family"]["parameters"].pop("fusion_hidden_dimension"),
+        lambda document: document["family"].update({"modalities": ["cxr"]}),
+        lambda document: document["family"].update({"family_id": "cxr_densenet"}),
+        lambda document: document["training"].pop("loader"),
     ],
 )
 def test_fusion_config_rejects_unknown_missing_and_nonfixed_fields(
@@ -132,14 +123,14 @@ def test_fusion_config_rejects_unknown_missing_and_nonfixed_fields(
 
 
 def test_fusion_training_requires_explicit_runtime_source_run(capsys) -> None:
-    assert train_main(["--config", "configs/fusion_concat_seed42.yaml"]) == 1
+    assert train_main(["--config", "configs/rsna_cxr_metadata_concat.yaml", "--seed", "42"]) == 1
     assert "--source-training-run-id" in capsys.readouterr().err
 
 
 def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership() -> None:
-    config = load_experiment_config("configs/fusion_concat_seed42.yaml")
+    config = load_experiment_config("configs/rsna_cxr_metadata_concat.yaml")
     model = FusionConcatModel(encoder_factory=_TinyEncoder).build(
-        config.model,
+        config.family,
         structured_dimension=7,
         weights=None,
     )
@@ -147,7 +138,7 @@ def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership
 
     assert logits.shape == (3,)
     assert torch.isfinite(logits).all()
-    architecture = fusion_architecture_contract(config.model, structured_input_dimension=7)
+    architecture = fusion_architecture_contract(config.family, structured_input_dimension=7)
     assert (
         model.classifier.image_projection[0].in_features
         == architecture["image_embedding_dimension"]
@@ -169,14 +160,14 @@ def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership
 
 
 def test_fusion_encoder_initialization_loads_only_exact_source_encoder_state() -> None:
-    config = load_experiment_config("configs/fusion_concat_seed42.yaml")
+    config = load_experiment_config("configs/rsna_cxr_metadata_concat.yaml")
     source = RsnaConcatFusionModel(
         _TinyEncoder(),
-        fusion_architecture_contract(config.model, structured_input_dimension=2),
+        fusion_architecture_contract(config.family, structured_input_dimension=2),
     )
     destination = RsnaConcatFusionModel(
         _TinyEncoder(),
-        fusion_architecture_contract(config.model, structured_input_dimension=5),
+        fusion_architecture_contract(config.family, structured_input_dimension=5),
     )
     source_state = {
         **{f"encoder.{key}": value for key, value in source.encoder.state_dict().items()},
@@ -192,8 +183,8 @@ def test_fusion_encoder_initialization_loads_only_exact_source_encoder_state() -
 def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
     tmp_path: Path,
 ) -> None:
-    config_path = Path("configs/fusion_concat_seed42.yaml")
-    config = load_experiment_config(config_path)
+    config_path = Path("configs/rsna_cxr_metadata_concat.yaml")
+    config = with_runtime(load_experiment_config(config_path), seed=42)
     features = pd.DataFrame(
         {
             "age_years": [20.0, 40.0, 60.0, 80.0],
@@ -237,7 +228,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         bundle_manifest_sha256="4" * 64,
         source_inventory=source_inventory,
     )
-    image = config.image
+    image = config.neural
     assert image is not None
     transform_kwargs = {
         "image_size": 224,
@@ -269,7 +260,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
             training_run_id="source-run",
             model_package_id="source-package",
             checkpoint_sha256="6" * 64,
-            semantic_config_sha256="7" * 64,
+            config_semantic_sha256="7" * 64,
             git_commit="commit-test",
             dependency_lock_sha256="5" * 64,
         ),
@@ -318,7 +309,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         == contract
     )
     assert validated["fusion_architecture"] == fusion_architecture_contract(
-        config.model,
+        config.family,
         structured_input_dimension=int(contract["transformed_dimension"]),
     )
 
@@ -330,7 +321,7 @@ def test_fusion_package_identity_binds_source_package_but_not_source_run() -> No
         "training_run_id": "run-a",
         "model_package_id": "package-a",
         "checkpoint_sha256": "1" * 64,
-        "semantic_config_sha256": "2" * 64,
+        "config_semantic_sha256": "2" * 64,
         "git_commit": "commit-a",
         "dependency_lock_sha256": "3" * 64,
     }
@@ -351,7 +342,7 @@ class _SourceRecord(SimpleNamespace):
     [
         ("dataset", "other"),
         ("task", "other"),
-        ("bundle_id", "build-other"),
+        ("bundle_id", "bundle-other"),
         ("split_assignment_id", "split-other"),
         ("label_policy_version", "label-other"),
         ("model_package_id", "package-other"),
@@ -363,19 +354,21 @@ class _SourceRecord(SimpleNamespace):
     ],
 )
 def test_source_cxr_lineage_mismatch_is_rejected(field: str, replacement: str) -> None:
-    source_config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    fusion_config = load_experiment_config("configs/fusion_concat_seed42.yaml")
+    source_config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=42)
+    fusion_config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42
+    )
     manifest = {
         "training_mlflow_run_id": "source-run",
         "modality": "image",
-        "model": "image_densenet",
+        "model": "cxr_densenet",
         "task": "pneumonia",
         "bundle_id": fusion_config.dataset.bundle_id,
         "bundle_manifest_sha256": "4" * 64,
         "split_assignment_id": "split-test",
         "label_policy_version": "label-test",
-        "source_config_sha256": source_config.source_sha256,
-        "semantic_config_sha256": image_semantic_config_sha256(source_config),
+        "config_source_sha256": source_config.config_source_sha256,
+        "config_semantic_sha256": source_config.config_semantic_sha256,
         "checkpoint_sha256": "6" * 64,
         "model_package_id": "source-package",
         "training_policy": {"seed": 42},
@@ -395,7 +388,7 @@ def test_source_cxr_lineage_mismatch_is_rejected(field: str, replacement: str) -
         model_package_id="source-package",
         split_assignment_id="split-test",
         label_policy_version="label-test",
-        semantic_config_sha256=image_semantic_config_sha256(source_config),
+        config_semantic_sha256=source_config.config_semantic_sha256,
         checkpoint_sha256="6" * 64,
         local_model_sha256="6" * 64,
         git_commit="source-commit",
@@ -419,19 +412,21 @@ def test_source_cxr_lineage_mismatch_is_rejected(field: str, replacement: str) -
 
 
 def test_source_cxr_git_commit_must_match_current_fusion_revision() -> None:
-    source_config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    fusion_config = load_experiment_config("configs/fusion_concat_seed42.yaml")
+    source_config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=42)
+    fusion_config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42
+    )
     manifest = {
         "training_mlflow_run_id": "source-run",
         "modality": "image",
-        "model": "image_densenet",
+        "model": "cxr_densenet",
         "task": "pneumonia",
         "bundle_id": fusion_config.dataset.bundle_id,
         "bundle_manifest_sha256": "4" * 64,
         "split_assignment_id": "split-test",
         "label_policy_version": "label-test",
-        "source_config_sha256": source_config.source_sha256,
-        "semantic_config_sha256": image_semantic_config_sha256(source_config),
+        "config_source_sha256": source_config.config_source_sha256,
+        "config_semantic_sha256": source_config.config_semantic_sha256,
         "checkpoint_sha256": "6" * 64,
         "model_package_id": "source-package",
         "training_policy": {"seed": 42},
@@ -451,7 +446,7 @@ def test_source_cxr_git_commit_must_match_current_fusion_revision() -> None:
         model_package_id="source-package",
         split_assignment_id="split-test",
         label_policy_version="label-test",
-        semantic_config_sha256=image_semantic_config_sha256(source_config),
+        config_semantic_sha256=source_config.config_semantic_sha256,
         checkpoint_sha256="6" * 64,
         local_model_sha256="6" * 64,
         git_commit="source-commit",
@@ -480,7 +475,7 @@ def test_source_cxr_seed_mismatch_is_rejected_before_package_access(
         run_kind="training",
         evaluation_scope="validation",
         modality="image",
-        model="image_densenet",
+        model="cxr_densenet",
         seed="17",
     )
     monkeypatch.setattr(
@@ -495,7 +490,7 @@ def test_source_cxr_seed_mismatch_is_rejected_before_package_access(
         resolve_source_cxr_training_run(
             SimpleNamespace(get_run=lambda run_id: object()),
             "source-run",
-            load_experiment_config("configs/fusion_concat_seed42.yaml"),
+            with_runtime(load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42),
             current_git_commit="fusion-commit",
             current_git_dirty=False,
             current_dependency_lock_sha256="5" * 64,
@@ -528,24 +523,10 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     document = _document()
-    document["dataset"].update(
+    document["dataset"]["bundle_id"] = _SYNTHETIC_BUNDLE_ID
+    document["training"]["loader"].update({"batch_size": 2})
+    document["training"]["parameters"].update(
         {
-            "bundle_id": _SYNTHETIC_BUNDLE_ID,
-            "dataset_root": str(tmp_path / "raw"),
-            "manifest_directory": str(tmp_path / "manifests"),
-        }
-    )
-    document["training"].update(
-        {
-            "model_directory": str(tmp_path / "models" / "rsna"),
-            "report_directory": str(tmp_path / "reports"),
-        }
-    )
-    document["image"].update(
-        {
-            "batch_size": 2,
-            "num_workers": 0,
-            "device": "cpu",
             "mixed_precision": False,
             "warmup_epochs": 1,
             "fine_tune_epochs": 1,
@@ -553,7 +534,18 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         }
     )
     config_path = _write(tmp_path, document)
-    config = load_experiment_config(config_path)
+    config = with_runtime(
+        load_experiment_config(config_path),
+        seed=42,
+        source_root=tmp_path / "raw",
+        manifest_directory=tmp_path / "manifests",
+        model_directory=tmp_path / "models" / "rsna",
+        report_directory=tmp_path / "reports",
+        private_output_directory=tmp_path / "explicit-private-root",
+        device="cpu",
+        num_workers=0,
+        pin_memory_policy="disabled",
+    )
     lineage = DatasetLineage(
         bundle_id=_SYNTHETIC_BUNDLE_ID,
         split_assignment_id="split-synthetic",
@@ -615,13 +607,13 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
 
     source_model = RsnaConcatFusionModel(
         _TinyEncoder(),
-        fusion_architecture_contract(config.model, structured_input_dimension=2),
+        fusion_architecture_contract(config.family, structured_input_dimension=2),
     )
     source_lineage = SourceCxrLineage(
         training_run_id="source-image-run",
         model_package_id="source-image-package",
         checkpoint_sha256="6" * 64,
-        semantic_config_sha256="7" * 64,
+        config_semantic_sha256="7" * 64,
         git_commit="fusion-commit",
         dependency_lock_sha256="8" * 64,
     )
@@ -719,13 +711,20 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert adapter.test_calls == 0
     manifest_path.write_bytes(original_manifest)
 
-    evaluation = evaluate_training_run(training.run_id, tracking_uri=tracking_uri)
+    evaluation = evaluate_training_run(
+        training.run_id,
+        tracking_uri=tracking_uri,
+        private_output_directory=config.runtime.private_output_directory,
+    )
     assert adapter.test_calls == 1
     assert evaluation.training_run_id == training.run_id
     private_manifest = validate_private_neural_predictions(evaluation.private_prediction_directory)
     assert private_manifest["training_run_id"] == training.run_id
     assert private_manifest["test_evaluation_run_id"] == evaluation.run_id
     assert private_manifest["model_package_id"] == training.model_package_id
+    assert evaluation.private_prediction_directory.parent.parent.parent == (
+        config.runtime.private_output_directory
+    )
     assert not any(path.suffix == ".parquet" for path in evaluation.artifact_directory.rglob("*"))
     recorded = configure_mlflow(tracking_uri=tracking_uri).get_run(evaluation.run_id)
     assert configure_mlflow(tracking_uri=tracking_uri).list_artifacts(evaluation.run_id) == []
@@ -746,12 +745,17 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
 
     monkeypatch.setattr("radfusion.training.evaluate_fusion.publish_directory", fail_publication)
     with pytest.raises(OSError):
-        evaluate_training_run(training.run_id, tracking_uri=tracking_uri)
+        evaluate_training_run(
+            training.run_id,
+            tracking_uri=tracking_uri,
+            private_output_directory=config.runtime.private_output_directory,
+        )
     failed = configure_mlflow(tracking_uri=tracking_uri).search_runs(
         experiment_ids=[recorded.info.experiment_id],
         filter_string="attributes.status = 'FAILED'",
     )
     assert any(run.data.tags.get("run_complete") == "false" for run in failed)
     assert not any(
-        (tmp_path / "private/predictions/rsna" / run.info.run_id).exists() for run in failed
+        (config.runtime.private_output_directory / "predictions/rsna" / run.info.run_id).exists()
+        for run in failed
     )

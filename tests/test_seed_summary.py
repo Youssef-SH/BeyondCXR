@@ -16,16 +16,16 @@ from radfusion.training.completed_runs import (
     require_completed_run,
     validated_image_test_metrics,
 )
-from radfusion.training.config import image_semantic_config_sha256, load_experiment_config
+from radfusion.training.config import load_experiment_config
 from radfusion.training.summarize_seeds import summarize_seed_runs
 from radfusion.utils.mlflow_utils import configure_mlflow
 
 _CONFIG_PATHS = {
-    17: Path("configs/image_densenet_seed17.yaml"),
-    42: Path("configs/image_densenet_seed42.yaml"),
-    2026: Path("configs/image_densenet_seed2026.yaml"),
+    17: Path("configs/rsna_cxr_densenet.yaml"),
+    42: Path("configs/rsna_cxr_densenet.yaml"),
+    2026: Path("configs/rsna_cxr_densenet.yaml"),
 }
-_BUNDLE_ID = "build-cfe6e3818fbc179af2cd6237641cdde716159a18c2d1430644bba71058adead0"
+_BUNDLE_ID = "bundle-8a6af8b0b28c64d409722a55444461a0623aa8fa47e48dd88431890c5219c624"
 _BUNDLE_MANIFEST_SHA256 = "c" * 64
 _SPLIT_ASSIGNMENT_ID = "split-assignment-test"
 _LABEL_POLICY_VERSION = "label-policy-test"
@@ -81,23 +81,23 @@ def _manifest(
     training_run_id: str,
     package_id: str,
     seed: int,
-    source_config_sha256: str,
-    semantic_config_sha256: str,
+    config_source_sha256: str,
+    config_semantic_sha256: str,
 ) -> dict[str, object]:
     return {
         "model_package_schema_version": 1,
         "model_package_id": package_id,
         "training_mlflow_run_id": training_run_id,
         "modality": "image",
-        "model": "image_densenet",
+        "model": "cxr_densenet",
         "task": "pneumonia",
         "positive_class": 1,
         "bundle_id": _BUNDLE_ID,
         "bundle_manifest_sha256": _BUNDLE_MANIFEST_SHA256,
         "split_assignment_id": _SPLIT_ASSIGNMENT_ID,
         "label_policy_version": _LABEL_POLICY_VERSION,
-        "source_config_sha256": source_config_sha256,
-        "semantic_config_sha256": semantic_config_sha256,
+        "config_source_sha256": config_source_sha256,
+        "config_semantic_sha256": config_semantic_sha256,
         "checkpoint_sha256": _CHECKPOINT_SHA256,
         "source_provenance": {
             "git_commit": _GIT_COMMIT,
@@ -109,8 +109,8 @@ def _manifest(
             "torchxrayvision_version": "test",
         },
         "model_identity": {
-            "registry_key": "image_densenet",
-            "modality": "image",
+            "family_id": "cxr_densenet",
+            "modalities": ["cxr"],
             "encoder_architecture": "densenet121",
             "image_size": 224,
             "embedding_dimension": 1024,
@@ -169,17 +169,17 @@ def _create_member(
     source = config_path or _CONFIG_PATHS[seed]
     config = load_experiment_config(source)
     source_bytes = source.read_bytes()
-    source_sha256 = config.source_sha256
-    semantic_sha256 = image_semantic_config_sha256(config)
+    source_sha256 = config.config_source_sha256
+    semantic_sha256 = config.config_semantic_sha256
     package_id = f"model-package-seed-{seed}"
     common_tags = {
-        "experiment_name": "image_densenet121",
+        "experiment_name": "cxr_densenet",
         "dataset": "rsna",
         "dataset_bundle_id": _BUNDLE_ID,
         "split_assignment_id": _SPLIT_ASSIGNMENT_ID,
         "label_policy_version": _LABEL_POLICY_VERSION,
         "task": "pneumonia",
-        "model": "image_densenet",
+        "model": "cxr_densenet",
         "modality": "image",
         "seed": str(seed),
         "git_commit": _GIT_COMMIT,
@@ -194,8 +194,8 @@ def _create_member(
             "run_kind": "training",
             "evaluation_scope": "validation",
             "run_complete": "true",
-            "source_config_sha256": source_sha256,
-            "semantic_config_sha256": semantic_sha256,
+            "config_source_sha256": source_sha256,
+            "config_semantic_sha256": semantic_sha256,
             "local_model_sha256": _CHECKPOINT_SHA256,
             "checkpoint_sha256": _CHECKPOINT_SHA256,
             "threshold_youden_j": "0.5",
@@ -220,8 +220,8 @@ def _create_member(
         training_run_id=training_id,
         package_id=package_id,
         seed=seed,
-        source_config_sha256=source_sha256,
-        semantic_config_sha256=semantic_sha256,
+        config_source_sha256=source_sha256,
+        config_semantic_sha256=semantic_sha256,
     )
     with mlflow.start_run(
         tags={
@@ -477,19 +477,19 @@ def test_summary_rejects_config_drift_beyond_seed(family: _Family, tmp_path: Pat
         if manifest["training_policy"]["seed"] == 2026
     )
     document = yaml.safe_load(_CONFIG_PATHS[2026].read_text(encoding="utf-8"))
-    document["image"]["brightness_jitter"] = 0.04
+    document["training"]["augmentation"]["brightness_jitter"] = 0.04
     config_path = package / "resolved_config.yaml"
     config_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     config = load_experiment_config(config_path)
     manifest = family.manifests[package]
-    manifest["source_config_sha256"] = config.source_sha256
-    manifest["semantic_config_sha256"] = image_semantic_config_sha256(config)
+    manifest["config_source_sha256"] = config.config_source_sha256
+    manifest["config_semantic_sha256"] = config.config_semantic_sha256
     client = configure_mlflow(tracking_uri=family.tracking_uri)
-    client.set_tag(family.training_ids[2026], "source_config_sha256", config.source_sha256)
+    client.set_tag(family.training_ids[2026], "config_source_sha256", config.config_source_sha256)
     client.set_tag(
         family.training_ids[2026],
-        "semantic_config_sha256",
-        image_semantic_config_sha256(config),
+        "config_semantic_sha256",
+        config.config_semantic_sha256,
     )
 
     with pytest.raises(ValueError):

@@ -18,10 +18,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.hashing import sha256_file
 from radfusion.data.tabular_preprocess import validate_metadata_pipeline
-from radfusion.evaluation.latency import benchmark_single_sample_latency_ms
+from radfusion.evaluation.latency import (
+    LATENCY_MEASURED_CALLS,
+    LATENCY_WARMUP_CALLS,
+    benchmark_single_sample_latency_ms,
+)
 from radfusion.evaluation.metrics import evaluate_operating_point, evaluate_probabilities
 from radfusion.evaluation.probabilities import positive_class_probabilities
-from radfusion.training.config import ConfigError, ExperimentConfig, load_experiment_config
+from radfusion.training.config import (
+    ConfigError,
+    ExperimentConfig,
+    load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
+)
 from radfusion.training.evaluate_fusion import (
     FusionTestEvaluationResult,
     evaluate_fusion_training_run,
@@ -76,6 +86,7 @@ def evaluate_training_run(
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
+    private_output_directory: str | Path | None = None,
 ) -> TestEvaluationResult | ImageTestEvaluationResult | FusionTestEvaluationResult:
     """Apply a completed training run's model and thresholds to test data."""
     client = configure_mlflow(tracking_uri=tracking_uri)
@@ -87,6 +98,7 @@ def evaluate_training_run(
             tracking_uri=tracking_uri,
             cache=cache,
             execution=execution,
+            private_output_directory=private_output_directory,
         )
     if source_modality == "fusion":
         return evaluate_fusion_training_run(
@@ -94,6 +106,7 @@ def evaluate_training_run(
             tracking_uri=tracking_uri,
             cache=cache,
             execution=execution,
+            private_output_directory=private_output_directory,
         )
     if source_modality != "metadata":
         raise ValueError("Source training run has no valid modality")
@@ -107,7 +120,13 @@ def evaluate_training_run(
     model_path = Path(source_run.data.tags["local_model_path"])
     package = model_path.parent
     manifest = validate_published_model(package)
-    config = load_experiment_config(package / "resolved_config.yaml")
+    training_report = Path(source_run.data.tags["report_directory"])
+    config = with_runtime(
+        load_experiment_config(package / "resolved_config.yaml"),
+        seed=int(manifest["seed"]),
+        model_directory=package.parent.parent,
+        report_directory=training_report.parents[2],
+    )
     evaluator_commit, evaluator_dirty = git_revision()
     evaluator_lock_hash = uv_lock_sha256()
     _verify_training_lineage(
@@ -121,8 +140,8 @@ def evaluate_training_run(
     )
     model = validate_metadata_pipeline(load_skops(model_path))
     log_event(_LOGGER, "training_package_verified", training_run_id=training_run_id)
-    dataset_implementation = get_dataset(config.dataset.registry_key)
-    pinned_lineage = dataset_implementation.load_lineage(config.dataset)
+    dataset_implementation = get_dataset(config.dataset.dataset_id)
+    pinned_lineage = dataset_implementation.load_lineage(config)
     if (
         pinned_lineage.bundle_id != manifest["bundle_id"]
         or pinned_lineage.split_assignment_id != manifest["split_assignment_id"]
@@ -130,10 +149,10 @@ def evaluate_training_run(
     ):
         raise ValueError("Pinned bundle lineage differs from the trained model")
     configure_mlflow(
-        experiment_name=config.mlflow.experiment_name,
+        experiment_name=config.runtime.experiment_name,
         tracking_uri=tracking_uri,
     )
-    experiment = client.get_experiment_by_name(config.mlflow.experiment_name)
+    experiment = client.get_experiment_by_name(config.runtime.experiment_name)
     if experiment is None or source_run.info.experiment_id != experiment.experiment_id:
         raise ValueError("Source training run belongs to a different MLflow experiment")
     best_iteration = manifest["best_iteration"]
@@ -141,13 +160,13 @@ def evaluate_training_run(
         "run_kind": "test_evaluation",
         "evaluation_scope": "test",
         "source_training_run_id": training_run_id,
-        "experiment_name": config.name,
-        "dataset": config.dataset.registry_key,
+        "experiment_name": config.family.family_id,
+        "dataset": config.dataset.dataset_id,
         "dataset_bundle_id": manifest["bundle_id"],
         "split_assignment_id": manifest["split_assignment_id"],
         "task": manifest["task"],
         "modality": "metadata",
-        "model": config.model.registry_key,
+        "model": config.family.family_id,
         "seed": str(manifest["seed"]),
         "model_sha256": manifest["model_sha256"],
         "model_package_id": manifest["model_package_id"],
@@ -157,19 +176,19 @@ def evaluate_training_run(
         "run_complete": "false",
     }
     with tracked_run(
-        run_name=f"{config.name}-test",
+        run_name=f"{config.family.family_id}-test",
         tags=tags,
         parameters={
             "source_training_run_id": training_run_id,
             "calibration_bins": config.evaluation.calibration_bins,
-            "latency_warmup_calls": config.evaluation.latency_warmup_calls,
-            "latency_measured_calls": config.evaluation.latency_measured_calls,
+            "latency_warmup_calls": LATENCY_WARMUP_CALLS,
+            "latency_measured_calls": LATENCY_MEASURED_CALLS,
             "best_iteration": best_iteration,
         },
     ) as evaluation_run_id:
-        context = {"run_id": evaluation_run_id, "model": config.model.registry_key}
+        context = {"run_id": evaluation_run_id, "model": config.family.family_id}
         with timed_phase(_LOGGER, "test_dataset_loading", **context):
-            test, lineage = dataset_implementation.load_test(config.dataset)
+            test, lineage = dataset_implementation.load_test(config)
         if (
             lineage.bundle_id != manifest["bundle_id"]
             or lineage.split_assignment_id != manifest["split_assignment_id"]
@@ -201,8 +220,8 @@ def evaluate_training_run(
             latency_ms = benchmark_single_sample_latency_ms(
                 model,
                 test.features,
-                warmup_calls=config.evaluation.latency_warmup_calls,
-                measured_calls=config.evaluation.latency_measured_calls,
+                warmup_calls=LATENCY_WARMUP_CALLS,
+                measured_calls=LATENCY_MEASURED_CALLS,
                 best_iteration=best_iteration,
             )
         document = metrics_document(
@@ -215,16 +234,13 @@ def evaluate_training_run(
             target_sensitivity=target_sensitivity,
         )
         report_directory = (
-            config.training.report_directory
-            / config.dataset.registry_key
-            / "runs"
-            / evaluation_run_id
+            config.runtime.report_directory / config.dataset.dataset_id / "runs" / evaluation_run_id
         )
         report_stage = staging_directory(report_directory)
         try:
             write_run_reports(
                 report_stage,
-                model_name=config.model.registry_key,
+                model_name=config.family.family_id,
                 targets=test.targets,
                 probabilities=probabilities,
                 document=document,
@@ -274,17 +290,18 @@ def _verify_training_lineage(
     evaluator_lock_hash: str,
 ) -> None:
     tags = run.data.tags
-    expected_package = config.training.model_directory / "runs" / run.info.run_id
+    expected_package = config.runtime.model_directory / "runs" / run.info.run_id
     if model_path.parent.resolve() != expected_package.resolve():
         raise ValueError("Training run points outside its configured model package")
     if manifest["training_mlflow_run_id"] != run.info.run_id:
         raise ValueError("Model manifest training run ID mismatch")
     checks = {
-        "source_config_sha256": config.source_sha256,
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "bundle_id": config.dataset.bundle_id,
-        "task": config.dataset.task_id,
-        "seed": config.training.seed,
-        "model": config.model.registry_key,
+        "task": config.task.task_id,
+        "seed": require_runtime_seed(config),
+        "model": config.family.family_id,
         "model_sha256": sha256_file(model_path),
     }
     for field, expected in checks.items():
@@ -296,11 +313,12 @@ def _verify_training_lineage(
         "dataset_bundle_id": manifest["bundle_id"],
         "split_assignment_id": manifest["split_assignment_id"],
         "task": manifest["task"],
-        "model": config.model.registry_key,
+        "model": config.family.family_id,
         "seed": str(manifest["seed"]),
         "git_commit": manifest["git_commit"],
         "git_dirty": str(manifest["git_dirty"]).lower(),
-        "source_config_sha256": manifest["source_config_sha256"],
+        "config_source_sha256": manifest["config_source_sha256"],
+        "config_semantic_sha256": manifest["config_semantic_sha256"],
         "dependency_lock_sha256": manifest["dependency_lock_sha256"],
         "local_model_sha256": manifest["model_sha256"],
         "model_package_id": manifest["model_package_id"],
@@ -343,7 +361,7 @@ def _verify_validation_choices(run, config: ExperimentConfig, manifest) -> None:
             raise ValueError(f"Training run metric {metric_name} mismatch")
 
     source_best_iteration = run.data.params.get("best_iteration")
-    if config.model.registry_key == "metadata_lightgbm":
+    if config.family.family_id == "metadata_lightgbm":
         try:
             parsed_best_iteration = int(source_best_iteration)
         except (TypeError, ValueError) as exc:
@@ -352,7 +370,7 @@ def _verify_validation_choices(run, config: ExperimentConfig, manifest) -> None:
             raise ValueError("Training run best_iteration is invalid")
         if manifest["best_iteration"] != parsed_best_iteration:
             raise ValueError("Training run best_iteration mismatch")
-    elif config.model.registry_key == "metadata_logistic":
+    elif config.family.family_id == "metadata_logistic":
         if manifest["best_iteration"] is not None:
             raise ValueError("Logistic Regression manifest declares best_iteration")
         if source_best_iteration not in {None, "not_applicable"}:
@@ -367,6 +385,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_TRACKING_URI,
         help="MLflow SQLite tracking URI",
     )
+    parser.add_argument("--private-output-directory", type=Path, default=None)
     add_logging_argument(parser)
     return parser
 
@@ -379,6 +398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = evaluate_training_run(
             args.run_id,
             tracking_uri=args.tracking_uri,
+            private_output_directory=args.private_output_directory,
         )
     except (
         ConfigError,

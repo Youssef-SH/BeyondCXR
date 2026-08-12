@@ -10,7 +10,12 @@ from typing import Any
 import torch
 
 from radfusion.training.completed_runs import require_completed_run
-from radfusion.training.config import ExperimentConfig, load_experiment_config
+from radfusion.training.config import (
+    ExperimentConfig,
+    load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
+)
 from radfusion.utils.neural_publication import (
     CONFIG_FILENAME,
     load_validated_neural_checkpoint,
@@ -25,7 +30,7 @@ class SourceCxrLineage:
     training_run_id: str
     model_package_id: str
     checkpoint_sha256: str
-    semantic_config_sha256: str
+    config_semantic_sha256: str
     git_commit: str
     dependency_lock_sha256: str
 
@@ -55,7 +60,7 @@ def resolve_source_cxr_training_run(
     """Resolve and verify one explicitly supplied same-seed image training run."""
     if not isinstance(training_run_id, str) or not training_run_id.strip():
         raise ValueError("Fusion training requires an explicit source CXR training run ID")
-    if fusion_config.model.modality != "fusion" or fusion_config.image is None:
+    if fusion_config.family.family_id != "cxr_metadata_concat" or fusion_config.neural is None:
         raise ValueError("Source CXR resolution requires a fusion experiment configuration")
     run = client.get_run(training_run_id)
     record = require_completed_run(run)
@@ -63,17 +68,19 @@ def resolve_source_cxr_training_run(
         record.run_kind != "training"
         or record.evaluation_scope != "validation"
         or record.modality != "image"
-        or record.model != "image_densenet"
+        or record.model != "cxr_densenet"
     ):
-        raise ValueError("Fusion source must be a completed image_densenet training run")
-    if record.integer_seed() != fusion_config.training.seed:
+        raise ValueError("Fusion source must be a completed cxr_densenet training run")
+    if record.integer_seed() != require_runtime_seed(fusion_config):
         raise ValueError("Fusion and source CXR training seeds differ")
     model_path = Path(record.local_model_path)
     if model_path.name != "model.pt":
         raise ValueError("Source CXR run has an invalid local package path")
     package_directory = model_path.parent
     manifest = validate_neural_package_metadata(package_directory)
-    source_config = load_experiment_config(package_directory / CONFIG_FILENAME)
+    source_config = with_runtime(
+        load_experiment_config(package_directory / CONFIG_FILENAME), seed=record.integer_seed()
+    )
     _validate_source_contract(
         record,
         source_config,
@@ -90,7 +97,7 @@ def resolve_source_cxr_training_run(
             training_run_id=training_run_id,
             model_package_id=str(manifest["model_package_id"]),
             checkpoint_sha256=str(manifest["checkpoint_sha256"]),
-            semantic_config_sha256=str(manifest["semantic_config_sha256"]),
+            config_semantic_sha256=str(manifest["config_semantic_sha256"]),
             git_commit=str(manifest["source_provenance"]["git_commit"]),
             dependency_lock_sha256=str(manifest["source_provenance"]["dependency_lock_sha256"]),
         ),
@@ -118,17 +125,17 @@ def _validate_source_contract(
     current_git_dirty: bool,
     current_dependency_lock_sha256: str,
 ) -> None:
-    if source_config.model.modality != "image" or source_config.image is None:
+    if source_config.family.family_id != "cxr_densenet" or source_config.neural is None:
         raise ValueError("Source CXR package does not archive an image experiment")
     expected_record = {
         "run_id": training_run_id,
-        "dataset": fusion_config.dataset.registry_key,
-        "task": fusion_config.dataset.task_id,
+        "dataset": fusion_config.dataset.dataset_id,
+        "task": fusion_config.task.task_id,
         "bundle_id": fusion_config.dataset.bundle_id,
         "model_package_id": manifest["model_package_id"],
         "split_assignment_id": manifest["split_assignment_id"],
         "label_policy_version": manifest["label_policy_version"],
-        "semantic_config_sha256": manifest["semantic_config_sha256"],
+        "config_semantic_sha256": manifest["config_semantic_sha256"],
         "checkpoint_sha256": manifest["checkpoint_sha256"],
         "local_model_sha256": manifest["checkpoint_sha256"],
     }
@@ -138,11 +145,11 @@ def _validate_source_contract(
     expected_manifest = {
         "training_mlflow_run_id": training_run_id,
         "modality": "image",
-        "model": "image_densenet",
-        "task": fusion_config.dataset.task_id,
+        "model": "cxr_densenet",
+        "task": fusion_config.task.task_id,
         "bundle_id": fusion_config.dataset.bundle_id,
-        "source_config_sha256": source_config.source_sha256,
-        "training_policy_seed": fusion_config.training.seed,
+        "config_source_sha256": source_config.config_source_sha256,
+        "training_policy_seed": require_runtime_seed(fusion_config),
     }
     for field, expected in expected_manifest.items():
         observed = (
@@ -154,11 +161,11 @@ def _validate_source_contract(
             raise ValueError(f"Source CXR package {field} is incompatible with fusion")
     common_parameters = ("encoder_name", "weights", "image_size", "embedding_dimension")
     if any(
-        source_config.model.parameters[field] != fusion_config.model.parameters[field]
+        source_config.family.parameters[field] != fusion_config.family.parameters[field]
         for field in common_parameters
     ):
         raise ValueError("Source CXR encoder identity differs from fusion configuration")
-    if source_config.image != fusion_config.image:
+    if source_config.neural != fusion_config.neural:
         raise ValueError("Source CXR transform and neural lifecycle differ from fusion")
     source = manifest["source_provenance"]
     if (
@@ -174,5 +181,5 @@ def _validate_source_contract(
     if record.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]:
         raise ValueError("Source CXR observed bundle-manifest identity is inconsistent")
     pretrained_name = manifest["model_identity"]["pretrained_weight"]["declared_name"]
-    if pretrained_name != fusion_config.model.parameters["weights"]:
+    if pretrained_name != fusion_config.family.parameters["weights"]:
         raise ValueError("Source CXR pretrained-weight identity differs from fusion")

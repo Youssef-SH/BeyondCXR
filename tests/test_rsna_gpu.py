@@ -12,7 +12,7 @@ import mlflow
 import pytest
 from mlflow.tracking import MlflowClient
 
-from radfusion.training.config import load_experiment_config
+from radfusion.training.config import load_experiment_config, with_runtime
 from radfusion.training.datasets import RsnaDataset
 from radfusion.training.rsna_gpu import (
     CampaignConfigs,
@@ -29,10 +29,16 @@ from radfusion.utils.mlflow_utils import configure_mlflow
 def _configs() -> CampaignConfigs:
     seeds = (17, 42, 2026)
     return CampaignConfigs(
-        load_experiment_config("configs/metadata_logistic.yaml"),
-        load_experiment_config("configs/metadata_lightgbm.yaml"),
-        tuple(load_experiment_config(f"configs/image_densenet_seed{seed}.yaml") for seed in seeds),
-        tuple(load_experiment_config(f"configs/fusion_concat_seed{seed}.yaml") for seed in seeds),
+        with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42),
+        with_runtime(load_experiment_config("configs/rsna_metadata_lightgbm.yaml"), seed=42),
+        tuple(
+            with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=seed)
+            for seed in seeds
+        ),
+        tuple(
+            with_runtime(load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=seed)
+            for seed in seeds
+        ),
     )
 
 
@@ -59,7 +65,7 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
             or SimpleNamespace(
                 paths=SimpleNamespace(
                     bundle_id="bundle",
-                    bundle_directory=Path("data/manifests/rsna/builds/bundle"),
+                    bundle_directory=Path("data/manifests/rsna/bundles/bundle-test"),
                     current_path=Path("data/manifests/rsna/CURRENT"),
                 )
             )
@@ -110,7 +116,7 @@ def test_campaign_hands_exact_ids_across_the_strict_test_boundary(
 
     def train_fusion(config, *, source_training_run_id, **kwargs):
         training_policies.append(kwargs["execution"])
-        run_id = f"fusion-{config.training.seed}"
+        run_id = f"fusion-{config.runtime.seed}"
         events.append(("fusion_source", (run_id, source_training_run_id)))
         events.append(("train", run_id))
         return result(run_id)
@@ -214,7 +220,7 @@ def test_training_failure_never_crosses_test_boundary(
         lambda *args: SimpleNamespace(
             paths=SimpleNamespace(
                 bundle_id="bundle",
-                bundle_directory=Path("data/manifests/rsna/builds/bundle"),
+                bundle_directory=Path("data/manifests/rsna/bundles/bundle-test"),
                 current_path=Path("data/manifests/rsna/CURRENT"),
             )
         ),
@@ -277,7 +283,7 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     included = (
-        Path("data/manifests/rsna/builds/build-test/metadata.json"),
+        Path("data/manifests/rsna/bundles/bundle-test/manifest.json"),
         Path("data/manifests/rsna/CURRENT"),
         Path("models/rsna/runs/train/model.skops"),
         Path("reports/rsna/campaigns/campaign-test/execution.log"),
@@ -287,8 +293,8 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
     for path in included:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("result\n", encoding="utf-8")
-    included[1].write_text("build-test\n", encoding="utf-8")
-    old_bundle = Path("data/manifests/rsna/builds/build-old/metadata.json")
+        included[1].write_text("bundle-test\n", encoding="utf-8")
+        old_bundle = Path("data/manifests/rsna/bundles/bundle-old/manifest.json")
     old_bundle.parent.mkdir(parents=True)
     old_bundle.write_text("old\n", encoding="utf-8")
     configure_mlflow(tracking_uri="sqlite:///mlflow.db", experiment_name="radfusion-rsna")
@@ -368,34 +374,34 @@ def test_campaign_rejects_neural_config_contract_mismatch(mismatch: str) -> None
         fusions = tuple(
             replace(
                 config,
-                model=replace(
-                    config.model,
-                    parameters=MappingProxyType({**config.model.parameters, "image_size": 225}),
+                family=replace(
+                    config.family,
+                    parameters=MappingProxyType({**config.family.parameters, "image_size": 225}),
                 ),
             )
             for config in configs.fusions
         )
     elif mismatch == "device":
         fusions = tuple(
-            replace(config, image=replace(config.image, device="cuda"))
+            replace(config, runtime=replace(config.runtime, device="cpu"))
             for config in configs.fusions
         )
     elif mismatch == "seed":
         fusions = (
             replace(
                 configs.fusions[0],
-                training=replace(configs.fusions[0].training, seed=18),
+                runtime=replace(configs.fusions[0].runtime, seed=18),
             ),
             *configs.fusions[1:],
         )
     elif mismatch == "batch_size":
         fusions = tuple(
-            replace(config, image=replace(config.image, batch_size=16))
+            replace(config, neural=replace(config.neural, batch_size=16))
             for config in configs.fusions
         )
     else:
         fusions = tuple(
-            replace(config, image=replace(config.image, num_workers=4))
+            replace(config, runtime=replace(config.runtime, num_workers=4))
             for config in configs.fusions
         )
 

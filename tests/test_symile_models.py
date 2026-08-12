@@ -48,7 +48,14 @@ def _labs(rows: int) -> pd.DataFrame:
 def test_symile_logistic_is_exact_unweighted_and_produces_logits() -> None:
     config = load_symile_development_config("configs/symile_labs_logistic.yaml")
     targets = np.tile(np.array([0, 1], dtype=np.int8), 10)
-    fit = fit_symile_labs_logistic(_labs(20), targets, parameters=config.model, repeat_seed=17)
+    fit = fit_symile_labs_logistic(
+        _labs(20),
+        targets,
+        parameters=config.training.parameters,
+        selection_metric=config.training.selection_metric,
+        lab_policy=str(config.preprocessing["lab_policy"]),
+        repeat_seed=17,
+    )
     classifier = fit.pipeline.named_steps["classifier"]
 
     assert isinstance(classifier, LogisticRegression)
@@ -67,7 +74,9 @@ def test_symile_lightgbm_is_exact_unweighted_and_seed_owned() -> None:
     fit = fit_symile_labs_lightgbm(
         _labs(40),
         targets,
-        parameters=config.model,
+        parameters={**config.family.parameters, **config.training.parameters},
+        selection_metric=config.training.selection_metric,
+        lab_policy=str(config.preprocessing["lab_policy"]),
         inner_training_indices=training,
         inner_validation_indices=validation,
         repeat_seed=42,
@@ -81,17 +90,58 @@ def test_symile_lightgbm_is_exact_unweighted_and_seed_owned() -> None:
     assert parameters["bagging_seed"] == 42
     assert parameters["feature_fraction_seed"] == 42
     assert parameters["deterministic"] is True
+    assert parameters["verbosity"] == -1
     assert fit.best_iteration == classifier.best_iteration_
     assert fit.best_iteration > 0
 
 
+def test_symile_tabular_builders_consume_canonical_selection_metric() -> None:
+    targets = np.tile(np.array([0, 1], dtype=np.int8), 10)
+    logistic = load_symile_development_config("configs/symile_labs_logistic.yaml")
+    with pytest.raises(ValueError, match="does not perform model selection"):
+        fit_symile_labs_logistic(
+            _labs(20),
+            targets,
+            parameters=logistic.training.parameters,
+            selection_metric="roc_auc",
+            lab_policy=str(logistic.preprocessing["lab_policy"]),
+            repeat_seed=17,
+        )
+
+    lightgbm = load_symile_development_config("configs/symile_labs_lightgbm.yaml")
+    with pytest.raises(ValueError, match="selection requires roc_auc"):
+        fit_symile_labs_lightgbm(
+            _labs(20),
+            targets,
+            parameters={**lightgbm.family.parameters, **lightgbm.training.parameters},
+            selection_metric="average_precision",
+            lab_policy=str(lightgbm.preprocessing["lab_policy"]),
+            inner_training_indices=np.arange(16, dtype=np.int64),
+            inner_validation_indices=np.arange(16, 20, dtype=np.int64),
+            repeat_seed=17,
+        )
+
+
+def test_symile_tabular_builder_consumes_lab_preprocessing_policy() -> None:
+    config = load_symile_development_config("configs/symile_labs_logistic.yaml")
+    with pytest.raises(ValueError, match="preprocessing policy"):
+        fit_symile_labs_logistic(
+            _labs(20),
+            np.tile(np.array([0, 1], dtype=np.int8), 10),
+            parameters=config.training.parameters,
+            selection_metric=config.training.selection_metric,
+            lab_policy="unsupported-policy",
+            repeat_seed=17,
+        )
+
+
 def test_concat_and_gated_shapes_and_per_feature_softmax() -> None:
-    concat_config = load_symile_development_config("configs/symile_concat.yaml")
-    gated_config = load_symile_development_config("configs/symile_gated.yaml")
+    concat_config = load_symile_development_config("configs/symile_cxr_labs_concat.yaml")
+    gated_config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
     images = torch.ones((3, 1, 224, 224), dtype=torch.float32)
     labs = torch.ones((3, 100), dtype=torch.float32)
-    concat = SymileConcatFusionModel(_TinyEncoder(), concat_config.model).eval()
-    gated = SymileGatedFusionModel(_TinyEncoder(), gated_config.model).eval()
+    concat = SymileConcatFusionModel(_TinyEncoder(), concat_config.family.parameters).eval()
+    gated = SymileGatedFusionModel(_TinyEncoder(), gated_config.family.parameters).eval()
 
     assert concat(images, labs).shape == (3,)
     embedding = gated.encoder.encode(images)
@@ -102,10 +152,10 @@ def test_concat_and_gated_shapes_and_per_feature_softmax() -> None:
 
 
 def test_symile_fusion_initializes_only_matching_cxr_encoder_state() -> None:
-    gated_config = load_symile_development_config("configs/symile_gated.yaml")
-    concat_config = load_symile_development_config("configs/symile_concat.yaml")
-    source = SymileGatedFusionModel(_TinyEncoder(), gated_config.model)
-    target = SymileConcatFusionModel(_TinyEncoder(), concat_config.model)
+    gated_config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
+    concat_config = load_symile_development_config("configs/symile_cxr_labs_concat.yaml")
+    source = SymileGatedFusionModel(_TinyEncoder(), gated_config.family.parameters)
+    target = SymileConcatFusionModel(_TinyEncoder(), concat_config.family.parameters)
     source_state = {
         f"encoder.{name}": value.detach().clone()
         for name, value in source.encoder.state_dict().items()
@@ -120,12 +170,14 @@ def test_symile_fusion_initializes_only_matching_cxr_encoder_state() -> None:
 
 
 def test_gated_ablation_uses_same_class_parameters_and_initial_non_cxr_state() -> None:
-    observed_config = load_symile_development_config("configs/symile_gated.yaml")
-    ablated_config = load_symile_development_config("configs/symile_gated_no_observedness.yaml")
+    observed_config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
+    ablated_config = load_symile_development_config(
+        "configs/symile_cxr_labs_gated_no_observedness.yaml"
+    )
     seed_neural_runtime(2026)
-    observed = SymileGatedFusionModel(_TinyEncoder(), observed_config.model)
+    observed = SymileGatedFusionModel(_TinyEncoder(), observed_config.family.parameters)
     seed_neural_runtime(2026)
-    ablated = SymileGatedFusionModel(_TinyEncoder(), ablated_config.model)
+    ablated = SymileGatedFusionModel(_TinyEncoder(), ablated_config.family.parameters)
 
     assert type(observed) is type(ablated)
     assert sum(parameter.numel() for parameter in observed.parameters()) == sum(
@@ -147,12 +199,14 @@ def test_gated_ablation_uses_same_class_parameters_and_initial_non_cxr_state() -
 
 
 def test_gated_observedness_zeroing_occurs_at_both_consumers() -> None:
-    observed_config = load_symile_development_config("configs/symile_gated.yaml")
-    ablated_config = load_symile_development_config("configs/symile_gated_no_observedness.yaml")
+    observed_config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
+    ablated_config = load_symile_development_config(
+        "configs/symile_cxr_labs_gated_no_observedness.yaml"
+    )
     seed_neural_runtime(17)
-    observed = SymileGatedFusionHead(observed_config.model).eval()
+    observed = SymileGatedFusionHead(observed_config.family.parameters).eval()
     seed_neural_runtime(17)
-    ablated = SymileGatedFusionHead(ablated_config.model).eval()
+    ablated = SymileGatedFusionHead(ablated_config.family.parameters).eval()
     ablated.load_state_dict(observed.state_dict(), strict=True)
     embeddings = torch.ones((2, 1024), dtype=torch.float32)
     labs = torch.cat((torch.full((2, 50), 0.5), torch.tensor([[1.0] * 50, [0.0] * 50])), dim=1)
@@ -167,7 +221,7 @@ def test_gated_observedness_zeroing_occurs_at_both_consumers() -> None:
 
 @pytest.mark.parametrize("modalities", [1, 3, 4])
 def test_gated_model_rejects_unfrozen_modality_counts(modalities: int) -> None:
-    config = load_symile_development_config("configs/symile_gated.yaml")
-    parameters = {**dict(config.model), "modalities": modalities}
+    config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
+    parameters = {**dict(config.family.parameters), "modality_count": modalities}
     with pytest.raises(ValueError):
         SymileGatedFusionHead(parameters)

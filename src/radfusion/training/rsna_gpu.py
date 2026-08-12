@@ -31,9 +31,9 @@ from radfusion.models.cxr_baseline import ensure_pretrained_weights
 from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (
     ExperimentConfig,
-    fusion_seed_compatibility_sha256,
-    image_seed_compatibility_sha256,
     load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
 )
 from radfusion.training.datasets import RsnaDataset, prepare_rsna_cxr_cache
 from radfusion.training.device import ResolvedDevice, resolve_device
@@ -146,7 +146,7 @@ def run_rsna_gpu_campaign() -> CampaignResult:
             transform = _transform(image_reference, training=False)
             with timed_phase(_LOGGER, "cxr_cache_preparation"):
                 cache = prepare_rsna_cxr_cache(
-                    dataset, image_reference.dataset, transform, cache_root=CACHE_ROOT
+                    dataset, image_reference, transform, cache_root=CACHE_ROOT
                 )
             runtime = _required_cuda_runtime(image_reference)
             training_execution = _training_execution_policy(image_reference, runtime)
@@ -274,24 +274,24 @@ def _validate_prerequisites() -> CampaignConfigs:
     if not all(path.is_dir() if path.suffix == "" else path.is_file() for path in required_raw):
         raise FileNotFoundError("RSNA raw dataset is incomplete")
     paths = {
-        "metadata_logistic": Path("configs/metadata_logistic.yaml"),
-        "metadata_lightgbm": Path("configs/metadata_lightgbm.yaml"),
-        **{
-            f"image_{seed}": Path(f"configs/image_densenet_seed{seed}.yaml")
-            for seed in EXPECTED_SEEDS
-        },
-        **{
-            f"fusion_{seed}": Path(f"configs/fusion_concat_seed{seed}.yaml")
-            for seed in EXPECTED_SEEDS
-        },
+        "metadata_logistic": Path("configs/rsna_metadata_logistic.yaml"),
+        "metadata_lightgbm": Path("configs/rsna_metadata_lightgbm.yaml"),
+        "image": Path("configs/rsna_cxr_densenet.yaml"),
+        "fusion": Path("configs/rsna_cxr_metadata_concat.yaml"),
     }
     if missing := [path for path in paths.values() if not path.is_file()]:
         raise FileNotFoundError(f"RSNA campaign configs are missing: {missing}")
     configs = CampaignConfigs(
-        load_experiment_config(paths["metadata_logistic"]),
-        load_experiment_config(paths["metadata_lightgbm"]),
-        tuple(load_experiment_config(paths[f"image_{seed}"]) for seed in EXPECTED_SEEDS),
-        tuple(load_experiment_config(paths[f"fusion_{seed}"]) for seed in EXPECTED_SEEDS),
+        with_runtime(load_experiment_config(paths["metadata_logistic"]), seed=42),
+        with_runtime(load_experiment_config(paths["metadata_lightgbm"]), seed=42),
+        tuple(
+            with_runtime(load_experiment_config(paths["image"]), seed=seed)
+            for seed in EXPECTED_SEEDS
+        ),
+        tuple(
+            with_runtime(load_experiment_config(paths["fusion"]), seed=seed)
+            for seed in EXPECTED_SEEDS
+        ),
     )
     _validate_neural_campaign_configs(configs)
     if DEFAULT_TRACKING_URI != "sqlite:///mlflow.db":
@@ -319,32 +319,32 @@ def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
     if (
         len(configs.images) != len(EXPECTED_SEEDS)
         or len(configs.fusions) != len(EXPECTED_SEEDS)
-        or tuple(config.training.seed for config in configs.images) != EXPECTED_SEEDS
-        or tuple(config.training.seed for config in configs.fusions) != EXPECTED_SEEDS
+        or tuple(require_runtime_seed(config) for config in configs.images) != EXPECTED_SEEDS
+        or tuple(require_runtime_seed(config) for config in configs.fusions) != EXPECTED_SEEDS
     ):
         raise ValueError("RSNA campaign requires image and fusion seeds 17, 42, and 2026")
-    if len({image_seed_compatibility_sha256(config) for config in configs.images}) != 1:
+    if len({config.config_semantic_sha256 for config in configs.images}) != 1:
         raise ValueError("RSNA image configurations do not form one scientific family")
-    if len({fusion_seed_compatibility_sha256(config) for config in configs.fusions}) != 1:
+    if len({config.config_semantic_sha256 for config in configs.fusions}) != 1:
         raise ValueError("RSNA fusion configurations do not form one scientific family")
     neural = (*configs.images, *configs.fusions)
-    images = tuple(config.image for config in neural)
+    images = tuple(config.neural for config in neural)
     if any(image is None for image in images):
         raise ValueError("RSNA campaign requires six complete neural configurations")
     resolved = cast(tuple[Any, ...], images)
     execution_contracts = {
         (
             image.batch_size,
-            image.num_workers,
-            image.device,
+            config.runtime.num_workers,
+            config.runtime.device,
             image.mixed_precision,
-            image.pin_memory_policy,
+            config.runtime.pin_memory_policy,
             image.rotation_degrees,
             image.translation_fraction,
             image.brightness_jitter,
             image.contrast_jitter,
         )
-        for image in resolved
+        for config, image in zip(neural, resolved, strict=True)
     }
     cache_identities = {
         preprocessing_identity(_transform(config, training=False)) for config in neural
@@ -353,8 +353,8 @@ def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
         len(execution_contracts) != 1
         or len(cache_identities) != 1
         or resolved[0].batch_size != 32
-        or resolved[0].device == "cpu"
-        or resolved[0].pin_memory_policy == "disabled"
+        or neural[0].runtime.device == "cpu"
+        or neural[0].runtime.pin_memory_policy == "disabled"
     ):
         raise ValueError("RSNA neural configurations do not share the campaign execution contract")
 
@@ -375,11 +375,13 @@ def _validate_configured_bundle(configs: CampaignConfigs, bundle_id: str) -> Non
 
 
 def _required_cuda_runtime(config: ExperimentConfig) -> ResolvedDevice:
-    image = config.image
+    image = config.neural
     if image is None:
         raise ValueError("RSNA image configuration is incomplete")
     runtime = resolve_device(
-        "cuda", mixed_precision=image.mixed_precision, pin_memory_policy="enabled"
+        "cuda",
+        mixed_precision=image.mixed_precision,
+        pin_memory_policy=config.runtime.pin_memory_policy,
     )
     if runtime.device.type != "cuda":
         raise RuntimeError("RSNA campaign neural runtime did not resolve to CUDA")
@@ -390,22 +392,23 @@ def _training_execution_policy(
     config: ExperimentConfig, runtime: ResolvedDevice
 ) -> LoaderExecutionPolicy:
     """Resolve the reviewed persistent policy for epoch-reused loaders."""
-    image = config.image
+    image = config.neural
     if image is None:
         raise ValueError("RSNA image configuration is incomplete")
     return reused_loader_policy(
-        num_workers=image.num_workers,
+        num_workers=config.runtime.num_workers,
         pin_memory=runtime.pin_memory_effective,
     )
 
 
 def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransform:
-    image = config.image
+    image = config.neural
     if image is None:
         raise ValueError("RSNA image configuration is incomplete")
     return StandardCxrTransform(
         training=training,
-        image_size=int(config.model.parameters["image_size"]),
+        policy_version=str(config.preprocessing["cxr_transform_policy"]),
+        image_size=int(config.family.parameters["image_size"]),
         rotation_degrees=image.rotation_degrees,
         translation_fraction=image.translation_fraction,
         brightness_jitter=image.brightness_jitter,
@@ -495,7 +498,7 @@ def _write_archive(
     expected_bundle_root = (MANIFEST_ROOT / "rsna" / BUNDLES_DIRECTORY).resolve()
     if (
         bundle_directory.resolve().parent != expected_bundle_root
-        or not bundle_directory.name.startswith("build-")
+        or not bundle_directory.name.startswith("bundle-")
         or current_path.resolve().parent != (MANIFEST_ROOT / "rsna").resolve()
         or current_path.name != "CURRENT"
         or current_path.read_text(encoding="utf-8").strip() != bundle_directory.name

@@ -76,7 +76,7 @@ def _cache_frame() -> pd.DataFrame:
 
 def _identity(transform: StandardCxrTransform) -> CxrCacheIdentity:
     return CxrCacheIdentity(
-        bundle_id="build-" + "0" * 64,
+        bundle_id="bundle-" + "0" * 64,
         bundle_manifest_sha256="1" * 64,
         source_inventory_file_sha256="2" * 64,
         source_inventory_arrow_sha256="3" * 64,
@@ -137,7 +137,7 @@ def test_cache_preserves_deterministic_preprocessing_and_strict_identity(cache) 
     with pytest.raises(ManifestBuildError):
         validate_cxr_cache(
             built.directory,
-            identity=replace(built.identity, bundle_id="build-" + "9" * 64),
+            identity=replace(built.identity, bundle_id="bundle-" + "9" * 64),
             expected_sample_partitions=_sample_partitions(),
         )
 
@@ -393,8 +393,8 @@ def _policy(workers: int, persistent: bool) -> LoaderExecutionPolicy:
 
 
 def _dataset_and_loader(cache, workers: int, persistent: bool, seed: int = 42):
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
     dataset = RsnaCachedImageDataset(
         _image_frame(),
         cache=cache,
@@ -406,7 +406,7 @@ def _dataset_and_loader(cache, workers: int, persistent: bool, seed: int = 42):
     loader = build_image_loaders(
         dataset,
         dataset,
-        config=replace(config.image, batch_size=2),
+        config=replace(config.neural, batch_size=2),
         runtime=resolve_device("cpu", mixed_precision=False, pin_memory_policy="disabled"),
         seed=seed,
         execution=_policy(workers, persistent),
@@ -431,8 +431,8 @@ def _epochs(cache, seed: int = 42):
 
 
 def _loader_epochs(cache, workers: int, persistent: bool, seed: int = 42):
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
     dataset = _WorkerDigestDataset(
         RsnaCachedImageDataset(
             _image_frame(),
@@ -446,7 +446,7 @@ def _loader_epochs(cache, workers: int, persistent: bool, seed: int = 42):
     loader = build_image_loaders(
         dataset,
         dataset,
-        config=replace(config.image, batch_size=2),
+        config=replace(config.neural, batch_size=2),
         runtime=resolve_device("cpu", mixed_precision=False, pin_memory_policy="disabled"),
         seed=seed,
         execution=_policy(workers, persistent),
@@ -580,7 +580,7 @@ def test_fusion_uses_the_same_cache_contract(cache) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("bundle_id", "build-" + "9" * 64),
+        ("bundle_id", "bundle-" + "9" * 64),
         ("bundle_manifest_sha256", "8" * 64),
         ("source_inventory_file_sha256", "7" * 64),
         ("source_inventory_arrow_sha256", "6" * 64),

@@ -42,7 +42,7 @@ def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsy
     monkeypatch.setattr("radfusion.training.train.train_configured_experiment", fake_train)
 
     for _ in range(2):
-        assert train_main(["--config", "configs/metadata_logistic.yaml"]) == 0
+        assert train_main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
         captured = capsys.readouterr()
         assert json.loads(captured.out)["mlflow_run_id"] == "run-test"
         assert "event=test_progress" not in captured.out

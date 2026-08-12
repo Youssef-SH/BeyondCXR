@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from radfusion.models.cxr_baseline import StandardCxrEncoder
-from radfusion.training.config import ModelConfig, fusion_architecture_contract
+from radfusion.training.config import FamilyConfig
 
 
 class ConcatFusionHead(nn.Module):
@@ -117,15 +117,14 @@ class FusionConcatModel:
 
     def build(
         self,
-        config: ModelConfig,
+        config: FamilyConfig,
         *,
         structured_dimension: int,
         weights: str | None = None,
     ) -> RsnaConcatFusionModel:
         """Build the fusion architecture with an explicit structured width."""
         architecture = fusion_architecture_contract(
-            config,
-            structured_input_dimension=structured_dimension,
+            config, structured_input_dimension=structured_dimension
         )
         encoder = self._encoder_factory(
             weights=weights,
@@ -135,6 +134,47 @@ class FusionConcatModel:
         if not isinstance(encoder, nn.Module):
             raise TypeError("Fusion encoder factory must return a torch.nn.Module")
         return RsnaConcatFusionModel(encoder, architecture)
+
+
+def fusion_architecture_contract(
+    config: FamilyConfig, *, structured_input_dimension: int
+) -> dict[str, int | float]:
+    """Derive the concat-head contract from the validated family configuration."""
+    if config.family_id != "cxr_metadata_concat" or config.modalities != (
+        "cxr",
+        "metadata",
+    ):
+        raise ValueError("RSNA concat requires the cxr_metadata_concat family")
+    if (
+        isinstance(structured_input_dimension, bool)
+        or not isinstance(structured_input_dimension, int)
+        or structured_input_dimension <= 0
+    ):
+        raise ValueError("Fusion structured input dimension must be positive")
+    parameters = config.parameters
+    return {
+        "image_embedding_dimension": int(parameters["embedding_dimension"]),
+        "image_projection_dimension": int(parameters["image_projection_dimension"]),
+        "structured_input_dimension": structured_input_dimension,
+        "structured_hidden_dimension": int(parameters["structured_hidden_dimension"]),
+        "structured_projection_dimension": int(parameters["structured_projection_dimension"]),
+        "fusion_input_dimension": int(parameters["image_projection_dimension"])
+        + int(parameters["structured_projection_dimension"]),
+        "fusion_hidden_dimension": int(parameters["fusion_hidden_dimension"]),
+        "dropout": float(parameters["dropout"]),
+        "output_dimension": 1,
+    }
+
+
+def fusion_structured_input_conversion_contract() -> dict[str, object]:
+    """Return the structural conversion from fitted metadata to neural input."""
+    return {
+        "source_dtype": "float64",
+        "tensor_dtype": "torch.float32",
+        "layout": "contiguous",
+        "finite": True,
+        "feature_order": "structured_preprocessor_contract.transformed_feature_names",
+    }
 
 
 def initialize_fusion_encoder(

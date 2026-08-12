@@ -33,9 +33,10 @@ from radfusion.evaluation.localization import (
 from radfusion.models.cxr_baseline import ImageDenseNetModel
 from radfusion.training.completed_runs import has_matching_training_parent, require_completed_run
 from radfusion.training.config import (
-    DatasetConfig,
-    image_seed_compatibility_sha256,
+    ExperimentConfig,
     load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
 )
 from radfusion.training.datasets import (
     RsnaCachedImageDataset,
@@ -107,7 +108,9 @@ def generate_localization_report(
             raise ValueError("Localization members must be linked completed image test runs")
         package = Path(training.local_model_path).parent
         manifest = validate_neural_package_metadata(package)
-        config = load_experiment_config(package / CONFIG_FILENAME)
+        config = with_runtime(
+            load_experiment_config(package / CONFIG_FILENAME), seed=test.integer_seed()
+        )
         verify_image_training_package(
             training_run,
             config,
@@ -121,17 +124,18 @@ def generate_localization_report(
     members.sort(key=lambda value: value[0].integer_seed())
     if tuple(value[0].integer_seed() for value in members) != EXPECTED_SEEDS:
         raise ValueError(f"Localization requires seeds {list(EXPECTED_SEEDS)}")
-    compatibility = {image_seed_compatibility_sha256(value[4]) for value in members}
+    compatibility = {value[4].config_semantic_sha256 for value in members}
     if len(compatibility) != 1:
         raise ValueError("Localization image runs are not scientifically compatible")
     reference_config = members[0][4]
-    reference_image = reference_config.image
+    reference_image = reference_config.neural
     if reference_image is None:
         raise ValueError("Localization package configuration is incomplete")
-    reference_dataset = _rsna_localization_dataset(reference_config.dataset)
+    reference_dataset = _rsna_localization_dataset(reference_config)
     reference_transform = StandardCxrTransform(
         training=False,
-        image_size=int(reference_config.model.parameters["image_size"]),
+        policy_version=str(reference_config.preprocessing["cxr_transform_policy"]),
+        image_size=int(reference_config.family.parameters["image_size"]),
         rotation_degrees=reference_image.rotation_degrees,
         translation_fraction=reference_image.translation_fraction,
         brightness_jitter=reference_image.brightness_jitter,
@@ -139,7 +143,7 @@ def generate_localization_report(
     )
     resolved_cache = cache or prepare_rsna_cxr_cache(
         reference_dataset,
-        reference_config.dataset,
+        reference_config,
         reference_transform,
     )
     ordered_run_ids = tuple(value[0].run_id for value in members)
@@ -216,27 +220,28 @@ def _evaluate_member(
     test, training, package, manifest, config, *, examples: Path, cache: ValidatedCxrCache
 ):
     checkpoint = load_validated_neural_checkpoint(package, manifest)
-    builder = cast(ImageDenseNetModel, get_model(config.model.registry_key))
-    model = builder.build_architecture(config.model)
+    builder = cast(ImageDenseNetModel, get_model(config.family.family_id))
+    model = builder.build_architecture(config.family)
     strict_load_checkpoint(model, checkpoint)
-    dataset_adapter = _rsna_localization_dataset(config.dataset)
+    dataset_adapter = _rsna_localization_dataset(config)
     localization = dataset_adapter.load_localization_test(
-        config.dataset,
+        config,
         expected_manifest_sha256=manifest["bundle_manifest_sha256"],
     )
-    image = config.image
-    if image is None or config.dataset.dataset_root is None:
+    image = config.neural
+    if image is None or config.runtime.source_root is None:
         raise ValueError("Localization package configuration is incomplete")
     runtime = resolve_device(
-        image.device,
+        config.runtime.device,
         mixed_precision=False,
-        pin_memory_policy=image.pin_memory_policy,
+        pin_memory_policy=config.runtime.pin_memory_policy,
     )
     model.to(runtime.device)
     target = standard_cxr_gradcam_target(model)
     transform = StandardCxrTransform(
         training=False,
-        image_size=int(config.model.parameters["image_size"]),
+        policy_version=str(config.preprocessing["cxr_transform_policy"]),
+        image_size=int(config.family.parameters["image_size"]),
         rotation_degrees=image.rotation_degrees,
         translation_fraction=image.translation_fraction,
         brightness_jitter=image.brightness_jitter,
@@ -258,9 +263,10 @@ def _evaluate_member(
         expected_cache_identity=expected_cache_identity,
         partition="test",
         transform=transform,
-        training_seed=config.training.seed,
+        training_seed=require_runtime_seed(config),
     )
-    seed_neural_runtime(config.training.seed)
+    seed = require_runtime_seed(config)
+    seed_neural_runtime(seed)
     model.eval()
     thresholds = manifest["thresholds"]
     threshold = float(thresholds["youden_j"])
@@ -277,7 +283,7 @@ def _evaluate_member(
         total=len(dataset),
         unit="samples",
         count_interval=250,
-        fields={"seed": config.training.seed, "operation": "prediction"},
+        fields={"seed": seed, "operation": "prediction"},
     )
     for index in range(len(dataset)):
         sample = dataset[index]
@@ -318,7 +324,7 @@ def _evaluate_member(
         total=len(required_indices),
         unit="samples",
         count_interval=50,
-        fields={"seed": config.training.seed, "operation": "gradcam"},
+        fields={"seed": seed, "operation": "gradcam"},
     )
     for completed, index in enumerate(required_indices, start=1):
         sample = dataset[index]
@@ -339,11 +345,11 @@ def _evaluate_member(
         stratum = selected_by_sample.get(sample["sample_id"])
         if stratum is not None:
             ordinal = ("TP", "FN", "FP", "TN").index(stratum) + 1
-            filename = f"seed-{config.training.seed}-example-{ordinal:02d}-{stratum.lower()}.png"
+            filename = f"seed-{seed}-example-{ordinal:02d}-{stratum.lower()}.png"
             _write_overlay(examples / filename, sample["image"], heatmap)
             private_examples.append(
                 {
-                    "seed": config.training.seed,
+                    "seed": seed,
                     "stratum": stratum,
                     "sample_id": sample["sample_id"],
                     "test_run_id": test.run_id,
@@ -357,7 +363,7 @@ def _evaluate_member(
         raise ValueError("Localization did not account for every positive test sample")
     return {
         "public": {
-            "seed": config.training.seed,
+            "seed": seed,
             "positive_test_sample_count": positive_test_sample_count,
             "localization_evaluated_count": localization_evaluated_count,
             "zero_heatmap_count": zero_maps,
@@ -372,11 +378,11 @@ def _evaluate_member(
     }
 
 
-def _rsna_localization_dataset(config: DatasetConfig) -> RsnaDataset:
+def _rsna_localization_dataset(config: ExperimentConfig) -> RsnaDataset:
     """Resolve the concrete RSNA adapter required by localization."""
-    if config.registry_key != "rsna":
+    if config.dataset.dataset_id != "rsna":
         raise ValueError("Localization supports only the RSNA dataset")
-    return cast(RsnaDataset, get_dataset(config.registry_key))
+    return cast(RsnaDataset, get_dataset(config.dataset.dataset_id))
 
 
 def _gradcam_indices(

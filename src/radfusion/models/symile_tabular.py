@@ -13,7 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 
-from radfusion.data.symile_preprocess import SymileLabEcdfTransformer
+from radfusion.data.symile_preprocess import LAB_ECDF_POLICY_VERSION, SymileLabEcdfTransformer
 from radfusion.evaluation.metrics import validated_binary_targets
 
 
@@ -30,13 +30,17 @@ def fit_symile_labs_logistic(
     outer_training_targets: np.ndarray,
     *,
     parameters: Mapping[str, object],
+    selection_metric: str,
+    lab_policy: str,
     repeat_seed: int,
 ) -> SymileTabularFit:
     """Fit the frozen LR path on complete outer training."""
+    if selection_metric != "none":
+        raise ValueError("Symile Labs Logistic Regression does not perform model selection")
     targets = validated_binary_targets(outer_training_targets)
     pipeline = Pipeline(
         [
-            ("preprocess", SymileLabEcdfTransformer()),
+            ("preprocess", _lab_transformer(lab_policy)),
             (
                 "classifier",
                 LogisticRegression(
@@ -59,11 +63,15 @@ def fit_symile_labs_lightgbm(
     outer_training_targets: np.ndarray,
     *,
     parameters: Mapping[str, object],
+    selection_metric: str,
+    lab_policy: str,
     inner_training_indices: np.ndarray,
     inner_validation_indices: np.ndarray,
     repeat_seed: int,
 ) -> SymileTabularFit:
     """Fit the frozen LightGBM path with inner-validation AUROC stopping."""
+    if selection_metric != "roc_auc":
+        raise ValueError("Symile Labs LightGBM selection requires roc_auc")
     targets = validated_binary_targets(outer_training_targets)
     train_indices = _validated_partition_indices(
         inner_training_indices, len(targets), "inner training"
@@ -75,7 +83,7 @@ def fit_symile_labs_lightgbm(
         validation_indices
     ) != set(range(len(targets))):
         raise ValueError("Inner LightGBM partitions must divide complete outer training")
-    preprocessor = SymileLabEcdfTransformer().fit(outer_training_features)
+    preprocessor = _lab_transformer(lab_policy).fit(outer_training_features)
     transformed = preprocessor.transform(outer_training_features)
     classifier = LGBMClassifier(
         objective=str(parameters["objective"]),
@@ -126,6 +134,12 @@ def fit_symile_labs_lightgbm(
         Pipeline([("preprocess", preprocessor), ("classifier", classifier)]),
         best_iteration,
     )
+
+
+def _lab_transformer(policy: str) -> SymileLabEcdfTransformer:
+    if policy != LAB_ECDF_POLICY_VERSION:
+        raise ValueError("Symile laboratory preprocessing policy is unsupported")
+    return SymileLabEcdfTransformer()
 
 
 def symile_tabular_logits(pipeline: Pipeline, features: pd.DataFrame) -> np.ndarray:
