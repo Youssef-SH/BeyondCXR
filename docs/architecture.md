@@ -4,10 +4,9 @@
 
 - **Dataset:** an external source collection with a stable logical identity.
 - **Build:** one execution of bundle construction. A successful build publishes one bundle.
-- **Bundle:** an immutable, validated set of typed artifacts stored under `build-<sha256>`.
-- **Manifest:** a bundle document such as `rsna_manifest_metadata.json` or
-  `symile_manifest_metadata.json` that declares identity, contents, hashes, policies, and
-  provenance.
+- **Bundle:** an immutable, validated set of typed artifacts stored under `bundle-<sha256>`.
+- **Manifest:** the bundle's `manifest.json`, which declares identity, contents, hashes, policies,
+  and provenance through the common bundle envelope.
 
 The lifecycle is: source dataset → build execution → immutable bundle → validated consumers.
 `CURRENT` selects the active bundle; published bundles remain immutable.

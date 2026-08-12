@@ -60,7 +60,8 @@ symile-analyze:
 train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
-	uv run python -m radfusion.training.train --config "$(CONFIG)" \
+	@test -n "$(SEED)" || (echo "SEED=<integer 0..2147483647> is required"; exit 2)
+	uv run python -m radfusion.training.train --config "$(CONFIG)" --seed "$(SEED)" \
 		$(if $(SOURCE_TRAINING_RUN_ID),--source-training-run-id "$(SOURCE_TRAINING_RUN_ID)")
 
 evaluate:
@@ -120,9 +121,9 @@ purge-generated: clean
 	artifact_count=0; current_count=0; \
 	if [ -d data/manifests ]; then \
 		artifact_count=$$(find data/manifests -type d \
-			\( -name 'build-*' -o -name 'cv-assignment-*' \) -print | wc -l); \
+			\( -name 'bundle-*' -o -name 'cv-assignment-*' \) -print | wc -l); \
 		find data/manifests -type d \
-			\( -name 'build-*' -o -name 'cv-assignment-*' \) -prune -exec rm -rf -- {} +; \
+			\( -name 'bundle-*' -o -name 'cv-assignment-*' \) -prune -exec rm -rf -- {} +; \
 		current_count=$$(find data/manifests \( -type f -o -type l \) -name CURRENT -print | wc -l); \
 		find data/manifests \( -type f -o -type l \) -name CURRENT -exec rm -f -- {} +; \
 		find data/manifests -depth -type d -empty ! -path data/manifests -exec rmdir -- {} \;; \

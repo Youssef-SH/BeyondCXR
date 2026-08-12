@@ -1,14 +1,14 @@
 # RSNA data contract
 
-RSNA manifest schema version `0.1.0` defines the current development contract. Version changes require
-an explicit contract decision. Bundle IDs and declared hashes identify exact content.
+The common bundle manifest schema version `1` defines the current development contract. Bundle IDs
+and declared hashes identify exact content.
 
 An RSNA bundle contains five Parquet artifacts and one JSON manifest. Column order, Arrow types,
 nullability, and deterministic row order are contractual.
 
 ## Samples
 
-File: `rsna_samples.parquet`. One row per labeled image, sorted by `sample_id`.
+File: `samples.parquet`. One row per labeled image, sorted by `sample_id`.
 
 | Field | Arrow type | Nullable | Definition |
 | --- | --- | --- | --- |
@@ -33,7 +33,7 @@ resolves beneath the raw dataset root and agrees with the discovered source file
 
 ## Labels
 
-File: `rsna_labels.parquet`. One row per sample and task, sorted by
+File: `labels.parquet`. One row per sample and task, sorted by
 `(sample_id, task_id)`.
 
 | Field | Arrow type | Nullable | Definition |
@@ -50,7 +50,7 @@ manifest.
 
 ## Annotations
 
-File: `rsna_annotations.parquet`. One row per positive bounding box, sorted by
+File: `annotations.parquet`. One row per positive bounding box, sorted by
 `annotation_id`.
 
 | Field | Arrow type | Nullable | Definition |
@@ -69,7 +69,7 @@ source DICOMs.
 
 ## Splits
 
-File: `rsna_splits.parquet`. One row per sample, sorted by `sample_id`.
+File: `splits.parquet`. One row per sample, sorted by `sample_id`.
 
 | Field | Arrow type | Nullable | Definition |
 | --- | --- | --- | --- |
@@ -82,7 +82,7 @@ Split-wide lineage is stored once in the manifest.
 
 ## Source inventory
 
-File: `rsna_source_inventory.parquet`. One row per sample, sorted by `sample_id`.
+File: `source_inventory.parquet`. One row per sample, sorted by `sample_id`.
 
 | Field | Arrow type | Nullable | Definition |
 | --- | --- | --- | --- |
@@ -97,7 +97,7 @@ not rehash the external dataset.
 
 ## Manifest
 
-File: `rsna_manifest_metadata.json`.
+File: `manifest.json`.
 
 The manifest owns bundle-level data: dataset and release identity, task definitions, split
 lineage, source CSV hashes, artifact hashes, essential counts, source-quality evidence, privacy
@@ -139,6 +139,6 @@ the five ordered logical artifact hashes. It excludes physical hashes, generated
 timestamps, commands, paths, tool diagnostics, and `CURRENT`.
 
 Publication validates a complete sibling staging directory once, atomically renames it to its
-immutable `build-<sha256>` directory, then atomically updates `CURRENT`. Independent consumers
+immutable `bundle-<sha256>` directory, then atomically updates `CURRENT`. Independent consumers
 perform complete validation when loading a bundle. Scientific runs should record an explicit
 bundle ID; `CURRENT` is the interactive selection pointer.
