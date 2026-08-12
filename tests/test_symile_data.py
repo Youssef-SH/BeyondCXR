@@ -21,6 +21,7 @@ from radfusion.data.symile_artifacts import (
     SymileBundlePaths,
     authenticate_source_asset,
     build_symile_artifacts,
+    bundle_identity_payload,
     official_split_assignment_id,
     read_symile_samples,
     resolve_symile_bundle,
@@ -33,6 +34,7 @@ from radfusion.data.symile_artifacts import (
 from radfusion.data.symile_audit import REPORT_FILENAMES, generate_symile_audit
 from radfusion.data.symile_cv import (
     CV_ASSIGNMENTS_FILENAME,
+    _cv_identity_payload,
     cv_assignment_id,
     generate_cv_assignments,
     publish_symile_cv,
@@ -251,30 +253,38 @@ def test_positive_self_query_selector_retains_original_rows() -> None:
 
 def _identity_metadata() -> dict[str, object]:
     return {
-        "manifest_schema_version": "0.1.0",
+        "bundle_manifest_schema_version": "1",
         "dataset": {"dataset_id": "symile", "release": "1.0.0"},
-        "task": {
-            "task_id": "pneumonia_strict",
-            "label_source": "symile_mimic_data.csv:Pneumonia",
-            "label_policy_version": "symile-pneumonia-strict-v1",
-            "positive": "pneumonia_state == 1",
-            "negative": "pneumonia_state == 0",
-            "excluded": ["pneumonia_state == -1", "pneumonia_state is null"],
+        "tasks": {
+            "pneumonia_strict": {
+                "task_id": "pneumonia_strict",
+                "label_source": "symile_mimic_data.csv:Pneumonia",
+                "label_policy_version": "symile-pneumonia-strict-v1",
+                "positive": "pneumonia_state == 1",
+                "negative": "pneumonia_state == 0",
+                "excluded": ["pneumonia_state == -1", "pneumonia_state is null"],
+            }
         },
-        "official_membership": {
+        "membership": {
             "source": {
                 "train": "train.csv",
                 "validation": "val.csv",
                 "test": "positive self-query rows of test.csv",
             },
             "test_selector": "label == 1 and label_hadm_id == hadm_id",
-            "official_split_assignment_id": "split-assignment-" + "0" * 64,
-            "counts": {"diagnostic": 1},
+            "split_assignment_id": "split-assignment-" + "0" * 64,
         },
-        "source_release": {
+        "source": {
             "release": "1.0.0",
             "checksum_manifest_sha256": "a" * 64,
-            "source_assets": [{"diagnostic": "ignored"}],
+            "source_assets": [
+                {
+                    "relative_path": "train.csv",
+                    "byte_size": 1,
+                    "expected_sha256": "b" * 64,
+                    "observed_sha256": "b" * 64,
+                }
+            ],
         },
         "modalities": {
             "common_locator": ["official_split", "source_row"],
@@ -309,15 +319,15 @@ def _identity_metadata() -> dict[str, object]:
                     "release_scope": "selected values without raw laboratory-event timestamps",
                 },
             },
-            "qualification": {"diagnostic": "ignored"},
+            "labs": {
+                "item_order": list(LAB_ITEM_IDS),
+                "item_names": LAB_NAMES,
+                "value_semantics": "raw float64 source value; null means unobserved",
+                "observed_semantics": "true exactly when the raw value is non-null",
+                "official_percentiles": "diagnostic",
+            },
         },
-        "laboratories": {
-            "item_order": list(LAB_ITEM_IDS),
-            "item_names": LAB_NAMES,
-            "value_semantics": "raw float64 source value; null means unobserved",
-            "observed_semantics": "true exactly when the raw value is non-null",
-            "official_percentiles": "diagnostic",
-        },
+        "qualification": {"diagnostic": "ignored"},
         "generation": {"timestamp": "ignored"},
         "artifacts": {"physical_file_sha256": "ignored"},
     }
@@ -334,30 +344,33 @@ def test_semantic_bundle_identity_includes_only_meaning_and_logical_content() ->
     metadata = _identity_metadata()
     logical = {SAMPLES_FILENAME: "b" * 64, LABS_FILENAME: "c" * 64}
     identity = semantic_bundle_id(metadata, logical)
-    for change in ("diagnostics", "generation", "physical", "split_assignment"):
+    for change in ("diagnostics", "generation", "physical", "checksum_manifest"):
         changed = deepcopy(metadata)
         if change == "diagnostics":
-            changed["official_membership"]["counts"] = {"diagnostic": 2}
-            changed["modalities"]["qualification"] = {"diagnostic": "changed"}
+            changed["qualification"] = {"diagnostic": "changed"}
         elif change == "generation":
             changed["generation"] = {"timestamp": "different"}
         elif change == "physical":
             changed["artifacts"] = {"physical_file_sha256": "different encoding"}
         else:
-            changed["official_membership"]["official_split_assignment_id"] = (
-                "split-assignment-" + "1" * 64
-            )
+            changed["source"]["checksum_manifest_sha256"] = "d" * 64
         assert semantic_bundle_id(changed, logical) == identity
 
     changes = []
     task_changed = deepcopy(metadata)
-    task_changed["task"]["positive"] = "different"
+    task_changed["tasks"]["pneumonia_strict"]["positive"] = "different"
     changes.append((task_changed, logical))
+    split_changed = deepcopy(metadata)
+    split_changed["membership"]["split_assignment_id"] = "split-assignment-" + "1" * 64
+    changes.append((split_changed, logical))
+    source_changed = deepcopy(metadata)
+    source_changed["source"]["source_assets"][0]["expected_sha256"] = "e" * 64
+    changes.append((source_changed, logical))
     modality_changed = deepcopy(metadata)
     modality_changed["modalities"]["cxr"]["dtype"] = "float64"
     changes.append((modality_changed, logical))
     labs_changed = deepcopy(metadata)
-    labs_changed["laboratories"]["observed_semantics"] = "different"
+    labs_changed["modalities"]["labs"]["observed_semantics"] = "different"
     changes.append((labs_changed, logical))
     changes.append((metadata, {**logical, SAMPLES_FILENAME: "d" * 64}))
     changes.append((metadata, {**logical, LABS_FILENAME: "e" * 64}))
@@ -378,6 +391,17 @@ def test_semantic_bundle_identity_is_independent_of_parquet_encoding(tmp_path: P
     assert semantic_bundle_id(
         metadata, {SAMPLES_FILENAME: first_hash, LABS_FILENAME: "c" * 64}
     ) == semantic_bundle_id(metadata, {SAMPLES_FILENAME: second_hash, LABS_FILENAME: "c" * 64})
+
+
+def test_symile_semantic_payload_uses_abstract_roles_and_canonical_source_assets() -> None:
+    metadata = _identity_metadata()
+    metadata["source"]["source_assets"] = list(reversed(metadata["source"]["source_assets"]))
+    payload = bundle_identity_payload(
+        metadata, {SAMPLES_FILENAME: "b" * 64, LABS_FILENAME: "c" * 64}
+    )
+
+    assert set(payload["artifacts"]) == {"samples", "labs"}
+    assert ".parquet" not in json.dumps(payload, sort_keys=True)
 
 
 def test_synthetic_source_bundle_audit_and_access_workflow(tmp_path: Path) -> None:
@@ -471,9 +495,9 @@ def test_manifest_cli_reports_complete_immutable_lineage(
         == 0
     )
     output = json.loads(capsys.readouterr().out)
-    assert output["bundle_id"].startswith("build-")
+    assert output["bundle_id"].startswith("bundle-")
     assert len(output["bundle_manifest_sha256"]) == 64
-    assert output["official_split_assignment_id"].startswith("split-assignment-")
+    assert output["split_assignment_id"].startswith("split-assignment-")
 
 
 @pytest.mark.parametrize("identifier_column", ["sample_id", "subject_id", "hadm_id"])
@@ -556,7 +580,7 @@ def test_source_asset_authentication_does_not_trust_changed_manifest_asset_hash(
     manifest = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
     entry = next(
         value
-        for value in manifest["source_release"]["source_assets"]
+        for value in manifest["source"]["source_assets"]
         if value["relative_path"] == "data_npy/train/cxr_train.npy"
     )
     entry["byte_size"] = asset.stat().st_size
@@ -646,7 +670,7 @@ def test_cv_is_deterministic_grouped_and_bundle_bound(tmp_path: Path) -> None:
     for seed in (17, 42, 2026):
         assert grouped.loc[grouped["repeat_seed"] == seed, "outer_fold"].nunique() == 1
     assert manifest["bundle_id"] == bundle.bundle_id
-    assert not (manifest_root / "symile" / "cv_assignments" / "CURRENT").exists()
+    assert not (manifest_root / "symile" / "cv" / "CURRENT").exists()
 
 
 def test_split_assignment_identity_is_order_independent() -> None:
@@ -657,17 +681,24 @@ def test_split_assignment_identity_is_order_independent() -> None:
 
 
 def test_cv_identity_changes_with_bundle_or_logical_assignment() -> None:
-    original = cv_assignment_id("build-" + "a" * 64, "b" * 64)
-    assert cv_assignment_id("build-" + "a" * 64, "b" * 64) == original
-    assert cv_assignment_id("build-" + "c" * 64, "b" * 64) != original
-    assert cv_assignment_id("build-" + "a" * 64, "d" * 64) != original
+    original = cv_assignment_id("bundle-" + "a" * 64, "b" * 64)
+    assert cv_assignment_id("bundle-" + "a" * 64, "b" * 64) == original
+    assert cv_assignment_id("bundle-" + "c" * 64, "b" * 64) != original
+    assert cv_assignment_id("bundle-" + "a" * 64, "d" * 64) != original
+
+
+def test_cv_semantic_payload_has_abstract_assignment_role_and_no_retired_parent_grammar() -> None:
+    payload = _cv_identity_payload("bundle-" + "a" * 64, "b" * 64)
+
+    assert payload["artifacts"] == {"assignments": "b" * 64}
+    assert "build" not in json.dumps(payload, sort_keys=True)
 
 
 def test_cv_validation_rejects_incorrect_declared_row_count(tmp_path: Path) -> None:
     source_root, bundle = _published_synthetic_release(tmp_path)
     del source_root
     assignment_id, directory = publish_symile_cv(bundle, manifest_directory=tmp_path / "manifests")
-    manifest_path = directory / "symile_cv_manifest.json"
+    manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["artifact"]["row_count"] += 1
     manifest_path.write_text(

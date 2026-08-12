@@ -61,9 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "bundle_directory": paths.bundle_directory.as_posix(),
                 "current_marker": paths.current_path.as_posix(),
                 "sample_count": result.samples.num_rows,
-                "official_split_assignment_id": result.metadata["official_membership"][
-                    "official_split_assignment_id"
-                ],
+                "split_assignment_id": result.metadata["membership"]["split_assignment_id"],
             },
             indent=2,
         )

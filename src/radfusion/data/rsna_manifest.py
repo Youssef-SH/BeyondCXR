@@ -86,9 +86,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "label_count": result.labels.num_rows,
                 "annotation_count": result.annotations.num_rows,
                 "split_count": result.splits.num_rows,
-                "split_recipe_id": result.metadata["split"]["split_recipe_id"],
-                "split_assignment_id": result.metadata["split"]["split_assignment_id"],
-                "arrow_ipc_sha256": dict(written.arrow_ipc_sha256),
+                "split_recipe_id": result.metadata["membership"]["split"]["split_recipe_id"],
+                "split_assignment_id": result.metadata["membership"]["split"][
+                    "split_assignment_id"
+                ],
+                "logical_arrow_sha256": dict(written.logical_arrow_sha256),
             },
             indent=2,
         )
