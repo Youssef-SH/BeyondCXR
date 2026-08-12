@@ -25,12 +25,13 @@ _SHA256 = "a" * 64
 
 def _manifest() -> dict[str, object]:
     return {
-        "bundle_id": "build-test",
+        "bundle_id": "bundle-test",
         "split_assignment_id": "assignment-test",
         "task": "pneumonia",
         "positive_class": 1,
         "model": "metadata_logistic",
-        "source_config_sha256": _SHA256,
+        "config_source_sha256": _SHA256,
+        "config_semantic_sha256": _SHA256,
         "seed": 42,
         "git_commit": "commit-test",
         "git_dirty": False,
@@ -50,7 +51,7 @@ def _publish(tmp_path: Path):
     config.write_text("config_version: 1\n", encoding="utf-8")
     manifest = {
         **_manifest(),
-        "source_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+        "config_source_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
     }
     published = publish_model_run(
         model_root=tmp_path / "models" / "rsna",
@@ -189,7 +190,7 @@ def test_model_publication_rejects_unsafe_run_ids(tmp_path: Path, run_id: str) -
             source_config_bytes=config.read_bytes(),
             manifest={
                 **_manifest(),
-                "source_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                "config_source_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
             },
         )
 
@@ -205,7 +206,7 @@ def test_conflicting_model_publication_retry_is_rejected(tmp_path: Path) -> None
             manifest={
                 **_manifest(),
                 "bundle_id": "different",
-                "source_config_sha256": hashlib.sha256(
+                "config_source_sha256": hashlib.sha256(
                     published.config_path.read_bytes()
                 ).hexdigest(),
             },

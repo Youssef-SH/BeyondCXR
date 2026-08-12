@@ -1,0 +1,60 @@
+config_version: 1
+
+dataset:
+  dataset_id: rsna
+  bundle_id: bundle-8a6af8b0b28c64d409722a55444461a0623aa8fa47e48dd88431890c5219c624
+  bundle_manifest_sha256: e3b974816dee63abbe9c1cd2df7f6c2a266ae6f5085d3a347e5bdf9bb3cc40b3
+  split_assignment_id: split-assignment-b36a1ab52e0a2310f3cf1631b40c9b96b027ce67cc65616cdc13c89787396bfd
+
+task:
+  task_id: pneumonia
+  label_policy_version: rsna-stage-2-target-v1
+
+family:
+  family_id: cxr_metadata_concat
+  modalities: [cxr, metadata]
+  parameters:
+    encoder_name: densenet121
+    weights: densenet121-res224-chex
+    image_size: 224
+    embedding_dimension: 1024
+    image_projection_dimension: 256
+    structured_hidden_dimension: 128
+    structured_projection_dimension: 64
+    fusion_hidden_dimension: 128
+    dropout: 0.20
+
+preprocessing:
+  metadata_policy: rsna-metadata-input-v1
+  cxr_transform_policy: torchxrayvision-densenet121-res224-v1
+
+training:
+  selection_metric: average_precision
+  parameters:
+    class_weighting: train_pos_weight
+    fine_tune_scope: all
+    optimizer: adamw
+    mixed_precision: true
+    warmup_epochs: 2
+    fine_tune_epochs: 28
+    warmup_head_learning_rate: 0.001
+    encoder_learning_rate: 0.00001
+    head_learning_rate: 0.0001
+    weight_decay: 0.0001
+    scheduler_factor: 0.5
+    scheduler_patience: 2
+    scheduler_min_learning_rate: 0.0000001
+    gradient_clip_norm: 1.0
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.0001
+  loader:
+    batch_size: 32
+  augmentation:
+    rotation_degrees: 7.0
+    translation_fraction: 0.05
+    brightness_jitter: 0.05
+    contrast_jitter: 0.05
+
+evaluation:
+  sensitivity_target: 0.90
+  calibration_bins: 15

@@ -27,8 +27,8 @@ MODELS: MappingProxyType[
     {
         "metadata_logistic": MetadataLogisticModel(),
         "metadata_lightgbm": MetadataLightgbmModel(),
-        "image_densenet": ImageDenseNetModel(),
-        "fusion_concat": FusionConcatModel(),
+        "cxr_densenet": ImageDenseNetModel(),
+        "cxr_metadata_concat": FusionConcatModel(),
     }
 )
 

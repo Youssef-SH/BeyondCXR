@@ -172,12 +172,12 @@ also receive the completed CXR development identity:
 ```bash
 make symile-develop CONFIG=configs/symile_labs_logistic.yaml
 make symile-develop CONFIG=configs/symile_labs_lightgbm.yaml
-make symile-develop CONFIG=configs/symile_cxr.yaml
-make symile-develop CONFIG=configs/symile_concat.yaml \
+make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
+make symile-develop CONFIG=configs/symile_cxr_labs_concat.yaml \
   SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
-make symile-develop CONFIG=configs/symile_gated.yaml \
+make symile-develop CONFIG=configs/symile_cxr_labs_gated.yaml \
   SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
-make symile-develop CONFIG=configs/symile_gated_no_observedness.yaml \
+make symile-develop CONFIG=configs/symile_cxr_labs_gated_no_observedness.yaml \
   SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
 ```
 

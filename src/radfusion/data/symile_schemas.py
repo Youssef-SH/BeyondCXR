@@ -6,7 +6,6 @@ import pyarrow as pa
 
 DATASET_ID = "symile"
 DATASET_RELEASE = "1.0.0"
-MANIFEST_SCHEMA_VERSION = "0.1.0"
 TASK_ID = "pneumonia_strict"
 LABEL_POLICY_VERSION = "symile-pneumonia-strict-v1"
 OFFICIAL_SPLITS = ("train", "validation", "test")

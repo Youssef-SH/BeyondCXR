@@ -24,14 +24,14 @@ data/
   manifests/
     rsna/
       CURRENT
-      builds/
-        build-<sha256>/
-          rsna_samples.parquet
-          rsna_labels.parquet
-          rsna_annotations.parquet
-          rsna_splits.parquet
-          rsna_source_inventory.parquet
-          rsna_manifest_metadata.json
+      bundles/
+        bundle-<sha256>/
+          manifest.json
+          samples.parquet
+          labels.parquet
+          annotations.parquet
+          splits.parquet
+          source_inventory.parquet
   cache/
     rsna/
       cache-<sha256>/
@@ -63,13 +63,13 @@ data/
   raw/symile/extracted/             # official restricted Symile-MIMIC 1.0.0 release
   manifests/symile/
     CURRENT
-    builds/build-<sha256>/
-      symile_samples.parquet
-      symile_labs.parquet
-      symile_manifest_metadata.json
-    cv_assignments/cv-assignment-<sha256>/
-      symile_cv_assignments.parquet
-      symile_cv_manifest.json
+    bundles/bundle-<sha256>/
+      manifest.json
+      samples.parquet
+      labs.parquet
+    cv/cv-assignment-<sha256>/
+      manifest.json
+      assignments.parquet
 ```
 
 Run `make symile-manifest`, `make symile-audit`, and `make symile-cv` in that order. `CURRENT` is

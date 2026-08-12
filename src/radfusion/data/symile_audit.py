@@ -79,9 +79,7 @@ def generate_symile_audit(
     return {
         "bundle_id": bundle.bundle_id,
         "bundle_manifest_sha256": manifest_sha256,
-        "official_split_assignment_id": metadata["official_membership"][
-            "official_split_assignment_id"
-        ],
+        "split_assignment_id": metadata["membership"]["split_assignment_id"],
         "report_directory": destination.as_posix(),
         "reports": list(REPORT_FILENAMES),
     }
@@ -124,17 +122,17 @@ def _audit_markdown(
     metadata: dict[str, object],
     samples: pd.DataFrame,
 ) -> str:
-    membership = metadata["official_membership"]
-    counts = membership["counts"]
-    strict = membership["strict_pneumonia_counts"]
-    asset_count = len(metadata["source_release"]["source_assets"])
+    membership = metadata["membership"]
+    counts = metadata["qualification"]["membership_counts"]
+    strict = metadata["qualification"]["strict_pneumonia_counts"]
+    asset_count = len(metadata["source"]["source_assets"])
     lines = [
         "# Symile-MIMIC data audit",
         "",
         f"- Dataset release: Symile-MIMIC {metadata['dataset']['release']}",
         f"- Bundle ID: `{bundle_id}`",
         f"- Bundle-manifest SHA-256: `{manifest_sha256}`",
-        f"- Official split assignment ID: `{membership['official_split_assignment_id']}`",
+        f"- Official split assignment ID: `{membership['split_assignment_id']}`",
         f"- Authenticated official source assets: {asset_count:,}",
         "- Source authentication: passed",
         "",

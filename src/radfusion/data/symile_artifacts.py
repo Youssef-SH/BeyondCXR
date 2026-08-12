@@ -12,12 +12,23 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from radfusion.data.bundle_contract import (
+    BUNDLE_MANIFEST_SCHEMA_VERSION,
+    BUNDLE_PREFIX,
+    BUNDLES_DIRECTORY,
+    CURRENT_FILENAME,
+    MANIFEST_FILENAME,
+    SAMPLES_FILENAME,
+    valid_bundle_id,
+    validate_common_bundle_envelope,
+)
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.symile_schemas import (
@@ -26,7 +37,6 @@ from radfusion.data.symile_schemas import (
     LAB_ITEM_IDS,
     LAB_NAMES,
     LAB_SCHEMA,
-    MANIFEST_SCHEMA_VERSION,
     OFFICIAL_SPLITS,
     SAMPLE_SCHEMA,
     task_contract,
@@ -39,26 +49,10 @@ from radfusion.data.symile_source import (
 )
 from radfusion.utils.publication import staging_directory, update_current_marker
 
-SAMPLES_FILENAME = "symile_samples.parquet"
-LABS_FILENAME = "symile_labs.parquet"
-METADATA_FILENAME = "symile_manifest_metadata.json"
-CURRENT_FILENAME = "CURRENT"
-BUILDS_DIRECTORY = "builds"
+LABS_FILENAME = "labs.parquet"
+METADATA_FILENAME = MANIFEST_FILENAME
 _EXPECTED_FILES = {SAMPLES_FILENAME: SAMPLE_SCHEMA, LABS_FILENAME: LAB_SCHEMA}
-_MANIFEST_FIELDS = {
-    "manifest_schema_version",
-    "dataset",
-    "task",
-    "official_membership",
-    "source_release",
-    "modalities",
-    "laboratories",
-    "privacy",
-    "bundle",
-    "artifacts",
-    "provenance",
-    "generation",
-}
+_ARTIFACT_ROLES = MappingProxyType({"samples": SAMPLES_FILENAME, "labs": LABS_FILENAME})
 _OFFICIAL_MEMBERSHIP_SOURCE = {
     "train": "train.csv",
     "validation": "val.csv",
@@ -147,15 +141,15 @@ def write_symile_bundle(
 ) -> SymileBundlePaths:
     """Validate and immutably publish one content-addressed Symile bundle."""
     dataset_root = Path(output_directory) / DATASET_ID
-    builds_root = dataset_root / BUILDS_DIRECTORY
-    builds_root.mkdir(parents=True, exist_ok=True)
+    bundles_root = dataset_root / BUNDLES_DIRECTORY
+    bundles_root.mkdir(parents=True, exist_ok=True)
     current_path = dataset_root / CURRENT_FILENAME
     logical_hashes = {
         SAMPLES_FILENAME: arrow_ipc_sha256(result.samples),
         LABS_FILENAME: arrow_ipc_sha256(result.labs),
     }
     bundle_id = semantic_bundle_id(result.metadata, logical_hashes)
-    destination = builds_root / bundle_id
+    destination = bundles_root / bundle_id
     stage = staging_directory(destination)
     try:
         pq.write_table(result.samples, stage / SAMPLES_FILENAME, compression="zstd")
@@ -183,32 +177,40 @@ def semantic_bundle_id(metadata: Mapping[str, Any], logical_hashes: Mapping[str,
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     ).hexdigest()
-    return "build-" + digest
+    return BUNDLE_PREFIX + digest
 
 
 def bundle_identity_payload(
     metadata: Mapping[str, Any], logical_hashes: Mapping[str, str]
 ) -> dict[str, object]:
-    """Build the frozen semantic bundle identity payload."""
+    """Build the canonical semantic bundle identity payload."""
+    membership = metadata["membership"]
+    source = metadata["source"]
+    modalities = metadata["modalities"]
+    source_assets = sorted(
+        (
+            {
+                "relative_path": asset["relative_path"],
+                "sha256": asset["expected_sha256"],
+            }
+            for asset in source["source_assets"]
+        ),
+        key=lambda asset: str(asset["relative_path"]),
+    )
     return {
-        "manifest_schema_version": metadata["manifest_schema_version"],
         "dataset": metadata["dataset"],
-        "task": metadata["task"],
-        "official_membership": {
-            key: metadata["official_membership"][key] for key in ("source", "test_selector")
+        "tasks": metadata["tasks"],
+        "membership": {
+            key: membership[key] for key in ("source", "test_selector", "split_assignment_id")
         },
-        "source_release": {
-            "release": metadata["source_release"]["release"],
-            "checksum_manifest_sha256": metadata["source_release"]["checksum_manifest_sha256"],
+        "source": {
+            "release": source["release"],
+            "assets": source_assets,
         },
         "modalities": {
-            key: metadata["modalities"][key] for key in ("common_locator", "cxr", "ecg", "temporal")
+            key: modalities[key] for key in ("common_locator", "cxr", "ecg", "labs", "temporal")
         },
-        "laboratories": {
-            key: metadata["laboratories"][key]
-            for key in ("item_order", "item_names", "value_semantics", "observed_semantics")
-        },
-        "logical_arrow_hashes": dict(sorted(logical_hashes.items())),
+        "artifacts": {role: logical_hashes[filename] for role, filename in _ARTIFACT_ROLES.items()},
     }
 
 
@@ -226,7 +228,7 @@ def resolve_symile_bundle(
         if current_path.is_symlink() or not current_path.is_file():
             raise ManifestBuildError("Symile CURRENT marker is missing")
         resolved = current_path.read_text(encoding="utf-8").strip()
-    if not _valid_identity(resolved, "build-"):
+    if not valid_bundle_id(resolved):
         raise ManifestBuildError("Symile bundle identity is invalid")
     paths = _bundle_paths(dataset_root, resolved)
     validator = validate_symile_bundle if full_validation else validate_symile_bundle_reference
@@ -258,6 +260,10 @@ def validate_symile_bundle(
     for filename, digest in actual.items():
         if digest != declared[filename]["logical_arrow_sha256"]:
             raise ManifestBuildError(f"Logical Arrow hash mismatch: {filename}")
+        if declared[filename]["row_count"] != (
+            samples.num_rows if filename == SAMPLES_FILENAME else labs.num_rows
+        ):
+            raise ManifestBuildError(f"Row count mismatch: {filename}")
     if semantic_bundle_id(reference.manifest, actual) != reference.manifest["bundle"]["bundle_id"]:
         raise ManifestBuildError("Symile semantic bundle identity does not match content")
     _validate_manifest_counts(reference.manifest, samples)
@@ -296,6 +302,8 @@ def validate_symile_bundle_reference(
             raise ManifestBuildError(f"Physical file hash mismatch: {filename}")
         if pq.read_schema(path) != schema:
             raise ManifestBuildError(f"Parquet schema mismatch: {filename}")
+        if pq.read_metadata(path).num_rows != declaration["row_count"]:
+            raise ManifestBuildError(f"Parquet row count mismatch: {filename}")
         logical_hashes[filename] = declaration["logical_arrow_sha256"]
     if semantic_bundle_id(metadata, logical_hashes) != bundle_id:
         raise ManifestBuildError("Symile declared semantic identity is invalid")
@@ -360,7 +368,7 @@ def authenticate_source_asset(
     relative = path.relative_to(Path(source_root)).as_posix()
     return authenticate_release_asset(
         source_root,
-        checksum_manifest_sha256=reference.manifest["source_release"]["checksum_manifest_sha256"],
+        checksum_manifest_sha256=reference.manifest["source"]["checksum_manifest_sha256"],
         relative_path=relative,
     )
 
@@ -371,17 +379,15 @@ def _base_metadata(source: QualifiedSymileSource, samples: pa.Table) -> dict[str
     train_evidence = modality_evidence["splits"]["train"]
     counts = _strict_counts(samples.to_pandas())
     return {
-        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "bundle_manifest_schema_version": BUNDLE_MANIFEST_SCHEMA_VERSION,
         "dataset": {"dataset_id": DATASET_ID, "release": DATASET_RELEASE},
-        "task": task_contract(),
-        "official_membership": {
+        "tasks": {"pneumonia_strict": task_contract()},
+        "membership": {
             "source": _OFFICIAL_MEMBERSHIP_SOURCE,
             "test_selector": "label == 1 and label_hadm_id == hadm_id",
-            "official_split_assignment_id": official_split_assignment_id(samples),
-            "counts": reconciliation,
-            "strict_pneumonia_counts": counts,
+            "split_assignment_id": official_split_assignment_id(samples),
         },
-        "source_release": {
+        "source": {
             "release": DATASET_RELEASE,
             "checksum_manifest": "SHA256SUMS.txt",
             "checksum_manifest_sha256": source.checksum_manifest_sha256,
@@ -398,18 +404,17 @@ def _base_metadata(source: QualifiedSymileSource, samples: pa.Table) -> dict[str
                 **_ECG_MODALITY_DECLARATIONS,
                 "sample_shape": train_evidence["ecg_shape"],
             },
-            "qualification": modality_evidence,
             "temporal": _TEMPORAL_DECLARATIONS,
-        },
-        "laboratories": {
-            "item_order": list(LAB_ITEM_IDS),
-            "item_names": {item: LAB_NAMES[item] for item in LAB_ITEM_IDS},
-            "value_semantics": _LAB_VALUE_SEMANTICS,
-            "observed_semantics": _LAB_OBSERVED_SEMANTICS,
-            "official_percentiles": (
-                "conformance reference for the upstream percentile representation"
-            ),
-            "labs_means": "official missing-percentile conformance reference",
+            "labs": {
+                "item_order": list(LAB_ITEM_IDS),
+                "item_names": {item: LAB_NAMES[item] for item in LAB_ITEM_IDS},
+                "value_semantics": _LAB_VALUE_SEMANTICS,
+                "observed_semantics": _LAB_OBSERVED_SEMANTICS,
+                "official_percentiles": (
+                    "conformance reference for the upstream percentile representation"
+                ),
+                "labs_means": "official missing-percentile conformance reference",
+            },
         },
         "privacy": {
             "classification": "restricted patient-level data",
@@ -420,6 +425,11 @@ def _base_metadata(source: QualifiedSymileSource, samples: pa.Table) -> dict[str
             "pandas": pd.__version__,
             "pyarrow": pa.__version__,
             "numpy": __import__("numpy").__version__,
+        },
+        "qualification": {
+            "membership_counts": reconciliation,
+            "strict_pneumonia_counts": counts,
+            "modalities": modality_evidence,
         },
     }
 
@@ -434,12 +444,13 @@ def _finalize_metadata(
         **base,
         "bundle": {
             "bundle_id": bundle_id,
-            "publication_model": "immutable-build-directory-with-atomic-CURRENT-marker",
+            "publication_model": "immutable-bundle-directory-with-atomic-CURRENT-marker",
         },
         "artifacts": {
             filename: {
                 "logical_arrow_sha256": logical_hashes[filename],
                 "physical_file_sha256": sha256_file(stage / filename),
+                "row_count": pq.read_metadata(stage / filename).num_rows,
             }
             for filename in sorted(_EXPECTED_FILES)
         },
@@ -451,22 +462,18 @@ def _finalize_metadata(
 
 
 def _validate_manifest(metadata: object) -> None:
-    if not isinstance(metadata, dict) or set(metadata) != _MANIFEST_FIELDS:
-        raise ManifestBuildError("Symile manifest field set is invalid")
-    if (
-        metadata["manifest_schema_version"] != MANIFEST_SCHEMA_VERSION
-        or metadata["dataset"] != {"dataset_id": DATASET_ID, "release": DATASET_RELEASE}
-        or metadata["task"] != task_contract()
-    ):
+    validate_common_bundle_envelope(metadata, expected_artifacts=set(_EXPECTED_FILES))
+    assert isinstance(metadata, dict)
+    if metadata["dataset"] != {"dataset_id": DATASET_ID, "release": DATASET_RELEASE} or metadata[
+        "tasks"
+    ] != {"pneumonia_strict": task_contract()}:
         raise ManifestBuildError("Symile manifest dataset/task contract is invalid")
     if metadata["privacy"] != {
         "classification": "restricted patient-level data",
         "public_reporting": "aggregate only",
     }:
         raise ManifestBuildError("Symile manifest privacy contract is invalid")
-    if set(metadata["artifacts"]) != set(_EXPECTED_FILES):
-        raise ManifestBuildError("Symile manifest artifact set is invalid")
-    laboratories = metadata["laboratories"]
+    laboratories = metadata["modalities"].get("labs")
     if (
         not isinstance(laboratories, dict)
         or laboratories.get("item_order") != list(LAB_ITEM_IDS)
@@ -475,12 +482,12 @@ def _validate_manifest(metadata: object) -> None:
         or laboratories.get("observed_semantics") != _LAB_OBSERVED_SEMANTICS
     ):
         raise ManifestBuildError("Symile manifest laboratory contract is invalid")
-    membership = metadata["official_membership"]
+    membership = metadata["membership"]
     if (
         not isinstance(membership, dict)
         or membership.get("source") != _OFFICIAL_MEMBERSHIP_SOURCE
         or membership.get("test_selector") != "label == 1 and label_hadm_id == hadm_id"
-        or not _valid_identity(membership.get("official_split_assignment_id"), "split-assignment-")
+        or not _valid_identity(membership.get("split_assignment_id"), "split-assignment-")
     ):
         raise ManifestBuildError("Symile official membership contract is invalid")
     modalities = metadata["modalities"]
@@ -497,7 +504,7 @@ def _validate_manifest(metadata: object) -> None:
         or modalities.get("temporal") != _TEMPORAL_DECLARATIONS
     ):
         raise ManifestBuildError("Symile manifest modality contract is invalid")
-    source_release = metadata["source_release"]
+    source_release = metadata["source"]
     assets = source_release.get("source_assets")
     if (
         source_release.get("release") != DATASET_RELEASE
@@ -524,15 +531,8 @@ def _validate_manifest(metadata: object) -> None:
         ):
             raise ManifestBuildError("Symile source asset identity is invalid")
     bundle_id = metadata["bundle"].get("bundle_id")
-    if not _valid_identity(bundle_id, "build-"):
+    if not valid_bundle_id(bundle_id):
         raise ManifestBuildError("Symile bundle identity declaration is invalid")
-    for declaration in metadata["artifacts"].values():
-        if (
-            not isinstance(declaration, dict)
-            or set(declaration) != {"logical_arrow_sha256", "physical_file_sha256"}
-            or not all(_valid_sha256(value) for value in declaration.values())
-        ):
-            raise ManifestBuildError("Symile artifact hash declaration is invalid")
 
 
 def _validate_tables(samples: pa.Table, labs: pa.Table) -> None:
@@ -584,7 +584,8 @@ def _validate_tables(samples: pa.Table, labs: pa.Table) -> None:
 
 def _validate_manifest_counts(metadata: Mapping[str, Any], samples: pa.Table) -> None:
     frame = samples.to_pandas()
-    counts = metadata["official_membership"]["counts"]
+    qualification = metadata["qualification"]
+    counts = qualification["membership_counts"]
     observed = {
         "official_admissions": len(frame),
         "train_admissions": int((frame["official_split"] == "train").sum()),
@@ -603,11 +604,9 @@ def _validate_manifest_counts(metadata: Mapping[str, Any], samples: pa.Table) ->
         or counts.get("admission_overlap") != 0
     ):
         raise ManifestBuildError("Symile manifest reconciliation counts are invalid")
-    if metadata["official_membership"]["strict_pneumonia_counts"] != _strict_counts(frame):
+    if qualification["strict_pneumonia_counts"] != _strict_counts(frame):
         raise ManifestBuildError("Symile strict-pneumonia counts do not match")
-    if metadata["official_membership"][
-        "official_split_assignment_id"
-    ] != official_split_assignment_id(frame):
+    if metadata["membership"]["split_assignment_id"] != official_split_assignment_id(frame):
         raise ManifestBuildError("Symile official split assignment identity does not match")
 
 
@@ -642,7 +641,7 @@ def _require_exact_regular_files(directory: Path, expected: set[str]) -> None:
 
 
 def _bundle_paths(dataset_root: Path, bundle_id: str) -> SymileBundlePaths:
-    directory = dataset_root / BUILDS_DIRECTORY / bundle_id
+    directory = dataset_root / BUNDLES_DIRECTORY / bundle_id
     return SymileBundlePaths(
         bundle_id,
         directory,

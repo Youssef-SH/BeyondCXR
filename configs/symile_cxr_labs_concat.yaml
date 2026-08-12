@@ -1,0 +1,58 @@
+config_version: 1
+
+dataset:
+  dataset_id: symile
+  bundle_id: bundle-390dbd1095ef3be4a28d9096b42c3029e7e3ae32239e6bb8440eda67bb43c3e4
+  bundle_manifest_sha256: e0c14d08763e3a8f8f96baea62ca40a355f446460d058b8e601c816c7a30da5a
+  split_assignment_id: split-assignment-917a594754a779f0774b690d9f988e29d8773d6a5f619fef379a263a7b700f27
+  cv_assignment_id: cv-assignment-ab8ed5a5040204e0e092d1ab269b48270d8396935530d22386f004be44f36102
+
+task:
+  task_id: pneumonia_strict
+  label_policy_version: symile-pneumonia-strict-v1
+
+family:
+  family_id: cxr_labs_concat
+  modalities: [cxr, labs]
+  parameters:
+    encoder_name: densenet121
+    weights: densenet121-res224-chex
+    image_size: 224
+    embedding_dimension: 1024
+    lab_input_dimension: 100
+    image_projection_dimension: 256
+    lab_hidden_dimension: 128
+    lab_projection_dimension: 64
+    fusion_hidden_dimension: 128
+    dropout: 0.2
+
+preprocessing:
+  cxr_transform_policy: torchxrayvision-densenet121-res224-v1
+  lab_policy: symile-outer-training-right-ecdf-v1
+
+training:
+  selection_metric: roc_auc
+  parameters:
+    pos_weight: 1.0
+    fine_tune_scope: terminal
+    optimizer: adamw
+    mixed_precision: true
+    warmup_epochs: 2
+    fine_tune_epochs: 28
+    warmup_head_learning_rate: 0.001
+    encoder_learning_rate: 0.00001
+    head_learning_rate: 0.0001
+    weight_decay: 0.0001
+    scheduler_factor: 0.5
+    scheduler_patience: 2
+    scheduler_min_learning_rate: 0.0000001
+    gradient_clip_norm: 1.0
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.0001
+  loader:
+    batch_size: 32
+  augmentation:
+    rotation_degrees: 7.0
+    translation_fraction: 0.05
+    brightness_jitter: 0.05
+    contrast_jitter: 0.05

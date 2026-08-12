@@ -146,8 +146,8 @@ class CxrCacheIdentity:
 
     def __post_init__(self) -> None:
         if (
-            not self.bundle_id.startswith("build-")
-            or not _is_sha256(self.bundle_id[6:])
+            not self.bundle_id.startswith("bundle-")
+            or not _is_sha256(self.bundle_id[7:])
             or not all(
                 _is_sha256(value)
                 for value in (

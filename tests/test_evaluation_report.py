@@ -23,7 +23,7 @@ def test_report_renders_configured_sensitivity_target_and_exact_metric_names(
     probability = evaluate_probabilities(targets, probabilities, calibration_bins=15)
     metrics = evaluate_operating_point(targets, probabilities, threshold=0.5)
     target_metrics = evaluate_operating_point(targets, probabilities, threshold=target_threshold)
-    config = load_experiment_config("configs/metadata_logistic.yaml")
+    config = load_experiment_config("configs/rsna_metadata_logistic.yaml")
     document = metrics_document(
         scope="validation",
         calibration_bins=15,

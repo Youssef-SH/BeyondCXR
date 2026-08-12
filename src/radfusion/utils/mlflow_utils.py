@@ -147,7 +147,7 @@ def log_source_config(config: SourceConfig) -> None:
     with tempfile.TemporaryDirectory(prefix="radfusion-config-") as temporary_directory:
         path = Path(temporary_directory) / "resolved_config.yaml"
         path.write_bytes(config.source_bytes)
-        if sha256_file(path) != config.source_sha256:
+        if sha256_file(path) != config.config_source_sha256:
             raise ValueError("Loaded source configuration SHA-256 mismatch")
         mlflow.log_artifact(str(path), artifact_path="config")
 

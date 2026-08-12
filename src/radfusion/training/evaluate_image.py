@@ -17,8 +17,9 @@ from radfusion.evaluation.metrics import evaluate_operating_point, evaluate_prob
 from radfusion.models.cxr_baseline import ImageDenseNetModel
 from radfusion.training.config import (
     ExperimentConfig,
-    image_semantic_config_sha256,
     load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
 )
 from radfusion.training.datasets import (
     RsnaCachedImageDataset,
@@ -60,7 +61,6 @@ from radfusion.utils.operational_logging import (
 )
 from radfusion.utils.privacy import validate_public_reports
 from radfusion.utils.private_predictions import (
-    private_root_for_reports,
     publish_private_neural_predictions,
 )
 from radfusion.utils.publication import publish_directory, staging_directory
@@ -85,6 +85,7 @@ def evaluate_image_training_run(
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
+    private_output_directory: str | Path | None = None,
 ) -> ImageTestEvaluationResult:
     """Verify one explicit image package before accessing its test partition."""
     client = configure_mlflow(tracking_uri=tracking_uri)
@@ -132,7 +133,14 @@ def evaluate_image_training_run(
         model_path = Path(source_run.data.tags["local_model_path"])
         package_directory = model_path.parent
         manifest = validate_neural_package_metadata(package_directory)
-        config = load_experiment_config(package_directory / "resolved_config.yaml")
+        training_report = Path(source_run.data.tags["report_directory"])
+        config = with_runtime(
+            load_experiment_config(package_directory / "resolved_config.yaml"),
+            seed=int(manifest["training_policy"]["seed"]),
+            model_directory=package_directory.parent.parent,
+            report_directory=training_report.parents[2],
+            private_output_directory=private_output_directory,
+        )
         verify_image_training_package(
             source_run,
             config,
@@ -143,16 +151,16 @@ def evaluate_image_training_run(
             evaluator_lock_hash=evaluator_lock_hash,
         )
         checkpoint = load_validated_neural_checkpoint(package_directory, manifest)
-        model_builder = cast(ImageDenseNetModel, get_model(config.model.registry_key))
-        model = model_builder.build_architecture(config.model)
+        model_builder = cast(ImageDenseNetModel, get_model(config.family.family_id))
+        model = model_builder.build_architecture(config.family)
         if not isinstance(model, nn.Module):
             raise TypeError("Registered image model builder must return torch.nn.Module")
         strict_load_checkpoint(model, checkpoint)
         log_event(_LOGGER, "training_package_verified", **context)
-        dataset_adapter = get_dataset(config.dataset.registry_key)
+        dataset_adapter = get_dataset(config.dataset.dataset_id)
         with timed_phase(_LOGGER, "dataset_loading", **context):
             image_data = dataset_adapter.load_image_test(
-                config.dataset,
+                config,
                 expected_manifest_sha256=manifest["bundle_manifest_sha256"],
             )
         if (
@@ -163,12 +171,13 @@ def evaluate_image_training_run(
             or image_data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
         ):
             raise ValueError("Test bundle lineage differs from the neural package")
-        image = config.image
-        if image is None or config.dataset.dataset_root is None:
+        image = config.neural
+        if image is None or config.runtime.source_root is None:
             raise ValueError("Verified image package has an incomplete configuration")
         evaluation_transform = StandardCxrTransform(
             training=False,
-            image_size=int(config.model.parameters["image_size"]),
+            policy_version=str(config.preprocessing["cxr_transform_policy"]),
+            image_size=int(config.family.parameters["image_size"]),
             rotation_degrees=image.rotation_degrees,
             translation_fraction=image.translation_fraction,
             brightness_jitter=image.brightness_jitter,
@@ -177,7 +186,7 @@ def evaluate_image_training_run(
         if evaluation_transform.contract() != manifest["evaluation_transform_contract"]:
             raise ValueError("Evaluation transform differs from the neural package")
         resolved_cache = cache or prepare_rsna_cxr_cache(
-            cast(RsnaDataset, dataset_adapter), config.dataset, evaluation_transform
+            cast(RsnaDataset, dataset_adapter), config, evaluation_transform
         )
         expected_cache_identity = expected_rsna_cxr_cache_identity(
             lineage=image_data.lineage,
@@ -195,12 +204,12 @@ def evaluate_image_training_run(
             expected_cache_identity=expected_cache_identity,
             partition="test",
             transform=evaluation_transform,
-            training_seed=config.training.seed,
+            training_seed=require_runtime_seed(config),
         )
         runtime = resolve_device(
-            image.device,
+            config.runtime.device,
             mixed_precision=image.mixed_precision,
-            pin_memory_policy=image.pin_memory_policy,
+            pin_memory_policy=config.runtime.pin_memory_policy,
         )
         loader_execution = execution or one_shot_loader_policy(
             pin_memory=runtime.pin_memory_effective
@@ -285,26 +294,23 @@ def evaluate_image_training_run(
             ],
         }
         report_directory = (
-            config.training.report_directory
-            / config.dataset.registry_key
-            / "runs"
-            / evaluation_run_id
+            config.runtime.report_directory / config.dataset.dataset_id / "runs" / evaluation_run_id
         )
         if report_directory.exists():
             raise FileExistsError(f"Image test report already exists: {report_directory}")
         report_stage = staging_directory(report_directory)
         report_published = False
         private_prediction_directory = (
-            private_root_for_reports(config.training.report_directory)
+            config.runtime.private_output_directory
             / "predictions"
-            / config.dataset.registry_key
+            / config.dataset.dataset_id
             / evaluation_run_id
         )
         private_predictions_published = False
         try:
             write_run_reports(
                 report_stage,
-                model_name=config.model.registry_key,
+                model_name=config.family.family_id,
                 targets=inference.targets,
                 probabilities=inference.probabilities,
                 document=document,
@@ -315,12 +321,12 @@ def evaluate_image_training_run(
                 forbidden_source_values={*inference.sample_ids, *inference.patient_ids},
             )
             publish_private_neural_predictions(
-                private_root=private_root_for_reports(config.training.report_directory),
-                dataset=config.dataset.registry_key,
+                private_root=config.runtime.private_output_directory,
+                dataset=config.dataset.dataset_id,
                 training_run_id=training_run_id,
                 test_evaluation_run_id=evaluation_run_id,
                 model_package_id=str(manifest["model_package_id"]),
-                seed=config.training.seed,
+                seed=require_runtime_seed(config),
                 sample_ids=inference.sample_ids,
                 patient_keys=inference.patient_ids,
                 targets=inference.targets,
@@ -403,20 +409,20 @@ def verify_image_training_package(
     evaluator_dirty: bool,
     evaluator_lock_hash: str,
 ) -> None:
-    if config.model.modality != "image":
+    if config.family.family_id != "cxr_densenet":
         raise ValueError("Neural package does not contain an image configuration")
-    expected_package = config.training.model_directory / "runs" / training_run_id
+    expected_package = config.runtime.model_directory / "runs" / training_run_id
     observed_package = Path(source_run.data.tags["local_model_path"]).parent.resolve()
     if observed_package != expected_package.resolve():
         raise ValueError("Image training run points outside its configured package")
     source = manifest["source_provenance"]
     checks = {
         "training_mlflow_run_id": training_run_id,
-        "source_config_sha256": config.source_sha256,
-        "semantic_config_sha256": image_semantic_config_sha256(config),
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "bundle_id": config.dataset.bundle_id,
-        "task": config.dataset.task_id,
-        "model": config.model.registry_key,
+        "task": config.task.task_id,
+        "model": config.family.family_id,
     }
     for field, expected in checks.items():
         if manifest[field] != expected:
@@ -430,8 +436,8 @@ def verify_image_training_package(
         "git_commit": source["git_commit"],
         "git_dirty": str(source["git_dirty"]).lower(),
         "dependency_lock_sha256": source["dependency_lock_sha256"],
-        "source_config_sha256": manifest["source_config_sha256"],
-        "semantic_config_sha256": manifest["semantic_config_sha256"],
+        "config_source_sha256": manifest["config_source_sha256"],
+        "config_semantic_sha256": manifest["config_semantic_sha256"],
         "local_model_sha256": manifest["checkpoint_sha256"],
         "model_package_id": manifest["model_package_id"],
     }

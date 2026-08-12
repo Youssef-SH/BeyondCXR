@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 from torch.utils.data import TensorDataset
 
-from radfusion.training.config import image_semantic_config_sha256, load_experiment_config
+from radfusion.training.config import load_experiment_config, with_runtime
 from radfusion.training.device import resolve_device
 from radfusion.training.execution import (
     LoaderExecutionPolicy,
@@ -37,21 +35,25 @@ def test_one_shot_loader_policy_is_synchronous() -> None:
 
 
 def test_loader_builders_apply_distinct_lifecycle_topologies() -> None:
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
     dataset = TensorDataset(torch.arange(4))
     runtime = resolve_device("cpu", mixed_precision=False, pin_memory_policy="disabled")
 
     reused = build_image_loaders(
         dataset,
         dataset,
-        config=config.image,
+        config=config.neural,
         runtime=runtime,
         seed=42,
+        execution=reused_loader_policy(
+            num_workers=config.runtime.num_workers,
+            pin_memory=runtime.pin_memory_effective,
+        ),
     )
-    one_shot = build_evaluation_loader(dataset, config=config.image, runtime=runtime)
+    one_shot = build_evaluation_loader(dataset, config=config.neural, runtime=runtime)
 
-    assert reused.train.num_workers == config.image.num_workers
+    assert reused.train.num_workers == config.runtime.num_workers
     assert reused.train.persistent_workers is True
     assert reused.train.prefetch_factor == 2
     assert reused.train.multiprocessing_context.get_start_method() == "spawn"
@@ -85,21 +87,21 @@ def test_loader_execution_provenance_rejects_redundant_derived_fields() -> None:
 
 
 def test_execution_knobs_do_not_change_neural_semantic_identity() -> None:
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
-    baseline = image_semantic_config_sha256(config)
-    changed_execution = replace(
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
+    baseline = config.config_semantic_sha256
+    changed_execution = with_runtime(
         config,
-        image=replace(config.image, num_workers=24, pin_memory_policy="disabled"),
+        source_root="/different/source",
+        model_directory="/different/models",
+        report_directory="/different/reports",
+        device="cpu",
+        seed=2026,
+        num_workers=24,
+        pin_memory_policy="disabled",
     )
-    assert image_semantic_config_sha256(changed_execution) == baseline
-    assert (
-        image_semantic_config_sha256(replace(config, image=replace(config.image, batch_size=16)))
-        != baseline
-    )
-    assert (
-        image_semantic_config_sha256(
-            replace(config, image=replace(config.image, rotation_degrees=8.0))
-        )
-        != baseline
-    )
+    assert changed_execution.config_semantic_sha256 == baseline
+    assert changed_execution.runtime.seed == 2026
+    assert changed_execution.runtime.device == "cpu"
+    assert changed_execution.runtime.num_workers == 24
+    assert changed_execution.runtime.pin_memory_policy == "disabled"

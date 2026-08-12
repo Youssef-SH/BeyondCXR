@@ -32,7 +32,7 @@ from radfusion.data.symile_cv import (
 )
 from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
 from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, REPEAT_SEEDS
-from radfusion.training.config import SymileDevelopmentConfig
+from radfusion.training.config import ExperimentConfig
 
 DEVELOPMENT_COUNT = 2_368
 DEVELOPMENT_POSITIVES = 1_104
@@ -74,13 +74,13 @@ class SymileInnerSplit:
 
 
 def load_symile_development(
-    config: SymileDevelopmentConfig,
+    config: ExperimentConfig,
     *,
     enforce_production_counts: bool = True,
 ) -> SymileDevelopmentData:
     """Load official train/validation strict rows without touching official test samples."""
     bundle = resolve_symile_bundle(
-        config.dataset.manifest_directory,
+        config.runtime.manifest_directory,
         bundle_id=config.dataset.bundle_id,
         full_validation=False,
     )
@@ -89,11 +89,11 @@ def load_symile_development(
         expected_bundle_id=config.dataset.bundle_id,
         expected_manifest_sha256=config.dataset.bundle_manifest_sha256,
     )
-    split_id = bundle_reference.manifest["official_membership"]["official_split_assignment_id"]
-    if split_id != config.dataset.official_split_assignment_id:
+    split_id = bundle_reference.manifest["membership"]["split_assignment_id"]
+    if split_id != config.dataset.split_assignment_id:
         raise ManifestBuildError("Symile official split assignment differs from configuration")
     cv_directory = (
-        config.dataset.manifest_directory
+        config.runtime.manifest_directory
         / "symile"
         / CV_DIRECTORY
         / config.dataset.cv_assignment_id

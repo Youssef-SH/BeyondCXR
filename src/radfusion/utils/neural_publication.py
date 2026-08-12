@@ -19,13 +19,14 @@ import torch
 from radfusion.data.cxr_cache import CxrCacheSourceAuthentication
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
+from radfusion.models.fusion_concat import (
+    fusion_architecture_contract,
+    fusion_structured_input_conversion_contract,
+)
 from radfusion.training.config import (
     ExperimentConfig,
-    fusion_architecture_contract,
-    fusion_semantic_config_sha256,
-    fusion_structured_input_conversion_contract,
-    image_semantic_config_sha256,
     load_experiment_config,
+    with_runtime,
 )
 from radfusion.training.execution import LoaderExecutionPolicy
 from radfusion.utils.model_publication import threshold_contract
@@ -59,8 +60,8 @@ NEURAL_MANIFEST_FIELDS = frozenset(
         "bundle_manifest_sha256",
         "split_assignment_id",
         "label_policy_version",
-        "source_config_sha256",
-        "semantic_config_sha256",
+        "config_source_sha256",
+        "config_semantic_sha256",
         "checkpoint_sha256",
         "source_provenance",
         "model_identity",
@@ -384,27 +385,24 @@ def _validate_manifest_metadata(
         raise ValueError("Neural model manifest positive class must be integer 1")
     for field in (
         "bundle_manifest_sha256",
-        "source_config_sha256",
-        "semantic_config_sha256",
+        "config_source_sha256",
+        "config_semantic_sha256",
         "checkpoint_sha256",
     ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Neural model manifest {field} must be a lowercase SHA-256")
     if document["checkpoint_sha256"] != sha256_file(model_path):
         raise ValueError("Neural checkpoint hash does not match package bytes")
-    if document["source_config_sha256"] != sha256_file(config_path):
+    if document["config_source_sha256"] != sha256_file(config_path):
         raise ValueError("Neural config hash does not match package bytes")
-    config = load_experiment_config(config_path)
+    training_policy = document.get("training_policy")
+    seed = training_policy.get("seed") if isinstance(training_policy, dict) else None
+    config = with_runtime(load_experiment_config(config_path), seed=seed)
     if (
         document["bundle_id"] != config.dataset.bundle_id
-        or document["task"] != config.dataset.task_id
-        or document["model"] != config.model.registry_key
-        or document["semantic_config_sha256"]
-        != (
-            image_semantic_config_sha256(config)
-            if config.model.modality == "image"
-            else fusion_semantic_config_sha256(config)
-        )
+        or document["task"] != config.task.task_id
+        or document["model"] != config.family.family_id
+        or document["config_semantic_sha256"] != config.config_semantic_sha256
     ):
         raise ValueError("Neural package identity differs from archived configuration")
     selection = document["selection"]
@@ -475,9 +473,10 @@ def _validate_manifest_metadata(
 
 
 def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig) -> None:
-    if config.model.modality not in {"image", "fusion"} or config.image is None:
+    if config.neural is None:
         raise ValueError("Neural package archived configuration is not a neural experiment")
-    if document["modality"] != config.model.modality:
+    modality = _package_modality(config)
+    if document["modality"] != modality:
         raise ValueError("Neural package modality differs from archived configuration")
     source = _exact_mapping(
         document["source_provenance"],
@@ -504,8 +503,8 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
     model = _exact_mapping(
         document["model_identity"],
         {
-            "registry_key",
-            "modality",
+            "family_id",
+            "modalities",
             "encoder_architecture",
             "image_size",
             "embedding_dimension",
@@ -515,11 +514,11 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
         "model identity",
     )
     expected_model = {
-        "registry_key": config.model.registry_key,
-        "modality": config.model.modality,
-        "encoder_architecture": config.model.parameters["encoder_name"],
-        "image_size": config.model.parameters["image_size"],
-        "embedding_dimension": config.model.parameters["embedding_dimension"],
+        "family_id": config.family.family_id,
+        "modalities": list(config.family.modalities),
+        "encoder_architecture": config.family.parameters["encoder_name"],
+        "image_size": config.family.parameters["image_size"],
+        "embedding_dimension": config.family.parameters["embedding_dimension"],
         "classifier_output_dimension": 1,
     }
     if any(model[field] != value for field, value in expected_model.items()):
@@ -530,7 +529,7 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
         "pretrained weight identity",
     )
     if (
-        weight["declared_name"] != config.model.parameters["weights"]
+        weight["declared_name"] != config.family.parameters["weights"]
         or not all(
             isinstance(weight[field], str) and weight[field]
             for field in ("stable_identifier", "cache_filename")
@@ -542,7 +541,7 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
     ):
         raise ValueError("Neural package pretrained weight identity is invalid")
 
-    image = config.image
+    image = config.neural
     selection = document["selection"]
     selected_epoch = selection["selected_epoch"]
     if (
@@ -552,7 +551,7 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
     ):
         raise ValueError("Neural package selected epoch is inconsistent with its stage")
     transform_kwargs = {
-        "image_size": int(config.model.parameters["image_size"]),
+        "image_size": int(config.family.parameters["image_size"]),
         "rotation_degrees": image.rotation_degrees,
         "translation_fraction": image.translation_fraction,
         "brightness_jitter": image.brightness_jitter,
@@ -569,7 +568,7 @@ def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig
     if document["input_contract"] != expected_evaluation_transform["input"]:
         raise ValueError("Neural package input contract is invalid")
     _validate_training_and_metrics(document, config, image)
-    if config.model.modality == "fusion":
+    if modality == "fusion":
         _validate_fusion_manifest(document, config)
 
 
@@ -590,7 +589,7 @@ def _validate_fusion_manifest(document: dict[str, Any], config: ExperimentConfig
     if document["structured_input_conversion"] != fusion_structured_input_conversion_contract():
         raise ValueError("Fusion structured tensor conversion contract is invalid")
     expected_architecture = fusion_architecture_contract(
-        config.model,
+        config.family,
         structured_input_dimension=contract["transformed_dimension"],
     )
     if document["fusion_architecture"] != expected_architecture:
@@ -601,7 +600,7 @@ def _validate_fusion_manifest(document: dict[str, Any], config: ExperimentConfig
             "training_run_id",
             "model_package_id",
             "checkpoint_sha256",
-            "semantic_config_sha256",
+            "config_semantic_sha256",
             "git_commit",
             "dependency_lock_sha256",
         },
@@ -611,7 +610,7 @@ def _validate_fusion_manifest(document: dict[str, Any], config: ExperimentConfig
         _is_sha256(lineage[field])
         for field in (
             "checkpoint_sha256",
-            "semantic_config_sha256",
+            "config_semantic_sha256",
             "dependency_lock_sha256",
         )
     ):
@@ -632,11 +631,20 @@ def _manifest_fields(modality: object) -> frozenset[str]:
     raise ValueError("Neural package has an invalid modality")
 
 
+def _package_modality(config: ExperimentConfig) -> str:
+    """Map the canonical family ontology to the frozen RSNA package modality."""
+    if config.family.family_id == "cxr_densenet":
+        return "image"
+    if config.family.family_id == "cxr_metadata_concat":
+        return "fusion"
+    raise ValueError("Neural package archived configuration has an unsupported family")
+
+
 def _identity_fields(manifest_fields: frozenset[str]) -> frozenset[str]:
     return manifest_fields - {
         "model_package_id",
         "runtime_provenance",
-        "source_config_sha256",
+        "config_source_sha256",
         "training_mlflow_run_id",
     }
 
@@ -661,7 +669,7 @@ def _validate_training_and_metrics(
         "training policy",
     )
     expected_policy = {
-        "seed": config.training.seed,
+        "seed": config.runtime.seed,
         "permitted_partitions": ["train", "validation"],
         "optimizer": "AdamW",
         "warmup": {

@@ -6,7 +6,6 @@ import pyarrow as pa
 
 # This development schema identifier changes through an explicit contract decision.
 # Bundle IDs and artifact hashes identify exact bundle content.
-MANIFEST_SCHEMA_VERSION = "0.1.0"
 DATASET_ID = "rsna"
 PNEUMONIA_TASK_ID = "pneumonia"
 PNEUMONIA_LABEL_SOURCE = "rsna-stage-2-challenge-target"

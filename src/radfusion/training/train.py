@@ -11,7 +11,7 @@ from pathlib import Path
 from mlflow.exceptions import MlflowException
 from sqlalchemy.exc import SQLAlchemyError
 
-from radfusion.training.config import ConfigError, load_experiment_config
+from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
 from radfusion.training.registry import RegistryError
 from radfusion.training.train_fusion import train_fusion_experiment
 from radfusion.training.train_image import train_image_experiment
@@ -23,6 +23,7 @@ from radfusion.utils.operational_logging import add_logging_argument, configure_
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Experiment YAML file")
+    parser.add_argument("--seed", type=int, required=True, help="Execution seed")
     parser.add_argument(
         "--tracking-uri",
         default=DEFAULT_TRACKING_URI,
@@ -41,8 +42,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
-        config = load_experiment_config(args.config)
-        if config.model.modality == "fusion":
+        config = with_runtime(load_experiment_config(args.config), seed=args.seed)
+        if config.family.family_id == "cxr_metadata_concat":
             if not args.source_training_run_id:
                 raise ValueError("Fusion training requires --source-training-run-id")
             result = train_fusion_experiment(
@@ -52,7 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.source_training_run_id:
             raise ValueError("--source-training-run-id is accepted only for fusion training")
-        elif config.model.modality == "image":
+        elif config.family.family_id == "cxr_densenet":
             result = train_image_experiment(config, tracking_uri=args.tracking_uri)
         else:
             result = train_configured_experiment(config, tracking_uri=args.tracking_uri)
@@ -70,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "experiment": config.name,
+                "experiment": config.family.family_id,
                 "config": config.source_path.as_posix(),
                 "model_name": result.model_name,
                 "mlflow_run_id": result.run_id,

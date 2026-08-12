@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any
 
 import pandas as pd
@@ -25,6 +26,16 @@ from radfusion.data.artifact_validation import (
     validate_annotation_table,
     validate_label_table,
     validate_sample_table,
+)
+from radfusion.data.bundle_contract import (
+    BUNDLE_MANIFEST_SCHEMA_VERSION,
+    BUNDLE_PREFIX,
+    BUNDLES_DIRECTORY,
+    CURRENT_FILENAME,
+    MANIFEST_FILENAME,
+    SAMPLES_FILENAME,
+    valid_bundle_id,
+    validate_common_bundle_envelope,
 )
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
@@ -42,7 +53,6 @@ from radfusion.data.rsna_source import (
 )
 from radfusion.data.schemas import (
     DATASET_ID,
-    MANIFEST_SCHEMA_VERSION,
     PNEUMONIA_LABEL_POLICY_VERSION,
     PNEUMONIA_LABEL_SOURCE,
     PNEUMONIA_TASK_ID,
@@ -78,15 +88,20 @@ from radfusion.utils.publication import update_current_marker
 
 DATASET_VERSION = "rsna-pneumonia-detection-challenge-stage-2"
 _LOGGER = get_operational_logger(__name__)
-SAMPLES_FILENAME = "rsna_samples.parquet"
-LABELS_FILENAME = "rsna_labels.parquet"
-ANNOTATIONS_FILENAME = "rsna_annotations.parquet"
-SPLITS_FILENAME = "rsna_splits.parquet"
-SOURCE_INVENTORY_FILENAME = "rsna_source_inventory.parquet"
-METADATA_FILENAME = "rsna_manifest_metadata.json"
-CURRENT_FILENAME = "CURRENT"
-BUNDLES_DIRECTORY = "builds"
-BUNDLE_IDENTITY_POLICY_VERSION = "rsna-bundle-identity-v2"
+LABELS_FILENAME = "labels.parquet"
+ANNOTATIONS_FILENAME = "annotations.parquet"
+SPLITS_FILENAME = "splits.parquet"
+SOURCE_INVENTORY_FILENAME = "source_inventory.parquet"
+METADATA_FILENAME = MANIFEST_FILENAME
+_ARTIFACT_ROLES = MappingProxyType(
+    {
+        "samples": SAMPLES_FILENAME,
+        "labels": LABELS_FILENAME,
+        "annotations": ANNOTATIONS_FILENAME,
+        "splits": SPLITS_FILENAME,
+        "source_inventory": SOURCE_INVENTORY_FILENAME,
+    }
+)
 _SPLIT_METADATA_FIELDS = frozenset(
     {
         "split_source",
@@ -175,7 +190,7 @@ class BundlePaths:
 @dataclass(frozen=True)
 class WriteResult:
     paths: BundlePaths
-    arrow_ipc_sha256: Mapping[str, str]
+    logical_arrow_sha256: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -310,18 +325,18 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
     """Publish an immutable bundle and atomically update its CURRENT marker."""
     output_root = Path(output_directory)
     dataset_bundle_root = output_root / DATASET_ID
-    builds_root = dataset_bundle_root / BUNDLES_DIRECTORY
-    builds_root.mkdir(parents=True, exist_ok=True)
+    bundles_root = dataset_bundle_root / BUNDLES_DIRECTORY
+    bundles_root.mkdir(parents=True, exist_ok=True)
     current_path = dataset_bundle_root / CURRENT_FILENAME
 
-    arrow_hashes = {
+    logical_hashes = {
         SAMPLES_FILENAME: arrow_ipc_sha256(result.samples),
         LABELS_FILENAME: arrow_ipc_sha256(result.labels),
         ANNOTATIONS_FILENAME: arrow_ipc_sha256(result.annotations),
         SPLITS_FILENAME: arrow_ipc_sha256(result.splits),
         SOURCE_INVENTORY_FILENAME: arrow_ipc_sha256(result.source_inventory),
     }
-    stage_directory = Path(tempfile.mkdtemp(prefix=".staging-", dir=builds_root))
+    stage_directory = Path(tempfile.mkdtemp(prefix=".staging-", dir=bundles_root))
 
     try:
         staged_paths = _bundle_paths("pending", stage_directory, current_path)
@@ -334,10 +349,10 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
             staged_paths.source_inventory_path,
             compression="zstd",
         )
-        bundle_id = _bundle_id(arrow_hashes, result.metadata)
-        final_directory = builds_root / bundle_id
+        bundle_id = _bundle_id(logical_hashes, result.metadata)
+        final_directory = bundles_root / bundle_id
         staged_paths = _bundle_paths(bundle_id, stage_directory, current_path)
-        metadata = _finalize_metadata(result.metadata, bundle_id, staged_paths, arrow_hashes)
+        metadata = _finalize_metadata(result.metadata, bundle_id, staged_paths, logical_hashes)
         staged_paths.metadata_path.write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -358,7 +373,7 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
         if stage_directory.exists():
             shutil.rmtree(stage_directory)
 
-    return WriteResult(final_paths, arrow_hashes)
+    return WriteResult(final_paths, logical_hashes)
 
 
 def build_and_write(
@@ -377,7 +392,7 @@ def load_current_bundle(output_directory: str | Path) -> BundlePaths:
     if not current_path.is_file():
         raise ManifestBuildError(f"Missing CURRENT marker: {current_path}")
     bundle_id = current_path.read_text(encoding="utf-8").strip()
-    if not bundle_id or Path(bundle_id).name != bundle_id:
+    if not valid_bundle_id(bundle_id):
         raise ManifestBuildError("CURRENT contains an invalid bundle identifier")
     bundle_directory = dataset_bundle_root / BUNDLES_DIRECTORY / bundle_id
     validate_bundle_directory(bundle_directory, expected_bundle_id=bundle_id)
@@ -398,16 +413,10 @@ def validate_bundle_directory(
     )
     metadata = dict(validated.manifest)
     directory = Path(bundle_directory)
-    expected_files = {
-        SAMPLES_FILENAME: RSNA_SAMPLE_SCHEMA,
-        LABELS_FILENAME: RSNA_LABEL_SCHEMA,
-        ANNOTATIONS_FILENAME: RSNA_ANNOTATION_SCHEMA,
-        SPLITS_FILENAME: RSNA_SPLIT_SCHEMA,
-        SOURCE_INVENTORY_FILENAME: RSNA_SOURCE_INVENTORY_SCHEMA,
-    }
+    expected_files = _artifact_schemas()
     bundle_id = metadata.get("bundle", {}).get("bundle_id")
     split_config = _validate_manifest_contract(metadata)
-    hashes = metadata.get("generated_artifact_hashes", {})
+    hashes = metadata.get("artifacts", {})
     actual_arrow_hashes: dict[str, str] = {}
     for filename in expected_files:
         path = directory / filename
@@ -415,8 +424,10 @@ def validate_bundle_directory(
         table = pq.read_table(path)
         actual_arrow_hash = arrow_ipc_sha256(table)
         actual_arrow_hashes[filename] = actual_arrow_hash
-        if actual_arrow_hash != declared.get("arrow_ipc_sha256"):
+        if actual_arrow_hash != declared.get("logical_arrow_sha256"):
             raise ManifestBuildError(f"Arrow IPC hash mismatch for {filename}")
+        if table.num_rows != declared.get("row_count"):
+            raise ManifestBuildError(f"Row count mismatch for {filename}")
     try:
         computed_bundle_id = _bundle_id(actual_arrow_hashes, metadata)
     except (KeyError, TypeError) as exc:
@@ -431,7 +442,7 @@ def validate_bundle_directory(
     validate_sample_table(samples)
     validate_label_table(labels, samples)
     validate_annotation_table(annotations, samples, labels)
-    split_metadata = metadata.get("split")
+    split_metadata = metadata.get("membership", {}).get("split")
     if not isinstance(split_metadata, dict):
         raise ManifestBuildError("Bundle metadata is missing split lineage")
     validate_split_table(splits, samples, labels, config=split_config)
@@ -454,13 +465,7 @@ def validate_bundle_reference(
 ) -> ValidatedBundleReference:
     """Validate a bundle reference and return its manifest and exact byte hash."""
     directory = Path(bundle_directory)
-    expected_files = {
-        SAMPLES_FILENAME: RSNA_SAMPLE_SCHEMA,
-        LABELS_FILENAME: RSNA_LABEL_SCHEMA,
-        ANNOTATIONS_FILENAME: RSNA_ANNOTATION_SCHEMA,
-        SPLITS_FILENAME: RSNA_SPLIT_SCHEMA,
-        SOURCE_INVENTORY_FILENAME: RSNA_SOURCE_INVENTORY_SCHEMA,
-    }
+    expected_files = _artifact_schemas()
     _require_exact_regular_entries(directory, {METADATA_FILENAME, *expected_files})
     metadata_path = directory / METADATA_FILENAME
     try:
@@ -478,28 +483,25 @@ def validate_bundle_reference(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestBuildError(f"Bundle metadata is unreadable: {metadata_path}") from exc
     bundle_id = metadata.get("bundle", {}).get("bundle_id")
+    if not valid_bundle_id(bundle_id):
+        raise ManifestBuildError("Bundle manifest identity is invalid")
     if expected_bundle_id is not None and bundle_id != expected_bundle_id:
         raise ManifestBuildError(
             f"Bundle metadata ID {bundle_id!r} does not match {expected_bundle_id!r}"
         )
-    schema_version = metadata.get("manifest_schema_version")
-    if schema_version != MANIFEST_SCHEMA_VERSION:
-        raise ManifestBuildError(f"Unsupported manifest_schema_version: {schema_version!r}")
     _validate_manifest_contract(metadata)
-    hashes = metadata.get("generated_artifact_hashes", {})
-    if not isinstance(hashes, dict) or set(hashes) != set(expected_files):
-        raise ManifestBuildError("Bundle metadata declares an unexpected artifact set")
+    hashes = metadata["artifacts"]
     declared_arrow_hashes: dict[str, str] = {}
     for filename, schema in expected_files.items():
         path = directory / filename
         declared = hashes.get(filename)
         if not isinstance(declared, dict):
             raise ManifestBuildError(f"Bundle is incomplete: {filename}")
-        if sha256_file(path) != declared.get("file_sha256"):
+        if sha256_file(path) != declared.get("physical_file_sha256"):
             raise ManifestBuildError(f"File hash mismatch for {filename}")
         if pq.read_schema(path) != schema:
             raise ManifestBuildError(f"{filename} schema mismatch")
-        arrow_hash = declared.get("arrow_ipc_sha256")
+        arrow_hash = declared.get("logical_arrow_sha256")
         if not _sha256_text(arrow_hash):
             raise ManifestBuildError(f"Arrow IPC hash declaration is invalid for {filename}")
         declared_arrow_hashes[filename] = arrow_hash
@@ -530,6 +532,12 @@ def _require_exact_regular_entries(directory: Path, required_names: set[str]) ->
 
 
 def _validate_manifest_contract(metadata: Mapping[str, Any]) -> SplitConfig:
+    validate_common_bundle_envelope(metadata, expected_artifacts=set(_artifact_schemas()))
+    if metadata.get("dataset") != {
+        "dataset_id": DATASET_ID,
+        "release": DATASET_VERSION,
+    }:
+        raise ManifestBuildError("Bundle metadata declares an unsupported dataset")
     tasks = metadata.get("tasks")
     if tasks != _task_definitions():
         raise ManifestBuildError("Bundle metadata declares an unsupported task contract")
@@ -538,7 +546,21 @@ def _validate_manifest_contract(metadata: Mapping[str, Any]) -> SplitConfig:
         "public_reporting": "aggregate only",
     }:
         raise ManifestBuildError("Bundle metadata declares an unsupported privacy classification")
-    split = metadata.get("split")
+    source = metadata.get("source")
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"files", "inventory"}
+        or source.get("inventory")
+        != {
+            "artifact": SOURCE_INVENTORY_FILENAME,
+            "authentication": "byte-size-and-sha256-per-sample",
+        }
+    ):
+        raise ManifestBuildError("Bundle metadata declares an unsupported source contract")
+    membership = metadata.get("membership")
+    if not isinstance(membership, dict) or set(membership) != {"split"}:
+        raise ManifestBuildError("Bundle metadata is missing membership lineage")
+    split = membership.get("split")
     if not isinstance(split, dict):
         raise ManifestBuildError("Bundle metadata is missing split lineage")
     if set(split) != _SPLIT_METADATA_FIELDS:
@@ -559,6 +581,16 @@ def _validate_manifest_contract(metadata: Mapping[str, Any]) -> SplitConfig:
     if any(split.get(key) != value for key, value in expected_split_policy.items()):
         raise ManifestBuildError("Bundle metadata contains an unsupported split algorithm")
     return _split_config_from_metadata(split)
+
+
+def _artifact_schemas() -> dict[str, pa.Schema]:
+    return {
+        SAMPLES_FILENAME: RSNA_SAMPLE_SCHEMA,
+        LABELS_FILENAME: RSNA_LABEL_SCHEMA,
+        ANNOTATIONS_FILENAME: RSNA_ANNOTATION_SCHEMA,
+        SPLITS_FILENAME: RSNA_SPLIT_SCHEMA,
+        SOURCE_INVENTORY_FILENAME: RSNA_SOURCE_INVENTORY_SCHEMA,
+    }
 
 
 def _label_records(sample_id: str, target: int, rsna_class: str) -> list[LabelRecord]:
@@ -641,67 +673,48 @@ def _build_aggregate_metadata(
         str(row["label_value"]) for row in label_rows if row["task_id"] == PNEUMONIA_TASK_ID
     )
     assignments = {row["sample_id"]: row["split_name"] for row in splits.to_pylist()}
+    split = {
+        "split_source": SPLIT_SOURCE,
+        "split_recipe_id": split_config.recipe_id,
+        "split_assignment_id": split_assignment_id(assignments),
+        "algorithm_version": SPLIT_ALGORITHM_VERSION,
+        "patient_grouping_rule": PATIENT_GROUPING_RULE,
+        "patient_target_consistency_rule": PATIENT_TARGET_CONSISTENCY_RULE,
+        "ranking_rule": PATIENT_RANKING_RULE,
+        "patient_hash_algorithm": PATIENT_HASH_ALGORITHM,
+        "patient_hash_input_encoding": PATIENT_HASH_INPUT_ENCODING,
+        "patient_hash_input_template": PATIENT_HASH_INPUT_TEMPLATE,
+        "seed": split_config.seed,
+        "stratification_target": STRATIFICATION_TARGET,
+        "allocation_rule": SPLIT_ALLOCATION_RULE,
+        "split_order": list(SPLIT_NAMES),
+        "ratios": split_config.recipe_payload["ratios"],
+    }
+    source_files = {
+        paths.labels.name: {"algorithm": "sha256", "file_sha256": sha256_file(paths.labels)},
+        paths.class_info.name: {
+            "algorithm": "sha256",
+            "file_sha256": sha256_file(paths.class_info),
+        },
+    }
     return {
-        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
-        "dataset_id": DATASET_ID,
-        "dataset_version": DATASET_VERSION,
+        "bundle_manifest_schema_version": BUNDLE_MANIFEST_SCHEMA_VERSION,
+        "dataset": {"dataset_id": DATASET_ID, "release": DATASET_VERSION},
         "tasks": _task_definitions(),
-        "sample_count": samples.num_rows,
-        "label_count": labels.num_rows,
-        "positive_count": pneumonia["1"],
-        "negative_count": pneumonia["0"],
-        "annotation_count": annotations.num_rows,
-        "source_inventory_count": source_inventory.num_rows,
-        "split": {
-            "split_source": SPLIT_SOURCE,
-            "split_recipe_id": split_config.recipe_id,
-            "split_assignment_id": split_assignment_id(assignments),
-            "algorithm_version": SPLIT_ALGORITHM_VERSION,
-            "patient_grouping_rule": PATIENT_GROUPING_RULE,
-            "patient_target_consistency_rule": PATIENT_TARGET_CONSISTENCY_RULE,
-            "ranking_rule": PATIENT_RANKING_RULE,
-            "patient_hash_algorithm": PATIENT_HASH_ALGORITHM,
-            "patient_hash_input_encoding": PATIENT_HASH_INPUT_ENCODING,
-            "patient_hash_input_template": PATIENT_HASH_INPUT_TEMPLATE,
-            "seed": split_config.seed,
-            "stratification_target": STRATIFICATION_TARGET,
-            "allocation_rule": SPLIT_ALLOCATION_RULE,
-            "split_order": list(SPLIT_NAMES),
-            "ratios": split_config.recipe_payload["ratios"],
-        },
-        "age_parsing_summary": {
-            "status_counts": _sorted_counter(audit.age_status),
-            "source_format_counts": _sorted_counter(audit.age_source_format),
-            "warning_counts": _sorted_counter(audit.age_warnings),
-        },
-        "implausible_age_count": audit.implausible_age_count,
-        "dicom_audit": {
-            "field_value_counts": {
-                keyword: _sorted_counter(counter)
-                for keyword, counter in sorted(audit.dicom_values.items())
-            },
-            "uid_uniqueness": {
-                "sop_instance_uid_unique_count": len(audit.sop_instance_uids),
-                "study_instance_uid_unique_count": len(audit.study_instance_uids),
-                "series_instance_uid_unique_count": len(audit.series_instance_uids),
-                "media_storage_sop_instance_uid_unique_count": len(
-                    audit.media_storage_sop_instance_uids
-                ),
-                "media_storage_matches_sop_count": audit.media_sop_matches,
+        "membership": {"split": split},
+        "source": {
+            "files": source_files,
+            "inventory": {
+                "artifact": SOURCE_INVENTORY_FILENAME,
+                "authentication": "byte-size-and-sha256-per-sample",
             },
         },
-        "source_file_hashes": {
-            paths.labels.name: {"algorithm": "sha256", "file_sha256": sha256_file(paths.labels)},
-            paths.class_info.name: {
-                "algorithm": "sha256",
-                "file_sha256": sha256_file(paths.class_info),
-            },
-        },
-        "hash_policy": {
-            "source_files": "SHA-256 over source CSV and DICOM bytes",
-            "arrow_ipc_sha256": "SHA-256 over ordered Arrow IPC stream including exact schema",
-            "artifact_files": "SHA-256 over generated Parquet bytes",
-            "dicom_files": "SHA-256 and byte size for every source DICOM",
+        "modalities": {
+            "cxr": {
+                "format": "DICOM",
+                "views": ["AP", "PA"],
+                "source_qualification": "selected-header-and-source-byte-authentication",
+            }
         },
         "privacy": {
             "classification": "protected patient-level data",
@@ -714,12 +727,43 @@ def _build_aggregate_metadata(
                 "pyarrow": pa.__version__,
                 "pandas": pd.__version__,
             },
-            "arrow_ipc_runtime": {
+            "logical_arrow_runtime": {
                 "pyarrow_version": pa.__version__,
                 "stability_scope": (
                     "Deterministic only for the recorded PyArrow version; cross-version "
                     "stability is not claimed"
                 ),
+            },
+        },
+        "qualification": {
+            "counts": {
+                "samples": samples.num_rows,
+                "labels": labels.num_rows,
+                "positive": pneumonia["1"],
+                "negative": pneumonia["0"],
+                "annotations": annotations.num_rows,
+                "source_inventory": source_inventory.num_rows,
+            },
+            "age_parsing": {
+                "status_counts": _sorted_counter(audit.age_status),
+                "source_format_counts": _sorted_counter(audit.age_source_format),
+                "warning_counts": _sorted_counter(audit.age_warnings),
+                "implausible_age_count": audit.implausible_age_count,
+            },
+            "dicom": {
+                "field_value_counts": {
+                    keyword: _sorted_counter(counter)
+                    for keyword, counter in sorted(audit.dicom_values.items())
+                },
+                "uid_uniqueness": {
+                    "sop_instance_uid_unique_count": len(audit.sop_instance_uids),
+                    "study_instance_uid_unique_count": len(audit.study_instance_uids),
+                    "series_instance_uid_unique_count": len(audit.series_instance_uids),
+                    "media_storage_sop_instance_uid_unique_count": len(
+                        audit.media_storage_sop_instance_uids
+                    ),
+                    "media_storage_matches_sop_count": audit.media_sop_matches,
+                },
             },
         },
     }
@@ -729,7 +773,7 @@ def _finalize_metadata(
     base: Mapping[str, Any],
     bundle_id: str,
     paths: BundlePaths,
-    arrow_hashes: Mapping[str, str],
+    logical_hashes: Mapping[str, str],
 ) -> dict[str, Any]:
     artifact_paths = {
         SAMPLES_FILENAME: paths.samples_path,
@@ -742,12 +786,13 @@ def _finalize_metadata(
         **base,
         "bundle": {
             "bundle_id": bundle_id,
-            "publication_model": "immutable-build-directory-with-atomic-CURRENT-marker",
+            "publication_model": "immutable-bundle-directory-with-atomic-CURRENT-marker",
         },
-        "generated_artifact_hashes": {
+        "artifacts": {
             filename: {
-                "arrow_ipc_sha256": arrow_hashes[filename],
-                "file_sha256": sha256_file(path),
+                "logical_arrow_sha256": logical_hashes[filename],
+                "physical_file_sha256": sha256_file(path),
+                "row_count": pq.read_metadata(path).num_rows,
             }
             for filename, path in artifact_paths.items()
         },
@@ -766,7 +811,7 @@ def _bundle_id(
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return f"build-{digest}"
+    return f"{BUNDLE_PREFIX}{digest}"
 
 
 def _bundle_identity_payload(
@@ -774,22 +819,26 @@ def _bundle_identity_payload(
     metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the explicit semantic identity payload for an RSNA bundle."""
-    split = metadata["split"]
+    split = metadata["membership"]["split"]
+    source_files = metadata["source"]["files"]
     return {
-        "identity_policy_version": BUNDLE_IDENTITY_POLICY_VERSION,
-        "manifest_schema_version": metadata["manifest_schema_version"],
-        "dataset_id": metadata["dataset_id"],
-        "dataset_version": metadata["dataset_version"],
+        "dataset": metadata["dataset"],
         "tasks": metadata["tasks"],
-        "split": {
+        "membership": {
             "split_source": split["split_source"],
+            "split_recipe_id": split["split_recipe_id"],
+            "split_assignment_id": split["split_assignment_id"],
             "algorithm_version": split["algorithm_version"],
             "seed": split["seed"],
             "stratification_target": split["stratification_target"],
             "ratios": split["ratios"],
         },
-        "source_file_hashes": metadata["source_file_hashes"],
-        "arrow_ipc_sha256": dict(sorted(arrow_hashes.items())),
+        "source": {
+            "labels": source_files["stage_2_train_labels.csv"]["file_sha256"],
+            "class_information": source_files["stage_2_detailed_class_info.csv"]["file_sha256"],
+        },
+        "modalities": metadata["modalities"],
+        "artifacts": {role: arrow_hashes[filename] for role, filename in _ARTIFACT_ROLES.items()},
     }
 
 
@@ -903,13 +952,15 @@ def _validate_metadata_counts(
         if row["task_id"] == PNEUMONIA_TASK_ID
     }
     expected = {
-        "sample_count": samples.num_rows,
-        "label_count": labels.num_rows,
-        "positive_count": sum(value == 1 for value in targets.values()),
-        "negative_count": sum(value == 0 for value in targets.values()),
-        "annotation_count": annotations.num_rows,
-        "source_inventory_count": source_inventory.num_rows,
+        "samples": samples.num_rows,
+        "labels": labels.num_rows,
+        "positive": sum(value == 1 for value in targets.values()),
+        "negative": sum(value == 0 for value in targets.values()),
+        "annotations": annotations.num_rows,
+        "source_inventory": source_inventory.num_rows,
     }
+    qualification = metadata.get("qualification")
+    counts = qualification.get("counts") if isinstance(qualification, dict) else None
     for field, value in expected.items():
-        if metadata.get(field) != value:
+        if not isinstance(counts, dict) or counts.get(field) != value:
             raise ManifestBuildError(f"Bundle metadata {field} does not match artifact content")

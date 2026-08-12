@@ -16,7 +16,12 @@ import mlflow
 import numpy as np
 
 from radfusion.data.tabular_preprocess import metadata_input_contract, validate_metadata_pipeline
-from radfusion.evaluation.latency import LATENCY_SAMPLE_POLICY, benchmark_single_sample_latency_ms
+from radfusion.evaluation.latency import (
+    LATENCY_MEASURED_CALLS,
+    LATENCY_SAMPLE_POLICY,
+    LATENCY_WARMUP_CALLS,
+    benchmark_single_sample_latency_ms,
+)
 from radfusion.evaluation.metrics import (
     CALIBRATION_BINNING_STRATEGY,
     OperatingPointMetrics,
@@ -28,7 +33,7 @@ from radfusion.evaluation.metrics import (
 )
 from radfusion.evaluation.plots import write_evaluation_plots
 from radfusion.evaluation.probabilities import positive_class_probabilities
-from radfusion.training.config import ExperimentConfig
+from radfusion.training.config import ExperimentConfig, require_runtime_seed
 from radfusion.training.registry import get_dataset, get_model
 from radfusion.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
@@ -84,8 +89,11 @@ def train_configured_experiment(
     tracking_uri: str = DEFAULT_TRACKING_URI,
 ) -> ModelResult:
     """Fit on train, select thresholds on validation, and publish the model."""
+    seed = require_runtime_seed(config)
+    if config.evaluation is None:
+        raise ValueError("RSNA tabular training requires evaluation policy")
     configure_mlflow(
-        experiment_name=config.mlflow.experiment_name,
+        experiment_name=config.runtime.experiment_name,
         tracking_uri=tracking_uri,
     )
     commit, dirty = git_revision()
@@ -93,38 +101,39 @@ def train_configured_experiment(
     base_tags = {
         "run_kind": "training",
         "evaluation_scope": "validation",
-        "experiment_name": config.name,
-        "dataset": config.dataset.registry_key,
+        "experiment_name": config.family.family_id,
+        "dataset": config.dataset.dataset_id,
         "dataset_bundle_id": config.dataset.bundle_id,
-        "task": config.dataset.task_id,
+        "task": config.task.task_id,
         "modality": "metadata",
-        "model": config.model.registry_key,
-        "seed": str(config.training.seed),
+        "model": config.family.family_id,
+        "seed": str(seed),
         "git_commit": commit,
         "git_dirty": str(dirty).lower(),
         "dependency_lock_sha256": lock_hash,
-        "source_config_sha256": config.source_sha256,
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "run_complete": "false",
     }
     base_parameters = {
-        "training_seed": config.training.seed,
+        "training_seed": seed,
         "sensitivity_target": config.evaluation.sensitivity_target,
         "calibration_bins": config.evaluation.calibration_bins,
         "latency_sample_policy": LATENCY_SAMPLE_POLICY,
-        "latency_warmup_calls": config.evaluation.latency_warmup_calls,
-        "latency_measured_calls": config.evaluation.latency_measured_calls,
-        **dict(config.model.parameters),
-        **dict(config.model.fit_parameters),
+        "latency_warmup_calls": LATENCY_WARMUP_CALLS,
+        "latency_measured_calls": LATENCY_MEASURED_CALLS,
+        **dict(config.family.parameters),
+        **dict(config.training.parameters),
     }
     with tracked_run(
-        run_name=config.name,
+        run_name=config.family.family_id,
         tags=base_tags,
         parameters=base_parameters,
     ) as run_id:
         log_source_config(config)
-        context = {"run_id": run_id, "model": config.model.registry_key}
+        context = {"run_id": run_id, "model": config.family.family_id}
         with timed_phase(_LOGGER, "dataset_loading", **context):
-            dataset = get_dataset(config.dataset.registry_key).load_train_validation(config.dataset)
+            dataset = get_dataset(config.dataset.dataset_id).load_train_validation(config)
         log_event(
             _LOGGER,
             "dataset_loaded",
@@ -139,9 +148,9 @@ def train_configured_experiment(
             }
         )
         with timed_phase(_LOGGER, "model_fitting", **context):
-            model_fit = get_model(config.model.registry_key).fit(
-                config.model,
-                config.training.seed,
+            model_fit = get_model(config.family.family_id).fit(
+                config,
+                seed,
                 dataset.train.features,
                 dataset.train.targets,
                 dataset.validation.features,
@@ -180,8 +189,8 @@ def train_configured_experiment(
             latency_ms = benchmark_single_sample_latency_ms(
                 model_fit.pipeline,
                 dataset.validation.features,
-                warmup_calls=config.evaluation.latency_warmup_calls,
-                measured_calls=config.evaluation.latency_measured_calls,
+                warmup_calls=LATENCY_WARMUP_CALLS,
+                measured_calls=LATENCY_MEASURED_CALLS,
                 best_iteration=best_iteration,
             )
         log_event(
@@ -202,14 +211,14 @@ def train_configured_experiment(
             target_sensitivity=sensitivity_metrics,
         )
         report_directory = (
-            config.training.report_directory / config.dataset.registry_key / "runs" / run_id
+            config.runtime.report_directory / config.dataset.dataset_id / "runs" / run_id
         )
         report_stage = staging_directory(report_directory)
         temporary_model_root = Path(tempfile.mkdtemp(prefix="radfusion-model-"))
         try:
             write_run_reports(
                 report_stage,
-                model_name=config.model.registry_key,
+                model_name=config.family.family_id,
                 targets=dataset.validation.targets,
                 probabilities=probabilities,
                 document=document,
@@ -251,7 +260,7 @@ def train_configured_experiment(
                 )
             )
             published = publish_model_run(
-                model_root=config.training.model_directory,
+                model_root=config.runtime.model_directory,
                 mlflow_run_id=run_id,
                 serialized_model_path=serialized,
                 source_config_bytes=config.source_bytes,
@@ -260,9 +269,10 @@ def train_configured_experiment(
                     "split_assignment_id": dataset.lineage.split_assignment_id,
                     "task": dataset.lineage.task_id,
                     "positive_class": 1,
-                    "model": config.model.registry_key,
-                    "source_config_sha256": config.source_sha256,
-                    "seed": config.training.seed,
+                    "model": config.family.family_id,
+                    "config_source_sha256": config.config_source_sha256,
+                    "config_semantic_sha256": config.config_semantic_sha256,
+                    "seed": seed,
                     "git_commit": commit,
                     "git_dirty": dirty,
                     "dependency_lock_sha256": lock_hash,
@@ -292,7 +302,7 @@ def train_configured_experiment(
         log_event(_LOGGER, "publication_completed", artifact="validation_report", **context)
 
     return ModelResult(
-        model_name=config.model.registry_key,
+        model_name=config.family.family_id,
         run_id=run_id,
         validation_probability=probability_metrics,
         validation_youden_j=youden_metrics,

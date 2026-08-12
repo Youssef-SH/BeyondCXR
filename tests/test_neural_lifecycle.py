@@ -31,8 +31,8 @@ from radfusion.models.cxr_baseline import PretrainedWeightIdentity
 from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (
     ExperimentConfig,
-    image_semantic_config_sha256,
     load_experiment_config,
+    with_runtime,
 )
 from radfusion.training.datasets import (
     ImageRunData,
@@ -41,13 +41,12 @@ from radfusion.training.datasets import (
 )
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
-from radfusion.training.execution import LoaderExecutionPolicy
+from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from radfusion.training.interfaces import DatasetLineage
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
     NeuralTrainingError,
     build_evaluation_loader,
-    build_image_loaders,
     candidate_is_improvement,
     deterministic_inference,
     fit_image_model,
@@ -56,6 +55,9 @@ from radfusion.training.neural import (
     seed_neural_runtime,
     train_one_epoch,
     training_class_weight,
+)
+from radfusion.training.neural import (
+    build_image_loaders as _build_image_loaders,
 )
 from radfusion.training.train_image import train_image_experiment
 from radfusion.utils.mlflow_utils import configure_mlflow
@@ -76,7 +78,17 @@ from radfusion.utils.neural_publication import (
 from radfusion.utils.operational_logging import configure_logging
 from radfusion.utils.private_predictions import validate_private_neural_predictions
 
-_SYNTHETIC_BUNDLE_ID = "build-" + "a" * 64
+_SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64
+
+
+def build_image_loaders(*args, execution=None, **kwargs):
+    """Build loaders with the test suite's explicit synchronous execution policy."""
+    runtime = kwargs["runtime"]
+    policy = execution or reused_loader_policy(
+        num_workers=0,
+        pin_memory=runtime.pin_memory_effective,
+    )
+    return _build_image_loaders(*args, execution=policy, **kwargs)
 
 
 class _TensorDataset(Dataset[dict[str, object]]):
@@ -172,12 +184,11 @@ def _runtime():
 
 
 def _image_config():
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
     return replace(
-        config.image,
+        config.neural,
         batch_size=2,
-        num_workers=0,
         warmup_epochs=1,
         fine_tune_epochs=2,
         early_stopping_patience=2,
@@ -216,6 +227,7 @@ def test_deterministic_loaders_class_weight_and_two_stage_training() -> None:
         config=_image_config(),
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
         epoch_callback=epochs.append,
         epoch_started_callback=lambda stage, global_epoch, stage_epoch: epoch_starts.append(
             (stage, global_epoch, stage_epoch)
@@ -289,6 +301,7 @@ def test_repeated_tiny_training_is_deterministic() -> None:
                 config=config,
                 runtime=_runtime(),
                 pos_weight=1.5,
+                selection_metric="average_precision",
                 **callbacks,
             )
         )
@@ -324,6 +337,7 @@ def test_two_stage_core_dispatches_ordered_multiple_inputs() -> None:
         config=config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
     model.load_state_dict(fit.selected_state_dict, strict=True)
     inference = deterministic_inference(
@@ -438,6 +452,7 @@ def test_fine_tune_history_records_learning_rate_used(
         config=config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
 
     assert result.history[0].encoder_learning_rate == config.encoder_learning_rate
@@ -514,6 +529,24 @@ def test_selected_metric_lifecycle_uses_auroc_without_changing_rsna_adapter(
     assert scheduler_metrics == [0.75, 0.25]
 
 
+def test_rsna_neural_adapter_rejects_roc_auc_selection() -> None:
+    config = _image_config()
+    dataset = _TensorDataset([0, 1, 0, 1])
+    loaders = build_image_loaders(dataset, dataset, config=config, runtime=_runtime(), seed=42)
+
+    with pytest.raises(NeuralTrainingError, match="requires average_precision"):
+        fit_two_stage_binary_model(
+            _TinyImageModel(),
+            loaders.train,
+            loaders.validation,
+            input_keys=("image",),
+            config=config,
+            runtime=_runtime(),
+            pos_weight=1.0,
+            selection_metric="roc_auc",
+        )
+
+
 def test_cpu_and_cuda_runtime_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     cpu = resolve_device("cpu", mixed_precision=True, pin_memory_policy="enabled").provenance()
     gpu_fields = (
@@ -576,6 +609,7 @@ def test_warmup_preserves_encoder_state_and_fine_tuning_uses_configured_groups(
         config=warmup_config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
 
     assert warmup_fit.selected_stage == "warmup"
@@ -623,6 +657,7 @@ def test_warmup_preserves_encoder_state_and_fine_tuning_uses_configured_groups(
         config=config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
 
     assert len(optimizers) == 2
@@ -795,6 +830,7 @@ def test_fine_tuning_patience_is_exact_and_best_stage_can_vary(monkeypatch) -> N
         config=config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
     assert warmup_best.selected_stage == "warmup"
     assert len(warmup_best.history) == 3
@@ -807,6 +843,7 @@ def test_fine_tuning_patience_is_exact_and_best_stage_can_vary(monkeypatch) -> N
         config=config,
         runtime=_runtime(),
         pos_weight=1.0,
+        selection_metric="average_precision",
     )
     assert fine_best.selected_stage == "fine_tune"
     assert fine_best.selected_epoch == 2
@@ -897,9 +934,9 @@ def test_inference_rejects_identifier_length_mismatch() -> None:
 
 
 def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, object]:
-    config_path = Path("configs/image_densenet_seed42.yaml")
-    config = load_experiment_config(config_path)
-    image = config.image
+    config_path = Path("configs/rsna_cxr_densenet.yaml")
+    config = with_runtime(load_experiment_config(config_path), seed=42)
+    image = config.neural
     assert image is not None
     digest = hashlib.sha256(config_bytes).hexdigest()
     transform_kwargs = {
@@ -913,15 +950,15 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
     evaluation_transform = StandardCxrTransform(training=False, **transform_kwargs).contract()
     return {
         "modality": "image",
-        "model": "image_densenet",
+        "model": "cxr_densenet",
         "task": "pneumonia",
         "positive_class": 1,
         "bundle_id": config.dataset.bundle_id,
         "bundle_manifest_sha256": "e" * 64,
         "split_assignment_id": "split-test",
         "label_policy_version": "label-v1",
-        "source_config_sha256": digest,
-        "semantic_config_sha256": image_semantic_config_sha256(config),
+        "config_source_sha256": digest,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
             "git_commit": "commit",
             "git_dirty": False,
@@ -932,8 +969,8 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
             "torchxrayvision_version": "test",
         },
         "model_identity": {
-            "registry_key": "image_densenet",
-            "modality": "image",
+            "family_id": "cxr_densenet",
+            "modalities": ["cxr"],
             "encoder_architecture": "densenet121",
             "image_size": 224,
             "embedding_dimension": 1024,
@@ -1024,7 +1061,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "checkpoint.pt")
     restored = load_neural_checkpoint(checkpoint_path)
     strict_load_checkpoint(_TinyImageModel(), restored)
-    config_bytes = Path("configs/image_densenet_seed42.yaml").read_bytes()
+    config_bytes = Path("configs/rsna_cxr_densenet.yaml").read_bytes()
     published = publish_neural_model_run(
         model_root=tmp_path / "models" / "rsna",
         mlflow_run_id="training-run",
@@ -1079,7 +1116,7 @@ def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutat
         validation_average_precision=0.5,
     )
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "checkpoint.pt")
-    config_bytes = Path("configs/image_densenet_seed42.yaml").read_bytes()
+    config_bytes = Path("configs/rsna_cxr_densenet.yaml").read_bytes()
     published = publish_neural_model_run(
         model_root=tmp_path / "models" / "rsna",
         mlflow_run_id="training-run",
@@ -1152,7 +1189,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         validation_average_precision=0.6,
     )
     identity = {
-        **_manifest(Path("configs/image_densenet_seed42.yaml").read_bytes(), checkpoint),
+        **_manifest(Path("configs/rsna_cxr_densenet.yaml").read_bytes(), checkpoint),
         "model_package_schema_version": 1,
         "training_mlflow_run_id": "run",
         "checkpoint_sha256": "d" * 64,
@@ -1160,8 +1197,8 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
     baseline = neural_model_package_id(identity)
     mutations = (
         lambda value: value.update({"checkpoint_sha256": "e" * 64}),
-        lambda value: value.update({"semantic_config_sha256": "e" * 64}),
-        lambda value: value.update({"bundle_id": "build-changed"}),
+        lambda value: value.update({"config_semantic_sha256": "e" * 64}),
+        lambda value: value.update({"bundle_id": "bundle-changed"}),
         lambda value: value.update({"bundle_manifest_sha256": "8" * 64}),
         lambda value: value.update({"split_assignment_id": "split-changed"}),
         lambda value: value.update({"task": "changed-task"}),
@@ -1203,22 +1240,20 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
     )
     assert neural_model_package_id(with_runtime_change) == baseline
     with_source_path_change = json.loads(json.dumps(identity))
-    with_source_path_change["source_config_sha256"] = "e" * 64
+    with_source_path_change["config_source_sha256"] = "e" * 64
     assert neural_model_package_id(with_source_path_change) == baseline
 
 
 def test_dataset_loading_failure_precedes_model_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    document = yaml.safe_load(
-        Path("configs/image_densenet_seed42.yaml").read_text(encoding="utf-8")
+    config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml"),
+        seed=42,
+        source_root=tmp_path / "raw",
+        model_directory=tmp_path / "models" / "rsna",
+        report_directory=tmp_path / "reports",
     )
-    document["dataset"]["dataset_root"] = str(tmp_path / "raw")
-    document["training"]["model_directory"] = str(tmp_path / "models" / "rsna")
-    document["training"]["report_directory"] = str(tmp_path / "reports")
-    config_path = tmp_path / "image.yaml"
-    config_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-    config = load_experiment_config(config_path)
     model_requested = []
 
     class FailingAdapter:
@@ -1241,7 +1276,7 @@ def test_dataset_loading_failure_precedes_model_construction(
 
     assert model_requested == []
     client = configure_mlflow(tracking_uri=tracking_uri)
-    experiment = client.get_experiment_by_name(config.mlflow.experiment_name)
+    experiment = client.get_experiment_by_name(config.runtime.experiment_name)
     assert experiment is not None
     runs = client.search_runs(experiment_ids=[experiment.experiment_id])
     assert len(runs) == 1
@@ -1263,27 +1298,11 @@ class _SyntheticImageLifecycle:
 def _synthetic_image_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> _SyntheticImageLifecycle:
-    document = yaml.safe_load(
-        Path("configs/image_densenet_seed42.yaml").read_text(encoding="utf-8")
-    )
-    document["dataset"].update(
+    document = yaml.safe_load(Path("configs/rsna_cxr_densenet.yaml").read_text(encoding="utf-8"))
+    document["dataset"]["bundle_id"] = _SYNTHETIC_BUNDLE_ID
+    document["training"]["loader"].update({"batch_size": 2})
+    document["training"]["parameters"].update(
         {
-            "bundle_id": _SYNTHETIC_BUNDLE_ID,
-            "dataset_root": str(tmp_path / "raw"),
-            "manifest_directory": str(tmp_path / "manifests"),
-        }
-    )
-    document["training"].update(
-        {
-            "model_directory": str(tmp_path / "models" / "rsna"),
-            "report_directory": str(tmp_path / "reports"),
-        }
-    )
-    document["image"].update(
-        {
-            "batch_size": 2,
-            "num_workers": 0,
-            "device": "cpu",
             "mixed_precision": False,
             "warmup_epochs": 1,
             "fine_tune_epochs": 1,
@@ -1292,7 +1311,18 @@ def _synthetic_image_lifecycle(
     )
     config_path = tmp_path / "image.yaml"
     config_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-    config = load_experiment_config(config_path)
+    config = with_runtime(
+        load_experiment_config(config_path),
+        seed=42,
+        source_root=tmp_path / "raw",
+        manifest_directory=tmp_path / "manifests",
+        model_directory=tmp_path / "models" / "rsna",
+        report_directory=tmp_path / "reports",
+        private_output_directory=tmp_path / "explicit-private-root",
+        device="cpu",
+        num_workers=0,
+        pin_memory_policy="disabled",
+    )
     lineage = DatasetLineage(
         bundle_id=_SYNTHETIC_BUNDLE_ID,
         split_assignment_id="split-synthetic",
@@ -1320,7 +1350,7 @@ def _synthetic_image_lifecycle(
         test_calls = 0
 
         def load_image_train_validation(self, dataset_config):
-            assert dataset_config.bundle_id == _SYNTHETIC_BUNDLE_ID
+            assert dataset_config.dataset.bundle_id == _SYNTHETIC_BUNDLE_ID
             return ImageRunData(
                 train=frame("train"),
                 validation=frame("validation"),
@@ -1344,8 +1374,8 @@ def _synthetic_image_lifecycle(
 
     class Builder:
         def build(self, model_config):
-            assert model_config.modality == "image"
-            build_calls.append(model_config.registry_key)
+            assert model_config.modalities == ("cxr",)
+            build_calls.append(model_config.family_id)
             construction_events.append("build")
             return _TinyImageModel()
 
@@ -1422,7 +1452,7 @@ def _synthetic_image_lifecycle(
 
 def _assert_single_failed_training_without_outputs(setup: _SyntheticImageLifecycle) -> None:
     client = configure_mlflow(tracking_uri=setup.tracking_uri)
-    experiment = client.get_experiment_by_name(setup.config.mlflow.experiment_name)
+    experiment = client.get_experiment_by_name(setup.config.runtime.experiment_name)
     assert experiment is not None
     failed_runs = [
         run
@@ -1433,9 +1463,9 @@ def _assert_single_failed_training_without_outputs(setup: _SyntheticImageLifecyc
     ]
     assert len(failed_runs) == 1
     run_id = failed_runs[0].info.run_id
-    assert not (setup.config.training.model_directory / "runs" / run_id).exists()
+    assert not (setup.config.runtime.model_directory / "runs" / run_id).exists()
     assert not (
-        setup.config.training.report_directory / setup.config.dataset.registry_key / "runs" / run_id
+        setup.config.runtime.report_directory / setup.config.dataset.dataset_id / "runs" / run_id
     ).exists()
 
 
@@ -1485,8 +1515,8 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
     training = train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     assert setup.adapter.test_calls == 0
-    assert setup.seed_calls == [setup.config.training.seed]
-    assert setup.build_calls == ["image_densenet"]
+    assert setup.seed_calls == [setup.config.runtime.seed]
+    assert setup.build_calls == ["cxr_densenet"]
     assert setup.construction_events == ["fingerprint", "build", "fingerprint"]
     assert training.model_path.name == "model.pt"
     package_manifest = validate_published_neural_model(training.model_path.parent)
@@ -1503,9 +1533,13 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert "bundle_manifest_sha256" not in recorded_training.data.tags
     assert recorded_training.data.params["bundle_manifest_sha256"] == "e" * 64
 
-    evaluation = evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
+    evaluation = evaluate_training_run(
+        training.run_id,
+        tracking_uri=setup.tracking_uri,
+        private_output_directory=setup.config.runtime.private_output_directory,
+    )
     assert setup.adapter.test_calls == 1
-    assert setup.build_calls == ["image_densenet", "image_densenet"]
+    assert setup.build_calls == ["cxr_densenet", "cxr_densenet"]
     assert evaluation.training_run_id == training.run_id
     assert evaluation.run_id != training.run_id
     assert evaluation.artifact_directory.is_dir()
@@ -1513,6 +1547,9 @@ def test_synthetic_image_training_package_and_separate_evaluation(
     assert private_manifest["training_run_id"] == training.run_id
     assert private_manifest["test_evaluation_run_id"] == evaluation.run_id
     assert private_manifest["model_package_id"] == training.model_package_id
+    assert evaluation.private_prediction_directory.parent.parent.parent == (
+        setup.config.runtime.private_output_directory
+    )
     assert not any(path.suffix == ".parquet" for path in evaluation.artifact_directory.rglob("*"))
     client = configure_mlflow(tracking_uri=setup.tracking_uri)
     evaluation_run = client.get_run(evaluation.run_id)
@@ -1683,7 +1720,11 @@ def test_image_publication_failures_remain_incomplete(
 
     monkeypatch.setattr("radfusion.training.evaluate_image.publish_directory", fail_publication)
     with pytest.raises(OSError):
-        evaluate_training_run(training.run_id, tracking_uri=setup.tracking_uri)
+        evaluate_training_run(
+            training.run_id,
+            tracking_uri=setup.tracking_uri,
+            private_output_directory=setup.config.runtime.private_output_directory,
+        )
     _, _, rows_after_failure = regenerate_comparison(
         tracking_uri=setup.tracking_uri,
         output_directory=tmp_path / "comparison-after-failure",
@@ -1704,9 +1745,7 @@ def test_image_publication_failures_remain_incomplete(
         if run.info.status == "FAILED" and run.data.tags.get("run_kind") == "test_evaluation"
     }
     assert not any(
-        (
-            setup.config.training.report_directory.parent / "private/predictions/rsna" / run_id
-        ).exists()
+        (setup.config.runtime.private_output_directory / "predictions/rsna" / run_id).exists()
         for run_id in failed_evaluation_ids
     )
 
@@ -1725,11 +1764,11 @@ def test_image_publication_failures_remain_incomplete(
     )
     assert failed_training.data.tags.get("run_complete") == "false"
     assert not (
-        setup.config.training.model_directory / "runs" / failed_training.info.run_id
+        setup.config.runtime.model_directory / "runs" / failed_training.info.run_id
     ).exists()
     assert not (
-        setup.config.training.report_directory
-        / setup.config.dataset.registry_key
+        setup.config.runtime.report_directory
+        / setup.config.dataset.dataset_id
         / "runs"
         / failed_training.info.run_id
     ).exists()

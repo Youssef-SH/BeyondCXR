@@ -84,16 +84,18 @@ def _audit_bundle(tmp_path: Path) -> SimpleNamespace:
     paths["metadata_path"].write_text(
         json.dumps(
             {
-                "implausible_age_count": 0,
-                "split": {
-                    "split_recipe_id": recipe_id,
-                    "split_assignment_id": assignment_id,
+                "membership": {
+                    "split": {
+                        "split_recipe_id": recipe_id,
+                        "split_assignment_id": assignment_id,
+                    },
                 },
+                "qualification": {"age_parsing": {"implausible_age_count": 0}},
             }
         ),
         encoding="utf-8",
     )
-    return SimpleNamespace(bundle_id="build-test", **paths)
+    return SimpleNamespace(bundle_id="bundle-test", **paths)
 
 
 def test_label_distribution_uses_task_specific_names() -> None:
@@ -192,7 +194,7 @@ def test_audit_publication_owns_only_the_bundle_specific_output(
     bundle = _audit_bundle(tmp_path)
     monkeypatch.setattr("radfusion.data.rsna_audit.load_current_bundle", lambda _: bundle)
     output = tmp_path / "reports" / "rsna"
-    other_bundle = output / "build-other"
+    other_bundle = output / "bundle-other"
     other_bundle.mkdir(parents=True)
     (other_bundle / "keep.txt").write_text("other", encoding="utf-8")
 
@@ -223,5 +225,5 @@ def test_audit_failure_preserves_previous_output(
         generate_rsna_audit(tmp_path / "manifests", output)
 
     assert (destination / "previous.txt").read_text(encoding="utf-8") == "complete"
-    assert not list(output.glob(".build-test-staging-*"))
-    assert not list(output.glob(".build-test-backup-*"))
+    assert not list(output.glob(".bundle-test-staging-*"))
+    assert not list(output.glob(".bundle-test-backup-*"))

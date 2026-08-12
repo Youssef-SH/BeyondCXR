@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import sklearn
 from sklearn.model_selection import StratifiedGroupKFold
 
+from radfusion.data.bundle_contract import BUNDLE_PREFIX, valid_bundle_id
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.symile_artifacts import (
@@ -45,9 +46,9 @@ from radfusion.utils.operational_logging import (
 )
 from radfusion.utils.publication import staging_directory
 
-CV_DIRECTORY = "cv_assignments"
-CV_ASSIGNMENTS_FILENAME = "symile_cv_assignments.parquet"
-CV_MANIFEST_FILENAME = "symile_cv_manifest.json"
+CV_DIRECTORY = "cv"
+CV_ASSIGNMENTS_FILENAME = "assignments.parquet"
+CV_MANIFEST_FILENAME = "manifest.json"
 _EXPECTED_FILES = {CV_ASSIGNMENTS_FILENAME, CV_MANIFEST_FILENAME}
 _LOGGER = get_operational_logger(__name__)
 
@@ -263,7 +264,7 @@ def _cv_identity_payload(bundle_id: str, logical_hash: str) -> dict[str, object]
         "n_splits": 5,
         "shuffle": True,
         "repeat_seeds": list(REPEAT_SEEDS),
-        "assignment_logical_arrow_sha256": logical_hash,
+        "artifacts": {"assignments": logical_hash},
     }
 
 
@@ -276,7 +277,12 @@ def _cv_manifest(
 ) -> dict[str, object]:
     return {
         "cv_assignment_id": assignment_id,
-        **_cv_identity_payload(bundle_id, logical_hash),
+        "bundle_id": bundle_id,
+        **{
+            key: value
+            for key, value in _cv_identity_payload(bundle_id, logical_hash).items()
+            if key != "bundle_id"
+        },
         "artifact": {
             "filename": CV_ASSIGNMENTS_FILENAME,
             "logical_arrow_sha256": logical_hash,
@@ -296,7 +302,7 @@ def _cv_manifest(
 
 
 def _validate_cv_manifest(manifest: object) -> None:
-    identity_fields = _cv_identity_payload("build-" + "0" * 64, "0" * 64)
+    identity_fields = _cv_identity_payload(BUNDLE_PREFIX + "0" * 64, "0" * 64)
     expected = {
         "cv_assignment_id",
         *identity_fields,
@@ -307,18 +313,22 @@ def _validate_cv_manifest(manifest: object) -> None:
     if not isinstance(manifest, dict) or set(manifest) != expected:
         raise ManifestBuildError("Symile CV manifest field set is invalid")
     bundle_id = manifest.get("bundle_id")
-    logical_hash = manifest.get("assignment_logical_arrow_sha256")
+    semantic_artifacts = manifest.get("artifacts")
+    logical_hash = (
+        semantic_artifacts.get("assignments") if isinstance(semantic_artifacts, dict) else None
+    )
     if (
-        not isinstance(bundle_id, str)
-        or not bundle_id.startswith("build-")
-        or len(bundle_id) != 70
-        or not all(character in "0123456789abcdef" for character in bundle_id[6:])
+        not valid_bundle_id(bundle_id)
         or not isinstance(logical_hash, str)
         or len(logical_hash) != 64
         or not all(character in "0123456789abcdef" for character in logical_hash)
     ):
         raise ManifestBuildError("Symile CV source identity declarations are invalid")
-    design = _cv_identity_payload(bundle_id, logical_hash)
+    design = {
+        key: value
+        for key, value in _cv_identity_payload(bundle_id, logical_hash).items()
+        if key != "bundle_id"
+    }
     if any(manifest.get(key) != value for key, value in design.items()):
         raise ManifestBuildError("Symile CV design contract is invalid")
     if not _identity(manifest.get("cv_assignment_id")):

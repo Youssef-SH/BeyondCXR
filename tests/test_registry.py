@@ -10,13 +10,13 @@ def test_builtin_component_mappings_are_immutable_and_complete() -> None:
     assert tuple(MODELS) == (
         "metadata_logistic",
         "metadata_lightgbm",
-        "image_densenet",
-        "fusion_concat",
+        "cxr_densenet",
+        "cxr_metadata_concat",
     )
     assert get_dataset("rsna") is DATASETS["rsna"]
     assert get_model("metadata_logistic") is MODELS["metadata_logistic"]
-    assert get_model("image_densenet") is MODELS["image_densenet"]
-    assert get_model("fusion_concat") is MODELS["fusion_concat"]
+    assert get_model("cxr_densenet") is MODELS["cxr_densenet"]
+    assert get_model("cxr_metadata_concat") is MODELS["cxr_metadata_concat"]
     with pytest.raises(TypeError):
         DATASETS["other"] = object()  # type: ignore[index]
     with pytest.raises(TypeError):

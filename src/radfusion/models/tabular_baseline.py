@@ -12,10 +12,8 @@ from sklearn.pipeline import Pipeline
 
 from radfusion.data.tabular_preprocess import build_rsna_preprocessor
 from radfusion.evaluation.metrics import validated_binary_targets
-from radfusion.training.config import ModelConfig
+from radfusion.training.config import ExperimentConfig
 from radfusion.training.interfaces import ModelFitResult
-
-_WEIGHTING_PARAMETERS = frozenset({"class_weight", "scale_pos_weight", "is_unbalance"})
 
 
 class MetadataLogisticModel:
@@ -23,7 +21,7 @@ class MetadataLogisticModel:
 
     def fit(
         self,
-        config: ModelConfig,
+        config: ExperimentConfig,
         training_seed: int,
         train_features: pd.DataFrame,
         train_targets: np.ndarray,
@@ -32,21 +30,21 @@ class MetadataLogisticModel:
     ) -> ModelFitResult:
         """Fit preprocessing and Logistic Regression on training data."""
         del validation_features, validation_targets
-        if config.fit_parameters:
-            raise ValueError(
-                f"Logistic Regression does not accept fit parameters: "
-                f"{sorted(config.fit_parameters)}"
-            )
-        _reject_weighting_parameter_conflicts(config)
+        parameters = config.training.parameters
+        expected = {"l1_ratio", "solver", "C", "max_iter", "class_weight"}
+        if set(parameters) != expected:
+            raise ValueError("Logistic Regression parameter field set is invalid")
         validated_targets = validated_binary_targets(train_targets)
         pipeline = Pipeline(
             [
-                ("preprocess", build_rsna_preprocessor()),
+                (
+                    "preprocess",
+                    build_rsna_preprocessor(str(config.preprocessing["metadata_policy"])),
+                ),
                 (
                     "classifier",
                     LogisticRegression(
-                        **dict(config.parameters),
-                        class_weight="balanced",
+                        **dict(parameters),
                         random_state=training_seed,
                     ),
                 ),
@@ -57,7 +55,7 @@ class MetadataLogisticModel:
             pipeline,
             {
                 "estimator_random_state": training_seed,
-                "resolved_class_weight": "balanced",
+                "resolved_class_weight": parameters["class_weight"],
             },
         )
 
@@ -67,7 +65,7 @@ class MetadataLightgbmModel:
 
     def fit(
         self,
-        config: ModelConfig,
+        config: ExperimentConfig,
         training_seed: int,
         train_features: pd.DataFrame,
         train_targets: np.ndarray,
@@ -75,10 +73,9 @@ class MetadataLightgbmModel:
         validation_targets: np.ndarray,
     ) -> ModelFitResult:
         """Fit train-only preprocessing and validation-monitored LightGBM."""
-        _reject_weighting_parameter_conflicts(config)
         validated_train_targets = validated_binary_targets(train_targets)
         validated_validation_targets = validated_binary_targets(validation_targets)
-        preprocessor = build_rsna_preprocessor()
+        preprocessor = build_rsna_preprocessor(str(config.preprocessing["metadata_policy"]))
         transformed_train = preprocessor.fit_transform(train_features, validated_train_targets)
         transformed_validation = preprocessor.transform(validation_features)
         negatives = int((validated_train_targets == 0).sum())
@@ -86,8 +83,28 @@ class MetadataLightgbmModel:
         scale_pos_weight = negatives / positives
         if not np.isfinite(scale_pos_weight) or scale_pos_weight <= 0:
             raise ValueError("Derived LightGBM positive-class weight must be finite and positive")
+        parameters = {**dict(config.family.parameters), **dict(config.training.parameters)}
+        expected = {
+            "objective",
+            "n_estimators",
+            "learning_rate",
+            "num_leaves",
+            "min_child_samples",
+            "subsample",
+            "subsample_freq",
+            "colsample_bytree",
+            "reg_lambda",
+            "class_weighting",
+            "early_stopping_rounds",
+        }
+        if set(parameters) != expected:
+            raise ValueError("LightGBM parameter field set is invalid")
+        early_stopping_rounds = int(parameters.pop("early_stopping_rounds"))
+        class_weighting = str(parameters.pop("class_weighting"))
+        if class_weighting != "train_neg_pos_ratio":
+            raise ValueError("LightGBM requires train_neg_pos_ratio class weighting")
         classifier = LGBMClassifier(
-            **dict(config.parameters),
+            **parameters,
             random_state=training_seed,
             bagging_seed=training_seed,
             feature_fraction_seed=training_seed,
@@ -99,14 +116,10 @@ class MetadataLightgbmModel:
             force_col_wise=True,
             n_jobs=1,
             metric="None",
+            verbosity=-1,
         )
-        fit_parameters = dict(config.fit_parameters)
-        early_stopping_rounds = int(fit_parameters.pop("early_stopping_rounds"))
-        eval_metric = str(fit_parameters.pop("eval_metric"))
-        if eval_metric != "average_precision":
-            raise ValueError("LightGBM early stopping requires eval_metric='average_precision'")
-        if fit_parameters:
-            raise ValueError(f"Unknown LightGBM fit parameters: {sorted(fit_parameters)}")
+        if config.training.selection_metric != "average_precision":
+            raise ValueError("RSNA LightGBM selection requires average_precision")
         classifier.fit(
             transformed_train,
             validated_train_targets,
@@ -136,7 +149,7 @@ class MetadataLightgbmModel:
             {
                 "scale_pos_weight": scale_pos_weight,
                 "early_stopping_rounds": early_stopping_rounds,
-                "early_stopping_metric": eval_metric,
+                "early_stopping_metric": config.training.selection_metric,
                 "early_stopping_dataset": "validation",
                 "early_stopping_greater_is_better": True,
                 "best_iteration": classifier.best_iteration_,
@@ -144,15 +157,8 @@ class MetadataLightgbmModel:
                 "lightgbm_deterministic": True,
                 "lightgbm_force_col_wise": True,
                 "lightgbm_n_jobs": 1,
+                "lightgbm_verbosity": -1,
             },
-        )
-
-
-def _reject_weighting_parameter_conflicts(config: ModelConfig) -> None:
-    conflicts = sorted(_WEIGHTING_PARAMETERS & config.parameters.keys())
-    if conflicts:
-        raise ValueError(
-            f"Estimator weighting parameters are fixed by the model adapter: {conflicts}"
         )
 
 

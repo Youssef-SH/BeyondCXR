@@ -124,8 +124,12 @@ def validate_metadata_pipeline(model: object) -> Pipeline:
     return model
 
 
-def build_rsna_preprocessor() -> Pipeline:
+def build_rsna_preprocessor(
+    policy_version: str = METADATA_INPUT_POLICY_VERSION,
+) -> Pipeline:
     """Return an unfitted reusable RSNA metadata preprocessing pipeline."""
+    if policy_version != METADATA_INPUT_POLICY_VERSION:
+        raise ValueError("RSNA metadata preprocessing policy is unsupported")
     numeric = Pipeline(
         [
             ("impute", SimpleImputer(strategy="median")),

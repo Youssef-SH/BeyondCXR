@@ -1,11 +1,11 @@
-"""Load and validate typed experiment configuration files."""
+"""Load the single strict version-1 scientific experiment configuration."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -13,6 +13,15 @@ from typing import Any
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
+
+from radfusion.data.bundle_contract import valid_bundle_id
+from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, STANDARD_CXR_IMAGE_SIZE
+from radfusion.data.symile_preprocess import LAB_ECDF_POLICY_VERSION
+from radfusion.data.tabular_preprocess import METADATA_INPUT_POLICY_VERSION
+
+
+class ConfigError(ValueError):
+    """Raised when an experiment configuration violates the version-1 grammar."""
 
 
 class _StrictSafeLoader(yaml.SafeLoader):
@@ -23,11 +32,11 @@ def _construct_unique_mapping(
     loader: _StrictSafeLoader, node: MappingNode, deep: bool = False
 ) -> dict[object, object]:
     loader.flatten_mapping(node)
-    mapping: dict[object, object] = {}
+    result: dict[object, object] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         try:
-            duplicate = key in mapping
+            duplicate = key in result
         except TypeError as exc:
             raise ConstructorError(
                 "while constructing a mapping",
@@ -42,19 +51,14 @@ def _construct_unique_mapping(
                 f"found duplicate key {key!r}",
                 key_node.start_mark,
             )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
 
 
 _StrictSafeLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
     _construct_unique_mapping,
 )
-
-
-class ConfigError(ValueError):
-    """Raised when an experiment configuration is invalid."""
-
 
 MODEL_RANDOMNESS_KEYS = frozenset(
     {
@@ -68,77 +72,222 @@ MODEL_RANDOMNESS_KEYS = frozenset(
     }
 )
 
-_FUSION_MODEL_PARAMETERS = MappingProxyType(
+FAMILY_MODALITIES = MappingProxyType(
     {
-        "encoder_name": "densenet121",
-        "weights": "densenet121-res224-chex",
-        "image_size": 224,
-        "embedding_dimension": 1024,
-        "image_projection_dimension": 256,
-        "structured_hidden_dimension": 128,
-        "structured_projection_dimension": 64,
-        "fusion_hidden_dimension": 128,
-        "dropout": 0.2,
-        "class_weighting": "train_pos_weight",
+        ("rsna", "metadata_logistic"): ("metadata",),
+        ("rsna", "metadata_lightgbm"): ("metadata",),
+        ("rsna", "cxr_densenet"): ("cxr",),
+        ("rsna", "cxr_metadata_concat"): ("cxr", "metadata"),
+        ("symile", "labs_logistic"): ("labs",),
+        ("symile", "labs_lightgbm"): ("labs",),
+        ("symile", "cxr_densenet"): ("cxr",),
+        ("symile", "cxr_labs_concat"): ("cxr", "labs"),
+        ("symile", "cxr_labs_gated"): ("cxr", "labs"),
+        ("symile", "cxr_labs_gated_no_observedness"): ("cxr", "labs"),
     }
 )
+
+_FAMILY_PARAMETER_FIELDS = MappingProxyType(
+    {
+        "metadata_logistic": frozenset(),
+        "metadata_lightgbm": frozenset(
+            {
+                "objective",
+                "num_leaves",
+                "min_child_samples",
+            }
+        ),
+        "labs_logistic": frozenset(),
+        "labs_lightgbm": frozenset(
+            {
+                "objective",
+                "num_leaves",
+                "min_child_samples",
+            }
+        ),
+        "cxr_metadata_concat": frozenset(
+            {
+                "encoder_name",
+                "weights",
+                "image_size",
+                "embedding_dimension",
+                "image_projection_dimension",
+                "structured_hidden_dimension",
+                "structured_projection_dimension",
+                "fusion_hidden_dimension",
+                "dropout",
+            }
+        ),
+        "cxr_labs_concat": frozenset(
+            {
+                "encoder_name",
+                "weights",
+                "image_size",
+                "embedding_dimension",
+                "lab_input_dimension",
+                "image_projection_dimension",
+                "lab_hidden_dimension",
+                "lab_projection_dimension",
+                "fusion_hidden_dimension",
+                "dropout",
+            }
+        ),
+        "cxr_labs_gated": frozenset(
+            {
+                "encoder_name",
+                "weights",
+                "image_size",
+                "embedding_dimension",
+                "lab_input_dimension",
+                "lab_hidden_dimension",
+                "lab_core_dimension",
+                "latent_dimension",
+                "observedness_dimension",
+                "gate_hidden_dimension",
+                "classifier_hidden_dimension",
+                "modality_count",
+                "dropout",
+                "use_observedness",
+            }
+        ),
+        "cxr_labs_gated_no_observedness": frozenset(
+            {
+                "encoder_name",
+                "weights",
+                "image_size",
+                "embedding_dimension",
+                "lab_input_dimension",
+                "lab_hidden_dimension",
+                "lab_core_dimension",
+                "latent_dimension",
+                "observedness_dimension",
+                "gate_hidden_dimension",
+                "classifier_hidden_dimension",
+                "modality_count",
+                "dropout",
+                "use_observedness",
+            }
+        ),
+    }
+)
+
+_TABULAR_TRAINING_FIELDS = MappingProxyType(
+    {
+        "metadata_logistic": frozenset({"l1_ratio", "solver", "C", "max_iter", "class_weight"}),
+        "labs_logistic": frozenset({"l1_ratio", "solver", "C", "max_iter", "class_weight"}),
+        "metadata_lightgbm": frozenset(
+            {
+                "n_estimators",
+                "learning_rate",
+                "subsample",
+                "subsample_freq",
+                "colsample_bytree",
+                "reg_lambda",
+                "class_weighting",
+                "early_stopping_rounds",
+            }
+        ),
+        "labs_lightgbm": frozenset(
+            {
+                "n_estimators",
+                "learning_rate",
+                "subsample",
+                "subsample_freq",
+                "colsample_bytree",
+                "reg_lambda",
+                "class_weight",
+                "early_stopping_rounds",
+            }
+        ),
+    }
+)
+
+_NEURAL_FAMILIES = frozenset(
+    {
+        "cxr_densenet",
+        "cxr_metadata_concat",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+    }
+)
+_SYMILE_FAMILIES = frozenset(family for dataset, family in FAMILY_MODALITIES if dataset == "symile")
 
 
 @dataclass(frozen=True)
 class DatasetConfig:
-    """Dataset adapter and bundle settings."""
+    """Immutable scientific dataset and integrity witnesses."""
 
-    registry_key: str
-    manifest_directory: Path
+    dataset_id: str
     bundle_id: str
-    task_id: str
-    dataset_root: Path | None
+    bundle_manifest_sha256: str
+    split_assignment_id: str
+    cv_assignment_id: str | None
 
 
 @dataclass(frozen=True)
-class ModelConfig:
-    """Registered model and its declarative parameters."""
+class TaskConfig:
+    """Prediction task and label-policy identity."""
 
-    registry_key: str
-    modality: str
+    task_id: str
+    label_policy_version: str
+
+
+@dataclass(frozen=True)
+class FamilyConfig:
+    """Scientific family, modalities, and topology parameters."""
+
+    family_id: str
+    modalities: tuple[str, ...]
     parameters: MappingProxyType[str, Any]
-    fit_parameters: MappingProxyType[str, Any]
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Training seed and generated-output locations."""
+    """Scientific fitting, loader, augmentation, and selection policies."""
 
-    seed: int
-    report_directory: Path
-    model_directory: Path
+    selection_metric: str
+    parameters: MappingProxyType[str, Any]
+    loader: MappingProxyType[str, Any]
+    augmentation: MappingProxyType[str, Any]
 
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Evaluation policies shared by model implementations."""
+    """Scientific evaluation policy, when applicable."""
 
-    sensitivity_target: float
-    calibration_bins: int
-    latency_warmup_calls: int
-    latency_measured_calls: int
+    parameters: MappingProxyType[str, Any]
+
+    @property
+    def sensitivity_target(self) -> float:
+        return float(self.parameters["sensitivity_target"])
+
+    @property
+    def calibration_bins(self) -> int:
+        return int(self.parameters["calibration_bins"])
 
 
 @dataclass(frozen=True)
-class MLflowConfig:
-    """MLflow experiment identity."""
+class RuntimeConfig:
+    """Operational paths, hardware choice, and execution seed."""
 
+    manifest_directory: Path
+    source_root: Path | None
+    model_directory: Path
+    report_directory: Path
+    private_output_directory: Path
     experiment_name: str
-
-
-@dataclass(frozen=True)
-class ImageConfig:
-    """Image augmentation, loading, runtime, and optimization settings."""
-
-    batch_size: int
+    device: str
     num_workers: int
     pin_memory_policy: str
-    device: str
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class NeuralConfig:
+    """Typed derived view of neural scientific training policy."""
+
+    batch_size: int
     mixed_precision: bool
     rotation_degrees: float
     translation_fraction: float
@@ -161,657 +310,409 @@ class ImageConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """Complete immutable experiment definition."""
+    """Validated science plus separately owned runtime coordinates."""
 
     config_version: int
-    name: str
     dataset: DatasetConfig
-    model: ModelConfig
-    training: TrainingConfig
-    evaluation: EvaluationConfig
-    mlflow: MLflowConfig
-    image: ImageConfig | None
-    source_path: Path
-    source_bytes: bytes
-    source_sha256: str
-
-
-@dataclass(frozen=True)
-class SymileDevelopmentDatasetConfig:
-    """Frozen M4 identities and development-only source location."""
-
-    manifest_directory: Path
-    source_root: Path | None
-    bundle_id: str
-    bundle_manifest_sha256: str
-    official_split_assignment_id: str
-    cv_assignment_id: str
-    task_id: str
-
-
-@dataclass(frozen=True)
-class SymileDevelopmentConfig:
-    """One fixed M5 family configuration executed over the frozen outer CV."""
-
-    config_version: int
-    name: str
-    family: str
-    dataset: SymileDevelopmentDatasetConfig
+    task: TaskConfig
+    family: FamilyConfig
     preprocessing: MappingProxyType[str, Any]
-    model: MappingProxyType[str, Any]
-    training: MappingProxyType[str, Any]
-    mlflow: MLflowConfig
-    image: ImageConfig | None
+    training: TrainingConfig
+    evaluation: EvaluationConfig | None
+    neural: NeuralConfig | None
+    runtime: RuntimeConfig
     source_path: Path
     source_bytes: bytes
-    source_sha256: str
+    config_source_sha256: str
+    config_semantic_sha256: str
 
 
-SYMILE_M5_FAMILIES = (
-    "labs_logistic",
-    "labs_lightgbm",
-    "cxr",
-    "concat",
-    "gated",
-    "gated_no_observedness",
-)
-_SYMILE_FUSION_FAMILIES = frozenset({"concat", "gated", "gated_no_observedness"})
-_SYMILE_NEURAL_FAMILIES = frozenset({"cxr", *_SYMILE_FUSION_FAMILIES})
-_SYMILE_LAB_FAMILIES = frozenset({"labs_logistic", "labs_lightgbm", *_SYMILE_FUSION_FAMILIES})
-_SYMILE_BUNDLE_ID = "build-a75d6c209a207440f24051a1f9038c18103f5936007c7e9e7e20a0a99e0e4826"
-_SYMILE_BUNDLE_MANIFEST_SHA256 = "eb8fd39108720a4b101c6965fb50d10effe01833f88afa8ba8e06e9f527552e5"
-_SYMILE_SPLIT_ASSIGNMENT_ID = (
-    "split-assignment-917a594754a779f0774b690d9f988e29d8773d6a5f619fef379a263a7b700f27"
-)
-_SYMILE_CV_ASSIGNMENT_ID = (
-    "cv-assignment-db3f94a74694566ae3ce874a11eb8dd716cbbe9d5a739a4c3848faee61b41163"
-)
-
-
-def image_semantic_config_sha256(config: ExperimentConfig) -> str:
-    """Hash the meaning-bearing, path-independent image experiment configuration."""
-    return _canonical_sha256(_image_semantic_config(config))
-
-
-def image_seed_compatibility_sha256(config: ExperimentConfig) -> str:
-    """Hash image experiment meaning after excluding only the training seed."""
-    payload = _image_semantic_config(config)
-    del payload["training"]["seed"]
-    return _canonical_sha256(payload)
-
-
-def fusion_semantic_config_sha256(config: ExperimentConfig) -> str:
-    """Hash the meaning-bearing, path-independent fusion experiment configuration."""
-    return _canonical_sha256(_fusion_semantic_config(config))
-
-
-def fusion_seed_compatibility_sha256(config: ExperimentConfig) -> str:
-    """Hash fusion experiment meaning after excluding only the training seed."""
-    payload = _fusion_semantic_config(config)
-    del payload["training"]["seed"]
-    return _canonical_sha256(payload)
-
-
-def _image_semantic_config(config: ExperimentConfig) -> dict[str, Any]:
-    return _neural_semantic_config(config, modality="image")
-
-
-def _fusion_semantic_config(config: ExperimentConfig) -> dict[str, Any]:
-    return _neural_semantic_config(config, modality="fusion")
-
-
-def _neural_semantic_config(
-    config: ExperimentConfig,
-    *,
-    modality: str,
-) -> dict[str, Any]:
-    if config.model.modality != modality or config.image is None:
-        raise ConfigError(f"Semantic {modality} configuration requires {modality} modality")
-    image = asdict(config.image)
-    del image["num_workers"]
-    del image["pin_memory_policy"]
-    return {
-        "config_version": config.config_version,
-        "dataset": {
-            "registry_key": config.dataset.registry_key,
-            "bundle_id": config.dataset.bundle_id,
-            "task_id": config.dataset.task_id,
-        },
-        "model": {
-            "registry_key": config.model.registry_key,
-            "modality": config.model.modality,
-            "parameters": dict(config.model.parameters),
-            "fit_parameters": dict(config.model.fit_parameters),
-        },
-        "training": {"seed": config.training.seed},
-        "evaluation": {
-            "sensitivity_target": config.evaluation.sensitivity_target,
-            "calibration_bins": config.evaluation.calibration_bins,
-        },
-        "image": image,
-    }
-
-
-def _canonical_sha256(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    ).hexdigest()
+SYMILE_M5_FAMILIES = tuple(sorted(_SYMILE_FAMILIES))
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    """Load and validate an experiment YAML file."""
+    """Load one strict canonical version-1 experiment YAML."""
     source = Path(path)
-    try:
-        source_bytes = source.read_bytes()
-        document = yaml.load(source_bytes.decode("utf-8"), Loader=_StrictSafeLoader)
-    except OSError as exc:
-        raise ConfigError(f"Experiment config is unreadable: {source}") from exc
-    except UnicodeError as exc:
-        raise ConfigError(f"Experiment config is not valid UTF-8: {source}") from exc
-    except yaml.YAMLError as exc:
-        detail = getattr(exc, "problem", None) or str(exc)
-        raise ConfigError(f"Experiment config is invalid YAML: {source}: {detail}") from exc
-    root = _mapping(document, "config")
+    source_bytes, root = _read_yaml(source)
     _keys(
         root,
-        required={
-            "config_version",
-            "name",
-            "dataset",
-            "model",
-            "training",
-            "evaluation",
-            "mlflow",
-        },
-        optional={"image"},
-        context="config",
-    )
-    config_version = _integer(root["config_version"], "config_version")
-    if config_version != 1:
-        raise ConfigError(f"Unsupported config_version: {config_version}")
-    model = _model_config(root["model"])
-    dataset = _dataset_config(root["dataset"])
-    if model.modality in {"image", "fusion"}:
-        expected_key = "image_densenet" if model.modality == "image" else "fusion_concat"
-        if model.registry_key != expected_key:
-            raise ConfigError(
-                f"{model.modality.capitalize()} experiments require "
-                f"model.registry_key={expected_key!r}"
-            )
-        if "image" not in root:
-            raise ConfigError("Neural experiments require an image configuration section")
-        if dataset.dataset_root is None:
-            raise ConfigError("Neural experiments require dataset.dataset_root")
-    else:
-        if model.registry_key not in {"metadata_logistic", "metadata_lightgbm"}:
-            raise ConfigError("Metadata experiments require a registered metadata model")
-        if dataset.dataset_root is not None:
-            raise ConfigError("Metadata experiments do not accept dataset.dataset_root")
-        if "image" in root:
-            raise ConfigError("The image configuration requires a neural modality")
-    return ExperimentConfig(
-        config_version=config_version,
-        name=_text(root["name"], "name"),
-        dataset=dataset,
-        model=model,
-        training=_training_config(root["training"]),
-        evaluation=_evaluation_config(root["evaluation"]),
-        mlflow=_mlflow_config(root["mlflow"]),
-        image=_image_config(root["image"]) if "image" in root else None,
-        source_path=source,
-        source_bytes=source_bytes,
-        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
-    )
-
-
-def load_symile_development_config(path: str | Path) -> SymileDevelopmentConfig:
-    """Load one strict family-level M5 development configuration."""
-    source = Path(path)
-    try:
-        source_bytes = source.read_bytes()
-        document = yaml.load(source_bytes.decode("utf-8"), Loader=_StrictSafeLoader)
-    except OSError as exc:
-        raise ConfigError(f"Symile development config is unreadable: {source}") from exc
-    except UnicodeError as exc:
-        raise ConfigError(f"Symile development config is not valid UTF-8: {source}") from exc
-    except yaml.YAMLError as exc:
-        detail = getattr(exc, "problem", None) or str(exc)
-        raise ConfigError(f"Symile development config is invalid YAML: {source}: {detail}") from exc
-    root = _mapping(document, "config")
-    _keys(
-        root,
-        required={
-            "config_version",
-            "name",
-            "family",
-            "dataset",
-            "preprocessing",
-            "model",
-            "training",
-            "mlflow",
-        },
-        optional={"image"},
+        required={"config_version", "dataset", "task", "family", "training"},
+        optional={"preprocessing", "evaluation"},
         context="config",
     )
     version = _integer(root["config_version"], "config_version")
     if version != 1:
-        raise ConfigError(f"Unsupported Symile development config_version: {version}")
-    family = _choice(root["family"], set(SYMILE_M5_FAMILIES), "family")
-    dataset = _symile_development_dataset(root["dataset"], family)
-    preprocessing = _mapping(root["preprocessing"], "preprocessing")
-    _keys(preprocessing, required={"lab_policy"}, context="preprocessing")
-    expected_policy = (
-        "symile-outer-training-right-ecdf-v1" if family in _SYMILE_LAB_FAMILIES else "none"
+        raise ConfigError(f"Unsupported config_version: {version}")
+    dataset = _dataset_config(root["dataset"])
+    task = _task_config(root["task"], dataset.dataset_id)
+    family = _family_config(root["family"], dataset.dataset_id)
+    preprocessing = _preprocessing_config(root.get("preprocessing", {}), dataset, family)
+    training = _training_config(root["training"], dataset.dataset_id, family.family_id)
+    evaluation = _evaluation_config(root["evaluation"]) if "evaluation" in root else None
+    _validate_section_applicability(dataset, family, training, evaluation)
+    runtime = _default_runtime(dataset.dataset_id)
+    neural = _neural_config(training) if family.family_id in _NEURAL_FAMILIES else None
+    semantic = _semantic_payload(
+        version, dataset, task, family, preprocessing, training, evaluation
     )
-    if _text(preprocessing["lab_policy"], "preprocessing.lab_policy") != expected_policy:
-        raise ConfigError(f"Symile family {family!r} requires lab_policy={expected_policy!r}")
-    model = _mapping(root["model"], "model")
-    if model != _symile_model_contract(family):
-        raise ConfigError(f"Symile family {family!r} model contract is not frozen exactly")
-    training = _mapping(root["training"], "training")
-    _keys(
+    return ExperimentConfig(
+        version,
+        dataset,
+        task,
+        family,
+        preprocessing,
         training,
-        required={"model_directory", "report_directory", "selection_metric"},
-        context="training",
-    )
-    expected_metric = "none" if family == "labs_logistic" else "roc_auc"
-    if _text(training["selection_metric"], "training.selection_metric") != expected_metric:
-        raise ConfigError(f"Symile family {family!r} requires selection_metric={expected_metric!r}")
-    normalized_training = {
-        "model_directory": Path(_text(training["model_directory"], "training.model_directory")),
-        "report_directory": Path(_text(training["report_directory"], "training.report_directory")),
-        "selection_metric": expected_metric,
-    }
-    image = _image_config(root["image"]) if "image" in root else None
-    if family in _SYMILE_NEURAL_FAMILIES:
-        if image is None or asdict(image) != _symile_image_contract():
-            raise ConfigError("Symile neural image training contract is not frozen exactly")
-    elif image is not None:
-        raise ConfigError("Symile laboratory-only families do not accept image configuration")
-    return SymileDevelopmentConfig(
-        config_version=version,
-        name=_text(root["name"], "name"),
-        family=family,
-        dataset=dataset,
-        preprocessing=MappingProxyType(dict(preprocessing)),
-        model=MappingProxyType(dict(model)),
-        training=MappingProxyType(normalized_training),
-        mlflow=_mlflow_config(root["mlflow"]),
-        image=image,
-        source_path=source,
-        source_bytes=source_bytes,
-        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        evaluation,
+        neural,
+        runtime,
+        source,
+        source_bytes,
+        hashlib.sha256(source_bytes).hexdigest(),
+        _canonical_sha256(semantic),
     )
 
 
-def symile_development_semantic_sha256(config: SymileDevelopmentConfig) -> str:
-    """Hash the path-independent scientific M5 family configuration."""
-    payload: dict[str, Any] = {
-        "config_version": config.config_version,
-        "family": config.family,
-        "dataset": {
-            "bundle_id": config.dataset.bundle_id,
-            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-            "official_split_assignment_id": config.dataset.official_split_assignment_id,
-            "cv_assignment_id": config.dataset.cv_assignment_id,
-            "task_id": config.dataset.task_id,
-        },
-        "preprocessing": dict(config.preprocessing),
-        "model": dict(config.model),
-        "selection_metric": config.training["selection_metric"],
-        "image": asdict(config.image) if config.image is not None else None,
-    }
-    return _canonical_sha256(payload)
+def load_symile_development_config(path: str | Path) -> ExperimentConfig:
+    """Load a canonical Symile development-family configuration."""
+    config = load_experiment_config(path)
+    if config.dataset.dataset_id != "symile":
+        raise ConfigError("Symile development requires dataset_id='symile'")
+    return config
 
 
-def _symile_development_dataset(value: object, family: str) -> SymileDevelopmentDatasetConfig:
-    data = _mapping(value, "dataset")
-    _keys(
-        data,
-        required={
-            "manifest_directory",
-            "bundle_id",
-            "bundle_manifest_sha256",
-            "official_split_assignment_id",
-            "cv_assignment_id",
-            "task_id",
-        },
-        optional={"source_root"},
-        context="dataset",
+def with_runtime(
+    config: ExperimentConfig,
+    *,
+    seed: int | None = None,
+    manifest_directory: str | Path | None = None,
+    source_root: str | Path | None = None,
+    model_directory: str | Path | None = None,
+    report_directory: str | Path | None = None,
+    private_output_directory: str | Path | None = None,
+    experiment_name: str | None = None,
+    device: str | None = None,
+    num_workers: int | None = None,
+    pin_memory_policy: str | None = None,
+) -> ExperimentConfig:
+    """Attach operational destinations and a seed without changing config identity."""
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**31 - 1
+    ):
+        raise ConfigError("Runtime seed must be an integer in [0, 2**31 - 1]")
+    if num_workers is not None and (
+        isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0
+    ):
+        raise ConfigError("Runtime num_workers must be a non-negative integer")
+    if pin_memory_policy is not None and pin_memory_policy not in {"auto", "enabled", "disabled"}:
+        raise ConfigError("Runtime pin_memory_policy is unsupported")
+    runtime = replace(
+        config.runtime,
+        seed=seed if seed is not None else config.runtime.seed,
+        manifest_directory=(
+            Path(manifest_directory)
+            if manifest_directory is not None
+            else config.runtime.manifest_directory
+        ),
+        source_root=Path(source_root) if source_root is not None else config.runtime.source_root,
+        model_directory=(
+            Path(model_directory) if model_directory is not None else config.runtime.model_directory
+        ),
+        report_directory=(
+            Path(report_directory)
+            if report_directory is not None
+            else config.runtime.report_directory
+        ),
+        private_output_directory=(
+            Path(private_output_directory)
+            if private_output_directory is not None
+            else config.runtime.private_output_directory
+        ),
+        experiment_name=experiment_name or config.runtime.experiment_name,
+        device=device or config.runtime.device,
+        num_workers=num_workers if num_workers is not None else config.runtime.num_workers,
+        pin_memory_policy=pin_memory_policy or config.runtime.pin_memory_policy,
     )
-    source_root = (
-        Path(_text(data["source_root"], "dataset.source_root")) if "source_root" in data else None
-    )
-    if family in _SYMILE_NEURAL_FAMILIES and source_root is None:
-        raise ConfigError("Symile neural families require dataset.source_root")
-    if family not in _SYMILE_NEURAL_FAMILIES and source_root is not None:
-        raise ConfigError("Symile laboratory-only families do not accept dataset.source_root")
-    expected = {
-        "bundle_id": _SYMILE_BUNDLE_ID,
-        "bundle_manifest_sha256": _SYMILE_BUNDLE_MANIFEST_SHA256,
-        "official_split_assignment_id": _SYMILE_SPLIT_ASSIGNMENT_ID,
-        "cv_assignment_id": _SYMILE_CV_ASSIGNMENT_ID,
-        "task_id": "pneumonia_strict",
-    }
-    for field, required in expected.items():
-        if _text(data[field], f"dataset.{field}") != required:
-            raise ConfigError(f"Symile M5 requires the frozen dataset.{field}")
-    return SymileDevelopmentDatasetConfig(
-        manifest_directory=Path(_text(data["manifest_directory"], "dataset.manifest_directory")),
-        source_root=source_root,
-        bundle_id=expected["bundle_id"],
-        bundle_manifest_sha256=expected["bundle_manifest_sha256"],
-        official_split_assignment_id=expected["official_split_assignment_id"],
-        cv_assignment_id=expected["cv_assignment_id"],
-        task_id=expected["task_id"],
-    )
+    return replace(config, runtime=runtime)
 
 
-def _symile_model_contract(family: str) -> dict[str, Any]:
-    contracts: dict[str, dict[str, Any]] = {
-        "labs_logistic": {
-            "l1_ratio": 0.0,
-            "solver": "liblinear",
-            "C": 1.0,
-            "max_iter": 2000,
-            "class_weight": None,
-        },
-        "labs_lightgbm": {
-            "objective": "binary",
-            "n_estimators": 500,
-            "learning_rate": 0.03,
-            "num_leaves": 31,
-            "min_child_samples": 20,
-            "subsample": 0.9,
-            "subsample_freq": 1,
-            "colsample_bytree": 0.9,
-            "reg_lambda": 1.0,
-            "class_weight": None,
-            "early_stopping_rounds": 50,
-        },
-        "cxr": _symile_cxr_contract(),
-        "concat": {
-            **_symile_cxr_contract(),
-            "lab_input_dimension": 100,
-            "image_projection_dimension": 256,
-            "lab_hidden_dimension": 128,
-            "lab_projection_dimension": 64,
-            "fusion_hidden_dimension": 128,
-            "dropout": 0.2,
-        },
-        "gated": _symile_gated_contract(True),
-        "gated_no_observedness": _symile_gated_contract(False),
-    }
-    return contracts[family]
-
-
-def _symile_cxr_contract() -> dict[str, Any]:
-    return {
-        "encoder_name": "densenet121",
-        "weights": "densenet121-res224-chex",
-        "image_size": 224,
-        "embedding_dimension": 1024,
-        "pos_weight": 1.0,
-        "fine_tune_scope": "terminal",
-    }
-
-
-def _symile_gated_contract(use_observedness: bool) -> dict[str, Any]:
-    return {
-        **_symile_cxr_contract(),
-        "lab_input_dimension": 100,
-        "image_projection_dimension": 256,
-        "lab_hidden_dimension": 128,
-        "lab_core_dimension": 64,
-        "latent_dimension": 256,
-        "observedness_dimension": 50,
-        "gate_hidden_dimension": 128,
-        "classifier_hidden_dimension": 128,
-        "modalities": 2,
-        "dropout": 0.2,
-        "use_observedness": use_observedness,
-    }
-
-
-def _symile_image_contract() -> dict[str, Any]:
-    return {
-        "batch_size": 32,
-        "num_workers": 2,
-        "pin_memory_policy": "enabled",
-        "device": "cuda",
-        "mixed_precision": True,
-        "rotation_degrees": 7.0,
-        "translation_fraction": 0.05,
-        "brightness_jitter": 0.05,
-        "contrast_jitter": 0.05,
-        "optimizer": "adamw",
-        "warmup_epochs": 2,
-        "fine_tune_epochs": 28,
-        "warmup_head_learning_rate": 0.001,
-        "encoder_learning_rate": 0.00001,
-        "head_learning_rate": 0.0001,
-        "weight_decay": 0.0001,
-        "scheduler_factor": 0.5,
-        "scheduler_patience": 2,
-        "scheduler_min_learning_rate": 0.0000001,
-        "gradient_clip_norm": 1.0,
-        "early_stopping_patience": 5,
-        "early_stopping_min_delta": 0.0001,
-    }
+def require_runtime_seed(config: ExperimentConfig) -> int:
+    """Return the explicit execution seed or fail before scientific work."""
+    if config.runtime.seed is None:
+        raise ConfigError("An explicit runtime seed is required")
+    return config.runtime.seed
 
 
 def _dataset_config(value: object) -> DatasetConfig:
     data = _mapping(value, "dataset")
     _keys(
         data,
-        required={"registry_key", "manifest_directory", "bundle_id", "task_id"},
-        optional={"dataset_root"},
+        required={
+            "dataset_id",
+            "bundle_id",
+            "bundle_manifest_sha256",
+            "split_assignment_id",
+        },
+        optional={"cv_assignment_id"},
         context="dataset",
     )
-    return DatasetConfig(
-        registry_key=_path_component(data["registry_key"], "dataset.registry_key"),
-        manifest_directory=Path(_text(data["manifest_directory"], "dataset.manifest_directory")),
-        bundle_id=_path_component(data["bundle_id"], "dataset.bundle_id"),
-        task_id=_text(data["task_id"], "dataset.task_id"),
-        dataset_root=(
-            Path(_text(data["dataset_root"], "dataset.dataset_root"))
-            if "dataset_root" in data
-            else None
-        ),
+    dataset_id = _choice(data["dataset_id"], {"rsna", "symile"}, "dataset.dataset_id")
+    bundle_id = _text(data["bundle_id"], "dataset.bundle_id")
+    if not valid_bundle_id(bundle_id):
+        raise ConfigError("dataset.bundle_id is invalid")
+    manifest_sha = _sha256(data["bundle_manifest_sha256"], "dataset.bundle_manifest_sha256")
+    split_id = _identity(
+        data["split_assignment_id"], "split-assignment-", "dataset.split_assignment_id"
     )
+    cv_id = None
+    if "cv_assignment_id" in data:
+        cv_id = _identity(data["cv_assignment_id"], "cv-assignment-", "dataset.cv_assignment_id")
+    if dataset_id == "symile" and cv_id is None:
+        raise ConfigError("Symile configs require dataset.cv_assignment_id")
+    if dataset_id == "rsna" and cv_id is not None:
+        raise ConfigError("RSNA configs do not accept dataset.cv_assignment_id")
+    return DatasetConfig(dataset_id, bundle_id, manifest_sha, split_id, cv_id)
 
 
-def _model_config(value: object) -> ModelConfig:
-    data = _mapping(value, "model")
-    _keys(
-        data,
-        required={
-            "registry_key",
-            "modality",
-            "parameters",
-            "fit_parameters",
-        },
-        context="model",
+def _task_config(value: object, dataset_id: str) -> TaskConfig:
+    data = _mapping(value, "task")
+    _keys(data, required={"task_id", "label_policy_version"}, context="task")
+    task = TaskConfig(
+        _text(data["task_id"], "task.task_id"),
+        _text(data["label_policy_version"], "task.label_policy_version"),
     )
-    modality = _text(data["modality"], "model.modality")
-    if modality not in {"metadata", "image", "fusion"}:
-        raise ConfigError("model.modality must be 'metadata', 'image', or 'fusion'")
-    parameters = _mapping(data["parameters"], "model.parameters")
-    randomness_conflicts = sorted(MODEL_RANDOMNESS_KEYS & parameters.keys())
-    if randomness_conflicts:
-        raise ConfigError(
-            "model.parameters contains randomness controls reserved for training.seed: "
-            f"{randomness_conflicts}"
+    supported = {
+        "rsna": ("pneumonia", "rsna-stage-2-target-v1"),
+        "symile": ("pneumonia_strict", "symile-pneumonia-strict-v1"),
+    }
+    if (task.task_id, task.label_policy_version) != supported[dataset_id]:
+        raise ConfigError("Task and label policy are incompatible with dataset")
+    return task
+
+
+def _family_config(value: object, dataset_id: str) -> FamilyConfig:
+    data = _mapping(value, "family")
+    _keys(data, required={"family_id", "modalities", "parameters"}, context="family")
+    family_id = _text(data["family_id"], "family.family_id")
+    expected_modalities = FAMILY_MODALITIES.get((dataset_id, family_id))
+    if expected_modalities is None:
+        raise ConfigError("family.family_id is unsupported for dataset")
+    raw_modalities = data["modalities"]
+    if not isinstance(raw_modalities, list) or not raw_modalities:
+        raise ConfigError("family.modalities must be a non-empty ordered list")
+    modalities = tuple(_text(item, "family.modalities") for item in raw_modalities)
+    if modalities != expected_modalities:
+        raise ConfigError("family.modalities are incompatible with family.family_id")
+    parameters = _mapping(data["parameters"], "family.parameters")
+    expected_fields = _FAMILY_PARAMETER_FIELDS.get(family_id)
+    if family_id == "cxr_densenet":
+        expected_fields = frozenset(
+            {"encoder_name", "weights", "image_size", "embedding_dimension"}
         )
-    if modality == "image":
-        _validate_image_model_parameters(parameters)
-        if _mapping(data["fit_parameters"], "model.fit_parameters"):
-            raise ConfigError("Image models require empty model.fit_parameters")
-    elif modality == "fusion":
-        _validate_fusion_model_parameters(parameters)
-        if _mapping(data["fit_parameters"], "model.fit_parameters"):
-            raise ConfigError("Fusion models require empty model.fit_parameters")
-    return ModelConfig(
-        registry_key=_path_component(data["registry_key"], "model.registry_key"),
-        modality=modality,
-        parameters=MappingProxyType(parameters),
-        fit_parameters=MappingProxyType(_mapping(data["fit_parameters"], "model.fit_parameters")),
-    )
+    if expected_fields is None or set(parameters) != expected_fields:
+        raise ConfigError("family.parameters has missing or unknown fields")
+    _validate_family_parameters(family_id, parameters)
+    return FamilyConfig(family_id, modalities, MappingProxyType(dict(parameters)))
 
 
-def _training_config(value: object) -> TrainingConfig:
+def _preprocessing_config(
+    value: object, dataset: DatasetConfig, family: FamilyConfig
+) -> MappingProxyType[str, Any]:
+    data = _mapping(value, "preprocessing")
+    required: set[str] = set()
+    if "metadata" in family.modalities:
+        required.add("metadata_policy")
+    if "cxr" in family.modalities:
+        required.add("cxr_transform_policy")
+    if "labs" in family.modalities:
+        required.add("lab_policy")
+    _keys(data, required=required, context="preprocessing")
+    expected = {
+        "metadata_policy": METADATA_INPUT_POLICY_VERSION,
+        "cxr_transform_policy": CXR_TRANSFORM_POLICY_VERSION,
+        "lab_policy": LAB_ECDF_POLICY_VERSION,
+    }
+    if any(_text(data[key], f"preprocessing.{key}") != expected[key] for key in required):
+        raise ConfigError("Preprocessing policy is unsupported by the configured implementation")
+    if dataset.dataset_id == "rsna" and "lab_policy" in data:
+        raise ConfigError("RSNA configurations do not accept Symile laboratory preprocessing")
+    return MappingProxyType(dict(data))
+
+
+def _training_config(value: object, dataset_id: str, family_id: str) -> TrainingConfig:
     data = _mapping(value, "training")
     _keys(
         data,
-        required={"seed", "report_directory", "model_directory"},
+        required={"selection_metric", "parameters"},
+        optional={"loader", "augmentation"},
         context="training",
     )
-    seed = _integer(data["seed"], "training.seed")
-    if not 0 <= seed <= 2**31 - 1:
-        raise ConfigError("training.seed must be between 0 and 2147483647")
+    selection = _choice(
+        data["selection_metric"],
+        {"none", "average_precision", "roc_auc"},
+        "training.selection_metric",
+    )
+    parameters = _mapping(data["parameters"], "training.parameters")
+    loader = _mapping(data.get("loader", {}), "training.loader")
+    augmentation = _mapping(data.get("augmentation", {}), "training.augmentation")
+    if family_id in _NEURAL_FAMILIES:
+        required = (
+            {"class_weighting", "fine_tune_scope"}
+            if dataset_id == "rsna"
+            else {
+                "pos_weight",
+                "fine_tune_scope",
+            }
+        )
+        if not required <= set(parameters):
+            raise ConfigError("Neural training weighting or fine-tuning policy is missing")
+        _validate_neural_training(parameters, loader, augmentation)
+        _validate_scientific_training_policy(dataset_id, family_id, parameters)
+    else:
+        expected = _TABULAR_TRAINING_FIELDS.get(family_id)
+        if expected is None or set(parameters) != expected or loader or augmentation:
+            raise ConfigError("Tabular training policy field set is invalid")
+        _validate_tabular_training(dataset_id, family_id, parameters)
     return TrainingConfig(
-        seed=seed,
-        report_directory=Path(_text(data["report_directory"], "training.report_directory")),
-        model_directory=Path(_text(data["model_directory"], "training.model_directory")),
+        selection,
+        MappingProxyType(dict(parameters)),
+        MappingProxyType(dict(loader)),
+        MappingProxyType(dict(augmentation)),
     )
 
 
 def _evaluation_config(value: object) -> EvaluationConfig:
     data = _mapping(value, "evaluation")
-    _keys(
-        data,
-        required={
-            "sensitivity_target",
-            "calibration_bins",
-            "latency_warmup_calls",
-            "latency_measured_calls",
-        },
-        context="evaluation",
-    )
-    sensitivity = _number(data["sensitivity_target"], "evaluation.sensitivity_target")
+    required = {"sensitivity_target", "calibration_bins"}
+    _keys(data, required=required, context="evaluation")
+    target = _number(data["sensitivity_target"], "evaluation.sensitivity_target")
     bins = _integer(data["calibration_bins"], "evaluation.calibration_bins")
-    warmup = _integer(data["latency_warmup_calls"], "evaluation.latency_warmup_calls")
-    measured = _integer(data["latency_measured_calls"], "evaluation.latency_measured_calls")
-    if not 0 < sensitivity <= 1:
-        raise ConfigError("evaluation.sensitivity_target must be in (0, 1]")
-    if bins <= 0 or warmup < 0 or measured <= 0:
-        raise ConfigError("Evaluation bin and latency call counts are invalid")
-    return EvaluationConfig(sensitivity, bins, warmup, measured)
+    if not 0 < target <= 1 or bins <= 1:
+        raise ConfigError("evaluation values are outside supported ranges")
+    return EvaluationConfig(MappingProxyType(dict(data)))
 
 
-def _mlflow_config(value: object) -> MLflowConfig:
-    data = _mapping(value, "mlflow")
-    _keys(data, required={"experiment_name"}, context="mlflow")
-    return MLflowConfig(
-        experiment_name=_text(data["experiment_name"], "mlflow.experiment_name"),
-    )
+def _validate_section_applicability(
+    dataset: DatasetConfig,
+    family: FamilyConfig,
+    training: TrainingConfig,
+    evaluation: EvaluationConfig | None,
+) -> None:
+    if dataset.dataset_id == "rsna" and evaluation is None:
+        raise ConfigError("RSNA configs require evaluation policy")
+    if dataset.dataset_id == "symile" and evaluation is not None:
+        raise ConfigError("Symile development configs do not accept held-out evaluation policy")
+    expected = {
+        "metadata_logistic": "none",
+        "metadata_lightgbm": "average_precision",
+        "cxr_metadata_concat": "average_precision",
+        "labs_logistic": "none",
+        "labs_lightgbm": "roc_auc",
+        "cxr_labs_concat": "roc_auc",
+        "cxr_labs_gated": "roc_auc",
+        "cxr_labs_gated_no_observedness": "roc_auc",
+    }.get(family.family_id)
+    if family.family_id == "cxr_densenet":
+        expected = "average_precision" if dataset.dataset_id == "rsna" else "roc_auc"
+    if training.selection_metric != expected:
+        raise ConfigError("training.selection_metric is incompatible with family and dataset")
 
 
-def _validate_image_model_parameters(parameters: dict[str, Any]) -> None:
-    required = {
-        "encoder_name",
-        "weights",
+def _validate_family_parameters(family_id: str, values: dict[str, Any]) -> None:
+    if any(key in MODEL_RANDOMNESS_KEYS for key in values):
+        raise ConfigError("Execution randomness belongs to runtime coordinates")
+    integer_fields = {
         "image_size",
-        "embedding_dimension",
-        "class_weighting",
+        "num_leaves",
+        "min_child_samples",
+        "modality_count",
     }
-    _keys(parameters, required=required, context="model.parameters")
-    if _text(parameters["encoder_name"], "model.parameters.encoder_name") != "densenet121":
-        raise ConfigError("The image encoder must be DenseNet121")
-    if _text(parameters["weights"], "model.parameters.weights") != "densenet121-res224-chex":
-        raise ConfigError("The image encoder must use densenet121-res224-chex weights")
-    if _integer(parameters["image_size"], "model.parameters.image_size") != 224:
-        raise ConfigError("The image model requires image_size=224")
-    if _integer(parameters["embedding_dimension"], "model.parameters.embedding_dimension") != 1024:
-        raise ConfigError("The image model requires embedding_dimension=1024")
-    if (
-        _text(parameters["class_weighting"], "model.parameters.class_weighting")
-        != "train_pos_weight"
+    for key, value in values.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ConfigError(f"family.parameters.{key} must be finite")
+        if key.endswith("dimension") or key in integer_fields:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"family.parameters.{key} must be a positive integer")
+    if family_id.startswith("cxr") and (
+        values.get("encoder_name") != "densenet121"
+        or values.get("weights") != "densenet121-res224-chex"
+        or values.get("image_size") != STANDARD_CXR_IMAGE_SIZE
+        or values.get("embedding_dimension") != 1024
     ):
-        raise ConfigError("The image model requires train_pos_weight class weighting")
+        raise ConfigError("Only the frozen standard CXR encoder identity is supported")
+    if "dropout" in values and not 0 <= _number(values["dropout"], "family.parameters.dropout") < 1:
+        raise ConfigError("family.parameters.dropout must be in [0, 1)")
+    if family_id.endswith("lightgbm"):
+        if values.get("objective") != "binary":
+            raise ConfigError("LightGBM families require the binary objective")
+    if family_id in {"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"}:
+        if values.get("lab_input_dimension") != 100:
+            raise ConfigError("Symile laboratory models require the 100-column lab contract")
+    if family_id in {"cxr_labs_gated", "cxr_labs_gated_no_observedness"}:
+        expected_observedness = family_id == "cxr_labs_gated"
+        if values.get("use_observedness") is not expected_observedness:
+            raise ConfigError("Gated-family observedness policy is inconsistent")
+        if values.get("modality_count") != 2:
+            raise ConfigError("Current gated families require modality_count=2")
+        if values.get("observedness_dimension") != 50:
+            raise ConfigError("Current gated families require 50 observedness indicators")
 
 
-def _validate_fusion_model_parameters(parameters: dict[str, Any]) -> None:
-    required = set(_FUSION_MODEL_PARAMETERS)
-    _keys(parameters, required=required, context="model.parameters")
-    encoder = _FUSION_MODEL_PARAMETERS["encoder_name"]
-    if _text(parameters["encoder_name"], "model.parameters.encoder_name") != encoder:
-        raise ConfigError(f"The fusion image encoder must be {encoder}")
-    weights = _FUSION_MODEL_PARAMETERS["weights"]
-    if _text(parameters["weights"], "model.parameters.weights") != weights:
-        raise ConfigError(f"The fusion image encoder must use {weights} weights")
-    expected_dimensions = {
-        field: value
-        for field, value in _FUSION_MODEL_PARAMETERS.items()
-        if field.endswith("dimension") or field == "image_size"
-    }
-    for field, expected in expected_dimensions.items():
-        if _integer(parameters[field], f"model.parameters.{field}") != expected:
-            raise ConfigError(f"The fusion model requires {field}={expected}")
-    dropout = _FUSION_MODEL_PARAMETERS["dropout"]
-    if _number(parameters["dropout"], "model.parameters.dropout") != dropout:
-        raise ConfigError(f"The fusion model requires dropout={dropout}")
-    class_weighting = _FUSION_MODEL_PARAMETERS["class_weighting"]
-    if _text(parameters["class_weighting"], "model.parameters.class_weighting") != class_weighting:
-        raise ConfigError(f"The fusion model requires {class_weighting} class weighting")
+def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str, Any]) -> None:
+    for key, value in values.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ConfigError(f"training.parameters.{key} must be finite")
+    if family_id.endswith("logistic"):
+        if (
+            not 0.0 <= _number(values["l1_ratio"], "training.parameters.l1_ratio") <= 1.0
+            or values["solver"] != "liblinear"
+            or _number(values["C"], "training.parameters.C") <= 0.0
+            or _integer(values["max_iter"], "training.parameters.max_iter") <= 0
+        ):
+            raise ConfigError("Logistic Regression fitting policy is unsupported")
+        expected_weight: object = "balanced" if dataset_id == "rsna" else None
+        if values["class_weight"] != expected_weight:
+            raise ConfigError("Logistic Regression class-weight policy is unsupported")
+        return
+    for key in {"n_estimators", "subsample_freq", "early_stopping_rounds"}:
+        if _integer(values[key], f"training.parameters.{key}") <= 0:
+            raise ConfigError(f"training.parameters.{key} must be a positive integer")
+    if _number(values["learning_rate"], "training.parameters.learning_rate") <= 0:
+        raise ConfigError("training.parameters.learning_rate must be positive")
+    for key in {"subsample", "colsample_bytree"}:
+        value = _number(values[key], f"training.parameters.{key}")
+        if not 0 < value <= 1:
+            raise ConfigError(f"training.parameters.{key} must be in (0, 1]")
+    if _number(values["reg_lambda"], "training.parameters.reg_lambda") < 0:
+        raise ConfigError("training.parameters.reg_lambda must be non-negative")
+    if dataset_id == "rsna":
+        if values["class_weighting"] != "train_neg_pos_ratio":
+            raise ConfigError("RSNA LightGBM weighting policy is unsupported")
+    elif values["class_weight"] is not None:
+        raise ConfigError("Symile LightGBM does not use class weighting")
 
 
-def fusion_architecture_contract(
-    config: ModelConfig,
-    *,
-    structured_input_dimension: int,
-) -> dict[str, int | float]:
-    """Derive the fixed concat-fusion architecture from validated configuration."""
-    if config.modality != "fusion" or config.registry_key != "fusion_concat":
-        raise ConfigError("Concat fusion requires the registered fusion configuration")
-    if config.fit_parameters:
-        raise ConfigError("Concat fusion does not accept model.fit_parameters")
-    _validate_fusion_model_parameters(dict(config.parameters))
-    if (
-        isinstance(structured_input_dimension, bool)
-        or not isinstance(structured_input_dimension, int)
-        or structured_input_dimension <= 0
-    ):
-        raise ConfigError("Fusion structured input dimension must be a positive integer")
-    parameters = config.parameters
-    return {
-        "image_embedding_dimension": parameters["embedding_dimension"],
-        "image_projection_dimension": parameters["image_projection_dimension"],
-        "structured_input_dimension": structured_input_dimension,
-        "structured_hidden_dimension": parameters["structured_hidden_dimension"],
-        "structured_projection_dimension": parameters["structured_projection_dimension"],
-        "fusion_input_dimension": parameters["image_projection_dimension"]
-        + parameters["structured_projection_dimension"],
-        "fusion_hidden_dimension": parameters["fusion_hidden_dimension"],
-        "dropout": parameters["dropout"],
-        "output_dimension": 1,
-    }
+def _validate_scientific_training_policy(
+    dataset_id: str, family_id: str, values: dict[str, Any]
+) -> None:
+    del family_id
+    if dataset_id == "rsna":
+        if values["class_weighting"] != "train_pos_weight":
+            raise ConfigError("RSNA neural families require train-derived positive weighting")
+        if values["fine_tune_scope"] != "all":
+            raise ConfigError("RSNA neural families require full encoder fine-tuning")
+    else:
+        if _number(values["pos_weight"], "training.parameters.pos_weight") != 1.0:
+            raise ConfigError("Symile neural families require pos_weight=1")
+        if values["fine_tune_scope"] != "terminal":
+            raise ConfigError("Symile neural families require terminal encoder fine-tuning")
 
 
-def fusion_structured_input_conversion_contract() -> dict[str, object]:
-    """Return the fixed conversion from fitted metadata output to neural input."""
-    return {
-        "source_dtype": "float64",
-        "tensor_dtype": "torch.float32",
-        "layout": "contiguous",
-        "finite": True,
-        "feature_order": "structured_preprocessor_contract.transformed_feature_names",
-    }
-
-
-def _image_config(value: object) -> ImageConfig:
-    data = _mapping(value, "image")
-    required = {
-        "batch_size",
-        "num_workers",
-        "pin_memory_policy",
-        "device",
-        "mixed_precision",
-        "rotation_degrees",
-        "translation_fraction",
-        "brightness_jitter",
-        "contrast_jitter",
+def _validate_neural_training(
+    parameters: dict[str, Any], loader: dict[str, Any], augmentation: dict[str, Any]
+) -> None:
+    shared_parameter_fields = {
         "optimizer",
+        "mixed_precision",
         "warmup_epochs",
         "fine_tune_epochs",
         "warmup_head_learning_rate",
@@ -825,156 +726,243 @@ def _image_config(value: object) -> ImageConfig:
         "early_stopping_patience",
         "early_stopping_min_delta",
     }
-    _keys(data, required=required, context="image")
-    device = _choice(data["device"], {"auto", "cpu", "cuda"}, "image.device")
-    pin_memory = _choice(
-        data["pin_memory_policy"],
-        {"auto", "enabled", "disabled"},
-        "image.pin_memory_policy",
+    loader_fields = {"batch_size"}
+    augmentation_fields = {
+        "rotation_degrees",
+        "translation_fraction",
+        "brightness_jitter",
+        "contrast_jitter",
+    }
+    policy_fields = (
+        {"class_weighting", "fine_tune_scope"}
+        if "class_weighting" in parameters
+        else {
+            "pos_weight",
+            "fine_tune_scope",
+        }
     )
-    optimizer = _choice(data["optimizer"], {"adamw"}, "image.optimizer")
-    config = ImageConfig(
-        batch_size=_integer(data["batch_size"], "image.batch_size"),
-        num_workers=_integer(data["num_workers"], "image.num_workers"),
-        pin_memory_policy=pin_memory,
-        device=device,
-        mixed_precision=_boolean(data["mixed_precision"], "image.mixed_precision"),
-        rotation_degrees=_number(data["rotation_degrees"], "image.rotation_degrees"),
-        translation_fraction=_number(data["translation_fraction"], "image.translation_fraction"),
-        brightness_jitter=_number(data["brightness_jitter"], "image.brightness_jitter"),
-        contrast_jitter=_number(data["contrast_jitter"], "image.contrast_jitter"),
-        optimizer=optimizer,
-        warmup_epochs=_integer(data["warmup_epochs"], "image.warmup_epochs"),
-        fine_tune_epochs=_integer(data["fine_tune_epochs"], "image.fine_tune_epochs"),
-        warmup_head_learning_rate=_number(
-            data["warmup_head_learning_rate"], "image.warmup_head_learning_rate"
-        ),
-        encoder_learning_rate=_number(data["encoder_learning_rate"], "image.encoder_learning_rate"),
-        head_learning_rate=_number(data["head_learning_rate"], "image.head_learning_rate"),
-        weight_decay=_number(data["weight_decay"], "image.weight_decay"),
-        scheduler_factor=_number(data["scheduler_factor"], "image.scheduler_factor"),
-        scheduler_patience=_integer(data["scheduler_patience"], "image.scheduler_patience"),
-        scheduler_min_learning_rate=_number(
-            data["scheduler_min_learning_rate"], "image.scheduler_min_learning_rate"
-        ),
-        gradient_clip_norm=_number(data["gradient_clip_norm"], "image.gradient_clip_norm"),
-        early_stopping_patience=_integer(
-            data["early_stopping_patience"], "image.early_stopping_patience"
-        ),
-        early_stopping_min_delta=_number(
-            data["early_stopping_min_delta"], "image.early_stopping_min_delta"
-        ),
+    parameter_fields = shared_parameter_fields | policy_fields
+    if (
+        set(parameters) != parameter_fields
+        or set(loader) != loader_fields
+        or set(augmentation) != augmentation_fields
+    ):
+        raise ConfigError("Neural training, loader, or augmentation field set is invalid")
+    if _text(parameters["optimizer"], "training.parameters.optimizer") != "adamw":
+        raise ConfigError("Only AdamW is supported")
+    _boolean(parameters["mixed_precision"], "training.parameters.mixed_precision")
+    integer_fields = {
+        "warmup_epochs",
+        "fine_tune_epochs",
+        "scheduler_patience",
+        "early_stopping_patience",
+    }
+    positive_integer_fields = {"warmup_epochs", "fine_tune_epochs"}
+    for key in integer_fields:
+        minimum = 1 if key in positive_integer_fields else 0
+        if _integer(parameters[key], f"training.parameters.{key}") < minimum:
+            qualifier = "positive" if minimum else "non-negative"
+            raise ConfigError(f"training.parameters.{key} must be {qualifier}")
+    numeric_fields = shared_parameter_fields - integer_fields - {"optimizer", "mixed_precision"}
+    for key in numeric_fields:
+        if _number(parameters[key], f"training.parameters.{key}") < 0:
+            raise ConfigError(f"training.parameters.{key} must be non-negative")
+    for key in {
+        "warmup_head_learning_rate",
+        "encoder_learning_rate",
+        "head_learning_rate",
+        "gradient_clip_norm",
+    }:
+        if _number(parameters[key], f"training.parameters.{key}") <= 0:
+            raise ConfigError(f"training.parameters.{key} must be positive")
+    scheduler_factor = _number(
+        parameters["scheduler_factor"], "training.parameters.scheduler_factor"
     )
-    _validate_image_ranges(config)
-    return config
+    if not 0 < scheduler_factor < 1:
+        raise ConfigError("training.parameters.scheduler_factor must be in (0, 1)")
+    scheduler_min = _number(
+        parameters["scheduler_min_learning_rate"],
+        "training.parameters.scheduler_min_learning_rate",
+    )
+    if scheduler_min >= min(
+        _number(parameters["encoder_learning_rate"], "training.parameters.encoder_learning_rate"),
+        _number(parameters["head_learning_rate"], "training.parameters.head_learning_rate"),
+    ):
+        raise ConfigError("scheduler minimum learning rate must be below trainable learning rates")
+    if _integer(loader["batch_size"], "training.loader.batch_size") <= 0:
+        raise ConfigError("training.loader.batch_size must be positive")
+    augmentation_limits = {
+        "rotation_degrees": 180.0,
+        "translation_fraction": 1.0,
+        "brightness_jitter": 1.0,
+        "contrast_jitter": 1.0,
+    }
+    for key, upper in augmentation_limits.items():
+        value = _number(augmentation[key], f"training.augmentation.{key}")
+        if not 0 <= value <= upper:
+            raise ConfigError(f"training.augmentation.{key} must be in [0, {upper:g}]")
 
 
-def _validate_image_ranges(config: ImageConfig) -> None:
-    if config.batch_size <= 0 or config.num_workers < 0:
-        raise ConfigError("Image batch size and worker count are invalid")
-    if config.warmup_epochs <= 0 or config.fine_tune_epochs <= 0:
-        raise ConfigError("Image stage epoch counts must be positive")
-    if not 0.0 <= config.rotation_degrees <= 180.0:
-        raise ConfigError("image.rotation_degrees must be within [0, 180]")
-    fractions = (
-        config.translation_fraction,
-        config.brightness_jitter,
-        config.contrast_jitter,
+def _neural_config(training: TrainingConfig) -> NeuralConfig:
+    p, loader, augmentation = training.parameters, training.loader, training.augmentation
+    return NeuralConfig(
+        batch_size=int(loader["batch_size"]),
+        mixed_precision=bool(p["mixed_precision"]),
+        rotation_degrees=float(augmentation["rotation_degrees"]),
+        translation_fraction=float(augmentation["translation_fraction"]),
+        brightness_jitter=float(augmentation["brightness_jitter"]),
+        contrast_jitter=float(augmentation["contrast_jitter"]),
+        optimizer=str(p["optimizer"]),
+        warmup_epochs=int(p["warmup_epochs"]),
+        fine_tune_epochs=int(p["fine_tune_epochs"]),
+        warmup_head_learning_rate=float(p["warmup_head_learning_rate"]),
+        encoder_learning_rate=float(p["encoder_learning_rate"]),
+        head_learning_rate=float(p["head_learning_rate"]),
+        weight_decay=float(p["weight_decay"]),
+        scheduler_factor=float(p["scheduler_factor"]),
+        scheduler_patience=int(p["scheduler_patience"]),
+        scheduler_min_learning_rate=float(p["scheduler_min_learning_rate"]),
+        gradient_clip_norm=float(p["gradient_clip_norm"]),
+        early_stopping_patience=int(p["early_stopping_patience"]),
+        early_stopping_min_delta=float(p["early_stopping_min_delta"]),
     )
-    if any(not 0.0 <= value <= 1.0 for value in fractions):
-        raise ConfigError("Image augmentation fractions must be within [0, 1]")
-    if any(
-        value <= 0.0
-        for value in (
-            config.warmup_head_learning_rate,
-            config.encoder_learning_rate,
-            config.head_learning_rate,
-            config.gradient_clip_norm,
+
+
+def _default_runtime(dataset_id: str) -> RuntimeConfig:
+    if dataset_id == "rsna":
+        return RuntimeConfig(
+            Path("data/manifests"),
+            Path("data/raw/rsna/extracted"),
+            Path("models/rsna"),
+            Path("reports"),
+            Path("private"),
+            "radfusion-rsna",
+            "auto",
+            2,
+            "auto",
         )
-    ):
-        raise ConfigError("Image learning rates and gradient clipping must be positive")
-    if any(
-        value < 0.0
-        for value in (
-            config.weight_decay,
-            config.scheduler_min_learning_rate,
-            config.early_stopping_min_delta,
-        )
-    ):
-        raise ConfigError("Image optimization values must be nonnegative")
-    if not 0.0 < config.scheduler_factor < 1.0:
-        raise ConfigError("image.scheduler_factor must be within (0, 1)")
-    if config.scheduler_min_learning_rate >= min(
-        config.encoder_learning_rate, config.head_learning_rate
-    ):
-        raise ConfigError("Scheduler minimum learning rate must be below fine-tuning rates")
-    if config.scheduler_patience < 0 or config.early_stopping_patience < 0:
-        raise ConfigError("Image patience values must be nonnegative")
+    return RuntimeConfig(
+        Path("data/manifests"),
+        Path("data/raw/symile/extracted"),
+        Path("models/symile/development"),
+        Path("reports/symile/development"),
+        Path("private"),
+        "radfusion-symile-development",
+        "cuda",
+        2,
+        "enabled",
+    )
+
+
+def _semantic_payload(
+    version: int,
+    dataset: DatasetConfig,
+    task: TaskConfig,
+    family: FamilyConfig,
+    preprocessing: MappingProxyType[str, Any],
+    training: TrainingConfig,
+    evaluation: EvaluationConfig | None,
+) -> dict[str, Any]:
+    return {
+        "config_version": version,
+        "dataset": {
+            "dataset_id": dataset.dataset_id,
+            "bundle_id": dataset.bundle_id,
+            "split_assignment_id": dataset.split_assignment_id,
+            "cv_assignment_id": dataset.cv_assignment_id,
+        },
+        "task": {"task_id": task.task_id, "label_policy_version": task.label_policy_version},
+        "family": {
+            "family_id": family.family_id,
+            "modalities": list(family.modalities),
+            "parameters": dict(family.parameters),
+        },
+        "preprocessing": dict(preprocessing),
+        "training": {
+            "selection_metric": training.selection_metric,
+            "parameters": dict(training.parameters),
+            "loader": dict(training.loader),
+            "augmentation": dict(training.augmentation),
+        },
+        "evaluation": dict(evaluation.parameters) if evaluation is not None else None,
+    }
+
+
+def _read_yaml(source: Path) -> tuple[bytes, dict[str, Any]]:
+    try:
+        source_bytes = source.read_bytes()
+        document = yaml.load(source_bytes.decode("utf-8"), Loader=_StrictSafeLoader)
+    except OSError as exc:
+        raise ConfigError(f"Experiment config is unreadable: {source}") from exc
+    except UnicodeError as exc:
+        raise ConfigError(f"Experiment config is not valid UTF-8: {source}") from exc
+    except yaml.YAMLError as exc:
+        detail = getattr(exc, "problem", None) or str(exc)
+        raise ConfigError(f"Experiment config is invalid YAML: {source}: {detail}") from exc
+    return source_bytes, _mapping(document, "config")
 
 
 def _mapping(value: object, context: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ConfigError(f"{context} must be a mapping with string keys")
-    return dict(value)
+    return value
 
 
 def _keys(
-    data: dict[str, Any],
-    *,
-    required: set[str],
-    context: str,
-    optional: set[str] | None = None,
+    value: dict[str, Any], *, required: set[str], optional: set[str] | None = None, context: str
 ) -> None:
-    missing = sorted(required - set(data))
-    unknown = sorted(set(data) - required - (optional or set()))
-    if missing:
-        raise ConfigError(f"{context} is missing keys: {missing}")
-    if unknown:
-        raise ConfigError(f"{context} has unknown keys: {unknown}")
+    allowed = required | (optional or set())
+    if required - set(value) or set(value) - allowed:
+        raise ConfigError(f"{context} has missing or unknown fields")
 
 
 def _text(value: object, context: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"{context} must be a non-empty string")
-    return value
-
-
-def _path_component(value: object, context: str) -> str:
-    text = _text(value, context)
-    if (
-        text in {".", ".."}
-        or Path(text).is_absolute()
-        or "/" in text
-        or "\\" in text
-        or Path(text).name != text
-    ):
-        raise ConfigError(f"{context} must be one safe path component")
-    return text
-
-
-def _integer(value: object, context: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ConfigError(f"{context} must be an integer")
-    return value
-
-
-def _number(value: object, context: str) -> float:
-    if not isinstance(value, int | float) or isinstance(value, bool):
-        raise ConfigError(f"{context} must be numeric")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ConfigError(f"{context} must be finite")
-    return number
-
-
-def _boolean(value: object, context: str) -> bool:
-    if not isinstance(value, bool):
-        raise ConfigError(f"{context} must be Boolean")
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ConfigError(f"{context} must be a non-empty trimmed string")
     return value
 
 
 def _choice(value: object, choices: set[str], context: str) -> str:
     text = _text(value, context)
     if text not in choices:
-        raise ConfigError(f"{context} must be one of {sorted(choices)}")
+        raise ConfigError(f"{context} is unsupported")
     return text
+
+
+def _integer(value: object, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{context} must be an integer")
+    return value
+
+
+def _number(value: object, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        raise ConfigError(f"{context} must be a finite number")
+    return float(value)
+
+
+def _boolean(value: object, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{context} must be boolean")
+    return value
+
+
+def _sha256(value: object, context: str) -> str:
+    text = _text(value, context)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ConfigError(f"{context} must be a lowercase SHA-256")
+    return text
+
+
+def _identity(value: object, prefix: str, context: str) -> str:
+    text = _text(value, context)
+    if not text.startswith(prefix):
+        raise ConfigError(f"{context} has an invalid prefix")
+    _sha256(text.removeprefix(prefix), context)
+    return text
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()

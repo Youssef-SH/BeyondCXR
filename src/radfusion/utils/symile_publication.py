@@ -38,9 +38,8 @@ from radfusion.models.symile_fusion import build_symile_concat_model, build_symi
 from radfusion.models.symile_tabular import symile_tabular_logits
 from radfusion.training.config import (
     SYMILE_M5_FAMILIES,
-    SymileDevelopmentConfig,
+    ExperimentConfig,
     load_symile_development_config,
-    symile_development_semantic_sha256,
 )
 from radfusion.training.symile_data import DEVELOPMENT_COUNT
 from radfusion.utils.privacy import validate_public_reports
@@ -72,8 +71,15 @@ OOF_SCHEMA = pa.schema(
     ]
 )
 TABULAR_FAMILIES = frozenset({"labs_logistic", "labs_lightgbm"})
-NEURAL_FAMILIES = frozenset({"cxr", "concat", "gated", "gated_no_observedness"})
-FUSION_FAMILIES = frozenset({"concat", "gated", "gated_no_observedness"})
+NEURAL_FAMILIES = frozenset(
+    {
+        "cxr_densenet",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+    }
+)
+FUSION_FAMILIES = frozenset({"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"})
 _FOLD_FIELDS = {
     "fold_schema_version",
     "fold_package_id",
@@ -91,7 +97,7 @@ _FOLD_FIELDS = {
 _LINEAGE_FIELDS = {
     "bundle_id",
     "bundle_manifest_sha256",
-    "official_split_assignment_id",
+    "split_assignment_id",
     "cv_assignment_id",
     "cv_manifest_sha256",
     "task_id",
@@ -106,9 +112,9 @@ _ANALYSIS_POLICY = {
     "alignment": ["sample_id", "repeat_seed"],
     "metrics": ["roc_auc", "average_precision", "brier_score"],
     "paired_comparisons": {
-        "concat_minus_cxr": ["concat", "cxr"],
-        "gated_minus_cxr": ["gated", "cxr"],
-        "gated_minus_concat": ["gated", "concat"],
+        "concat_minus_cxr": ["cxr_labs_concat", "cxr_densenet"],
+        "gated_minus_cxr": ["cxr_labs_gated", "cxr_densenet"],
+        "gated_minus_concat": ["cxr_labs_gated", "cxr_labs_concat"],
     },
     "neural_ensemble": "align three repeat logits; arithmetic mean logits; sigmoid once",
     "uncertainty": "none; folds are not treated as independent replicates",
@@ -212,7 +218,7 @@ def publish_fold_package(
     outer_fold: int,
     config_bytes: bytes,
     config_sha256: str,
-    semantic_config_sha256: str,
+    config_semantic_sha256: str,
     lineage: Mapping[str, object],
     inner_split: Mapping[str, object],
     selection: Mapping[str, object],
@@ -253,7 +259,7 @@ def publish_fold_package(
             family=family,
             repeat_seed=repeat_seed,
             outer_fold=outer_fold,
-            semantic_config_sha256=semantic_config_sha256,
+            config_semantic_sha256=config_semantic_sha256,
             lineage=lineage,
             inner_split=inner_split,
             selection=selection,
@@ -268,8 +274,8 @@ def publish_fold_package(
             "repeat_seed": repeat_seed,
             "outer_fold": outer_fold,
             "config": {
-                "source_sha256": config_sha256,
-                "semantic_sha256": semantic_config_sha256,
+                "config_source_sha256": config_sha256,
+                "config_semantic_sha256": config_semantic_sha256,
             },
             "lineage": dict(lineage),
             "inner_split": dict(inner_split),
@@ -330,7 +336,7 @@ def validate_fold_package(
             raise ManifestBuildError(f"Symile fold artifact declaration is invalid: {filename}")
         if sha256_file(root / filename) != declaration.get("physical_sha256"):
             raise ManifestBuildError(f"Symile fold physical hash mismatch: {filename}")
-    if sha256_file(root / CONFIG_FILENAME) != document["config"]["source_sha256"]:
+    if sha256_file(root / CONFIG_FILENAME) != document["config"]["config_source_sha256"]:
         raise ManifestBuildError("Symile fold resolved config hash does not match")
     try:
         config = load_symile_development_config(root / CONFIG_FILENAME)
@@ -379,7 +385,7 @@ def publish_development_result(
     report_root: str | Path,
     model_root: str | Path,
     family: str,
-    semantic_config_sha256: str,
+    config_semantic_sha256: str,
     folds: Sequence[ValidatedFoldPackage],
     repeat_metrics: Mapping[str, Mapping[str, float]],
     selected_values: Sequence[int] | None,
@@ -395,7 +401,7 @@ def publish_development_result(
         raise ManifestBuildError("Symile family development does not contain exact 3 x 5 folds")
     if any(
         item.manifest["family"] != family
-        or item.manifest["config"]["semantic_sha256"] != semantic_config_sha256
+        or item.manifest["config"]["config_semantic_sha256"] != config_semantic_sha256
         for item in ordered
     ):
         raise ManifestBuildError("Symile family fold compatibility is invalid")
@@ -422,7 +428,7 @@ def publish_development_result(
     identity_payload = {
         "development_schema_version": DEVELOPMENT_SCHEMA_VERSION,
         "family": family,
-        "semantic_config_sha256": semantic_config_sha256,
+        "config_semantic_sha256": config_semantic_sha256,
         "fold_packages": fold_refs,
         "repeat_metrics": repeat_metrics,
         "selected_values": list(selected_values) if selected_values is not None else None,
@@ -484,7 +490,7 @@ def validate_development_result(
         "development_schema_version",
         "development_id",
         "family",
-        "semantic_config_sha256",
+        "config_semantic_sha256",
         "fold_packages",
         "repeat_metrics",
         "selected_values",
@@ -660,7 +666,7 @@ def _fold_identity_payload(
     family: str,
     repeat_seed: int,
     outer_fold: int,
-    semantic_config_sha256: str,
+    config_semantic_sha256: str,
     lineage: Mapping[str, object],
     inner_split: Mapping[str, object],
     selection: Mapping[str, object],
@@ -672,7 +678,7 @@ def _fold_identity_payload(
         "family": family,
         "repeat_seed": repeat_seed,
         "outer_fold": outer_fold,
-        "semantic_config_sha256": semantic_config_sha256,
+        "config_semantic_sha256": config_semantic_sha256,
         "lineage": dict(lineage),
         "inner_split": dict(inner_split),
         "selection": dict(selection),
@@ -686,7 +692,7 @@ def _fold_payload_from_manifest(document: Mapping[str, Any]) -> dict[str, object
         family=document["family"],
         repeat_seed=document["repeat_seed"],
         outer_fold=document["outer_fold"],
-        semantic_config_sha256=document["config"]["semantic_sha256"],
+        config_semantic_sha256=document["config"]["config_semantic_sha256"],
         lineage=document["lineage"],
         inner_split=document["inner_split"],
         selection=document["selection"],
@@ -720,7 +726,7 @@ def _validate_fold_manifest(document: object) -> None:
     config = document.get("config")
     if (
         not isinstance(config, dict)
-        or set(config) != {"source_sha256", "semantic_sha256"}
+        or set(config) != {"config_source_sha256", "config_semantic_sha256"}
         or not all(_sha256(value) for value in config.values())
     ):
         raise ManifestBuildError("Symile fold config identity is invalid")
@@ -731,9 +737,9 @@ def _validate_fold_manifest(document: object) -> None:
     lineage = document["lineage"]
     if (
         set(lineage) != _LINEAGE_FIELDS
-        or not _identity(lineage.get("bundle_id"), "build-")
+        or not _identity(lineage.get("bundle_id"), "bundle-")
         or not _sha256(lineage.get("bundle_manifest_sha256"))
-        or not _identity(lineage.get("official_split_assignment_id"), "split-assignment-")
+        or not _identity(lineage.get("split_assignment_id"), "split-assignment-")
         or not _identity(lineage.get("cv_assignment_id"), "cv-assignment-")
         or not _sha256(lineage.get("cv_manifest_sha256"))
         or lineage.get("task_id") != "pneumonia_strict"
@@ -757,7 +763,7 @@ def _validate_fold_manifest(document: object) -> None:
             != ("torchxrayvision-densenet121-res224-v1")
         ):
             raise ManifestBuildError("Symile neural fold encoder/transform lineage is invalid")
-        if document["family"] == "cxr":
+        if document["family"] == "cxr_densenet":
             weight = lineage.get("pretrained_weight")
             if (
                 not isinstance(weight, dict)
@@ -937,36 +943,41 @@ def _validate_neural_checkpoint(document: object) -> None:
         raise ManifestBuildError("Symile neural checkpoint is invalid")
 
 
-def _validate_fold_config(config: SymileDevelopmentConfig, document: Mapping[str, Any]) -> None:
+def _validate_fold_config(config: ExperimentConfig, document: Mapping[str, Any]) -> None:
     lineage = document["lineage"]
     inner_policy = document["inner_split"]["policy"]
     encoder_identity = (
         {
             "library": "torchxrayvision",
-            "architecture": config.model["encoder_name"],
-            "weights": config.model["weights"],
-            "embedding_dimension": config.model["embedding_dimension"],
+            "architecture": config.family.parameters["encoder_name"],
+            "weights": config.family.parameters["weights"],
+            "embedding_dimension": config.family.parameters["embedding_dimension"],
         }
-        if config.family in NEURAL_FAMILIES
+        if config.family.family_id in NEURAL_FAMILIES
         else None
     )
     transform_contract = (
-        _evaluation_transform_contract(config) if config.family in NEURAL_FAMILIES else None
+        _evaluation_transform_contract(config)
+        if config.family.family_id in NEURAL_FAMILIES
+        else None
     )
     pretrained = lineage["pretrained_weight"]
     if (
-        config.family != document["family"]
-        or config.source_sha256 != document["config"]["source_sha256"]
-        or symile_development_semantic_sha256(config) != document["config"]["semantic_sha256"]
+        config.family.family_id != document["family"]
+        or config.config_source_sha256 != document["config"]["config_source_sha256"]
+        or config.config_semantic_sha256 != document["config"]["config_semantic_sha256"]
         or config.dataset.bundle_id != lineage["bundle_id"]
         or config.dataset.bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
-        or config.dataset.official_split_assignment_id != lineage["official_split_assignment_id"]
+        or config.dataset.split_assignment_id != lineage["split_assignment_id"]
         or config.dataset.cv_assignment_id != lineage["cv_assignment_id"]
-        or config.dataset.task_id != lineage["task_id"]
-        or config.training["selection_metric"] != document["selection"]["metric"]
+        or config.task.task_id != lineage["task_id"]
+        or config.training.selection_metric != document["selection"]["metric"]
         or lineage["encoder_identity"] != encoder_identity
         or lineage["transform_contract"] != transform_contract
-        or (config.family == "cxr" and pretrained["declared_name"] != config.model["weights"])
+        or (
+            config.family.family_id == "cxr_densenet"
+            and pretrained["declared_name"] != config.family.parameters["weights"]
+        )
         or inner_policy.get("repeat_seed") != document["repeat_seed"]
         or inner_policy.get("outer_fold") != document["outer_fold"]
         or inner_policy.get("inner_seed") != document["inner_split"]["inner_seed"]
@@ -974,22 +985,23 @@ def _validate_fold_config(config: SymileDevelopmentConfig, document: Mapping[str
         raise ManifestBuildError("Symile fold configuration and manifest disagree")
 
 
-def _evaluation_transform_contract(config: SymileDevelopmentConfig) -> dict[str, object]:
-    if config.image is None:
+def _evaluation_transform_contract(config: ExperimentConfig) -> dict[str, object]:
+    if config.neural is None:
         raise ManifestBuildError("Symile neural config lacks image settings")
     return StandardCxrTransform(
         training=False,
-        image_size=int(config.model["image_size"]),
-        rotation_degrees=config.image.rotation_degrees,
-        translation_fraction=config.image.translation_fraction,
-        brightness_jitter=config.image.brightness_jitter,
-        contrast_jitter=config.image.contrast_jitter,
+        policy_version=str(config.preprocessing["cxr_transform_policy"]),
+        image_size=int(config.family.parameters["image_size"]),
+        rotation_degrees=config.neural.rotation_degrees,
+        translation_fraction=config.neural.translation_fraction,
+        brightness_jitter=config.neural.brightness_jitter,
+        contrast_jitter=config.neural.contrast_jitter,
     ).contract()
 
 
 def _validate_tabular_reconstruction(
     root: Path,
-    config: SymileDevelopmentConfig,
+    config: ExperimentConfig,
     document: Mapping[str, Any],
 ) -> None:
     try:
@@ -1003,8 +1015,8 @@ def _validate_tabular_reconstruction(
     except (ValueError, TypeError) as exc:
         raise ManifestBuildError("Symile tabular preprocessing contract is invalid") from exc
     classifier = model.named_steps["classifier"]
-    parameters = config.model
-    if config.family == "labs_logistic":
+    parameters = {**config.family.parameters, **config.training.parameters}
+    if config.family.family_id == "labs_logistic":
         if not isinstance(classifier, LogisticRegression):
             raise ManifestBuildError("Symile Logistic Regression fold has the wrong estimator")
         actual = classifier.get_params(deep=False)
@@ -1074,11 +1086,11 @@ def _preprocessor_probe(transformer: SymileLabEcdfTransformer) -> pd.DataFrame:
 
 
 def _validate_neural_reconstruction(
-    config: SymileDevelopmentConfig, checkpoint: Mapping[str, Any]
+    config: ExperimentConfig, checkpoint: Mapping[str, Any]
 ) -> None:
     try:
-        parameters = config.model
-        if config.family == "cxr":
+        parameters = config.family.parameters
+        if config.family.family_id == "cxr_densenet":
             model: torch.nn.Module = CxrBinaryClassifier(
                 StandardCxrEncoder(
                     weights=None,
@@ -1088,7 +1100,7 @@ def _validate_neural_reconstruction(
                 embedding_dimension=int(parameters["embedding_dimension"]),
                 image_size=int(parameters["image_size"]),
             )
-        elif config.family == "concat":
+        elif config.family.family_id == "cxr_labs_concat":
             model = build_symile_concat_model(parameters, weights=None)
         else:
             model = build_symile_gated_model(parameters, weights=None)
@@ -1105,7 +1117,7 @@ def _validate_neural_reconstruction(
 def _validate_training_history(
     history: Sequence[object],
     selection: Mapping[str, Any],
-    config: SymileDevelopmentConfig,
+    config: ExperimentConfig,
 ) -> None:
     fields = {
         "epoch",
@@ -1118,15 +1130,15 @@ def _validate_training_history(
     epochs: list[int] = []
     stages: dict[int, str] = {}
     metrics: dict[int, float] = {}
-    if config.image is None:
+    if config.neural is None:
         raise ManifestBuildError("Symile neural history lacks image configuration")
-    if len(history) > config.image.warmup_epochs + config.image.fine_tune_epochs:
+    if len(history) > config.neural.warmup_epochs + config.neural.fine_tune_epochs:
         raise ManifestBuildError("Symile training history exceeds the configured lifecycle")
     for ordinal, entry in enumerate(history, start=1):
         if not isinstance(entry, dict) or set(entry) != fields:
             raise ManifestBuildError("Symile training history fields are invalid")
         epoch = entry["epoch"]
-        expected_stage = "warmup" if ordinal <= config.image.warmup_epochs else "fine_tune"
+        expected_stage = "warmup" if ordinal <= config.neural.warmup_epochs else "fine_tune"
         encoder_rate = entry["encoder_learning_rate"]
         if (
             isinstance(epoch, bool)
@@ -1256,11 +1268,12 @@ def _resolve_family_folds(
             or package.manifest["repeat_seed"] != reference["repeat_seed"]
             or package.manifest["outer_fold"] != reference["outer_fold"]
             or package.manifest["family"] != document["family"]
-            or package.manifest["config"]["semantic_sha256"] != document["semantic_config_sha256"]
+            or package.manifest["config"]["config_semantic_sha256"]
+            != document["config_semantic_sha256"]
         ):
             raise ManifestBuildError("Symile development fold reference is inconsistent")
         lineage = package.manifest["lineage"]
-        source_sha256 = package.manifest["config"]["source_sha256"]
+        source_sha256 = package.manifest["config"]["config_source_sha256"]
         source_development = (
             package.manifest["source_cxr"]["development_id"]
             if package.manifest["source_cxr"] is not None
@@ -1271,7 +1284,7 @@ def _resolve_family_folds(
             for key in (
                 "bundle_id",
                 "bundle_manifest_sha256",
-                "official_split_assignment_id",
+                "split_assignment_id",
                 "cv_assignment_id",
                 "cv_manifest_sha256",
                 "task_id",
@@ -1438,19 +1451,27 @@ def _derive_analysis(
         for family, frame in frames.items()
     }
     comparisons = {
-        "concat_minus_cxr": ("concat", "cxr"),
-        "gated_minus_cxr": ("gated", "cxr"),
-        "gated_minus_concat": ("gated", "concat"),
+        "concat_minus_cxr": ("cxr_labs_concat", "cxr_densenet"),
+        "gated_minus_cxr": ("cxr_labs_gated", "cxr_densenet"),
+        "gated_minus_concat": ("cxr_labs_gated", "cxr_labs_concat"),
     }
     paired = {
         name: _paired_effects(frames[left], frames[right])
         for name, (left, right) in comparisons.items()
     }
-    neural = ("cxr", "concat", "gated", "gated_no_observedness")
+    neural = (
+        "cxr_densenet",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+    )
     ensemble = {family: _ensemble_metrics(frames[family]) for family in neural}
-    ablation_repeats = _paired_effects(frames["gated"], frames["gated_no_observedness"])
+    ablation_repeats = _paired_effects(
+        frames["cxr_labs_gated"], frames["cxr_labs_gated_no_observedness"]
+    )
     ablation_ensemble = {
-        metric: ensemble["gated"][metric] - ensemble["gated_no_observedness"][metric]
+        metric: ensemble["cxr_labs_gated"][metric]
+        - ensemble["cxr_labs_gated_no_observedness"][metric]
         for metric in ("roc_auc", "average_precision", "brier_score")
     }
     return {
@@ -1472,7 +1493,7 @@ def _validate_cross_family_fold_lineage(
     data_fields = (
         "bundle_id",
         "bundle_manifest_sha256",
-        "official_split_assignment_id",
+        "split_assignment_id",
         "cv_assignment_id",
         "cv_manifest_sha256",
         "task_id",
@@ -1486,11 +1507,11 @@ def _validate_cross_family_fold_lineage(
             for field in data_fields
         ):
             raise ManifestBuildError("Symile analysis families use different frozen data lineage")
-        cxr = families["cxr"][coordinate]
+        cxr = families["cxr_densenet"][coordinate]
         for family in FUSION_FAMILIES:
             source = families[family][coordinate].manifest["source_cxr"]
             if (
-                source["development_id"] != family_ids["cxr"]
+                source["development_id"] != family_ids["cxr_densenet"]
                 or source["fold_package_id"] != cxr.manifest["fold_package_id"]
                 or source["fold_manifest_sha256"] != cxr.manifest_sha256
             ):

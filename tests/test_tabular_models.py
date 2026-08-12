@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
 import pytest
 import skops.io as sio
+import yaml
 
 from radfusion.models.tabular_baseline import MetadataLightgbmModel, MetadataLogisticModel
 from radfusion.training.config import load_experiment_config
@@ -36,9 +38,9 @@ def _features() -> tuple[pd.DataFrame, np.ndarray]:
 def _fit_registered_model(config_path: str, *, seed: int | None = None):
     config = load_experiment_config(config_path)
     features, target = _features()
-    fitted = get_model(config.model.registry_key).fit(
-        config.model,
-        config.training.seed if seed is None else seed,
+    fitted = get_model(config.family.family_id).fit(
+        config,
+        42 if seed is None else seed,
         features,
         target,
         features,
@@ -49,9 +51,11 @@ def _fit_registered_model(config_path: str, *, seed: int | None = None):
 
 def test_fixed_baselines_fit_with_shared_preprocessing() -> None:
     logistic_config, features, _, logistic_fit = _fit_registered_model(
-        "configs/metadata_logistic.yaml"
+        "configs/rsna_metadata_logistic.yaml"
     )
-    lightgbm_config, _, _, lightgbm_fit = _fit_registered_model("configs/metadata_lightgbm.yaml")
+    lightgbm_config, _, _, lightgbm_fit = _fit_registered_model(
+        "configs/rsna_metadata_lightgbm.yaml"
+    )
     logistic = logistic_fit.pipeline
     lightgbm = lightgbm_fit.pipeline
     logistic_parameters = logistic.named_steps["classifier"].get_params()
@@ -59,18 +63,27 @@ def test_fixed_baselines_fit_with_shared_preprocessing() -> None:
 
     assert logistic.predict_proba(features).shape == (len(features), 2)
     assert lightgbm.predict_proba(features).shape == (len(features), 2)
-    for key, value in logistic_config.model.parameters.items():
+    for key, value in logistic_config.training.parameters.items():
         assert logistic_parameters[key] == value
-    for key, value in lightgbm_config.model.parameters.items():
+    estimator_parameters = {
+        key: value
+        for key, value in {
+            **lightgbm_config.family.parameters,
+            **lightgbm_config.training.parameters,
+        }.items()
+        if key not in {"class_weighting", "early_stopping_rounds"}
+    }
+    for key, value in estimator_parameters.items():
         assert lightgbm_parameters[key] == value
-    assert logistic_parameters["random_state"] == logistic_config.training.seed
-    assert lightgbm_parameters["random_state"] == lightgbm_config.training.seed
+    assert logistic_parameters["random_state"] == 42
+    assert lightgbm_parameters["random_state"] == 42
     assert logistic_parameters["class_weight"] == "balanced"
     assert lightgbm_parameters["scale_pos_weight"] == 1.0
     assert lightgbm_parameters["metric"] == "None"
     assert lightgbm_parameters["deterministic"] is True
     assert lightgbm_parameters["force_col_wise"] is True
     assert lightgbm_parameters["n_jobs"] == 1
+    assert lightgbm_parameters["verbosity"] == -1
     assert set(lightgbm.named_steps["classifier"].evals_result_) == {"validation"}
     assert set(lightgbm.named_steps["classifier"].evals_result_["validation"]) == {
         "average_precision"
@@ -87,8 +100,8 @@ def test_fixed_baselines_fit_with_shared_preprocessing() -> None:
 
 def test_skops_round_trip_preserves_baseline_predictions(tmp_path) -> None:
     for name, config_path in (
-        ("logistic", "configs/metadata_logistic.yaml"),
-        ("lightgbm", "configs/metadata_lightgbm.yaml"),
+        ("logistic", "configs/rsna_metadata_logistic.yaml"),
+        ("lightgbm", "configs/rsna_metadata_lightgbm.yaml"),
     ):
         _, features, _, fitted = _fit_registered_model(config_path)
         model = fitted.pipeline
@@ -157,34 +170,48 @@ def test_environment_provenance_distinguishes_cpu_architecture_and_model(monkeyp
     assert provenance["environment_cpu_model"] == "test-model"
 
 
-def test_logistic_model_rejects_silent_fit_parameters() -> None:
+def test_logistic_model_consumes_validated_alternate_c(tmp_path: Path) -> None:
     features, target = _features()
-    config = load_experiment_config("configs/metadata_logistic.yaml").model
-    invalid = replace(config, fit_parameters=MappingProxyType({"unexpected": True}))
+    document = yaml.safe_load(
+        Path("configs/rsna_metadata_logistic.yaml").read_text(encoding="utf-8")
+    )
+    document["training"]["parameters"]["C"] = 0.5
+    path = tmp_path / "logistic.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    config = load_experiment_config(path)
 
-    with pytest.raises(ValueError):
-        MetadataLogisticModel().fit(invalid, 42, features, target, features, target)
+    fitted = MetadataLogisticModel().fit(config, 42, features, target, features, target)
+
+    classifier = fitted.pipeline.named_steps["classifier"]
+    assert classifier.C == 0.5
+    assert classifier.class_weight == "balanced"
 
 
-@pytest.mark.parametrize("key", ["class_weight", "scale_pos_weight", "is_unbalance"])
-def test_logistic_model_rejects_weighting_parameter_conflicts(key: str) -> None:
+@pytest.mark.parametrize("key", ["scale_pos_weight", "is_unbalance"])
+def test_logistic_model_rejects_unknown_estimator_parameters(key: str) -> None:
     features, target = _features()
-    config = load_experiment_config("configs/metadata_logistic.yaml").model
+    config = load_experiment_config("configs/rsna_metadata_logistic.yaml")
     invalid = replace(
         config,
-        parameters=MappingProxyType({**config.parameters, key: "balanced"}),
+        training=replace(
+            config.training,
+            parameters=MappingProxyType({**config.training.parameters, key: "balanced"}),
+        ),
     )
     with pytest.raises(ValueError):
         MetadataLogisticModel().fit(invalid, 42, features, target, features, target)
 
 
 @pytest.mark.parametrize("key", ["class_weight", "scale_pos_weight", "is_unbalance"])
-def test_lightgbm_model_rejects_weighting_parameter_conflicts(key: str) -> None:
+def test_lightgbm_model_rejects_unknown_weighting_parameters(key: str) -> None:
     features, target = _features()
-    config = load_experiment_config("configs/metadata_lightgbm.yaml").model
+    config = load_experiment_config("configs/rsna_metadata_lightgbm.yaml")
     invalid = replace(
         config,
-        parameters=MappingProxyType({**config.parameters, key: 1}),
+        training=replace(
+            config.training,
+            parameters=MappingProxyType({**config.training.parameters, key: 1}),
+        ),
     )
     with pytest.raises(ValueError):
         MetadataLightgbmModel().fit(invalid, 42, features, target, features, target)
@@ -193,14 +220,23 @@ def test_lightgbm_model_rejects_weighting_parameter_conflicts(key: str) -> None:
 def test_lightgbm_rejects_degenerate_training_targets() -> None:
     features, _ = _features()
     target = np.zeros(len(features), dtype=np.int8)
-    config = load_experiment_config("configs/metadata_lightgbm.yaml").model
+    config = load_experiment_config("configs/rsna_metadata_lightgbm.yaml")
     with pytest.raises(ValueError):
         MetadataLightgbmModel().fit(config, 42, features, target, features, target)
 
 
+def test_rsna_lightgbm_consumes_canonical_selection_metric() -> None:
+    features, target = _features()
+    config = load_experiment_config("configs/rsna_metadata_lightgbm.yaml")
+    invalid = replace(config, training=replace(config.training, selection_metric="roc_auc"))
+
+    with pytest.raises(ValueError, match="selection requires average_precision"):
+        MetadataLightgbmModel().fit(invalid, 42, features, target, features, target)
+
+
 @pytest.mark.parametrize(
     "config_path",
-    ["configs/metadata_logistic.yaml", "configs/metadata_lightgbm.yaml"],
+    ["configs/rsna_metadata_logistic.yaml", "configs/rsna_metadata_lightgbm.yaml"],
 )
 def test_training_seed_sets_estimator_random_state(config_path: str) -> None:
     _, _, _, first = _fit_registered_model(config_path, seed=42)

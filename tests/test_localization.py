@@ -21,7 +21,7 @@ from radfusion.evaluation.localization import (
     union_box_mask,
 )
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
-from radfusion.training.config import load_experiment_config
+from radfusion.training.config import load_experiment_config, with_runtime
 from radfusion.training.datasets import RsnaDataset
 from radfusion.training.localize import (
     _evaluate_member,
@@ -49,15 +49,15 @@ class _GradCamModel(nn.Module):
 def test_localization_rejects_non_rsna_before_dataset_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    dataset = replace(config.dataset, registry_key="symile")
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    non_rsna = replace(config, dataset=replace(config.dataset, dataset_id="symile"))
     monkeypatch.setattr(
         "radfusion.training.localize.get_dataset",
         lambda key: pytest.fail(f"dataset registry accessed for {key}"),
     )
 
     with pytest.raises(ValueError):
-        _rsna_localization_dataset(dataset)
+        _rsna_localization_dataset(non_rsna)
 
 
 def test_standalone_localization_resolves_one_shared_cache(
@@ -65,7 +65,8 @@ def test_standalone_localization_resolves_one_shared_cache(
 ) -> None:
     seeds = (17, 42, 2026)
     configs = {
-        seed: load_experiment_config(f"configs/image_densenet_seed{seed}.yaml") for seed in seeds
+        seed: with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=seed)
+        for seed in seeds
     }
     runs = {}
     for seed in seeds:
@@ -102,9 +103,6 @@ def test_standalone_localization_resolves_one_shared_cache(
     monkeypatch.setattr(
         "radfusion.training.localize.verify_image_training_package", lambda *a, **k: None
     )
-    monkeypatch.setattr(
-        "radfusion.training.localize.image_seed_compatibility_sha256", lambda config: "compatible"
-    )
     monkeypatch.setattr("radfusion.training.localize.get_dataset", lambda key: RsnaDataset())
     prepared: list[object] = []
     shared_cache = object()
@@ -121,7 +119,7 @@ def test_standalone_localization_resolves_one_shared_cache(
         observed_caches.append(cache)
         return {
             "public": {
-                "seed": config.training.seed,
+                "seed": config.runtime.seed,
                 "positive_test_sample_count": 1,
                 "localization_evaluated_count": 1,
                 "zero_heatmap_count": 0,
@@ -157,11 +155,12 @@ def test_standalone_localization_resolves_one_shared_cache(
 def test_localization_member_emits_generic_operation_completion(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_experiment_config("configs/image_densenet_seed42.yaml")
-    assert config.image is not None
-    config = replace(
-        config,
-        image=replace(config.image, device="cpu", pin_memory_policy="disabled"),
+    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    assert config.neural is not None
+    config = with_runtime(
+        replace(config, runtime=replace(config.runtime, pin_memory_policy="disabled")),
+        seed=42,
+        device="cpu",
     )
     samples = (
         {

@@ -28,6 +28,7 @@ from radfusion.data.rsna_artifacts import (
     SPLITS_FILENAME,
     BuildResult,
     _bundle_id,
+    _bundle_identity_payload,
     build_rsna_artifacts,
     load_current_bundle,
     validate_bundle_directory,
@@ -46,7 +47,7 @@ from radfusion.data.schemas import (
     RSNA_SOURCE_INVENTORY_SCHEMA,
     RSNA_SPLIT_SCHEMA,
 )
-from radfusion.training.config import load_experiment_config
+from radfusion.training.config import load_experiment_config, with_runtime
 from radfusion.training.datasets import RsnaDataset
 from radfusion.utils.privacy import validate_public_reports
 
@@ -354,7 +355,7 @@ def test_missing_optional_metadata_is_preserved_as_null(tmp_path: Path) -> None:
     assert positive["sex"] is None
     assert positive["view_position"] is None
     assert positive["pixel_spacing_row_mm"] is None
-    assert result.metadata["age_parsing_summary"]["status_counts"]["missing"] == 1
+    assert result.metadata["qualification"]["age_parsing"]["status_counts"]["missing"] == 1
 
 
 def test_malformed_and_implausible_ages_are_reported_in_aggregate(tmp_path: Path) -> None:
@@ -363,14 +364,14 @@ def test_malformed_and_implausible_ages_are_reported_in_aggregate(tmp_path: Path
     malformed = build_rsna_artifacts(malformed_root)
     assert malformed.samples.to_pylist()[1]["age_years"] is None
     assert malformed.samples.to_pylist()[1]["age_is_implausible"] is False
-    assert malformed.metadata["age_parsing_summary"]["status_counts"]["malformed"] == 1
+    assert malformed.metadata["qualification"]["age_parsing"]["status_counts"]["malformed"] == 1
 
     with pytest.warns(UserWarning):
         implausible_root = _write_sources(tmp_path / "implausible", age="155")
     implausible = build_rsna_artifacts(implausible_root)
     assert implausible.samples.to_pylist()[1]["age_years"] == 155.0
     assert implausible.samples.to_pylist()[1]["age_is_implausible"] is True
-    assert implausible.metadata["implausible_age_count"] == 1
+    assert implausible.metadata["qualification"]["age_parsing"]["implausible_age_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -597,9 +598,9 @@ def test_arrow_ipc_hashes_are_deterministic(tmp_path: Path) -> None:
     first = write_bundle(result, tmp_path / "first")
     second = write_bundle(result, tmp_path / "second")
 
-    assert first.arrow_ipc_sha256 == second.arrow_ipc_sha256
+    assert first.logical_arrow_sha256 == second.logical_arrow_sha256
     assert first.paths.bundle_id == second.paths.bundle_id
-    assert first.arrow_ipc_sha256[SAMPLES_FILENAME] == arrow_ipc_sha256(result.samples)
+    assert first.logical_arrow_sha256[SAMPLES_FILENAME] == arrow_ipc_sha256(result.samples)
 
 
 def test_logical_hash_ignores_null_buffers_and_survives_parquet_round_trip(
@@ -670,7 +671,6 @@ def test_bundle_id_ignores_nonsemantic_metadata(tmp_path: Path) -> None:
         result,
         metadata={
             **result.metadata,
-            "identity_test_field": "ignored",
             "generation": {"timestamp_utc": "2099-01-01T00:00:00+00:00"},
             "provenance": {
                 "tool_versions": {
@@ -691,15 +691,19 @@ def test_bundle_id_ignores_nonsemantic_metadata(tmp_path: Path) -> None:
 
 def test_bundle_id_changes_with_semantic_metadata(tmp_path: Path) -> None:
     _, result = _tables(tmp_path)
-    changed = replace(
-        result,
-        metadata={**result.metadata, "dataset_version": "semantic-change"},
-    )
+    changed = {
+        **result.metadata,
+        "dataset": {**result.metadata["dataset"], "release": "semantic-change"},
+    }
+    logical_hashes = {
+        SAMPLES_FILENAME: arrow_ipc_sha256(result.samples),
+        LABELS_FILENAME: arrow_ipc_sha256(result.labels),
+        ANNOTATIONS_FILENAME: arrow_ipc_sha256(result.annotations),
+        SPLITS_FILENAME: arrow_ipc_sha256(result.splits),
+        SOURCE_INVENTORY_FILENAME: arrow_ipc_sha256(result.source_inventory),
+    }
 
-    first = write_bundle(result, tmp_path / "first")
-    second = write_bundle(changed, tmp_path / "second")
-
-    assert first.paths.bundle_id != second.paths.bundle_id
+    assert _bundle_id(logical_hashes, result.metadata) != _bundle_id(logical_hashes, changed)
 
 
 def test_bundle_validation_ignores_provenance_and_generation_changes(tmp_path: Path) -> None:
@@ -719,15 +723,43 @@ def test_bundle_validation_ignores_provenance_and_generation_changes(tmp_path: P
 
 def test_bundle_id_uses_semantic_metadata_and_logical_artifact_hashes(tmp_path: Path) -> None:
     _, result = _tables(tmp_path)
-    arrow_hashes = {"table": "arrow-a"}
+    arrow_hashes = {
+        SAMPLES_FILENAME: "a" * 64,
+        LABELS_FILENAME: "b" * 64,
+        ANNOTATIONS_FILENAME: "c" * 64,
+        SPLITS_FILENAME: "d" * 64,
+        SOURCE_INVENTORY_FILENAME: "e" * 64,
+    }
     original = _bundle_id(arrow_hashes, result.metadata)
     changed_split = {
         **result.metadata,
-        "split": {**result.metadata["split"], "seed": 43},
+        "membership": {"split": {**result.metadata["membership"]["split"], "seed": 43}},
     }
 
     assert _bundle_id(arrow_hashes, changed_split) != original
-    assert _bundle_id({"table": "arrow-b"}, result.metadata) != original
+    assert _bundle_id({**arrow_hashes, SAMPLES_FILENAME: "f" * 64}, result.metadata) != original
+
+
+def test_rsna_semantic_payload_uses_abstract_artifact_roles(tmp_path: Path) -> None:
+    _, result = _tables(tmp_path)
+    logical_hashes = {
+        SAMPLES_FILENAME: "a" * 64,
+        LABELS_FILENAME: "b" * 64,
+        ANNOTATIONS_FILENAME: "c" * 64,
+        SPLITS_FILENAME: "d" * 64,
+        SOURCE_INVENTORY_FILENAME: "e" * 64,
+    }
+
+    payload = _bundle_identity_payload(logical_hashes, result.metadata)
+
+    assert set(payload["artifacts"]) == {
+        "samples",
+        "labels",
+        "annotations",
+        "splits",
+        "source_inventory",
+    }
+    assert ".parquet" not in json.dumps(payload, sort_keys=True)
 
 
 def test_staging_failure_preserves_current_bundle(
@@ -816,10 +848,21 @@ def test_bundle_reference_allows_new_operational_metadata_for_same_identity(
 ) -> None:
     _, result = _tables(tmp_path)
     written = write_bundle(result, tmp_path / "manifests")
-    configured = replace(
-        load_experiment_config("configs/image_densenet_seed42.yaml").dataset,
+    published_metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
+    base = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    configured = with_runtime(
+        replace(
+            base,
+            dataset=replace(
+                base.dataset,
+                bundle_id=written.paths.bundle_id,
+                bundle_manifest_sha256=sha256_file(written.paths.metadata_path),
+                split_assignment_id=published_metadata["membership"]["split"][
+                    "split_assignment_id"
+                ],
+            ),
+        ),
         manifest_directory=tmp_path / "manifests",
-        bundle_id=written.paths.bundle_id,
     )
     original_lineage = RsnaDataset().load_lineage(configured)
     original = validate_bundle_reference(
@@ -839,7 +882,14 @@ def test_bundle_reference_allows_new_operational_metadata_for_same_identity(
 
     assert regenerated.manifest["bundle"]["bundle_id"] == written.paths.bundle_id
     assert regenerated.manifest_sha256 != original.manifest_sha256
-    assert RsnaDataset().load_lineage(configured) == original_lineage
+    refreshed_config = replace(
+        configured,
+        dataset=replace(
+            configured.dataset,
+            bundle_manifest_sha256=sha256_file(written.paths.metadata_path),
+        ),
+    )
+    assert RsnaDataset().load_lineage(refreshed_config) == original_lineage
 
 
 def test_bundle_reference_rejects_wrong_selection_and_malformed_manifest(tmp_path: Path) -> None:
@@ -848,7 +898,7 @@ def test_bundle_reference_rejects_wrong_selection_and_malformed_manifest(tmp_pat
     with pytest.raises(ManifestBuildError):
         validate_bundle_reference(
             selected.paths.bundle_directory,
-            expected_bundle_id="build-wrong",
+            expected_bundle_id="bundle-wrong",
         )
 
     malformed = write_bundle(result, tmp_path / "malformed")
@@ -865,11 +915,11 @@ def test_image_test_manifest_mismatch_fails_before_partition_access(
 ) -> None:
     _, result = _tables(tmp_path)
     written = write_bundle(result, tmp_path / "manifests")
-    configured = replace(
-        load_experiment_config("configs/image_densenet_seed42.yaml").dataset,
+    base = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    configured = with_runtime(
+        replace(base, dataset=replace(base.dataset, bundle_id=written.paths.bundle_id)),
         manifest_directory=tmp_path / "manifests",
-        bundle_id=written.paths.bundle_id,
-        dataset_root=tmp_path / "raw",
+        source_root=tmp_path / "raw",
     )
     monkeypatch.setattr(
         "radfusion.training.datasets._task_frame",
@@ -893,7 +943,7 @@ def test_bundle_reference_lineage_rejects_manifest_and_coordinated_artifact_tamp
     table = pq.read_table(written.paths.labels_path)
     pq.write_table(table, written.paths.labels_path, compression=None)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    metadata["generated_artifact_hashes"][LABELS_FILENAME]["file_sha256"] = sha256_file(
+    metadata["artifacts"][LABELS_FILENAME]["physical_file_sha256"] = sha256_file(
         written.paths.labels_path
     )
     written.paths.metadata_path.write_text(
@@ -925,7 +975,7 @@ def test_bundle_reference_lineage_rejects_artifact_only_and_metadata_only_tamper
     manifest = write_bundle(result, tmp_path / "manifest")
     manifest_sha256 = sha256_file(manifest.paths.metadata_path)
     document = json.loads(manifest.paths.metadata_path.read_text(encoding="utf-8"))
-    document["source_file_hashes"][next(iter(document["source_file_hashes"]))] = "a" * 64
+    document["source"]["files"][next(iter(document["source"]["files"]))] = "a" * 64
     manifest.paths.metadata_path.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -942,7 +992,7 @@ def test_consumer_rejects_declared_artifact_hash_tampering(tmp_path: Path) -> No
     output = tmp_path / "manifests"
     written = write_bundle(result, output)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    metadata["generated_artifact_hashes"][LABELS_FILENAME]["file_sha256"] = "tampered"
+    metadata["artifacts"][LABELS_FILENAME]["physical_file_sha256"] = "tampered"
     written.paths.metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -987,7 +1037,7 @@ def test_consumer_rejects_extra_declared_artifact(tmp_path: Path) -> None:
     output = tmp_path / "manifests"
     written = write_bundle(result, output)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    metadata["generated_artifact_hashes"]["unexpected.parquet"] = {}
+    metadata["artifacts"]["unexpected.parquet"] = {}
     written.paths.metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1001,7 +1051,7 @@ def test_consumer_rejects_unsupported_manifest_schema(tmp_path: Path) -> None:
     output = tmp_path / "manifests"
     written = write_bundle(result, output)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    metadata["manifest_schema_version"] = "unsupported"
+    metadata["bundle_manifest_schema_version"] = "unsupported"
     written.paths.metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1051,7 +1101,7 @@ def test_consumer_rejects_metadata_that_does_not_match_bundle_id(tmp_path: Path)
     output = tmp_path / "manifests"
     written = write_bundle(result, output)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    metadata["split"]["seed"] = 43
+    metadata["membership"]["split"]["seed"] = 43
     written.paths.metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1077,7 +1127,7 @@ def test_consumer_rejects_noncanonical_split_metadata(
     output = tmp_path / "manifests"
     written = write_bundle(result, output)
     metadata = json.loads(written.paths.metadata_path.read_text(encoding="utf-8"))
-    split = metadata["split"]
+    split = metadata["membership"]["split"]
     if invalid_form == "dictionary-ratios":
         split["ratios"] = {"train": 0.7, "validation": 0.15, "test": 0.15}
     elif invalid_form == "reordered-ratios":
@@ -1107,26 +1157,24 @@ def test_cli_success_and_failure_exit_codes(tmp_path: Path) -> None:
     assert current.splits_path.is_file()
     assert current.source_inventory_path.is_file()
     metadata = json.loads(current.metadata_path.read_text(encoding="utf-8"))
-    assert metadata["sample_count"] == 2
-    assert metadata["label_count"] == 4
-    assert metadata["manifest_schema_version"] == "0.1.0"
-    assert metadata["split"]["patient_hash_algorithm"] == "sha256"
-    assert metadata["split"]["patient_hash_input_encoding"] == "utf-8"
-    assert metadata["split"]["patient_hash_input_template"] == "<seed>\\0<patient_id>"
-    assert metadata["split"]["stratification_target"] == "pneumonia"
-    assert (
-        metadata["split"]["allocation_rule"]
-        == "feasible-minimum-then-largest-remainder-canonical-tiebreak"
-    )
-    assert metadata["split"]["seed"] == 42
-    assert metadata["split"]["ratios"] == [
+    assert metadata["qualification"]["counts"]["samples"] == 2
+    assert metadata["qualification"]["counts"]["labels"] == 4
+    assert metadata["bundle_manifest_schema_version"] == "1"
+    split = metadata["membership"]["split"]
+    assert split["patient_hash_algorithm"] == "sha256"
+    assert split["patient_hash_input_encoding"] == "utf-8"
+    assert split["patient_hash_input_template"] == "<seed>\\0<patient_id>"
+    assert split["stratification_target"] == "pneumonia"
+    assert split["allocation_rule"] == "feasible-minimum-then-largest-remainder-canonical-tiebreak"
+    assert split["seed"] == 42
+    assert split["ratios"] == [
         {"split_name": "train", "ratio": 0.7},
         {"split_name": "validation", "ratio": 0.15},
         {"split_name": "test", "ratio": 0.15},
     ]
-    assert metadata["split"]["split_recipe_id"].startswith("split-recipe-")
-    assert metadata["split"]["split_assignment_id"].startswith("split-assignment-")
-    assert set(metadata["split"]) == {
+    assert split["split_recipe_id"].startswith("split-recipe-")
+    assert split["split_assignment_id"].startswith("split-assignment-")
+    assert set(split) == {
         "split_source",
         "split_recipe_id",
         "split_assignment_id",
@@ -1151,12 +1199,12 @@ def test_cli_success_and_failure_exit_codes(tmp_path: Path) -> None:
         "image_dimensions_summary",
     ):
         assert derived_field not in metadata
-    assert metadata["source_inventory_count"] == 2
-    assert SOURCE_INVENTORY_FILENAME in metadata["generated_artifact_hashes"]
-    assert metadata["provenance"]["arrow_ipc_runtime"]["pyarrow_version"] == pa.__version__
+    assert metadata["qualification"]["counts"]["source_inventory"] == 2
+    assert SOURCE_INVENTORY_FILENAME in metadata["artifacts"]
+    assert metadata["provenance"]["logical_arrow_runtime"]["pyarrow_version"] == pa.__version__
     assert (
         "cross-version stability is not claimed"
-        in metadata["provenance"]["arrow_ipc_runtime"]["stability_scope"]
+        in metadata["provenance"]["logical_arrow_runtime"]["stability_scope"]
     )
     assert main(["--dataset-root", str(tmp_path / "missing")]) == 1
 

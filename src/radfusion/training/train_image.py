@@ -25,7 +25,10 @@ from radfusion.evaluation.metrics import (
     youden_j_threshold,
 )
 from radfusion.models.cxr_baseline import fingerprint_pretrained_weights
-from radfusion.training.config import ExperimentConfig, image_semantic_config_sha256
+from radfusion.training.config import (
+    ExperimentConfig,
+    require_runtime_seed,
+)
 from radfusion.training.datasets import (
     ImageRunData,
     RsnaCachedImageDataset,
@@ -110,10 +113,15 @@ def train_image_experiment(
     execution: LoaderExecutionPolicy | None = None,
 ) -> ImageModelResult:
     """Train on image train/validation partitions and publish one selected package."""
-    if config.model.modality != "image" or config.image is None:
+    if config.family.family_id != "cxr_densenet" or config.neural is None:
         raise ValueError("Image training requires a complete image experiment configuration")
+    if config.evaluation is None:
+        raise ValueError("RSNA image training requires evaluation policy")
+    seed = require_runtime_seed(config)
+    neural = config.neural
+    family = config.family
     configure_mlflow(
-        experiment_name=config.mlflow.experiment_name,
+        experiment_name=config.runtime.experiment_name,
         tracking_uri=tracking_uri,
     )
     commit, dirty = git_revision()
@@ -122,40 +130,40 @@ def train_image_experiment(
     base_tags = {
         "run_kind": "training",
         "evaluation_scope": "validation",
-        "experiment_name": config.name,
-        "dataset": config.dataset.registry_key,
+        "experiment_name": family.family_id,
+        "dataset": config.dataset.dataset_id,
         "dataset_bundle_id": config.dataset.bundle_id,
-        "task": config.dataset.task_id,
+        "task": config.task.task_id,
         "modality": "image",
-        "model": config.model.registry_key,
-        "seed": str(config.training.seed),
+        "model": family.family_id,
+        "seed": str(seed),
         "git_commit": commit,
         "git_dirty": str(dirty).lower(),
         "dependency_lock_sha256": lock_hash,
-        "source_config_sha256": config.source_sha256,
-        "semantic_config_sha256": image_semantic_config_sha256(config),
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "run_complete": "false",
     }
     initial_parameters = {
-        "training_seed": config.training.seed,
-        "requested_device": config.image.device,
-        "requested_mixed_precision": config.image.mixed_precision,
-        "requested_pin_memory_policy": config.image.pin_memory_policy,
+        "training_seed": seed,
+        "requested_device": config.runtime.device,
+        "requested_mixed_precision": neural.mixed_precision,
+        "requested_pin_memory_policy": config.runtime.pin_memory_policy,
         "sensitivity_target": config.evaluation.sensitivity_target,
         "calibration_bins": config.evaluation.calibration_bins,
-        **dict(config.model.parameters),
+        **dict(family.parameters),
         **environment,
     }
     with tracked_run(
-        run_name=config.name,
+        run_name=family.family_id,
         tags=base_tags,
         parameters=initial_parameters,
     ) as run_id:
         log_source_config(config)
-        context = {"run_id": run_id, "model": config.model.registry_key}
-        dataset_adapter = get_dataset(config.dataset.registry_key)
+        context = {"run_id": run_id, "model": family.family_id}
+        dataset_adapter = get_dataset(config.dataset.dataset_id)
         with timed_phase(_LOGGER, "dataset_loading", **context):
-            image_data = dataset_adapter.load_image_train_validation(config.dataset)
+            image_data = dataset_adapter.load_image_train_validation(config)
         mlflow.set_tags(
             {
                 "split_assignment_id": image_data.lineage.split_assignment_id,
@@ -164,11 +172,11 @@ def train_image_experiment(
         )
         mlflow.log_param("bundle_manifest_sha256", image_data.bundle_manifest_sha256)
         with timed_phase(_LOGGER, "image_runtime_preparation", **context):
-            seed_neural_runtime(config.training.seed)
+            seed_neural_runtime(seed)
             train_transform = _transform(config, training=True)
             evaluation_transform = _transform(config, training=False)
             resolved_cache = cache or prepare_rsna_cxr_cache(
-                cast(RsnaDataset, dataset_adapter), config.dataset, evaluation_transform
+                cast(RsnaDataset, dataset_adapter), config, evaluation_transform
             )
             expected_cache_identity = expected_rsna_cxr_cache_identity(
                 lineage=image_data.lineage,
@@ -184,7 +192,7 @@ def train_image_experiment(
                 expected_cache_identity=expected_cache_identity,
                 partition="train",
                 transform=train_transform,
-                training_seed=config.training.seed,
+                training_seed=seed,
             )
             validation_dataset = RsnaCachedImageDataset(
                 image_data.validation,
@@ -192,24 +200,24 @@ def train_image_experiment(
                 expected_cache_identity=expected_cache_identity,
                 partition="validation",
                 transform=evaluation_transform,
-                training_seed=config.training.seed,
+                training_seed=seed,
             )
             runtime = resolve_device(
-                config.image.device,
-                mixed_precision=config.image.mixed_precision,
-                pin_memory_policy=config.image.pin_memory_policy,
+                config.runtime.device,
+                mixed_precision=neural.mixed_precision,
+                pin_memory_policy=config.runtime.pin_memory_policy,
             )
             log_event(_LOGGER, "device_resolved", device=runtime.device.type, **context)
             loader_execution = execution or reused_loader_policy(
-                num_workers=config.image.num_workers,
+                num_workers=config.runtime.num_workers,
                 pin_memory=runtime.pin_memory_effective,
             )
             loaders = build_image_loaders(
                 train_dataset,
                 validation_dataset,
-                config=config.image,
+                config=neural,
                 runtime=runtime,
-                seed=config.training.seed,
+                seed=seed,
                 execution=loader_execution,
             )
             train_targets = image_data.train["target"].to_numpy(dtype=np.int8)
@@ -221,16 +229,11 @@ def train_image_experiment(
                     if not isinstance(value, dict)
                 }
             )
-        model_builder = cast(ImageModelImplementation, get_model(config.model.registry_key))
+        model_builder = cast(ImageModelImplementation, get_model(family.family_id))
         with timed_phase(_LOGGER, "model_construction", **context):
-            weight_identity = fingerprint_pretrained_weights(
-                str(config.model.parameters["weights"])
-            )
-            model = model_builder.build(config.model)
-            if (
-                fingerprint_pretrained_weights(str(config.model.parameters["weights"]))
-                != weight_identity
-            ):
+            weight_identity = fingerprint_pretrained_weights(str(family.parameters["weights"]))
+            model = model_builder.build(family)
+            if fingerprint_pretrained_weights(str(family.parameters["weights"])) != weight_identity:
                 raise RuntimeError("Pretrained weight file changed during model construction")
             if not isinstance(model, nn.Module):
                 raise TypeError("Registered image model builder must return torch.nn.Module")
@@ -282,14 +285,14 @@ def train_image_experiment(
             if (
                 record.stage == "fine_tune"
                 and not record.selected_best
-                and record.no_improvement_count >= config.image.early_stopping_patience
+                and record.no_improvement_count >= neural.early_stopping_patience
             ):
                 log_event(
                     _LOGGER,
                     "early_stopping_triggered",
                     stage=record.stage,
                     global_epoch=record.global_epoch,
-                    patience=config.image.early_stopping_patience,
+                    patience=neural.early_stopping_patience,
                     **context,
                 )
 
@@ -341,9 +344,10 @@ def train_image_experiment(
             fit = fit_image_model(
                 model,
                 loaders,
-                config=config.image,
+                config=neural,
                 runtime=runtime,
                 pos_weight=pos_weight,
+                selection_metric=config.training.selection_metric,
                 epoch_callback=epoch_completed,
                 epoch_started_callback=epoch_started,
                 stage_callback=stage_started,
@@ -434,11 +438,11 @@ def train_image_experiment(
             },
             "source_authentication": authentication,
             "model_identity": {
-                "registry_key": config.model.registry_key,
-                "modality": config.model.modality,
-                "encoder_architecture": config.model.parameters["encoder_name"],
-                "image_size": config.model.parameters["image_size"],
-                "embedding_dimension": config.model.parameters["embedding_dimension"],
+                "family_id": family.family_id,
+                "modalities": list(family.modalities),
+                "encoder_architecture": family.parameters["encoder_name"],
+                "image_size": family.parameters["image_size"],
+                "embedding_dimension": family.parameters["embedding_dimension"],
                 "classifier_output_dimension": 1,
                 "pretrained_weight": weight_identity.as_dict(),
             },
@@ -465,7 +469,7 @@ def train_image_experiment(
             ],
         }
         report_directory = (
-            config.training.report_directory / config.dataset.registry_key / "runs" / run_id
+            config.runtime.report_directory / config.dataset.dataset_id / "runs" / run_id
         )
         if report_directory.exists():
             raise FileExistsError(f"Image validation report already exists: {report_directory}")
@@ -509,7 +513,7 @@ def train_image_experiment(
                 thresholds=thresholds,
             )
             published = publish_neural_model_run(
-                model_root=config.training.model_directory,
+                model_root=config.runtime.model_directory,
                 mlflow_run_id=run_id,
                 checkpoint_path=checkpoint_path,
                 source_config_bytes=config.source_bytes,
@@ -523,7 +527,7 @@ def train_image_experiment(
             }
             write_run_reports(
                 report_stage,
-                model_name=config.model.registry_key,
+                model_name=family.family_id,
                 targets=final_validation.targets,
                 probabilities=final_validation.probabilities,
                 document=document,
@@ -590,7 +594,7 @@ def train_image_experiment(
         log_event(_LOGGER, "publication_completed", artifact="model_package", **context)
         log_event(_LOGGER, "publication_completed", artifact="validation_report", **context)
     return ImageModelResult(
-        model_name=config.model.registry_key,
+        model_name=family.family_id,
         run_id=run_id,
         validation_probability=probability_metrics,
         validation_youden_j=youden_metrics,
@@ -605,12 +609,13 @@ def train_image_experiment(
 
 
 def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransform:
-    image = config.image
+    image = config.neural
     if image is None:
         raise ValueError("Image transform requires image configuration")
     return StandardCxrTransform(
         training=training,
-        image_size=int(config.model.parameters["image_size"]),
+        policy_version=str(config.preprocessing["cxr_transform_policy"]),
+        image_size=int(config.family.parameters["image_size"]),
         rotation_degrees=image.rotation_degrees,
         translation_fraction=image.translation_fraction,
         brightness_jitter=image.brightness_jitter,
@@ -638,20 +643,20 @@ def _manifest(
     final_average_precision: float,
     thresholds: dict[str, float],
 ) -> dict[str, Any]:
-    image = config.image
+    image = config.neural
     if image is None:
         raise ValueError("Image manifest requires image configuration")
     return {
         "modality": "image",
-        "model": config.model.registry_key,
+        "model": config.family.family_id,
         "task": image_data.lineage.task_id,
         "positive_class": 1,
         "bundle_id": image_data.lineage.bundle_id,
         "bundle_manifest_sha256": image_data.bundle_manifest_sha256,
         "split_assignment_id": image_data.lineage.split_assignment_id,
         "label_policy_version": image_data.lineage.label_policy_version,
-        "source_config_sha256": config.source_sha256,
-        "semantic_config_sha256": image_semantic_config_sha256(config),
+        "config_source_sha256": config.config_source_sha256,
+        "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
             "git_commit": commit,
             "git_dirty": dirty,
@@ -662,11 +667,11 @@ def _manifest(
             "torchxrayvision_version": runtime["torchxrayvision_version"],
         },
         "model_identity": {
-            "registry_key": config.model.registry_key,
-            "modality": config.model.modality,
-            "encoder_architecture": config.model.parameters["encoder_name"],
-            "image_size": config.model.parameters["image_size"],
-            "embedding_dimension": config.model.parameters["embedding_dimension"],
+            "family_id": config.family.family_id,
+            "modalities": list(config.family.modalities),
+            "encoder_architecture": config.family.parameters["encoder_name"],
+            "image_size": config.family.parameters["image_size"],
+            "embedding_dimension": config.family.parameters["embedding_dimension"],
             "classifier_output_dimension": 1,
             "pretrained_weight": weight_identity,
         },
@@ -674,7 +679,7 @@ def _manifest(
         "training_transform_contract": train_transform,
         "evaluation_transform_contract": evaluation_transform,
         "training_policy": {
-            "seed": config.training.seed,
+            "seed": require_runtime_seed(config),
             "permitted_partitions": ["train", "validation"],
             "class_weight": {
                 "policy_version": CLASS_WEIGHT_POLICY_VERSION,

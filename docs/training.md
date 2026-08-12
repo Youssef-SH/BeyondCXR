@@ -4,41 +4,60 @@ Each experiment is defined by one strict YAML file:
 
 ```yaml
 config_version: 1
-name: metadata_logistic_regression
 
 dataset:
-  registry_key: rsna
-  manifest_directory: data/manifests
-  bundle_id: build-<sha256>
-  task_id: pneumonia
+  dataset_id: rsna
+  bundle_id: bundle-<sha256>
+  bundle_manifest_sha256: <sha256>
+  split_assignment_id: split-assignment-<sha256>
 
-model:
-  registry_key: metadata_logistic
+task:
+  task_id: pneumonia
+  label_policy_version: rsna-stage-2-target-v1
+
+family:
+  family_id: metadata_logistic
+  modalities: [metadata]
   parameters: {}
-  fit_parameters: {}
+
+preprocessing:
+  metadata_policy: rsna-metadata-input-v1
 
 training:
-  seed: 42
-  report_directory: reports
-  model_directory: models/rsna
+  selection_metric: none
+  parameters:
+    l1_ratio: 0.0
+    solver: liblinear
+    C: 1.0
+    max_iter: 2000
+    class_weight: balanced
 
 evaluation:
   sensitivity_target: 0.90
   calibration_bins: 15
-  latency_warmup_calls: 100
-  latency_measured_calls: 1000
 
-mlflow:
-  experiment_name: radfusion-rsna
 ```
 
-The loader rejects missing, unknown, and duplicate keys. Each experiment names an exact immutable
-bundle ID. `training.seed` is the single randomness authority.
+The loader rejects missing, unknown, duplicate, mistyped, non-finite, and incompatible values.
+Each experiment names an exact immutable bundle and exact manifest-byte integrity witness.
+Filesystem paths, MLflow destinations, hardware destinations, execution seeds, worker counts, and
+pin-memory policies are runtime coordinates and do not appear in YAML.
 
-All experiment configs use schema version 1. Metadata configs are `configs/metadata_logistic.yaml`
-and `configs/metadata_lightgbm.yaml`. Image configs are `configs/image_densenet_seed17.yaml`,
-`configs/image_densenet_seed42.yaml`, and `configs/image_densenet_seed2026.yaml`. Fusion configs use
-the corresponding `configs/fusion_concat_seed*.yaml` files.
+Family parameters describe estimator/model topology. Preprocessing identifiers own implemented
+scientific transforms. Fitting, optimization, loss weighting, iteration, early-stopping, loader,
+and augmentation policy belong to `training`. `selection_metric` is `none` when fitting performs
+no model selection. Evaluation owns sensitivity and calibration policy. Latency benchmarking uses
+the operational defaults of 100 warm-up calls and 1,000 measured calls; those counts are outside
+scientific configuration identity.
+LightGBM runs quietly with operational `verbosity=-1`; logging verbosity is not scientific
+configuration.
+
+All experiment configs use schema version 1. RSNA uses one YAML for each of metadata Logistic
+Regression, metadata LightGBM, CXR DenseNet, and CXR-metadata concat. Symile uses one YAML for each
+of labs Logistic Regression, labs LightGBM, CXR DenseNet, CXR-labs concat, CXR-labs gated, and the
+gated no-observedness ablation. The canonical filenames are listed in the repository `configs/`
+directory. Manual RSNA training receives `SEED` explicitly; the authoritative campaign owns its
+fixed family-by-seed matrix.
 
 ## Feature boundary
 
@@ -98,9 +117,9 @@ evaluation. Dispatch is determined by `model.modality`.
 
 ## Image training
 
-The image configuration defines one seed, the fixed TorchXRayVision DenseNet121 encoder, source
-dataset root, augmentation, optimization stages, and device policy.
-Each invocation trains one seed. Training validates the pinned bundle, loads only train and
+The image configuration defines the fixed TorchXRayVision DenseNet121 encoder, augmentation, and
+optimization stages; runtime owns the source root, device, and explicit execution seed. Each
+invocation trains one seed. Training validates the pinned bundle, loads only train and
 validation rows, and verifies their coverage by the validated deterministic CXR cache before
 constructing the model.
 
@@ -137,12 +156,14 @@ sample order is a stable function of seed and epoch. Augmentation is a stable fu
 epoch, and sample ID, so worker count, worker lifetime, and prefetch timing do not change the
 scientific realization.
 
-Train and validation loaders use the configured reused-loader worker count, which is 2 in the
-canonical RSNA configurations. Positive-worker loaders use `spawn`, persistent workers, and
+Train and validation loaders use the runtime-owned reused-loader worker count, which defaults to 2
+for RSNA and Symile. Positive-worker loaders use `spawn`, persistent workers, and
 prefetch factor 2. One-shot test inference is synchronous and uses no worker processes,
 persistence, prefetch, or multiprocessing context. The actual lifecycle-specific policy is
-recorded as runtime provenance outside semantic experiment compatibility. Batch size, augmentation,
-optimization, AMP, and all other numerical policies remain scientific configuration.
+recorded as runtime provenance outside scientific semantic identity. Batch size, augmentation,
+optimization, and AMP remain scientific configuration. Worker count and pin-memory policy are
+runtime/reproducibility coordinates; prefetch factor and persistent-worker use are derived
+execution behavior.
 
 Image packages contain:
 
@@ -167,10 +188,10 @@ Six strict family configs define the implemented Symile development surface:
 ```text
 configs/symile_labs_logistic.yaml
 configs/symile_labs_lightgbm.yaml
-configs/symile_cxr.yaml
-configs/symile_concat.yaml
-configs/symile_gated.yaml
-configs/symile_gated_no_observedness.yaml
+configs/symile_cxr_densenet.yaml
+configs/symile_cxr_labs_concat.yaml
+configs/symile_cxr_labs_gated.yaml
+configs/symile_cxr_labs_gated_no_observedness.yaml
 ```
 
 Every config pins the immutable Symile bundle, observed bundle-manifest hash, official split
@@ -192,9 +213,9 @@ architecture and initialization; the ablation replaces observedness inputs with 
 boundary while preserving the 100-dimensional lab preprocessing contract.
 
 ```bash
-make symile-develop CONFIG=configs/symile_cxr.yaml
+make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
 make symile-develop \
-  CONFIG=configs/symile_concat.yaml \
+  CONFIG=configs/symile_cxr_labs_concat.yaml \
   SOURCE_CXR_DEVELOPMENT_ID=development-<sha256>
 make symile-analyze \
   DEVELOPMENT_IDS="<labs-lr> <labs-lgbm> <cxr> <concat> <gated> <gated-no-observedness>"
@@ -325,6 +346,7 @@ Image and fusion test evaluators publish one ordered Parquet table under
 `private/predictions/<dataset>/<test-run-id>/`. It binds each test row's sample and private patient
 keys, target, logit, probability, split, seed, training run, evaluation run, and model package.
 These patient-level tables are neither public reports nor MLflow artifacts.
+`RuntimeConfig.private_output_directory` is the single root authority for this private publication.
 
 The training, evaluation, and comparison CLIs default to `sqlite:///mlflow.db` and accept
 `--tracking-uri` when an isolated local SQLite database is required.

@@ -104,8 +104,8 @@ def _generate_rsna_audit(
 
     return {
         "bundle_id": bundle.bundle_id,
-        "split_recipe_id": str(metadata["split"]["split_recipe_id"]),
-        "split_assignment_id": str(metadata["split"]["split_assignment_id"]),
+        "split_recipe_id": str(metadata["membership"]["split"]["split_recipe_id"]),
+        "split_assignment_id": str(metadata["membership"]["split"]["split_assignment_id"]),
         "report_directory": output.as_posix(),
         "reports": list(REPORT_FILENAMES),
     }
@@ -260,7 +260,8 @@ def _dataset_summary(
         f"- Positive samples: {positive:,}",
         f"- Negative samples: {len(frame) - positive:,}",
         f"- Bounding boxes: {len(annotations):,}",
-        f"- Implausible ages above 120 years: {int(metadata['implausible_age_count']):,}",
+        "- Implausible ages above 120 years: "
+        f"{int(metadata['qualification']['age_parsing']['implausible_age_count']):,}",
         "",
         "The benchmark endpoint is the radiology-derived RSNA challenge target.",
         "",
@@ -269,7 +270,7 @@ def _dataset_summary(
 
 
 def _split_summary(metadata: dict[str, object], frame: pd.DataFrame) -> str:
-    split_metadata = metadata["split"]
+    split_metadata = metadata["membership"]["split"]
     lines = [
         "# RSNA split summary",
         "",

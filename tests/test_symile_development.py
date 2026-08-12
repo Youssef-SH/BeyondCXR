@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
@@ -28,7 +27,7 @@ from radfusion.models.symile_tabular import (
     fit_symile_labs_lightgbm,
     fit_symile_labs_logistic,
 )
-from radfusion.training.config import load_symile_development_config
+from radfusion.training.config import load_symile_development_config, with_runtime
 from radfusion.training.symile_analysis import analyze_symile_development
 from radfusion.training.symile_data import (
     SymileCxrStore,
@@ -94,13 +93,13 @@ def _assignments(frame: pd.DataFrame) -> pa.Table:
 
 def _bundle(tmp_path: Path) -> SymileBundlePaths:
     root = tmp_path / "manifests/symile"
-    directory = root / "builds" / ("build-" + "a" * 64)
+    directory = root / "bundles" / ("bundle-" + "a" * 64)
     return SymileBundlePaths(
-        "build-" + "a" * 64,
+        "bundle-" + "a" * 64,
         directory,
-        directory / "symile_samples.parquet",
-        directory / "symile_labs.parquet",
-        directory / "symile_manifest_metadata.json",
+        directory / "samples.parquet",
+        directory / "labs.parquet",
+        directory / "manifest.json",
         root / "CURRENT",
     )
 
@@ -146,11 +145,7 @@ def test_development_loader_requests_only_train_and_validation(
         symile_data,
         "validate_symile_bundle_reference",
         lambda *args, **kwargs: ValidatedSymileBundleReference(
-            {
-                "official_membership": {
-                    "official_split_assignment_id": config.dataset.official_split_assignment_id
-                }
-            },
+            {"membership": {"split_assignment_id": config.dataset.split_assignment_id}},
             config.dataset.bundle_manifest_sha256,
         ),
     )
@@ -208,15 +203,20 @@ def _lab_preprocessor() -> SymileLabEcdfTransformer:
 
 
 def _lineage(family: str) -> dict[str, object]:
-    config = load_symile_development_config(f"configs/symile_{family}.yaml")
-    neural = family in {"cxr", "concat", "gated", "gated_no_observedness"}
+    config = load_symile_development_config(_family_config_path(family))
+    neural = family in {
+        "cxr_densenet",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+    }
     return {
         "bundle_id": config.dataset.bundle_id,
         "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "official_split_assignment_id": config.dataset.official_split_assignment_id,
+        "split_assignment_id": config.dataset.split_assignment_id,
         "cv_assignment_id": config.dataset.cv_assignment_id,
         "cv_manifest_sha256": "e" * 64,
-        "task_id": config.dataset.task_id,
+        "task_id": config.task.task_id,
         "git_commit": "f" * 40,
         "dependency_lock_sha256": "1" * 64,
         "encoder_identity": (
@@ -232,13 +232,13 @@ def _lineage(family: str) -> dict[str, object]:
         "transform_contract": (
             StandardCxrTransform(
                 training=False,
-                image_size=int(config.model["image_size"]),
-                rotation_degrees=config.image.rotation_degrees,
-                translation_fraction=config.image.translation_fraction,
-                brightness_jitter=config.image.brightness_jitter,
-                contrast_jitter=config.image.contrast_jitter,
+                image_size=int(config.family.parameters["image_size"]),
+                rotation_degrees=config.neural.rotation_degrees,
+                translation_fraction=config.neural.translation_fraction,
+                brightness_jitter=config.neural.brightness_jitter,
+                contrast_jitter=config.neural.contrast_jitter,
             ).contract()
-            if neural and config.image is not None
+            if neural and config.neural is not None
             else None
         ),
         "pretrained_weight": (
@@ -249,10 +249,22 @@ def _lineage(family: str) -> dict[str, object]:
                 "byte_size": 1,
                 "sha256": "2" * 64,
             }
-            if family == "cxr"
+            if family == "cxr_densenet"
             else None
         ),
     }
+
+
+def _family_config_path(family: str) -> str:
+    names = {
+        "labs_logistic": "symile_labs_logistic",
+        "labs_lightgbm": "symile_labs_lightgbm",
+        "cxr_densenet": "symile_cxr_densenet",
+        "cxr_labs_concat": "symile_cxr_labs_concat",
+        "cxr_labs_gated": "symile_cxr_labs_gated",
+        "cxr_labs_gated_no_observedness": "symile_cxr_labs_gated_no_observedness",
+    }
+    return f"configs/{names[family]}.yaml"
 
 
 def _inner_split(seed: int, fold: int) -> dict[str, object]:
@@ -282,9 +294,14 @@ def _publish_family_folds(
     source_cxr_folds: list[ValidatedFoldPackage] | None = None,
     source_cxr_development_id: str | None = None,
 ) -> tuple[list[ValidatedFoldPackage], str]:
-    config = load_symile_development_config(f"configs/symile_{family}.yaml")
-    semantic_hash = symile_development.symile_development_semantic_sha256(config)
-    neural_family = family in {"cxr", "concat", "gated", "gated_no_observedness"}
+    config = load_symile_development_config(_family_config_path(family))
+    semantic_hash = config.config_semantic_sha256
+    neural_family = family in {
+        "cxr_densenet",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+    }
     lineage = _lineage(family)
     folds: list[ValidatedFoldPackage] = []
     for seed_index, seed in enumerate((17, 42, 2026)):
@@ -323,21 +340,29 @@ def _publish_family_folds(
                     fitted = fit_symile_labs_logistic(
                         features,
                         targets,
-                        parameters=config.model,
+                        parameters=config.training.parameters,
+                        selection_metric=config.training.selection_metric,
+                        lab_policy=str(config.preprocessing["lab_policy"]),
                         repeat_seed=seed,
                     )
                 else:
                     fitted = fit_symile_labs_lightgbm(
                         features,
                         targets,
-                        parameters=config.model,
+                        parameters={**config.family.parameters, **config.training.parameters},
+                        selection_metric=config.training.selection_metric,
+                        lab_policy=str(config.preprocessing["lab_policy"]),
                         inner_training_indices=np.arange(16, dtype=np.int64),
                         inner_validation_indices=np.arange(16, 20, dtype=np.int64),
                         repeat_seed=seed,
                     )
                     selection["best_iteration"] = fitted.best_iteration
                 model = fitted.pipeline
-            fusion = family in {"concat", "gated", "gated_no_observedness"}
+            fusion = family in {
+                "cxr_labs_concat",
+                "cxr_labs_gated",
+                "cxr_labs_gated_no_observedness",
+            }
             source_fold = (
                 next(
                     item
@@ -349,12 +374,12 @@ def _publish_family_folds(
             )
             package = publish_fold_package(
                 model_root=tmp_path / "models/symile/development",
-                family=family,
+                family=config.family.family_id,
                 repeat_seed=seed,
                 outer_fold=fold,
                 config_bytes=config.source_bytes,
-                config_sha256=config.source_sha256,
-                semantic_config_sha256=semantic_hash,
+                config_sha256=config.config_source_sha256,
+                config_semantic_sha256=semantic_hash,
                 lineage=lineage,
                 inner_split=_inner_split(seed, fold),
                 selection=selection,
@@ -417,8 +442,8 @@ def test_fold_publication_rejects_wrong_model_malformed_state_and_history(
             repeat_seed=17,
             outer_fold=0,
             config_bytes=logistic.source_bytes,
-            config_sha256=logistic.source_sha256,
-            semantic_config_sha256=symile_development.symile_development_semantic_sha256(logistic),
+            config_sha256=logistic.config_source_sha256,
+            config_semantic_sha256=logistic.config_semantic_sha256,
             lineage=_lineage("labs_logistic"),
             inner_split=_inner_split(17, 0),
             selection={"metric": "none", "selected_epoch": None, "best_iteration": None},
@@ -427,7 +452,7 @@ def test_fold_publication_rejects_wrong_model_malformed_state_and_history(
             operational={"mlflow_run_id": "run-wrong", "runtime_provenance": None},
         )
 
-    cxr = load_symile_development_config("configs/symile_cxr.yaml")
+    cxr = load_symile_development_config("configs/symile_cxr_densenet.yaml")
     selection = {
         "metric": "roc_auc",
         "selected_epoch": 1,
@@ -444,13 +469,13 @@ def test_fold_publication_rejects_wrong_model_malformed_state_and_history(
     with pytest.raises(ManifestBuildError, match="cannot reconstruct exactly"):
         publish_fold_package(
             model_root=tmp_path / "malformed-neural",
-            family="cxr",
+            family="cxr_densenet",
             repeat_seed=17,
             outer_fold=0,
             config_bytes=cxr.source_bytes,
-            config_sha256=cxr.source_sha256,
-            semantic_config_sha256=symile_development.symile_development_semantic_sha256(cxr),
-            lineage=_lineage("cxr"),
+            config_sha256=cxr.config_source_sha256,
+            config_semantic_sha256=cxr.config_semantic_sha256,
+            lineage=_lineage("cxr_densenet"),
             inner_split=_inner_split(17, 0),
             selection=selection,
             oof=oof,
@@ -479,13 +504,13 @@ def test_fold_publication_rejects_wrong_model_malformed_state_and_history(
     with pytest.raises(ManifestBuildError, match="selected epoch is absent"):
         publish_fold_package(
             model_root=tmp_path / "bad-history",
-            family="cxr",
+            family="cxr_densenet",
             repeat_seed=17,
             outer_fold=0,
             config_bytes=cxr.source_bytes,
-            config_sha256=cxr.source_sha256,
-            semantic_config_sha256=symile_development.symile_development_semantic_sha256(cxr),
-            lineage=_lineage("cxr"),
+            config_sha256=cxr.config_source_sha256,
+            config_semantic_sha256=cxr.config_semantic_sha256,
+            lineage=_lineage("cxr_densenet"),
             inner_split=_inner_split(17, 0),
             selection=history_selection,
             oof=oof,
@@ -514,7 +539,14 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
     cxr_folds: list[ValidatedFoldPackage] | None = None
     cxr_development_id: str | None = None
     for family_index, family in enumerate(
-        ("labs_logistic", "labs_lightgbm", "cxr", "concat", "gated", "gated_no_observedness")
+        (
+            "labs_logistic",
+            "labs_lightgbm",
+            "cxr_densenet",
+            "cxr_labs_concat",
+            "cxr_labs_gated",
+            "cxr_labs_gated_no_observedness",
+        )
     ):
         folds, semantic_hash = _publish_family_folds(
             tmp_path,
@@ -523,8 +555,9 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
             source_cxr_folds=cxr_folds,
             source_cxr_development_id=cxr_development_id,
         )
+        canonical_family = str(folds[0].manifest["family"])
         metrics, selected, budget = aggregate_family_folds(
-            family,
+            canonical_family,
             folds,
             expected_sample_ids={f"sample-{index:03d}" for index in range(20)},
         )
@@ -534,8 +567,8 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
                 publish_development_result(
                     report_root=tmp_path / "reports/symile/development",
                     model_root=tmp_path / "models/symile/development",
-                    family=family,
-                    semantic_config_sha256=semantic_hash,
+                    family=canonical_family,
+                    config_semantic_sha256=semantic_hash,
                     folds=[*folds[:-1], folds[-2]],
                     repeat_metrics=metrics,
                     selected_values=selected,
@@ -547,8 +580,8 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
                 publish_development_result(
                     report_root=tmp_path / "reports/symile/development",
                     model_root=tmp_path / "models/symile/development",
-                    family=family,
-                    semantic_config_sha256=semantic_hash,
+                    family=canonical_family,
+                    config_semantic_sha256=semantic_hash,
                     folds=folds,
                     repeat_metrics=corrupted,
                     selected_values=selected,
@@ -562,8 +595,8 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
                     publish_development_result(
                         report_root=tmp_path / "reports/symile/development",
                         model_root=tmp_path / "models/symile/development",
-                        family=family,
-                        semantic_config_sha256=semantic_hash,
+                        family=canonical_family,
+                        config_semantic_sha256=semantic_hash,
                         folds=folds,
                         repeat_metrics=metrics,
                         selected_values=selected,
@@ -572,15 +605,15 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
         result = publish_development_result(
             report_root=tmp_path / "reports/symile/development",
             model_root=tmp_path / "models/symile/development",
-            family=family,
-            semantic_config_sha256=semantic_hash,
+            family=canonical_family,
+            config_semantic_sha256=semantic_hash,
             folds=folds,
             repeat_metrics=metrics,
             selected_values=selected,
             median_m6_budget=budget,
         )
         developments.append(result)
-        if family == "cxr":
+        if family == "cxr_densenet":
             cxr_folds = folds
             cxr_development_id = str(result.manifest["development_id"])
     for result in developments:
@@ -604,10 +637,10 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
     assert set(analysis["family_development_ids"]) == {
         "labs_logistic",
         "labs_lightgbm",
-        "cxr",
-        "concat",
-        "gated",
-        "gated_no_observedness",
+        "cxr_densenet",
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
     }
     assert "sample-" not in (analysis_directory / "summary.md").read_text(encoding="utf-8")
     corrupted_effects = {
@@ -629,7 +662,7 @@ def test_family_completeness_medians_analysis_alignment_and_privacy(
     corrupted_ensemble = {
         family: dict(metrics) for family, metrics in analysis["ensemble_metrics"].items()
     }
-    corrupted_ensemble["gated"]["average_precision"] -= 0.01
+    corrupted_ensemble["cxr_labs_gated"]["average_precision"] -= 0.01
     with pytest.raises(ManifestBuildError, match="ensemble_metrics differs"):
         publish_analysis_result(
             report_root=tmp_path / "reports/symile/development",
@@ -662,17 +695,10 @@ def test_mlflow_completion_failure_rolls_back_new_fold_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_symile_development_config("configs/symile_labs_logistic.yaml")
-    config = type(config)(
-        **{
-            **config.__dict__,
-            "training": MappingProxyType(
-                {
-                    **dict(config.training),
-                    "model_directory": tmp_path / "models/symile/development",
-                    "report_directory": tmp_path / "reports/symile/development",
-                }
-            ),
-        }
+    config = with_runtime(
+        config,
+        model_directory=tmp_path / "models/symile/development",
+        report_directory=tmp_path / "reports/symile/development",
     )
     data = _data(tmp_path)
     data = SymileDevelopmentData(
@@ -714,7 +740,9 @@ def test_mlflow_completion_failure_rolls_back_new_fold_package(
         fitted = fit_symile_labs_logistic(
             outer.training[list(LAB_FEATURE_COLUMNS)],
             outer.training["target"].to_numpy(dtype=np.int8),
-            parameters=config.model,
+            parameters=config.training.parameters,
+            selection_metric=config.training.selection_metric,
+            lab_policy=str(config.preprocessing["lab_policy"]),
             repeat_seed=outer.repeat_seed,
         )
         return {
@@ -735,7 +763,7 @@ def test_mlflow_completion_failure_rolls_back_new_fold_package(
     assert not list((tmp_path / "models/symile/development/folds").glob("fold-package-*"))
     tags = run_arguments["tags"]
     assert isinstance(tags, dict)
-    assert tags["config_name"] == "symile_labs_logistic"
+    assert tags["config_name"] == "labs_logistic"
     assert tags["repeat_seed"] == "17"
     assert "seed" not in tags
     assert "experiment_name" not in tags

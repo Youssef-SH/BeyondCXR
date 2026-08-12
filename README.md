@@ -67,14 +67,14 @@ make rsna-gpu        # run and export the complete authoritative RSNA campaign
 make symile-manifest # authenticate Symile-MIMIC and publish its immutable bundle
 make symile-audit    # publish the bundle-qualified aggregate Symile audit
 make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
-make symile-develop CONFIG=configs/symile_cxr.yaml
+make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
 make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
 
 # Lower-level inspection and debugging commands
 make rsna-manifest   # publish an RSNA bundle
 make rsna-audit      # generate reports under reports/rsna/audit/<bundle-id>
-make train CONFIG=configs/metadata_logistic.yaml
-make train CONFIG=configs/image_densenet_seed42.yaml
+make train CONFIG=configs/rsna_metadata_logistic.yaml SEED=42
+make train CONFIG=configs/rsna_cxr_densenet.yaml SEED=42
 make evaluate RUN_ID=<training-run-id>
 make compare         # regenerate CSV and Markdown comparison views from MLflow
 make clean           # remove tool caches and interrupted-publication staging state
@@ -85,7 +85,7 @@ make inspect FILE=path/to/image.dcm
 ```
 
 `symile-audit` and `symile-cv` resolve `data/manifests/symile/CURRENT` once for interactive use.
-Pass `BUNDLE_ID=build-...` to select an immutable bundle explicitly. Published CV artifacts bind
+Pass `BUNDLE_ID=bundle-...` to select an immutable bundle explicitly. Published CV artifacts bind
 the resolved immutable bundle ID. Later scientific configurations pin both immutable identities.
 
 `symile-develop` runs one configured family across all 15 frozen outer folds; repeat and fold are
@@ -129,7 +129,8 @@ Fusion training requires an explicit same-seed image training run at execution t
 fusion YAML remains a stable scientific definition; the resulting package records the exact source
 CXR package and embeds its train-fitted structured preprocessor.
 
-The image and fusion configs lock seeds 17, 42, and 2026. Linked test runs for one modality can be
+The RSNA campaign owns the image and fusion seeds 17, 42, and 2026; seed is an execution
+coordinate rather than YAML content. Linked test runs for one modality can be
 summarized only by supplying all three run IDs explicitly. The summary retains individual results
 and reports their mean and sample standard deviation without selecting a canonical seed or
 averaging models.
