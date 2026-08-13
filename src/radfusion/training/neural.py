@@ -7,7 +7,7 @@ import random
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
 import numpy as np
@@ -52,26 +52,6 @@ class TwoStageBinaryModel(Protocol):
 
 
 @dataclass(frozen=True)
-class EpochRecord:
-    """Aggregate state recorded after one completed training epoch."""
-
-    global_epoch: int
-    stage_epoch: int
-    stage: str
-    training_loss: float
-    validation_average_precision: float
-    selected_best: bool
-    encoder_learning_rate: float | None
-    head_learning_rate: float
-    scheduler_last_epoch: int | None
-    no_improvement_count: int
-
-    def as_dict(self) -> dict[str, object]:
-        """Return a serializable epoch record."""
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class EpochThroughput:
     """Operational train/validation timing for one completed epoch."""
 
@@ -95,23 +75,12 @@ class InferenceResult:
     average_precision: float
 
 
-@dataclass(frozen=True)
-class NeuralFitResult:
-    """Selected CPU state and aggregate training history."""
-
-    selected_state_dict: dict[str, torch.Tensor]
-    selected_epoch: int
-    selected_stage: str
-    selected_validation_average_precision: float
-    history: tuple[EpochRecord, ...]
-
-
 SelectionMetricName = Literal["average_precision", "roc_auc"]
 FineTuneScope = Literal["all", "terminal"]
 
 
 @dataclass(frozen=True)
-class SelectedMetricEpochRecord:
+class TrainingEpochRecord:
     """Metric-neutral state recorded for one selected-metric training epoch."""
 
     global_epoch: int
@@ -127,7 +96,7 @@ class SelectedMetricEpochRecord:
 
 
 @dataclass(frozen=True)
-class SelectedMetricFitResult:
+class SelectedTrainingResult:
     """Selected neural state under one explicit validation metric."""
 
     selected_state_dict: dict[str, torch.Tensor]
@@ -135,7 +104,7 @@ class SelectedMetricFitResult:
     selected_stage: str
     selection_metric: SelectionMetricName
     selected_validation_metric: float
-    history: tuple[SelectedMetricEpochRecord, ...]
+    history: tuple[TrainingEpochRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -146,14 +115,12 @@ class ImageLoaders:
     validation: DataLoader[Any]
 
 
-EpochCallback = Callable[[EpochRecord], None]
-EpochThroughputCallback = Callable[[EpochRecord, EpochThroughput], None]
 EpochStartedCallback = Callable[[str, int, int], None]
 StageCallback = Callable[[str, int], None]
 BatchProgressCallback = Callable[[int, int], None]
 NeuralProgressCallback = Callable[[str, str, int, int, int], None]
-SelectedEpochCallback = Callable[[SelectedMetricEpochRecord], None]
-SelectedEpochThroughputCallback = Callable[[SelectedMetricEpochRecord, EpochThroughput], None]
+TrainingEpochCallback = Callable[[TrainingEpochRecord], None]
+TrainingEpochThroughputCallback = Callable[[TrainingEpochRecord, EpochThroughput], None]
 
 
 class EpochPermutationSampler(Sampler[tuple[int, int]]):
@@ -441,22 +408,21 @@ def deterministic_inference(
     )
 
 
-def fit_image_model(
+def fit_rsna_cxr_model(
     model: nn.Module,
     loaders: ImageLoaders,
     *,
     config: NeuralConfig,
     runtime: ResolvedDevice,
     pos_weight: float,
-    selection_metric: SelectionMetricName,
-    epoch_callback: EpochCallback | None = None,
+    epoch_callback: TrainingEpochCallback | None = None,
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
     progress_callback: NeuralProgressCallback | None = None,
-    throughput_callback: EpochThroughputCallback | None = None,
-) -> NeuralFitResult:
+    throughput_callback: TrainingEpochThroughputCallback | None = None,
+) -> SelectedTrainingResult:
     """Run head warm-up and full fine-tuning with validation checkpoint selection."""
-    return fit_two_stage_binary_model(
+    return fit_rsna_two_stage_binary_model(
         model,
         loaders.train,
         loaders.validation,
@@ -464,7 +430,40 @@ def fit_image_model(
         config=config,
         runtime=runtime,
         pos_weight=pos_weight,
-        selection_metric=selection_metric,
+        epoch_callback=epoch_callback,
+        epoch_started_callback=epoch_started_callback,
+        stage_callback=stage_callback,
+        progress_callback=progress_callback,
+        throughput_callback=throughput_callback,
+    )
+
+
+def fit_rsna_two_stage_binary_model(
+    model: nn.Module,
+    train_loader: DataLoader[Any],
+    validation_loader: DataLoader[Any],
+    *,
+    input_keys: tuple[str, ...],
+    config: NeuralConfig,
+    runtime: ResolvedDevice,
+    pos_weight: float,
+    epoch_callback: TrainingEpochCallback | None = None,
+    epoch_started_callback: EpochStartedCallback | None = None,
+    stage_callback: StageCallback | None = None,
+    progress_callback: NeuralProgressCallback | None = None,
+    throughput_callback: TrainingEpochThroughputCallback | None = None,
+) -> SelectedTrainingResult:
+    """Run the frozen RSNA AP-selected two-stage binary lifecycle."""
+    return fit_two_stage_binary_model(
+        model,
+        train_loader,
+        validation_loader,
+        input_keys=input_keys,
+        config=config,
+        runtime=runtime,
+        pos_weight=pos_weight,
+        selection_metric="average_precision",
+        fine_tune_scope="all",
         epoch_callback=epoch_callback,
         epoch_started_callback=epoch_started_callback,
         stage_callback=stage_callback,
@@ -483,81 +482,13 @@ def fit_two_stage_binary_model(
     runtime: ResolvedDevice,
     pos_weight: float,
     selection_metric: SelectionMetricName,
-    epoch_callback: EpochCallback | None = None,
-    epoch_started_callback: EpochStartedCallback | None = None,
-    stage_callback: StageCallback | None = None,
-    progress_callback: NeuralProgressCallback | None = None,
-    throughput_callback: EpochThroughputCallback | None = None,
-) -> NeuralFitResult:
-    """Run the frozen RSNA AP-selected two-stage binary lifecycle."""
-    if selection_metric != "average_precision":
-        raise NeuralTrainingError("RSNA neural adapter requires average_precision selection")
-    selected_history: list[EpochRecord] = []
-
-    def adapt_epoch(record: SelectedMetricEpochRecord) -> None:
-        legacy = EpochRecord(
-            record.global_epoch,
-            record.stage_epoch,
-            record.stage,
-            record.training_loss,
-            record.validation_metric,
-            record.selected_best,
-            record.encoder_learning_rate,
-            record.head_learning_rate,
-            record.scheduler_last_epoch,
-            record.no_improvement_count,
-        )
-        selected_history.append(legacy)
-        _best_effort_callback(epoch_callback, legacy)
-
-    def adapt_throughput(record: SelectedMetricEpochRecord, value: EpochThroughput) -> None:
-        legacy = selected_history[-1]
-        if legacy.global_epoch != record.global_epoch:
-            raise NeuralTrainingError("RSNA epoch callback adaptation is inconsistent")
-        _best_effort_callback(throughput_callback, legacy, value)
-
-    result = fit_selected_two_stage_binary_model(
-        model,
-        train_loader,
-        validation_loader,
-        input_keys=input_keys,
-        config=config,
-        runtime=runtime,
-        pos_weight=pos_weight,
-        selection_metric=selection_metric,
-        fine_tune_scope="all",
-        epoch_callback=adapt_epoch,
-        epoch_started_callback=epoch_started_callback,
-        stage_callback=stage_callback,
-        progress_callback=progress_callback,
-        throughput_callback=adapt_throughput,
-    )
-    return NeuralFitResult(
-        selected_state_dict=result.selected_state_dict,
-        selected_epoch=result.selected_epoch,
-        selected_stage=result.selected_stage,
-        selected_validation_average_precision=result.selected_validation_metric,
-        history=tuple(selected_history),
-    )
-
-
-def fit_selected_two_stage_binary_model(
-    model: nn.Module,
-    train_loader: DataLoader[Any],
-    validation_loader: DataLoader[Any],
-    *,
-    input_keys: tuple[str, ...],
-    config: NeuralConfig,
-    runtime: ResolvedDevice,
-    pos_weight: float,
-    selection_metric: SelectionMetricName,
     fine_tune_scope: FineTuneScope,
-    epoch_callback: SelectedEpochCallback | None = None,
+    epoch_callback: TrainingEpochCallback | None = None,
     epoch_started_callback: EpochStartedCallback | None = None,
     stage_callback: StageCallback | None = None,
     progress_callback: NeuralProgressCallback | None = None,
-    throughput_callback: SelectedEpochThroughputCallback | None = None,
-) -> SelectedMetricFitResult:
+    throughput_callback: TrainingEpochThroughputCallback | None = None,
+) -> SelectedTrainingResult:
     """Run one shared two-stage lifecycle under an explicit selection metric."""
     _validate_input_keys(input_keys)
     if selection_metric not in {"average_precision", "roc_auc"}:
@@ -577,7 +508,7 @@ def fit_selected_two_stage_binary_model(
     best_state: dict[str, torch.Tensor] | None = None
     selected_epoch = 0
     selected_stage = ""
-    history: list[SelectedMetricEpochRecord] = []
+    history: list[TrainingEpochRecord] = []
     global_epoch = 0
 
     neural_model.freeze_encoder()
@@ -628,7 +559,7 @@ def fit_selected_two_stage_binary_model(
             best_state = copy_state_dict_to_cpu(model)
             selected_epoch = global_epoch
             selected_stage = "warmup"
-        record = SelectedMetricEpochRecord(
+        record = TrainingEpochRecord(
             global_epoch,
             stage_epoch,
             "warmup",
@@ -733,7 +664,7 @@ def fit_selected_two_stage_binary_model(
         else:
             no_improvement += 1
         scheduler.step(metric)
-        record = SelectedMetricEpochRecord(
+        record = TrainingEpochRecord(
             global_epoch,
             stage_epoch,
             "fine_tune",
@@ -763,7 +694,7 @@ def fit_selected_two_stage_binary_model(
             break
     if best_state is None or selected_stage not in {"warmup", "fine_tune"}:
         raise NeuralTrainingError("Training did not produce a selected validation checkpoint")
-    return SelectedMetricFitResult(
+    return SelectedTrainingResult(
         selected_state_dict=best_state,
         selected_epoch=selected_epoch,
         selected_stage=selected_stage,

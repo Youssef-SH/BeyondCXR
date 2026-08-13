@@ -1,4 +1,4 @@
-"""Define the fixed RSNA image-metadata concat model."""
+"""Define shared concat-fusion primitives and the RSNA CXR-metadata implementation."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from radfusion.training.config import FamilyConfig
 
 
 class ConcatFusionHead(nn.Module):
-    """Project image and structured representations into one binary head."""
+    """Project CXR and structured representations into one binary head."""
 
     def __init__(self, architecture: Mapping[str, int | float]) -> None:
         super().__init__()
@@ -45,10 +45,10 @@ class ConcatFusionHead(nn.Module):
         )
 
     def forward(self, image_embedding: torch.Tensor, structured: torch.Tensor) -> torch.Tensor:
-        """Return one raw binary logit per aligned image-structured row."""
+        """Return one raw binary logit per aligned CXR-structured row."""
         if image_embedding.ndim != 2 or image_embedding.shape[1] != self.image_embedding_dimension:
             raise ValueError(
-                f"Fusion image embeddings must have shape N x {self.image_embedding_dimension}"
+                f"Fusion CXR embeddings must have shape N x {self.image_embedding_dimension}"
             )
         if (
             structured.ndim != 2
@@ -96,18 +96,18 @@ class RsnaConcatFusionModel(nn.Module):
         return self.classifier(image_embedding, structured)
 
     def freeze_encoder(self) -> None:
-        """Freeze only the DenseNet image encoder."""
+        """Freeze only the DenseNet CXR encoder."""
         for parameter in self.encoder.parameters():
             parameter.requires_grad = False
 
     def unfreeze_encoder(self) -> None:
-        """Restore DenseNet image-encoder trainability."""
+        """Restore DenseNet CXR-encoder trainability."""
         for parameter in self.encoder.parameters():
             parameter.requires_grad = True
 
 
-class FusionConcatModel:
-    """Build the fixed RSNA image-metadata concat model."""
+class RsnaCxrMetadataConcatModel:
+    """Build the fixed RSNA CXR-metadata concat model."""
 
     def __init__(
         self,
@@ -181,7 +181,7 @@ def initialize_fusion_encoder(
     model: RsnaConcatFusionModel,
     source_state: Mapping[str, torch.Tensor],
 ) -> None:
-    """Strictly initialize only the fusion image encoder from a CXR checkpoint."""
+    """Strictly initialize only the fusion CXR encoder from a CXR checkpoint."""
     prefix = "encoder."
     extracted = {
         key[len(prefix) :]: value

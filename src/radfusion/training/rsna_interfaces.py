@@ -1,11 +1,11 @@
-"""Define typed boundaries for tabular experiment components."""
+"""Define typed boundaries for RSNA experiment components."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import pandas as pd
@@ -14,10 +14,18 @@ from torch import nn
 
 from radfusion.training.config import ExperimentConfig, FamilyConfig
 
+if TYPE_CHECKING:
+    from radfusion.training.rsna_datasets import (
+        CxrRunData,
+        CxrTestData,
+        FusionRunData,
+        FusionTestData,
+    )
+
 
 @dataclass(frozen=True)
 class DatasetLineage:
-    """Pinned dataset and task lineage shared by all partitions."""
+    """Pinned RSNA dataset and task lineage shared by all partitions."""
 
     bundle_id: str
     split_assignment_id: str
@@ -27,7 +35,7 @@ class DatasetLineage:
 
 @dataclass(frozen=True)
 class DatasetPartition:
-    """Approved model inputs separated from identifiers and partition lineage."""
+    """Own mutable scientific arrays for one approved, isolated RSNA partition."""
 
     features: pd.DataFrame
     targets: np.ndarray
@@ -38,7 +46,7 @@ class DatasetPartition:
 
 @dataclass(frozen=True)
 class DatasetRunData:
-    """The only partitions available to the training runner."""
+    """The only RSNA partitions available to the training runner."""
 
     train: DatasetPartition
     validation: DatasetPartition
@@ -47,7 +55,7 @@ class DatasetRunData:
 
 @dataclass(frozen=True)
 class ModelFitResult:
-    """Fitted pipeline and model-derived logging parameters."""
+    """Fitted RSNA metadata pipeline and model-derived logging parameters."""
 
     pipeline: Pipeline
     derived_parameters: Mapping[str, Any]
@@ -60,8 +68,8 @@ class ModelFitResult:
         )
 
 
-class DatasetImplementation(Protocol):
-    """Dataset adapter used by the tabular runner and evaluator."""
+class RsnaDatasetImplementation(Protocol):
+    """RSNA dataset adapter used by training and evaluation runners."""
 
     def load_train_validation(self, config: ExperimentConfig) -> DatasetRunData:
         """Load only train and validation partitions from a pinned bundle."""
@@ -72,18 +80,18 @@ class DatasetImplementation(Protocol):
     def load_test(self, config: ExperimentConfig) -> tuple[DatasetPartition, DatasetLineage]:
         """Load only the test partition and its pinned lineage."""
 
-    def load_image_train_validation(self, config: ExperimentConfig) -> Any:
-        """Load source-inventory-bound image train and validation rows."""
+    def load_cxr_train_validation(self, config: ExperimentConfig) -> CxrRunData:
+        """Load source-inventory-bound CXR train and validation rows."""
 
-    def load_image_test(
+    def load_cxr_test(
         self,
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
-    ) -> Any:
-        """Load source-inventory-bound image test rows."""
+    ) -> CxrTestData:
+        """Load source-inventory-bound CXR test rows."""
 
-    def load_fusion_train_validation(self, config: ExperimentConfig) -> Any:
+    def load_fusion_train_validation(self, config: ExperimentConfig) -> FusionRunData:
         """Load source-inventory-bound aligned fusion train and validation rows."""
 
     def load_fusion_test(
@@ -91,12 +99,12 @@ class DatasetImplementation(Protocol):
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
-    ) -> Any:
+    ) -> FusionTestData:
         """Load source-inventory-bound aligned fusion test rows."""
 
 
-class ModelImplementation(Protocol):
-    """Registered model implementation used by the experiment runner."""
+class RsnaMetadataModelImplementation(Protocol):
+    """Registered RSNA metadata model implementation."""
 
     def fit(
         self,
@@ -110,15 +118,18 @@ class ModelImplementation(Protocol):
         """Fit one model from training data with validation monitoring."""
 
 
-class ImageModelImplementation(Protocol):
-    """Registered image model builder used by the neural runner."""
+class RsnaCxrModelImplementation(Protocol):
+    """Registered RSNA CXR model builder used by the neural runner."""
 
     def build(self, config: FamilyConfig) -> nn.Module:
-        """Build an unfitted image model."""
+        """Build an unfitted CXR model."""
+
+    def build_architecture(self, config: FamilyConfig) -> nn.Module:
+        """Build the package architecture without loading pretrained weights."""
 
 
-class FusionModelImplementation(Protocol):
-    """Registered fusion model builder used by the neural runner."""
+class RsnaFusionModelImplementation(Protocol):
+    """Registered RSNA fusion model builder used by the neural runner."""
 
     def build(
         self,
