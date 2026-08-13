@@ -13,10 +13,10 @@ import mlflow
 import numpy as np
 from sklearn.pipeline import Pipeline
 
-from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
-from radfusion.data.tabular_preprocess import (
+from radfusion.data.rsna_cxr_cache import ValidatedCxrCache
+from radfusion.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     build_rsna_preprocessor,
     fitted_rsna_preprocessor_contract,
@@ -44,13 +44,6 @@ from radfusion.training.config import (
     ExperimentConfig,
     require_runtime_seed,
 )
-from radfusion.training.datasets import (
-    FusionRunData,
-    RsnaCachedFusionDataset,
-    RsnaDataset,
-    expected_rsna_cxr_cache_identity,
-    prepare_rsna_cxr_cache,
-)
 from radfusion.training.device import resolve_device
 from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from radfusion.training.fusion_source import (
@@ -68,12 +61,19 @@ from radfusion.training.neural import (
     seed_neural_runtime,
     training_class_weight,
 )
-from radfusion.training.registry import get_dataset, get_model
-from radfusion.training.train_image import (
+from radfusion.training.rsna_datasets import (
+    FusionRunData,
+    RsnaCachedFusionDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
+from radfusion.training.rsna_registry import get_dataset, get_model
+from radfusion.training.rsna_train_cxr import (
     NEURAL_METRICS_POLICY_VERSION,
     NEURAL_THRESHOLD_POLICY_VERSION,
 )
-from radfusion.training.train_tabular import (
+from radfusion.training.rsna_train_metadata import (
     metrics_document,
     mlflow_metrics,
     validate_report_set,

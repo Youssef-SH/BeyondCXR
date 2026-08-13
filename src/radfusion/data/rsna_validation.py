@@ -14,18 +14,18 @@ from radfusion.data.rsna_dicom import (
     ALLOWED_VIEW_POSITIONS,
     validate_spacing_pair,
 )
-from radfusion.data.rsna_source import (
-    RSNA_CLASS_VALUES,
-    canonical_image_path,
-    resolve_image_path,
-)
-from radfusion.data.schemas import (
+from radfusion.data.rsna_schemas import (
     PNEUMONIA_TASK_ID,
     RSNA_ANNOTATION_SCHEMA,
     RSNA_CLASS_TASK_ID,
     RSNA_LABEL_SCHEMA,
     RSNA_SAMPLE_SCHEMA,
     require_exact_schema,
+)
+from radfusion.data.rsna_source import (
+    RSNA_CLASS_VALUES,
+    canonical_image_path,
+    resolve_image_path,
 )
 
 

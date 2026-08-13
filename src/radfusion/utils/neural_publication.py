@@ -16,9 +16,9 @@ from typing import Any
 
 import torch
 
-from radfusion.data.cxr_cache import CxrCacheSourceAuthentication
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.hashing import sha256_file
+from radfusion.data.rsna_cxr_cache import CxrCacheSourceAuthentication
 from radfusion.models.fusion_concat import (
     fusion_architecture_contract,
     fusion_structured_input_conversion_contract,

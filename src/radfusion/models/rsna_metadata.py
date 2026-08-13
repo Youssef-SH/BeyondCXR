@@ -10,10 +10,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score
 from sklearn.pipeline import Pipeline
 
-from radfusion.data.tabular_preprocess import build_rsna_preprocessor
+from radfusion.data.rsna_metadata_preprocess import build_rsna_preprocessor
 from radfusion.evaluation.metrics import validated_binary_targets
 from radfusion.training.config import ExperimentConfig
-from radfusion.training.interfaces import ModelFitResult
+from radfusion.training.rsna_interfaces import ModelFitResult
 
 
 class MetadataLogisticModel:

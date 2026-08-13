@@ -12,10 +12,10 @@ from mlflow.exceptions import MlflowException
 from sqlalchemy.exc import SQLAlchemyError
 
 from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
-from radfusion.training.registry import RegistryError
-from radfusion.training.train_fusion import train_fusion_experiment
-from radfusion.training.train_image import train_image_experiment
-from radfusion.training.train_tabular import train_configured_experiment
+from radfusion.training.rsna_registry import RegistryError
+from radfusion.training.rsna_train_cxr import train_image_experiment
+from radfusion.training.rsna_train_fusion import train_fusion_experiment
+from radfusion.training.rsna_train_metadata import train_configured_experiment
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI
 from radfusion.utils.operational_logging import add_logging_argument, configure_logging
 

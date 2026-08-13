@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
-from radfusion.training.train import main as train_main
+from radfusion.training.rsna_train import main as train_main
 
 
 def _image_document() -> dict[str, object]:
@@ -139,7 +139,7 @@ def test_image_config_dispatches_to_image_runner(monkeypatch, capsys) -> None:
             },
         )()
 
-    monkeypatch.setattr("radfusion.training.train.train_image_experiment", fake_training)
+    monkeypatch.setattr("radfusion.training.rsna_train.train_image_experiment", fake_training)
 
     assert train_main(["--config", "configs/rsna_cxr_densenet.yaml", "--seed", "42"]) == 0
     assert captured["config"].family.modalities == ("cxr",)

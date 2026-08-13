@@ -6,8 +6,7 @@ import pyarrow as pa
 import pytest
 import skops.io as sio
 
-from radfusion.data.schemas import RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from radfusion.data.tabular_preprocess import (
+from radfusion.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     RsnaMetadataFeatures,
     build_rsna_preprocessor,
@@ -19,6 +18,7 @@ from radfusion.data.tabular_preprocess import (
     transformed_rsna_feature_names,
     validate_fitted_rsna_preprocessor,
 )
+from radfusion.data.rsna_schemas import RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
 
 
 def _tables() -> tuple[pa.Table, pa.Table]:

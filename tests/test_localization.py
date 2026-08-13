@@ -22,7 +22,6 @@ from radfusion.evaluation.localization import (
 )
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
 from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.datasets import RsnaDataset
 from radfusion.training.localize import (
     _evaluate_member,
     _gradcam_indices,
@@ -32,6 +31,7 @@ from radfusion.training.localize import (
     _validate_localization_output_boundaries,
     generate_localization_report,
 )
+from radfusion.training.rsna_datasets import RsnaDataset
 from radfusion.utils.operational_logging import configure_logging
 
 

@@ -18,15 +18,15 @@ import yaml
 from torch import nn
 from torch.utils.data import Dataset
 
-from radfusion.data.cxr_cache import (
+from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.errors import ManifestBuildError
+from radfusion.data.hashing import sha256_file
+from radfusion.data.rsna_cxr_cache import (
     SOURCE_AUTHENTICATION_POLICY_VERSION,
     CxrCacheIdentity,
     CxrCacheSourceAuthentication,
     preprocessing_identity,
 )
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import sha256_file
 from radfusion.models.cxr_baseline import PretrainedWeightIdentity
 from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (
@@ -34,15 +34,9 @@ from radfusion.training.config import (
     load_experiment_config,
     with_runtime,
 )
-from radfusion.training.datasets import (
-    ImageRunData,
-    ImageTestData,
-    SourceInventoryIdentity,
-)
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
 from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
-from radfusion.training.interfaces import DatasetLineage
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
     NeuralTrainingError,
@@ -59,7 +53,13 @@ from radfusion.training.neural import (
 from radfusion.training.neural import (
     build_image_loaders as _build_image_loaders,
 )
-from radfusion.training.train_image import train_image_experiment
+from radfusion.training.rsna_datasets import (
+    ImageRunData,
+    ImageTestData,
+    SourceInventoryIdentity,
+)
+from radfusion.training.rsna_interfaces import DatasetLineage
+from radfusion.training.rsna_train_cxr import train_image_experiment
 from radfusion.utils.mlflow_utils import configure_mlflow
 from radfusion.utils.model_publication import threshold_contract
 from radfusion.utils.neural_publication import (
@@ -1261,14 +1261,16 @@ def test_dataset_loading_failure_precedes_model_construction(
             del dataset_config
             raise ManifestBuildError("dataset loading failed")
 
-    monkeypatch.setattr("radfusion.training.train_image.get_dataset", lambda key: FailingAdapter())
     monkeypatch.setattr(
-        "radfusion.training.train_image.get_model", lambda key: model_requested.append(key)
+        "radfusion.training.rsna_train_cxr.get_dataset", lambda key: FailingAdapter()
     )
     monkeypatch.setattr(
-        "radfusion.training.train_image.git_revision", lambda: ("commit-test", False)
+        "radfusion.training.rsna_train_cxr.get_model", lambda key: model_requested.append(key)
     )
-    monkeypatch.setattr("radfusion.training.train_image.uv_lock_sha256", lambda: "9" * 64)
+    monkeypatch.setattr(
+        "radfusion.training.rsna_train_cxr.git_revision", lambda: ("commit-test", False)
+    )
+    monkeypatch.setattr("radfusion.training.rsna_train_cxr.uv_lock_sha256", lambda: "9" * 64)
     tracking_uri = f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}"
 
     with pytest.raises(ManifestBuildError):
@@ -1395,7 +1397,7 @@ def _synthetic_image_lifecycle(
         del kwargs
         return _TensorDataset(frame_value["target"].astype(int).tolist())
 
-    for module in ("radfusion.training.train_image", "radfusion.training.evaluate_image"):
+    for module in ("radfusion.training.rsna_train_cxr", "radfusion.training.evaluate_image"):
         monkeypatch.setattr(f"{module}.get_dataset", lambda key: adapter)
         monkeypatch.setattr(f"{module}.get_model", lambda key: Builder())
         monkeypatch.setattr(f"{module}.RsnaCachedImageDataset", synthetic_dataset)
@@ -1431,12 +1433,12 @@ def _synthetic_image_lifecycle(
         return weight
 
     monkeypatch.setattr(
-        "radfusion.training.train_image.fingerprint_pretrained_weights",
+        "radfusion.training.rsna_train_cxr.fingerprint_pretrained_weights",
         fingerprint,
     )
 
     seed_calls = []
-    monkeypatch.setattr("radfusion.training.train_image.seed_neural_runtime", seed_calls.append)
+    monkeypatch.setattr("radfusion.training.rsna_train_cxr.seed_neural_runtime", seed_calls.append)
 
     tracking_uri = f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}"
     return _SyntheticImageLifecycle(
@@ -1474,7 +1476,7 @@ def test_cache_failure_precedes_neural_model_construction(
 ) -> None:
     setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        "radfusion.training.train_image.prepare_rsna_cxr_cache",
+        "radfusion.training.rsna_train_cxr.prepare_rsna_cxr_cache",
         lambda *args, **kwargs: (_ for _ in ()).throw(ManifestBuildError("cache invalid")),
     )
 
@@ -1501,7 +1503,7 @@ def test_image_training_progress_accepts_unsized_validation_loader(
         return type(loaders)(loaders.train, UnsizedLoader(loaders.validation))
 
     monkeypatch.setattr(
-        "radfusion.training.train_image.build_image_loaders", unsized_validation_loader
+        "radfusion.training.rsna_train_cxr.build_image_loaders", unsized_validation_loader
     )
 
     result = train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
@@ -1585,11 +1587,11 @@ def test_pretrained_weight_mutation_aborts_before_fitting(
     )
     observed = iter((setup.weight, changed))
     monkeypatch.setattr(
-        "radfusion.training.train_image.fingerprint_pretrained_weights",
+        "radfusion.training.rsna_train_cxr.fingerprint_pretrained_weights",
         lambda weights: next(observed),
     )
     monkeypatch.setattr(
-        "radfusion.training.train_image.fit_image_model",
+        "radfusion.training.rsna_train_cxr.fit_image_model",
         lambda *args, **kwargs: pytest.fail("fitting must not begin"),
     )
 
@@ -1607,7 +1609,7 @@ def test_missing_pretrained_weight_prevents_model_construction(
         raise FileNotFoundError("must be materialized before formal training")
 
     monkeypatch.setattr(
-        "radfusion.training.train_image.fingerprint_pretrained_weights",
+        "radfusion.training.rsna_train_cxr.fingerprint_pretrained_weights",
         missing_weight,
     )
     with pytest.raises(FileNotFoundError):
@@ -1622,7 +1624,7 @@ def test_pretrained_weight_mutation_cleans_outputs_and_leaves_run_incomplete(
     setup = _synthetic_image_lifecycle(tmp_path, monkeypatch)
     observed = iter((setup.weight, replace(setup.weight, sha256="0" * 64)))
     monkeypatch.setattr(
-        "radfusion.training.train_image.fingerprint_pretrained_weights",
+        "radfusion.training.rsna_train_cxr.fingerprint_pretrained_weights",
         lambda weights: next(observed),
     )
 
@@ -1749,7 +1751,7 @@ def test_image_publication_failures_remain_incomplete(
         for run_id in failed_evaluation_ids
     )
 
-    monkeypatch.setattr("radfusion.training.train_image.write_run_reports", fail_publication)
+    monkeypatch.setattr("radfusion.training.rsna_train_cxr.write_run_reports", fail_publication)
     with pytest.raises(OSError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)
     runs_after_training_failure = client.search_runs(
@@ -1787,7 +1789,7 @@ def test_image_rollback_failure_path_has_no_final_publication_event(
             raise RuntimeError("post-publication metadata failed")
         original_set_tags(tags)
 
-    monkeypatch.setattr("radfusion.training.train_image.mlflow.set_tags", fail_after_publication)
+    monkeypatch.setattr("radfusion.training.rsna_train_cxr.mlflow.set_tags", fail_after_publication)
 
     with pytest.raises(RuntimeError):
         train_image_experiment(setup.config, tracking_uri=setup.tracking_uri)

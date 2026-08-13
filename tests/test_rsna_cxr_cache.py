@@ -13,24 +13,24 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from radfusion.data.cxr_cache import (
+from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.dicom_loader import DicomRecord
+from radfusion.data.errors import ManifestBuildError
+from radfusion.data.hashing import sha256_file
+from radfusion.data.rsna_cxr_cache import (
     CxrCacheIdentity,
     build_cxr_cache,
     preprocessing_identity,
     validate_cxr_cache,
 )
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.dicom_loader import DicomRecord
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import sha256_file
 from radfusion.training.config import load_experiment_config
-from radfusion.training.datasets import (
-    RsnaCachedFusionDataset,
-    RsnaCachedImageDataset,
-)
 from radfusion.training.device import resolve_device
 from radfusion.training.execution import LoaderExecutionPolicy
 from radfusion.training.neural import EpochPermutationSampler, build_image_loaders
+from radfusion.training.rsna_datasets import (
+    RsnaCachedFusionDataset,
+    RsnaCachedImageDataset,
+)
 
 
 class _WorkerDigestDataset:
@@ -116,7 +116,7 @@ def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             photometric_interpretation="MONOCHROME2",
         )
 
-    monkeypatch.setattr("radfusion.data.cxr_cache.read_dicom", decode)
+    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.read_dicom", decode)
     transform = StandardCxrTransform(training=False)
     built = build_cxr_cache(
         _cache_frame(),
@@ -172,7 +172,7 @@ def test_cache_source_frame_requires_all_three_partitions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "radfusion.data.cxr_cache.read_dicom",
+        "radfusion.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded partial cache")),
     )
     with pytest.raises(ManifestBuildError):
@@ -189,7 +189,7 @@ def test_cache_source_frame_rejects_task_columns_before_decoding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "radfusion.data.cxr_cache.read_dicom",
+        "radfusion.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded labeled rows")),
     )
 
@@ -279,7 +279,7 @@ def test_interrupted_cache_publication_cannot_leave_a_valid_destination(
         del stage, destination
         raise OSError("interrupted publication")
 
-    monkeypatch.setattr("radfusion.data.cxr_cache.publish_directory", interrupt)
+    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.publish_directory", interrupt)
     with pytest.raises(OSError):
         build_cxr_cache(
             _cache_frame(),
@@ -306,7 +306,7 @@ def test_cache_mmaps_close_on_build_and_validation_failure(
 
     monkeypatch.setattr(np.lib.format, "open_memmap", tracked_open_memmap)
     monkeypatch.setattr(
-        "radfusion.data.cxr_cache.read_dicom",
+        "radfusion.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError((args, kwargs))),
     )
     identity = replace(built.identity, bundle_manifest_sha256="4" * 64)
@@ -376,7 +376,7 @@ def test_cache_build_rejects_unsafe_paths_and_decoded_patient_mismatch(
             photometric_interpretation="MONOCHROME2",
         )
 
-    monkeypatch.setattr("radfusion.data.cxr_cache.read_dicom", wrong_patient)
+    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.read_dicom", wrong_patient)
     with pytest.raises(ManifestBuildError):
         build_cxr_cache(
             _cache_frame(),

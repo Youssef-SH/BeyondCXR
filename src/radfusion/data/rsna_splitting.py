@@ -11,9 +11,9 @@ from typing import Any
 
 import pyarrow as pa
 
-from radfusion.data.artifact_validation import pneumonia_targets
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.schemas import PNEUMONIA_TASK_ID, RSNA_SPLIT_SCHEMA, require_exact_schema
+from radfusion.data.rsna_schemas import PNEUMONIA_TASK_ID, RSNA_SPLIT_SCHEMA, require_exact_schema
+from radfusion.data.rsna_validation import pneumonia_targets
 
 SPLIT_NAMES = ("train", "validation", "test")
 SPLIT_ALGORITHM = "patient-stratified-sha256"

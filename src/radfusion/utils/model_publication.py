@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from radfusion.data.hashing import sha256_file
-from radfusion.data.tabular_preprocess import metadata_input_contract
+from radfusion.data.rsna_metadata_preprocess import metadata_input_contract
 from radfusion.utils.skops_io import trusted_types_for_file
 
 MODEL_FILENAME = "model.skops"

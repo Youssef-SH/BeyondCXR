@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 from sklearn.linear_model import LogisticRegression
 
-from radfusion.data.tabular_preprocess import metadata_input_contract
+from radfusion.data.rsna_metadata_preprocess import metadata_input_contract
 from radfusion.utils.model_publication import (
     MODEL_PACKAGE_ID_PREFIX,
     REQUIRED_MANIFEST_FIELDS,

@@ -8,9 +8,9 @@ import pyarrow as pa
 import pytest
 
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.tabular_preprocess import SOURCE_FEATURES
+from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
-from radfusion.training.datasets import RsnaDataset, _image_cache_frame
+from radfusion.training.rsna_datasets import RsnaDataset, _image_cache_frame
 
 
 def _tables() -> dict[str, pa.Table]:
@@ -83,7 +83,7 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
             },
         }
 
-    monkeypatch.setattr("radfusion.training.datasets.validate_bundle_directory", validate)
+    monkeypatch.setattr("radfusion.training.rsna_datasets.validate_bundle_directory", validate)
 
     def validate_reference(
         path, *, expected_bundle_id, expected_manifest_sha256
@@ -95,7 +95,9 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
             manifest_sha256=expected_manifest_sha256,
         )
 
-    monkeypatch.setattr("radfusion.training.datasets.validate_bundle_reference", validate_reference)
+    monkeypatch.setattr(
+        "radfusion.training.rsna_datasets.validate_bundle_reference", validate_reference
+    )
 
     def read_table(path, *, columns, filters):
         filename = Path(path).name
@@ -111,7 +113,7 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
                 raise AssertionError(f"Unexpected filter operator: {operator}")
         return pa.Table.from_pylist([{column: row[column] for column in columns} for row in rows])
 
-    monkeypatch.setattr("radfusion.training.datasets.pq.read_table", read_table)
+    monkeypatch.setattr("radfusion.training.rsna_datasets.pq.read_table", read_table)
 
     data = RsnaDataset().load_train_validation(config)
     test, lineage = RsnaDataset().load_test(config)
@@ -239,13 +241,15 @@ def test_rsna_adapter_rejects_every_mismatched_configured_witness_before_rows(
             manifest_sha256=baseline.dataset.bundle_manifest_sha256,
         )
 
-    monkeypatch.setattr("radfusion.training.datasets.validate_bundle_reference", validate_reference)
     monkeypatch.setattr(
-        "radfusion.training.datasets.validate_bundle_directory",
+        "radfusion.training.rsna_datasets.validate_bundle_reference", validate_reference
+    )
+    monkeypatch.setattr(
+        "radfusion.training.rsna_datasets.validate_bundle_directory",
         lambda *args, **kwargs: metadata,
     )
     monkeypatch.setattr(
-        "radfusion.training.datasets.pq.read_table",
+        "radfusion.training.rsna_datasets.pq.read_table",
         lambda *args, **kwargs: pytest.fail("row access occurred before witness rejection"),
     )
 
@@ -265,7 +269,7 @@ def test_cache_source_frame_reads_samples_and_splits_without_task_labels(
         rows = tables[filename].to_pylist()
         return pa.Table.from_pylist([{column: row[column] for column in columns} for row in rows])
 
-    monkeypatch.setattr("radfusion.training.datasets.pq.read_table", read_table)
+    monkeypatch.setattr("radfusion.training.rsna_datasets.pq.read_table", read_table)
     frame = _image_cache_frame(
         SimpleNamespace(
             splits_path=Path("splits.parquet"),

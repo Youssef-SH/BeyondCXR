@@ -11,9 +11,9 @@ from typing import cast
 import mlflow
 import numpy as np
 
-from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.tabular_preprocess import SOURCE_FEATURES, transform_rsna_metadata
+from radfusion.data.rsna_cxr_cache import ValidatedCxrCache
+from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES, transform_rsna_metadata
 from radfusion.evaluation.metrics import evaluate_operating_point, evaluate_probabilities
 from radfusion.models.fusion_concat import (
     FusionConcatModel,
@@ -25,19 +25,19 @@ from radfusion.training.config import (
     require_runtime_seed,
     with_runtime,
 )
-from radfusion.training.datasets import (
+from radfusion.training.device import resolve_device
+from radfusion.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
+from radfusion.training.fusion_source import resolve_source_cxr_training_run
+from radfusion.training.neural import build_evaluation_loader, deterministic_inference
+from radfusion.training.rsna_datasets import (
     RsnaCachedFusionDataset,
     RsnaDataset,
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
-from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
-from radfusion.training.fusion_source import resolve_source_cxr_training_run
-from radfusion.training.neural import build_evaluation_loader, deterministic_inference
-from radfusion.training.registry import get_dataset, get_model
-from radfusion.training.train_fusion import load_validated_rsna_fusion_preprocessor
-from radfusion.training.train_tabular import (
+from radfusion.training.rsna_registry import get_dataset, get_model
+from radfusion.training.rsna_train_fusion import load_validated_rsna_fusion_preprocessor
+from radfusion.training.rsna_train_metadata import (
     metrics_document,
     mlflow_metrics,
     validate_report_set,

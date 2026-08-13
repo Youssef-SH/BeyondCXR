@@ -8,7 +8,7 @@ from radfusion.evaluation.metrics import (
     target_sensitivity_threshold,
 )
 from radfusion.training.config import load_experiment_config
-from radfusion.training.train_tabular import (
+from radfusion.training.rsna_train_metadata import (
     _write_evaluation_report,
     metrics_document,
 )

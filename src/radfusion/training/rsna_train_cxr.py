@@ -14,8 +14,8 @@ import mlflow
 import numpy as np
 from torch import nn
 
-from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.rsna_cxr_cache import ValidatedCxrCache
 from radfusion.evaluation.metrics import (
     OperatingPointMetrics,
     ProbabilityMetrics,
@@ -29,16 +29,8 @@ from radfusion.training.config import (
     ExperimentConfig,
     require_runtime_seed,
 )
-from radfusion.training.datasets import (
-    ImageRunData,
-    RsnaCachedImageDataset,
-    RsnaDataset,
-    expected_rsna_cxr_cache_identity,
-    prepare_rsna_cxr_cache,
-)
 from radfusion.training.device import resolve_device
 from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
-from radfusion.training.interfaces import ImageModelImplementation
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
     EpochRecord,
@@ -50,8 +42,16 @@ from radfusion.training.neural import (
     seed_neural_runtime,
     training_class_weight,
 )
-from radfusion.training.registry import get_dataset, get_model
-from radfusion.training.train_tabular import (
+from radfusion.training.rsna_datasets import (
+    ImageRunData,
+    RsnaCachedImageDataset,
+    RsnaDataset,
+    expected_rsna_cxr_cache_identity,
+    prepare_rsna_cxr_cache,
+)
+from radfusion.training.rsna_interfaces import ImageModelImplementation
+from radfusion.training.rsna_registry import get_dataset, get_model
+from radfusion.training.rsna_train_metadata import (
     metrics_document,
     mlflow_metrics,
     validate_report_set,

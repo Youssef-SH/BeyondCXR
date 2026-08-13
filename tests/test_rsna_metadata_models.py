@@ -10,9 +10,9 @@ import pytest
 import skops.io as sio
 import yaml
 
-from radfusion.models.tabular_baseline import MetadataLightgbmModel, MetadataLogisticModel
+from radfusion.models.rsna_metadata import MetadataLightgbmModel, MetadataLogisticModel
 from radfusion.training.config import load_experiment_config
-from radfusion.training.registry import get_model
+from radfusion.training.rsna_registry import get_model
 from radfusion.utils.mlflow_utils import cpu_model, environment_provenance
 from radfusion.utils.skops_io import load_skops, save_skops
 

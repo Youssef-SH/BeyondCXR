@@ -6,9 +6,9 @@ from types import MappingProxyType
 
 from radfusion.models.cxr_baseline import ImageDenseNetModel
 from radfusion.models.fusion_concat import FusionConcatModel
-from radfusion.models.tabular_baseline import MetadataLightgbmModel, MetadataLogisticModel
-from radfusion.training.datasets import RsnaDataset
-from radfusion.training.interfaces import (
+from radfusion.models.rsna_metadata import MetadataLightgbmModel, MetadataLogisticModel
+from radfusion.training.rsna_datasets import RsnaDataset
+from radfusion.training.rsna_interfaces import (
     DatasetImplementation,
     FusionModelImplementation,
     ImageModelImplementation,

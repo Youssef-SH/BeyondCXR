@@ -13,13 +13,6 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-from radfusion.data.cxr_cache import (
-    CXR_CACHE_FRAME_COLUMNS,
-    CxrCacheIdentity,
-    ValidatedCxrCache,
-    build_cxr_cache,
-    preprocessing_identity,
-)
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_artifacts import (
@@ -33,10 +26,17 @@ from radfusion.data.rsna_artifacts import (
     validate_bundle_directory,
     validate_bundle_reference,
 )
-from radfusion.data.tabular_preprocess import SOURCE_FEATURES
+from radfusion.data.rsna_cxr_cache import (
+    CXR_CACHE_FRAME_COLUMNS,
+    CxrCacheIdentity,
+    ValidatedCxrCache,
+    build_cxr_cache,
+    preprocessing_identity,
+)
+from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from radfusion.evaluation.metrics import validated_binary_targets
 from radfusion.training.config import ExperimentConfig
-from radfusion.training.interfaces import DatasetLineage, DatasetPartition, DatasetRunData
+from radfusion.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
 
 _IMAGE_FRAME_COLUMNS = ("sample_id", "patient_id", "image_path", "split_name", "target")
 _FUSION_FRAME_COLUMNS = (

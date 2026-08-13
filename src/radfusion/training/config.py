@@ -16,8 +16,8 @@ from yaml.nodes import MappingNode
 
 from radfusion.data.bundle_contract import valid_bundle_id
 from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, STANDARD_CXR_IMAGE_SIZE
+from radfusion.data.rsna_metadata_preprocess import METADATA_INPUT_POLICY_VERSION
 from radfusion.data.symile_preprocess import LAB_ECDF_POLICY_VERSION
-from radfusion.data.tabular_preprocess import METADATA_INPUT_POLICY_VERSION
 
 
 class ConfigError(ValueError):

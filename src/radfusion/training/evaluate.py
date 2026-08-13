@@ -15,9 +15,9 @@ import mlflow
 from mlflow.exceptions import MlflowException
 from sqlalchemy.exc import SQLAlchemyError
 
-from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.hashing import sha256_file
-from radfusion.data.tabular_preprocess import validate_metadata_pipeline
+from radfusion.data.rsna_cxr_cache import ValidatedCxrCache
+from radfusion.data.rsna_metadata_preprocess import validate_metadata_pipeline
 from radfusion.evaluation.latency import (
     LATENCY_MEASURED_CALLS,
     LATENCY_WARMUP_CALLS,
@@ -41,8 +41,8 @@ from radfusion.training.evaluate_image import (
     evaluate_image_training_run,
 )
 from radfusion.training.execution import LoaderExecutionPolicy
-from radfusion.training.registry import RegistryError, get_dataset
-from radfusion.training.train_tabular import (
+from radfusion.training.rsna_registry import RegistryError, get_dataset
+from radfusion.training.rsna_train_metadata import (
     metrics_document,
     mlflow_metrics,
     validate_report_set,

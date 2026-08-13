@@ -13,7 +13,7 @@ import pytest
 from mlflow.tracking import MlflowClient
 
 from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.datasets import RsnaDataset
+from radfusion.training.rsna_datasets import RsnaDataset
 from radfusion.training.rsna_gpu import (
     CampaignConfigs,
     _validate_neural_campaign_configs,

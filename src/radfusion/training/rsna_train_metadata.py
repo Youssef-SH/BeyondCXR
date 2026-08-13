@@ -15,7 +15,10 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "radfusi
 import mlflow
 import numpy as np
 
-from radfusion.data.tabular_preprocess import metadata_input_contract, validate_metadata_pipeline
+from radfusion.data.rsna_metadata_preprocess import (
+    metadata_input_contract,
+    validate_metadata_pipeline,
+)
 from radfusion.evaluation.latency import (
     LATENCY_MEASURED_CALLS,
     LATENCY_SAMPLE_POLICY,
@@ -34,7 +37,7 @@ from radfusion.evaluation.metrics import (
 from radfusion.evaluation.plots import write_evaluation_plots
 from radfusion.evaluation.probabilities import positive_class_probabilities
 from radfusion.training.config import ExperimentConfig, require_runtime_seed
-from radfusion.training.registry import get_dataset, get_model
+from radfusion.training.rsna_registry import get_dataset, get_model
 from radfusion.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,

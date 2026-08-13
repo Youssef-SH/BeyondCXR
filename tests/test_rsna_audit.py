@@ -17,8 +17,8 @@ from radfusion.data.rsna_audit import (
     _label_distribution,
     generate_rsna_audit,
 )
-from radfusion.data.schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from radfusion.data.splitting import SplitConfig, split_assignment_id
+from radfusion.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
+from radfusion.data.rsna_splitting import SplitConfig, split_assignment_id
 
 
 def _audit_bundle(tmp_path: Path) -> SimpleNamespace:

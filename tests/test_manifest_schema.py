@@ -12,11 +12,6 @@ import pytest
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
-from radfusion.data.artifact_validation import (
-    validate_annotation_table,
-    validate_label_table,
-    validate_sample_table,
-)
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.rsna_artifacts import (
@@ -37,8 +32,7 @@ from radfusion.data.rsna_artifacts import (
 )
 from radfusion.data.rsna_audit import REPORT_FILENAMES, generate_rsna_audit
 from radfusion.data.rsna_manifest import main
-from radfusion.data.rsna_source import aggregate_labels
-from radfusion.data.schemas import (
+from radfusion.data.rsna_schemas import (
     PNEUMONIA_TASK_ID,
     RSNA_ANNOTATION_SCHEMA,
     RSNA_CLASS_TASK_ID,
@@ -47,8 +41,14 @@ from radfusion.data.schemas import (
     RSNA_SOURCE_INVENTORY_SCHEMA,
     RSNA_SPLIT_SCHEMA,
 )
+from radfusion.data.rsna_source import aggregate_labels
+from radfusion.data.rsna_validation import (
+    validate_annotation_table,
+    validate_label_table,
+    validate_sample_table,
+)
 from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.datasets import RsnaDataset
+from radfusion.training.rsna_datasets import RsnaDataset
 from radfusion.utils.privacy import validate_public_reports
 
 
@@ -922,7 +922,7 @@ def test_image_test_manifest_mismatch_fails_before_partition_access(
         source_root=tmp_path / "raw",
     )
     monkeypatch.setattr(
-        "radfusion.training.datasets._task_frame",
+        "radfusion.training.rsna_datasets._task_frame",
         lambda *args, **kwargs: pytest.fail((args, kwargs, "test partition access")),
     )
 

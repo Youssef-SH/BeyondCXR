@@ -16,9 +16,8 @@ from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
 from radfusion.data.rsna_artifacts import build_and_write
-from radfusion.data.tabular_preprocess import SOURCE_FEATURES
+from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.datasets import RsnaDataset
 from radfusion.training.evaluate import (
     TestEvaluationResult as EvaluationResult,
 )
@@ -29,8 +28,9 @@ from radfusion.training.evaluate import (
 from radfusion.training.evaluate import (
     main as evaluate_main,
 )
-from radfusion.training.interfaces import DatasetLineage, DatasetPartition, DatasetRunData
-from radfusion.training.train_tabular import train_configured_experiment, validate_report_set
+from radfusion.training.rsna_datasets import RsnaDataset
+from radfusion.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
+from radfusion.training.rsna_train_metadata import train_configured_experiment, validate_report_set
 from radfusion.utils.mlflow_utils import configure_mlflow
 from radfusion.utils.model_publication import (
     model_package_id,
@@ -87,8 +87,8 @@ def _config(
 
 @pytest.fixture(autouse=True)
 def _small_operational_latency_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("radfusion.training.train_tabular.LATENCY_WARMUP_CALLS", 1)
-    monkeypatch.setattr("radfusion.training.train_tabular.LATENCY_MEASURED_CALLS", 3)
+    monkeypatch.setattr("radfusion.training.rsna_train_metadata.LATENCY_WARMUP_CALLS", 1)
+    monkeypatch.setattr("radfusion.training.rsna_train_metadata.LATENCY_MEASURED_CALLS", 3)
     monkeypatch.setattr("radfusion.training.evaluate.LATENCY_WARMUP_CALLS", 1)
     monkeypatch.setattr("radfusion.training.evaluate.LATENCY_MEASURED_CALLS", 3)
 
@@ -138,10 +138,10 @@ def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, D
 
 def _fixed_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "radfusion.training.train_tabular.git_revision",
+        "radfusion.training.rsna_train_metadata.git_revision",
         lambda: ("commit-synthetic", False),
     )
-    monkeypatch.setattr("radfusion.training.train_tabular.uv_lock_sha256", lambda: _SHA256)
+    monkeypatch.setattr("radfusion.training.rsna_train_metadata.uv_lock_sha256", lambda: _SHA256)
     monkeypatch.setattr(
         "radfusion.training.evaluate.git_revision",
         lambda: ("commit-synthetic", False),
@@ -303,7 +303,9 @@ def test_fit_failure_leaves_failed_mlflow_run(
             assert mlflow.active_run() is not None
             raise RuntimeError("fit failed")
 
-    monkeypatch.setattr("radfusion.training.train_tabular.get_model", lambda _: FailingModel())
+    monkeypatch.setattr(
+        "radfusion.training.rsna_train_metadata.get_model", lambda _: FailingModel()
+    )
     with pytest.raises(RuntimeError):
         _train(config, tmp_path)
     runs = _client(tmp_path).search_runs(
@@ -371,7 +373,7 @@ def test_required_model_publication_failure_leaves_failed_mlflow_run(
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.train_tabular.publish_model_run",
+        "radfusion.training.rsna_train_metadata.publish_model_run",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("publication failed")),
     )
 
@@ -417,7 +419,7 @@ def test_training_report_publication_failure_does_not_complete_run(
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.train_tabular.publish_directory",
+        "radfusion.training.rsna_train_metadata.publish_directory",
         lambda *args: (_ for _ in ()).throw(RuntimeError("report publication failed")),
     )
 
@@ -549,7 +551,7 @@ def test_formal_evaluation_rejects_incompatible_source_before_test_loading(
     _fixed_provenance(monkeypatch)
     if case == "dirty_package":
         monkeypatch.setattr(
-            "radfusion.training.train_tabular.git_revision",
+            "radfusion.training.rsna_train_metadata.git_revision",
             lambda: ("commit-synthetic", True),
         )
     config = _config(tmp_path)

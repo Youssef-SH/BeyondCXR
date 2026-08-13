@@ -61,7 +61,7 @@ train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
 	@test -n "$(SEED)" || (echo "SEED=<integer 0..2147483647> is required"; exit 2)
-	uv run python -m radfusion.training.train --config "$(CONFIG)" --seed "$(SEED)" \
+	uv run python -m radfusion.training.rsna_train --config "$(CONFIG)" --seed "$(SEED)" \
 		$(if $(SOURCE_TRAINING_RUN_ID),--source-training-run-id "$(SOURCE_TRAINING_RUN_ID)")
 
 evaluate:

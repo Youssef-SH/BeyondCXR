@@ -21,8 +21,8 @@ from sqlalchemy.exc import SQLAlchemyError
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from radfusion.data.cxr_cache import ValidatedCxrCache
 from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.rsna_cxr_cache import ValidatedCxrCache
 from radfusion.evaluation.gradcam import gradcam_heatmaps, standard_cxr_gradcam_target
 from radfusion.evaluation.localization import (
     deterministic_qualitative_selection,
@@ -38,16 +38,16 @@ from radfusion.training.config import (
     require_runtime_seed,
     with_runtime,
 )
-from radfusion.training.datasets import (
+from radfusion.training.device import resolve_device
+from radfusion.training.evaluate_image import verify_image_training_package
+from radfusion.training.neural import seed_neural_runtime
+from radfusion.training.rsna_datasets import (
     RsnaCachedImageDataset,
     RsnaDataset,
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
-from radfusion.training.device import resolve_device
-from radfusion.training.evaluate_image import verify_image_training_package
-from radfusion.training.neural import seed_neural_runtime
-from radfusion.training.registry import get_dataset, get_model
+from radfusion.training.rsna_registry import get_dataset, get_model
 from radfusion.training.summarize_seeds import EXPECTED_SEEDS
 from radfusion.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,

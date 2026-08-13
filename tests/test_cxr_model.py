@@ -18,7 +18,7 @@ from radfusion.models.cxr_baseline import (
     set_cxr_encoder_training_mode,
 )
 from radfusion.training.config import load_experiment_config
-from radfusion.training.registry import MODELS, get_model
+from radfusion.training.rsna_registry import MODELS, get_model
 
 
 class _TinyEncoder(nn.Module):

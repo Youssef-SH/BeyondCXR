@@ -6,8 +6,8 @@ import pyarrow as pa
 import pytest
 
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from radfusion.data.splitting import (
+from radfusion.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
+from radfusion.data.rsna_splitting import (
     SPLIT_ALGORITHM_VERSION,
     SPLIT_NAMES,
     SplitConfig,

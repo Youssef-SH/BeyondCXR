@@ -11,15 +11,15 @@ import yaml
 from torch import nn
 from torch.utils.data import Dataset
 
-from radfusion.data.cxr_cache import (
+from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.hashing import sha256_file
+from radfusion.data.rsna_cxr_cache import (
     SOURCE_AUTHENTICATION_POLICY_VERSION,
     CxrCacheIdentity,
     CxrCacheSourceAuthentication,
     preprocessing_identity,
 )
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.hashing import sha256_file
-from radfusion.data.tabular_preprocess import (
+from radfusion.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     build_rsna_preprocessor,
     fitted_rsna_preprocessor_contract,
@@ -37,11 +37,6 @@ from radfusion.training.config import (
     load_experiment_config,
     with_runtime,
 )
-from radfusion.training.datasets import (
-    FusionRunData,
-    FusionTestData,
-    SourceInventoryIdentity,
-)
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
 from radfusion.training.fusion_source import (
@@ -50,9 +45,14 @@ from radfusion.training.fusion_source import (
     _validate_source_contract,
     resolve_source_cxr_training_run,
 )
-from radfusion.training.interfaces import DatasetLineage
-from radfusion.training.train import main as train_main
-from radfusion.training.train_fusion import (
+from radfusion.training.rsna_datasets import (
+    FusionRunData,
+    FusionTestData,
+    SourceInventoryIdentity,
+)
+from radfusion.training.rsna_interfaces import DatasetLineage
+from radfusion.training.rsna_train import main as train_main
+from radfusion.training.rsna_train_fusion import (
     _manifest,
     load_validated_rsna_fusion_preprocessor,
     train_fusion_experiment,
@@ -652,7 +652,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         del kwargs
         return _FusionTensorDataset(frame_value, structured)
 
-    for module in ("radfusion.training.train_fusion", "radfusion.training.evaluate_fusion"):
+    for module in ("radfusion.training.rsna_train_fusion", "radfusion.training.evaluate_fusion"):
         monkeypatch.setattr(f"{module}.get_dataset", lambda key: adapter)
         monkeypatch.setattr(f"{module}.get_model", lambda key: builder)
         monkeypatch.setattr(f"{module}.RsnaCachedFusionDataset", synthetic_dataset)

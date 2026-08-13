@@ -22,11 +22,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pydicom
 
-from radfusion.data.artifact_validation import (
-    validate_annotation_table,
-    validate_label_table,
-    validate_sample_table,
-)
 from radfusion.data.bundle_contract import (
     BUNDLE_MANIFEST_SCHEMA_VERSION,
     BUNDLE_PREFIX,
@@ -40,18 +35,7 @@ from radfusion.data.bundle_contract import (
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
 from radfusion.data.rsna_dicom import AuditAccumulator, read_dicom_metadata
-from radfusion.data.rsna_source import (
-    RSNA_CLASS_VALUES,
-    BoundingBox,
-    RsnaPaths,
-    canonical_image_path,
-    discover_dicoms,
-    load_source_samples,
-    resolve_image_path,
-    validate_box_bounds,
-    validate_identifier_sets,
-)
-from radfusion.data.schemas import (
+from radfusion.data.rsna_schemas import (
     DATASET_ID,
     PNEUMONIA_LABEL_POLICY_VERSION,
     PNEUMONIA_LABEL_SOURCE,
@@ -66,7 +50,18 @@ from radfusion.data.schemas import (
     RSNA_SPLIT_SCHEMA,
     require_exact_schema,
 )
-from radfusion.data.splitting import (
+from radfusion.data.rsna_source import (
+    RSNA_CLASS_VALUES,
+    BoundingBox,
+    RsnaPaths,
+    canonical_image_path,
+    discover_dicoms,
+    load_source_samples,
+    resolve_image_path,
+    validate_box_bounds,
+    validate_identifier_sets,
+)
+from radfusion.data.rsna_splitting import (
     PATIENT_GROUPING_RULE,
     PATIENT_HASH_ALGORITHM,
     PATIENT_HASH_INPUT_ENCODING,
@@ -82,6 +77,11 @@ from radfusion.data.splitting import (
     create_patient_stratified_splits,
     split_assignment_id,
     validate_split_table,
+)
+from radfusion.data.rsna_validation import (
+    validate_annotation_table,
+    validate_label_table,
+    validate_sample_table,
 )
 from radfusion.utils.operational_logging import CountProgress, get_operational_logger
 from radfusion.utils.publication import update_current_marker
