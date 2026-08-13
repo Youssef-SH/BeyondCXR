@@ -30,7 +30,7 @@ from radfusion.data.bundle_contract import (
     validate_common_bundle_envelope,
 )
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
+from radfusion.data.hashing import logical_arrow_sha256, sha256_file
 from radfusion.data.symile_schemas import (
     DATASET_ID,
     DATASET_RELEASE,
@@ -145,8 +145,8 @@ def write_symile_bundle(
     bundles_root.mkdir(parents=True, exist_ok=True)
     current_path = dataset_root / CURRENT_FILENAME
     logical_hashes = {
-        SAMPLES_FILENAME: arrow_ipc_sha256(result.samples),
-        LABS_FILENAME: arrow_ipc_sha256(result.labs),
+        SAMPLES_FILENAME: logical_arrow_sha256(result.samples),
+        LABS_FILENAME: logical_arrow_sha256(result.labs),
     }
     bundle_id = semantic_bundle_id(result.metadata, logical_hashes)
     destination = bundles_root / bundle_id
@@ -253,8 +253,8 @@ def validate_symile_bundle(
     labs = pq.read_table(root / LABS_FILENAME)
     _validate_tables(samples, labs)
     actual = {
-        SAMPLES_FILENAME: arrow_ipc_sha256(samples),
-        LABS_FILENAME: arrow_ipc_sha256(labs),
+        SAMPLES_FILENAME: logical_arrow_sha256(samples),
+        LABS_FILENAME: logical_arrow_sha256(labs),
     }
     declared = reference.manifest["artifacts"]
     for filename, digest in actual.items():

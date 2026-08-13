@@ -14,6 +14,11 @@ import pytest
 import yaml
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
+from radfusion.utils.model_publication import (
+    model_package_id,
+    threshold_contract,
+    validate_published_model,
+)
 
 from radfusion.data.rsna_artifacts import build_and_write
 from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES
@@ -32,11 +37,6 @@ from radfusion.training.rsna_datasets import RsnaDataset
 from radfusion.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
 from radfusion.training.rsna_train_metadata import train_configured_experiment, validate_report_set
 from radfusion.utils.mlflow_utils import configure_mlflow
-from radfusion.utils.model_publication import (
-    model_package_id,
-    threshold_contract,
-    validate_published_model,
-)
 from radfusion.utils.operational_logging import configure_logging
 
 _SHA256 = "a" * 64

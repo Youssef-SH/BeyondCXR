@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 
 def staging_directory(destination: str | Path) -> Path:
@@ -13,6 +16,48 @@ def staging_directory(destination: str | Path) -> Path:
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=f".{target.name}-staging-", dir=target.parent))
+
+
+def install_immutable_directory(
+    stage: str | Path,
+    destination: str | Path,
+    validator: Callable[..., Any],
+) -> bool:
+    """Install on the current POSIX workflow, or validate and reuse a completed winner.
+
+    Identity destinations are required to be either absent or completed non-empty immutable
+    objects. The sibling rename and destination are on the same filesystem.
+    """
+    staged = Path(stage)
+    target = Path(destination)
+    validator(staged, enforce_directory_name=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        validator(target)
+        return False
+    try:
+        os.rename(staged, target)
+    except OSError as exc:
+        if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise
+        validator(target)
+        return False
+    return True
+
+
+def validate_path_component(value: object, field: str) -> str:
+    """Require one non-special path component on POSIX and Windows."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or Path(value).is_absolute()
+        or Path(value).name != value
+    ):
+        raise ValueError(f"{field} must be one safe path component")
+    return value
 
 
 def update_current_marker(current_path: str | Path, immutable_id: str) -> None:
@@ -36,7 +81,7 @@ def update_current_marker(current_path: str | Path, immutable_id: str) -> None:
 
 
 def publish_directory(stage: str | Path, destination: str | Path) -> None:
-    """Publish a complete staged directory, restoring the previous version on failure."""
+    """Publish a complete staged directory, restoring an existing destination on failure."""
     staged = Path(stage)
     target = Path(destination)
     if not staged.is_dir():
@@ -44,26 +89,26 @@ def publish_directory(stage: str | Path, destination: str | Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     backup = Path(tempfile.mkdtemp(prefix=f".{target.name}-backup-", dir=target.parent))
     backup.rmdir()
-    previous_moved = False
+    destination_backed_up = False
     try:
         if target.exists():
             os.replace(target, backup)
-            previous_moved = True
+            destination_backed_up = True
         try:
             os.replace(staged, target)
         except BaseException:
-            if previous_moved:
+            if destination_backed_up:
                 os.replace(backup, target)
-                previous_moved = False
+                destination_backed_up = False
             raise
-        if previous_moved:
+        if destination_backed_up:
             shutil.rmtree(backup)
-            previous_moved = False
+            destination_backed_up = False
     finally:
         if staged.exists():
             shutil.rmtree(staged)
         if backup.exists():
-            if previous_moved and not target.exists():
+            if destination_backed_up and not target.exists():
                 os.replace(backup, target)
             else:
                 shutil.rmtree(backup)

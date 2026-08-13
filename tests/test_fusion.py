@@ -8,6 +8,20 @@ import pandas as pd
 import pytest
 import torch
 import yaml
+from radfusion.training.fusion_source import (
+    SourceCxrLineage,
+    VerifiedSourceCxr,
+    _validate_source_contract,
+    resolve_source_cxr_training_run,
+)
+from radfusion.utils.neural_publication import (
+    FUSION_MANIFEST_FIELDS,
+    checkpoint_document,
+    neural_model_package_id,
+    publish_neural_model_run,
+    save_neural_checkpoint,
+    validate_published_neural_model,
+)
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -39,12 +53,6 @@ from radfusion.training.config import (
 )
 from radfusion.training.device import resolve_device
 from radfusion.training.evaluate import evaluate_training_run
-from radfusion.training.fusion_source import (
-    SourceCxrLineage,
-    VerifiedSourceCxr,
-    _validate_source_contract,
-    resolve_source_cxr_training_run,
-)
 from radfusion.training.rsna_datasets import (
     FusionRunData,
     FusionTestData,
@@ -58,14 +66,6 @@ from radfusion.training.rsna_train_fusion import (
     train_fusion_experiment,
 )
 from radfusion.utils.mlflow_utils import configure_mlflow
-from radfusion.utils.neural_publication import (
-    FUSION_MANIFEST_FIELDS,
-    checkpoint_document,
-    neural_model_package_id,
-    publish_neural_model_run,
-    save_neural_checkpoint,
-    validate_published_neural_model,
-)
 from radfusion.utils.private_predictions import validate_private_neural_predictions
 
 _SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64

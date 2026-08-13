@@ -1,4 +1,4 @@
-"""Train and validate one configured tabular metadata experiment."""
+"""Train and validate one configured RSNA metadata family."""
 
 from __future__ import annotations
 
@@ -44,13 +44,14 @@ from radfusion.utils.mlflow_utils import (
     environment_provenance,
     git_revision,
     log_source_config,
+    serialize_modalities,
     tracked_run,
     uv_lock_sha256,
 )
-from radfusion.utils.model_publication import publish_model_run, threshold_contract
 from radfusion.utils.operational_logging import get_operational_logger, log_event, timed_phase
 from radfusion.utils.privacy import validate_public_reports
 from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.utils.rsna_model_publication import publish_model_package, threshold_contract
 from radfusion.utils.skops_io import load_skops, save_skops
 
 REQUIRED_REPORT_FILENAMES = frozenset(
@@ -69,10 +70,9 @@ _LOGGER = get_operational_logger(__name__)
 
 
 @dataclass(frozen=True)
-class ModelResult:
+class MetadataModelResult:
     """Published outputs from one completed training run."""
 
-    model_name: str
     run_id: str
     validation_probability: ProbabilityMetrics
     validation_youden_j: OperatingPointMetrics
@@ -86,11 +86,11 @@ class ModelResult:
     model_size_mib: float
 
 
-def train_configured_experiment(
+def train_metadata_experiment(
     config: ExperimentConfig,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
-) -> ModelResult:
+) -> MetadataModelResult:
     """Fit on train, select thresholds on validation, and publish the model."""
     seed = require_runtime_seed(config)
     if config.evaluation is None:
@@ -104,15 +104,15 @@ def train_configured_experiment(
     base_tags = {
         "run_kind": "training",
         "evaluation_scope": "validation",
-        "experiment_name": config.family.family_id,
-        "dataset": config.dataset.dataset_id,
-        "dataset_bundle_id": config.dataset.bundle_id,
-        "task": config.task.task_id,
-        "modality": "metadata",
-        "model": config.family.family_id,
+        "dataset_id": config.dataset.dataset_id,
+        "task_id": config.task.task_id,
+        "family_id": config.family.family_id,
+        "modalities": serialize_modalities(config.family.modalities),
+        "bundle_id": config.dataset.bundle_id,
+        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
+        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
         "git_commit": commit,
-        "git_dirty": str(dirty).lower(),
         "dependency_lock_sha256": lock_hash,
         "config_source_sha256": config.config_source_sha256,
         "config_semantic_sha256": config.config_semantic_sha256,
@@ -134,7 +134,7 @@ def train_configured_experiment(
         parameters=base_parameters,
     ) as run_id:
         log_source_config(config)
-        context = {"run_id": run_id, "model": config.family.family_id}
+        context = {"run_id": run_id, "family_id": config.family.family_id}
         with timed_phase(_LOGGER, "dataset_loading", **context):
             dataset = get_dataset(config.dataset.dataset_id).load_train_validation(config)
         log_event(
@@ -144,12 +144,8 @@ def train_configured_experiment(
             validation_count=len(dataset.validation.targets),
             **context,
         )
-        mlflow.set_tags(
-            {
-                "split_assignment_id": dataset.lineage.split_assignment_id,
-                "label_policy_version": dataset.lineage.label_policy_version,
-            }
-        )
+        if dataset.lineage.split_assignment_id != config.dataset.split_assignment_id:
+            raise ValueError("Loaded split assignment differs from the configuration")
         with timed_phase(_LOGGER, "model_fitting", **context):
             model_fit = get_model(config.family.family_id).fit(
                 config,
@@ -218,6 +214,7 @@ def train_configured_experiment(
         )
         report_stage = staging_directory(report_directory)
         temporary_model_root = Path(tempfile.mkdtemp(prefix="radfusion-model-"))
+        published = None
         try:
             write_run_reports(
                 report_stage,
@@ -262,17 +259,16 @@ def train_configured_experiment(
                     model_size_mib=serialized.stat().st_size / (1024.0 * 1024.0),
                 )
             )
-            published = publish_model_run(
+            published = publish_model_package(
                 model_root=config.runtime.model_directory,
-                mlflow_run_id=run_id,
                 serialized_model_path=serialized,
                 source_config_bytes=config.source_bytes,
                 manifest={
                     "bundle_id": dataset.lineage.bundle_id,
                     "split_assignment_id": dataset.lineage.split_assignment_id,
-                    "task": dataset.lineage.task_id,
+                    "task_id": dataset.lineage.task_id,
                     "positive_class": 1,
-                    "model": config.family.family_id,
+                    "family_id": config.family.family_id,
                     "config_source_sha256": config.config_source_sha256,
                     "config_semantic_sha256": config.config_semantic_sha256,
                     "seed": seed,
@@ -288,14 +284,14 @@ def train_configured_experiment(
                 },
             )
             publish_directory(report_stage, report_directory)
-            mlflow.set_tags(
+            mlflow.log_params(
                 {
-                    "local_model_path": published.model_path.as_posix(),
-                    "local_model_sha256": published.model_sha256,
-                    "model_package_id": published.model_package_id,
+                    "model_sha256": published.model_sha256,
+                    "model_path": published.model_path.as_posix(),
                     "report_directory": report_directory.as_posix(),
                 }
             )
+            mlflow.set_tags({"package_kind": "model", "package_id": published.model_package_id})
             mlflow.set_tag("run_complete", "true")
         finally:
             if report_stage.exists():
@@ -304,8 +300,7 @@ def train_configured_experiment(
         log_event(_LOGGER, "publication_completed", artifact="model_package", **context)
         log_event(_LOGGER, "publication_completed", artifact="validation_report", **context)
 
-    return ModelResult(
-        model_name=config.family.family_id,
+    return MetadataModelResult(
         run_id=run_id,
         validation_probability=probability_metrics,
         validation_youden_j=youden_metrics,
@@ -448,9 +443,9 @@ def _write_evaluation_report(path: Path, model_name: str, document: dict[str, An
                 f"{metrics['specificity']:.6f} | {metrics['f1']:.6f} |",
             ]
         )
-    if image_run := document.get("image_run"):
-        selection = image_run["selection"]
-        authentication = image_run["source_authentication"]
+    if cxr_training := document.get("cxr_training"):
+        selection = cxr_training["selection"]
+        authentication = cxr_training["source_authentication"]
         lines.extend(
             [
                 "",
@@ -462,8 +457,8 @@ def _write_evaluation_report(path: Path, model_name: str, document: dict[str, An
                 "- Test data were not loaded, decoded, authenticated, or evaluated.",
             ]
         )
-    if image_evaluation := document.get("image_evaluation"):
-        counts = image_evaluation["test_counts"]
+    if cxr_evaluation := document.get("cxr_evaluation"):
+        counts = cxr_evaluation["test_counts"]
         lines.extend(
             [
                 "",

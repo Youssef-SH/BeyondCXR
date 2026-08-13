@@ -1,4 +1,4 @@
-"""Train and validate one configured RSNA image experiment."""
+"""Train and validate one configured RSNA CXR family."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import math
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -33,23 +33,23 @@ from radfusion.training.device import resolve_device
 from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
-    EpochRecord,
     EpochThroughput,
-    NeuralFitResult,
+    SelectedTrainingResult,
+    TrainingEpochRecord,
     build_image_loaders,
     deterministic_inference,
-    fit_image_model,
+    fit_rsna_cxr_model,
     seed_neural_runtime,
     training_class_weight,
 )
 from radfusion.training.rsna_datasets import (
-    ImageRunData,
+    CxrRunData,
     RsnaCachedImageDataset,
     RsnaDataset,
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
-from radfusion.training.rsna_interfaces import ImageModelImplementation
+from radfusion.training.rsna_interfaces import RsnaCxrModelImplementation
 from radfusion.training.rsna_registry import get_dataset, get_model
 from radfusion.training.rsna_train_metadata import (
     metrics_document,
@@ -63,16 +63,9 @@ from radfusion.utils.mlflow_utils import (
     environment_provenance,
     git_revision,
     log_source_config,
+    serialize_modalities,
     tracked_run,
     uv_lock_sha256,
-)
-from radfusion.utils.model_publication import threshold_contract
-from radfusion.utils.neural_publication import (
-    checkpoint_document,
-    load_neural_checkpoint,
-    publish_neural_model_run,
-    save_neural_checkpoint,
-    strict_load_checkpoint,
 )
 from radfusion.utils.operational_logging import (
     CountProgress,
@@ -82,17 +75,22 @@ from radfusion.utils.operational_logging import (
 )
 from radfusion.utils.privacy import validate_public_reports
 from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.utils.rsna_model_publication import threshold_contract
+from radfusion.utils.rsna_neural_publication import (
+    checkpoint_document,
+    load_neural_checkpoint,
+    publish_neural_model_package,
+    save_neural_checkpoint,
+    strict_load_checkpoint,
+)
 
-NEURAL_METRICS_POLICY_VERSION = "binary-probability-and-frozen-operating-points-v1"
-NEURAL_THRESHOLD_POLICY_VERSION = "validation-frozen-thresholds-v1"
 _LOGGER = get_operational_logger(__name__)
 
 
 @dataclass(frozen=True)
-class ImageModelResult:
-    """Published outputs from one completed image training run."""
+class CxrModelResult:
+    """Published outputs from one completed CXR training run."""
 
-    model_name: str
     run_id: str
     validation_probability: ProbabilityMetrics
     validation_youden_j: OperatingPointMetrics
@@ -105,18 +103,18 @@ class ImageModelResult:
     model_size_mib: float
 
 
-def train_image_experiment(
+def train_cxr_experiment(
     config: ExperimentConfig,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
-) -> ImageModelResult:
-    """Train on image train/validation partitions and publish one selected package."""
+) -> CxrModelResult:
+    """Train on CXR train/validation partitions and publish one selected package."""
     if config.family.family_id != "cxr_densenet" or config.neural is None:
-        raise ValueError("Image training requires a complete image experiment configuration")
+        raise ValueError("CXR training requires a complete CXR experiment configuration")
     if config.evaluation is None:
-        raise ValueError("RSNA image training requires evaluation policy")
+        raise ValueError("RSNA CXR training requires evaluation policy")
     seed = require_runtime_seed(config)
     neural = config.neural
     family = config.family
@@ -130,15 +128,15 @@ def train_image_experiment(
     base_tags = {
         "run_kind": "training",
         "evaluation_scope": "validation",
-        "experiment_name": family.family_id,
-        "dataset": config.dataset.dataset_id,
-        "dataset_bundle_id": config.dataset.bundle_id,
-        "task": config.task.task_id,
-        "modality": "image",
-        "model": family.family_id,
+        "dataset_id": config.dataset.dataset_id,
+        "task_id": config.task.task_id,
+        "family_id": family.family_id,
+        "modalities": serialize_modalities(family.modalities),
+        "bundle_id": config.dataset.bundle_id,
+        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
+        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
         "git_commit": commit,
-        "git_dirty": str(dirty).lower(),
         "dependency_lock_sha256": lock_hash,
         "config_source_sha256": config.config_source_sha256,
         "config_semantic_sha256": config.config_semantic_sha256,
@@ -160,18 +158,13 @@ def train_image_experiment(
         parameters=initial_parameters,
     ) as run_id:
         log_source_config(config)
-        context = {"run_id": run_id, "model": family.family_id}
+        context = {"run_id": run_id, "family_id": family.family_id}
         dataset_adapter = get_dataset(config.dataset.dataset_id)
         with timed_phase(_LOGGER, "dataset_loading", **context):
-            image_data = dataset_adapter.load_image_train_validation(config)
-        mlflow.set_tags(
-            {
-                "split_assignment_id": image_data.lineage.split_assignment_id,
-                "label_policy_version": image_data.lineage.label_policy_version,
-            }
-        )
-        mlflow.log_param("bundle_manifest_sha256", image_data.bundle_manifest_sha256)
-        with timed_phase(_LOGGER, "image_runtime_preparation", **context):
+            cxr_data = dataset_adapter.load_cxr_train_validation(config)
+        if cxr_data.lineage.split_assignment_id != config.dataset.split_assignment_id:
+            raise ValueError("Loaded split assignment differs from the configuration")
+        with timed_phase(_LOGGER, "cxr_runtime_preparation", **context):
             seed_neural_runtime(seed)
             train_transform = _transform(config, training=True)
             evaluation_transform = _transform(config, training=False)
@@ -179,15 +172,15 @@ def train_image_experiment(
                 cast(RsnaDataset, dataset_adapter), config, evaluation_transform
             )
             expected_cache_identity = expected_rsna_cxr_cache_identity(
-                lineage=image_data.lineage,
-                bundle_manifest_sha256=image_data.bundle_manifest_sha256,
-                source_inventory=image_data.source_inventory,
+                lineage=cxr_data.lineage,
+                bundle_manifest_sha256=cxr_data.bundle_manifest_sha256,
+                source_inventory=cxr_data.source_inventory,
                 transform=evaluation_transform,
             )
             authentication = resolved_cache.source_authentication.as_dict()
-            mlflow.set_tag("source_authentication_policy", authentication["policy_version"])
+            mlflow.log_param("source_authentication_policy", authentication["policy_version"])
             train_dataset = RsnaCachedImageDataset(
-                image_data.train,
+                cxr_data.train,
                 cache=resolved_cache,
                 expected_cache_identity=expected_cache_identity,
                 partition="train",
@@ -195,7 +188,7 @@ def train_image_experiment(
                 training_seed=seed,
             )
             validation_dataset = RsnaCachedImageDataset(
-                image_data.validation,
+                cxr_data.validation,
                 cache=resolved_cache,
                 expected_cache_identity=expected_cache_identity,
                 partition="validation",
@@ -220,7 +213,7 @@ def train_image_experiment(
                 seed=seed,
                 execution=loader_execution,
             )
-            train_targets = image_data.train["target"].to_numpy(dtype=np.int8)
+            train_targets = cxr_data.train["target"].to_numpy(dtype=np.int8)
             positive_count, negative_count, pos_weight = training_class_weight(train_targets)
             mlflow.log_params(
                 {
@@ -229,14 +222,14 @@ def train_image_experiment(
                     if not isinstance(value, dict)
                 }
             )
-        model_builder = cast(ImageModelImplementation, get_model(family.family_id))
+        model_builder = cast(RsnaCxrModelImplementation, get_model(family.family_id))
         with timed_phase(_LOGGER, "model_construction", **context):
             weight_identity = fingerprint_pretrained_weights(str(family.parameters["weights"]))
             model = model_builder.build(family)
             if fingerprint_pretrained_weights(str(family.parameters["weights"])) != weight_identity:
                 raise RuntimeError("Pretrained weight file changed during model construction")
             if not isinstance(model, nn.Module):
-                raise TypeError("Registered image model builder must return torch.nn.Module")
+                raise TypeError("Registered CXR model builder must return torch.nn.Module")
             model.to(runtime.device)
         log_event(_LOGGER, "pretrained_weight_fingerprint_stable", **context)
 
@@ -263,7 +256,7 @@ def train_image_experiment(
                 **context,
             )
 
-        def epoch_completed(record: EpochRecord) -> None:
+        def epoch_completed(record: TrainingEpochRecord) -> None:
             nonlocal epoch_started_at
             now = time.perf_counter()
             log_event(
@@ -273,7 +266,7 @@ def train_image_experiment(
                 global_epoch=record.global_epoch,
                 stage_epoch=record.stage_epoch,
                 training_loss=record.training_loss,
-                validation_average_precision=record.validation_average_precision,
+                validation_average_precision=record.validation_metric,
                 selected_best=record.selected_best,
                 encoder_learning_rate=record.encoder_learning_rate,
                 head_learning_rate=record.head_learning_rate,
@@ -296,7 +289,7 @@ def train_image_experiment(
                     **context,
                 )
 
-        def epoch_throughput(record: EpochRecord, throughput: EpochThroughput) -> None:
+        def epoch_throughput(record: TrainingEpochRecord, throughput: EpochThroughput) -> None:
             log_event(
                 _LOGGER,
                 "epoch_throughput",
@@ -340,14 +333,13 @@ def train_image_experiment(
             if reporter is not None:
                 reporter.update(completed)
 
-        with timed_phase(_LOGGER, "image_training", **context):
-            fit = fit_image_model(
+        with timed_phase(_LOGGER, "cxr_training", **context):
+            fit = fit_rsna_cxr_model(
                 model,
                 loaders,
                 config=neural,
                 runtime=runtime,
                 pos_weight=pos_weight,
-                selection_metric=config.training.selection_metric,
                 epoch_callback=epoch_completed,
                 epoch_started_callback=epoch_started,
                 stage_callback=stage_started,
@@ -359,7 +351,7 @@ def train_image_experiment(
             "checkpoint_selected",
             selected_epoch=fit.selected_epoch,
             selected_stage=fit.selected_stage,
-            validation_average_precision=fit.selected_validation_average_precision,
+            validation_average_precision=fit.selected_validation_metric,
             **context,
         )
         model.load_state_dict(fit.selected_state_dict, strict=True)
@@ -389,11 +381,11 @@ def train_image_experiment(
             )
         if not math.isclose(
             final_validation.average_precision,
-            fit.selected_validation_average_precision,
+            fit.selected_validation_metric,
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
-            raise ValueError("Restored image checkpoint changed validation Average Precision")
+            raise ValueError("Restored CXR checkpoint changed validation Average Precision")
         thresholds = {
             "youden_j": youden_j_threshold(
                 final_validation.targets, final_validation.probabilities
@@ -428,13 +420,13 @@ def train_image_experiment(
             youden=youden_metrics,
             target_sensitivity=sensitivity_metrics,
         )
-        document["image_run"] = {
+        document["cxr_training"] = {
             "lineage": {
-                "bundle_id": image_data.lineage.bundle_id,
-                "bundle_manifest_sha256": image_data.bundle_manifest_sha256,
-                "split_assignment_id": image_data.lineage.split_assignment_id,
-                "task": image_data.lineage.task_id,
-                "label_policy_version": image_data.lineage.label_policy_version,
+                "bundle_id": cxr_data.lineage.bundle_id,
+                "bundle_manifest_sha256": cxr_data.bundle_manifest_sha256,
+                "split_assignment_id": cxr_data.lineage.split_assignment_id,
+                "task_id": cxr_data.lineage.task_id,
+                "label_policy_version": cxr_data.lineage.label_policy_version,
             },
             "source_authentication": authentication,
             "model_identity": {
@@ -457,7 +449,13 @@ def train_image_experiment(
                 "pos_weight": pos_weight,
             },
             "runtime": runtime.provenance(),
-            "epoch_history": [record.as_dict() for record in fit.history],
+            "epoch_history": [
+                {
+                    ("validation_average_precision" if key == "validation_metric" else key): value
+                    for key, value in asdict(record).items()
+                }
+                for record in fit.history
+            ],
             "selection": {
                 "selected_epoch": fit.selected_epoch,
                 "selected_stage": fit.selected_stage,
@@ -472,7 +470,7 @@ def train_image_experiment(
             config.runtime.report_directory / config.dataset.dataset_id / "runs" / run_id
         )
         if report_directory.exists():
-            raise FileExistsError(f"Image validation report already exists: {report_directory}")
+            raise FileExistsError(f"CXR validation report already exists: {report_directory}")
         report_stage = staging_directory(report_directory)
         temporary_model_root = Path(tempfile.mkdtemp(prefix="radfusion-neural-model-"))
         published = None
@@ -491,7 +489,7 @@ def train_image_experiment(
             strict_load_checkpoint(model, loaded_checkpoint)
             manifest = _manifest(
                 config=config,
-                image_data=image_data,
+                cxr_data=cxr_data,
                 source_authentication=authentication,
                 commit=commit,
                 dirty=dirty,
@@ -512,14 +510,13 @@ def train_image_experiment(
                 final_average_precision=final_validation.average_precision,
                 thresholds=thresholds,
             )
-            published = publish_neural_model_run(
+            published = publish_neural_model_package(
                 model_root=config.runtime.model_directory,
-                mlflow_run_id=run_id,
                 checkpoint_path=checkpoint_path,
                 source_config_bytes=config.source_bytes,
                 manifest=manifest,
             )
-            document["image_run"]["package"] = {
+            document["cxr_training"]["package"] = {
                 "training_run_id": run_id,
                 "model_package_id": published.model_package_id,
                 "checkpoint_sha256": published.checkpoint_sha256,
@@ -538,8 +535,8 @@ def train_image_experiment(
                 forbidden_source_values={
                     *final_validation.sample_ids,
                     *final_validation.patient_ids,
-                    *image_data.train["sample_id"].astype(str),
-                    *image_data.train["patient_id"].astype(str),
+                    *cxr_data.train["sample_id"].astype(str),
+                    *cxr_data.train["patient_id"].astype(str),
                 },
             )
             mlflow.log_params(
@@ -567,21 +564,18 @@ def train_image_experiment(
             mlflow.log_metrics(metrics)
             publish_directory(report_stage, report_directory)
             report_published = True
-            mlflow.set_tags(
+            mlflow.log_params(
                 {
-                    "local_model_path": published.model_path.as_posix(),
-                    "local_model_sha256": published.checkpoint_sha256,
                     "checkpoint_sha256": published.checkpoint_sha256,
-                    "model_package_id": published.model_package_id,
+                    "model_path": published.model_path.as_posix(),
                     "report_directory": report_directory.as_posix(),
-                    "threshold_youden_j": str(thresholds["youden_j"]),
-                    "threshold_target_sensitivity": str(thresholds["target_sensitivity"]),
+                    "threshold_youden_j": thresholds["youden_j"],
+                    "threshold_target_sensitivity": thresholds["target_sensitivity"],
                 }
             )
+            mlflow.set_tags({"package_kind": "model", "package_id": published.model_package_id})
             mlflow.set_tag("run_complete", "true")
         except BaseException:
-            if published is not None and published.run_directory.exists():
-                shutil.rmtree(published.run_directory)
             if report_published and report_directory.exists():
                 shutil.rmtree(report_directory)
             raise
@@ -590,11 +584,10 @@ def train_image_experiment(
                 shutil.rmtree(report_stage)
             shutil.rmtree(temporary_model_root, ignore_errors=True)
         if published is None:
-            raise RuntimeError("Image training completed without a published package")
+            raise RuntimeError("CXR training completed without a published package")
         log_event(_LOGGER, "publication_completed", artifact="model_package", **context)
         log_event(_LOGGER, "publication_completed", artifact="validation_report", **context)
-    return ImageModelResult(
-        model_name=family.family_id,
+    return CxrModelResult(
         run_id=run_id,
         validation_probability=probability_metrics,
         validation_youden_j=youden_metrics,
@@ -609,24 +602,24 @@ def train_image_experiment(
 
 
 def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransform:
-    image = config.neural
-    if image is None:
-        raise ValueError("Image transform requires image configuration")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("CXR transform requires CXR configuration")
     return StandardCxrTransform(
         training=training,
         policy_version=str(config.preprocessing["cxr_transform_policy"]),
         image_size=int(config.family.parameters["image_size"]),
-        rotation_degrees=image.rotation_degrees,
-        translation_fraction=image.translation_fraction,
-        brightness_jitter=image.brightness_jitter,
-        contrast_jitter=image.contrast_jitter,
+        rotation_degrees=neural.rotation_degrees,
+        translation_fraction=neural.translation_fraction,
+        brightness_jitter=neural.brightness_jitter,
+        contrast_jitter=neural.contrast_jitter,
     )
 
 
 def _manifest(
     *,
     config: ExperimentConfig,
-    image_data: ImageRunData,
+    cxr_data: CxrRunData,
     source_authentication: dict[str, object],
     commit: str,
     dirty: bool,
@@ -639,22 +632,22 @@ def _manifest(
     positive_count: int,
     negative_count: int,
     pos_weight: float,
-    fit: NeuralFitResult,
+    fit: SelectedTrainingResult,
     final_average_precision: float,
     thresholds: dict[str, float],
 ) -> dict[str, Any]:
-    image = config.neural
-    if image is None:
-        raise ValueError("Image manifest requires image configuration")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("CXR manifest requires CXR configuration")
     return {
-        "modality": "image",
-        "model": config.family.family_id,
-        "task": image_data.lineage.task_id,
+        "family_id": config.family.family_id,
+        "modalities": list(config.family.modalities),
+        "task_id": cxr_data.lineage.task_id,
         "positive_class": 1,
-        "bundle_id": image_data.lineage.bundle_id,
-        "bundle_manifest_sha256": image_data.bundle_manifest_sha256,
-        "split_assignment_id": image_data.lineage.split_assignment_id,
-        "label_policy_version": image_data.lineage.label_policy_version,
+        "bundle_id": cxr_data.lineage.bundle_id,
+        "bundle_manifest_sha256": cxr_data.bundle_manifest_sha256,
+        "split_assignment_id": cxr_data.lineage.split_assignment_id,
+        "label_policy_version": cxr_data.lineage.label_policy_version,
         "config_source_sha256": config.config_source_sha256,
         "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
@@ -690,28 +683,28 @@ def _manifest(
             },
             "optimizer": "AdamW",
             "warmup": {
-                "epochs": image.warmup_epochs,
-                "head_learning_rate": image.warmup_head_learning_rate,
+                "epochs": neural.warmup_epochs,
+                "head_learning_rate": neural.warmup_head_learning_rate,
                 "encoder_frozen": True,
             },
             "fine_tuning": {
-                "maximum_epochs": image.fine_tune_epochs,
-                "encoder_learning_rate": image.encoder_learning_rate,
-                "head_learning_rate": image.head_learning_rate,
+                "maximum_epochs": neural.fine_tune_epochs,
+                "encoder_learning_rate": neural.encoder_learning_rate,
+                "head_learning_rate": neural.head_learning_rate,
             },
-            "weight_decay": image.weight_decay,
-            "gradient_clip_norm": image.gradient_clip_norm,
+            "weight_decay": neural.weight_decay,
+            "gradient_clip_norm": neural.gradient_clip_norm,
             "scheduler": {
                 "name": "ReduceLROnPlateau",
                 "mode": "max",
-                "factor": image.scheduler_factor,
-                "patience": image.scheduler_patience,
-                "min_lr": image.scheduler_min_learning_rate,
+                "factor": neural.scheduler_factor,
+                "patience": neural.scheduler_patience,
+                "min_lr": neural.scheduler_min_learning_rate,
             },
             "early_stopping": {
                 "metric": "validation_average_precision",
-                "patience": image.early_stopping_patience,
-                "minimum_delta": image.early_stopping_min_delta,
+                "patience": neural.early_stopping_patience,
+                "minimum_delta": neural.early_stopping_min_delta,
             },
         },
         "selection": {
@@ -723,12 +716,6 @@ def _manifest(
         "threshold_contract": threshold_contract(
             sensitivity_target=config.evaluation.sensitivity_target
         ),
-        "metrics_policy": {
-            "version": NEURAL_METRICS_POLICY_VERSION,
-            "calibration_bins": config.evaluation.calibration_bins,
-            "threshold_policy_version": NEURAL_THRESHOLD_POLICY_VERSION,
-            "sensitivity_target": config.evaluation.sensitivity_target,
-        },
         "source_authentication": source_authentication,
         "runtime_provenance": runtime,
     }

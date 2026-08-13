@@ -1,4 +1,4 @@
-"""Create and validate deterministic patient-level data splits."""
+"""Create and validate deterministic RSNA patient-level data splits."""
 
 from __future__ import annotations
 

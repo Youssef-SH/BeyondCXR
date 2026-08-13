@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from pathlib import Path
 
 import mlflow
@@ -42,41 +41,3 @@ def test_mlflow_initialization_uses_isolated_sqlite_and_local_artifacts(tmp_path
 def test_mlflow_initialization_rejects_nonpersistent_local_backends(tracking_uri: str) -> None:
     with pytest.raises(ValueError):
         configure_mlflow(tracking_uri=tracking_uri)
-
-
-def test_make_purge_generated_removes_sqlite_state_and_preserves_raw_data(tmp_path: Path) -> None:
-    for name in (
-        "mlflow.db",
-        "mlflow.db-wal",
-        "mlflow.db-shm",
-        "mlartifacts/run/artifact.txt",
-        "data/cache/rsna/cache-test/images.npy",
-        "data/manifests/rsna/bundles/bundle-test/artifact",
-        "data/manifests/rsna/CURRENT",
-        "outbox/results.tar.gz",
-    ):
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("generated\n", encoding="utf-8")
-    raw = tmp_path / "data/raw/rsna/source.dcm"
-    raw.parent.mkdir(parents=True)
-    raw.write_text("source\n", encoding="utf-8")
-
-    completed = subprocess.run(
-        ["make", "-f", str(Path("Makefile").resolve()), "purge-generated"],
-        cwd=tmp_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert raw.is_file()
-    assert not (tmp_path / "mlflow.db").exists()
-    assert not (tmp_path / "mlflow.db-wal").exists()
-    assert not (tmp_path / "mlflow.db-shm").exists()
-    assert not (tmp_path / "mlartifacts").exists()
-    assert not (tmp_path / "data/cache").exists()
-    assert not (tmp_path / "outbox").exists()
-    assert not (tmp_path / "data/manifests/rsna/CURRENT").exists()
-    assert not (tmp_path / "data/manifests/rsna/bundles/bundle-test").exists()

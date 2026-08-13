@@ -1,4 +1,4 @@
-"""Train and validate one configured RSNA image-metadata fusion experiment."""
+"""Train and validate one configured RSNA CXR-metadata fusion family."""
 
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ from radfusion.evaluation.metrics import (
     youden_j_threshold,
 )
 from radfusion.models.fusion_concat import (
-    FusionConcatModel,
     RsnaConcatFusionModel,
+    RsnaCxrMetadataConcatModel,
     fusion_architecture_contract,
     fusion_structured_input_conversion_contract,
     initialize_fusion_encoder,
@@ -46,18 +46,13 @@ from radfusion.training.config import (
 )
 from radfusion.training.device import resolve_device
 from radfusion.training.execution import LoaderExecutionPolicy, reused_loader_policy
-from radfusion.training.fusion_source import (
-    SourceCxrLineage,
-    resolve_source_cxr_training_run,
-    source_encoder_state,
-)
 from radfusion.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
-    EpochRecord,
     EpochThroughput,
+    TrainingEpochRecord,
     build_image_loaders,
     deterministic_inference,
-    fit_two_stage_binary_model,
+    fit_rsna_two_stage_binary_model,
     seed_neural_runtime,
     training_class_weight,
 )
@@ -68,11 +63,8 @@ from radfusion.training.rsna_datasets import (
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
+from radfusion.training.rsna_fusion_source import resolve_source_cxr_package, source_encoder_state
 from radfusion.training.rsna_registry import get_dataset, get_model
-from radfusion.training.rsna_train_cxr import (
-    NEURAL_METRICS_POLICY_VERSION,
-    NEURAL_THRESHOLD_POLICY_VERSION,
-)
 from radfusion.training.rsna_train_metadata import (
     metrics_document,
     mlflow_metrics,
@@ -85,20 +77,21 @@ from radfusion.utils.mlflow_utils import (
     environment_provenance,
     git_revision,
     log_source_config,
+    serialize_modalities,
     tracked_run,
     uv_lock_sha256,
-)
-from radfusion.utils.model_publication import threshold_contract
-from radfusion.utils.neural_publication import (
-    STRUCTURED_PREPROCESSOR_FILENAME,
-    checkpoint_document,
-    publish_neural_model_run,
-    save_neural_checkpoint,
-    strict_load_checkpoint,
 )
 from radfusion.utils.operational_logging import get_operational_logger, log_event, timed_phase
 from radfusion.utils.privacy import validate_public_reports
 from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.utils.rsna_model_publication import threshold_contract
+from radfusion.utils.rsna_neural_publication import (
+    STRUCTURED_PREPROCESSOR_FILENAME,
+    checkpoint_document,
+    publish_neural_model_package,
+    save_neural_checkpoint,
+    strict_load_checkpoint,
+)
 
 _LOGGER = get_operational_logger(__name__)
 
@@ -107,7 +100,6 @@ _LOGGER = get_operational_logger(__name__)
 class FusionModelResult:
     """Published outputs from one completed fusion training run."""
 
-    model_name: str
     run_id: str
     validation_probability: ProbabilityMetrics
     validation_youden_j: OperatingPointMetrics
@@ -123,7 +115,7 @@ class FusionModelResult:
 def train_fusion_experiment(
     config: ExperimentConfig,
     *,
-    source_training_run_id: str,
+    source_cxr_package_id: str,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
@@ -136,37 +128,28 @@ def train_fusion_experiment(
     seed = require_runtime_seed(config)
     neural = config.neural
     family = config.family
-    client = configure_mlflow(
+    configure_mlflow(
         experiment_name=config.runtime.experiment_name,
         tracking_uri=tracking_uri,
     )
     commit, dirty = git_revision()
     lock_hash = uv_lock_sha256()
     environment = environment_provenance()
-    source = resolve_source_cxr_training_run(
-        client,
-        source_training_run_id,
-        config,
-        current_git_commit=commit,
-        current_git_dirty=dirty,
-        current_dependency_lock_sha256=lock_hash,
-    )
-    source_lineage = source.lineage
+    source = resolve_source_cxr_package(source_cxr_package_id, config)
+    source_package_id = source.source_package_id
     tags = {
         "run_kind": "training",
         "evaluation_scope": "validation",
-        "experiment_name": family.family_id,
-        "dataset": config.dataset.dataset_id,
-        "dataset_bundle_id": config.dataset.bundle_id,
-        "task": config.task.task_id,
-        "modality": "fusion",
-        "model": family.family_id,
+        "dataset_id": config.dataset.dataset_id,
+        "task_id": config.task.task_id,
+        "family_id": family.family_id,
+        "modalities": serialize_modalities(family.modalities),
+        "bundle_id": config.dataset.bundle_id,
+        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
+        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
-        "source_cxr_training_run_id": source_lineage.training_run_id,
-        "source_cxr_model_package_id": source_lineage.model_package_id,
-        "source_cxr_checkpoint_sha256": source_lineage.checkpoint_sha256,
+        "source_package_id": source_package_id,
         "git_commit": commit,
-        "git_dirty": str(dirty).lower(),
         "dependency_lock_sha256": lock_hash,
         "config_source_sha256": config.config_source_sha256,
         "config_semantic_sha256": config.config_semantic_sha256,
@@ -177,29 +160,19 @@ def train_fusion_experiment(
         tags=tags,
         parameters={
             "training_seed": seed,
-            "source_cxr_training_run_id": source_lineage.training_run_id,
-            "source_cxr_model_package_id": source_lineage.model_package_id,
-            "source_cxr_checkpoint_sha256": source_lineage.checkpoint_sha256,
-            "source_cxr_config_semantic_sha256": source_lineage.config_semantic_sha256,
-            "source_cxr_git_commit": source_lineage.git_commit,
-            "source_cxr_dependency_lock_sha256": source_lineage.dependency_lock_sha256,
+            "source_package_id": source_package_id,
             **dict(family.parameters),
             **environment,
         },
     ) as run_id:
         log_source_config(config)
-        context = {"run_id": run_id, "model": family.family_id}
+        context = {"run_id": run_id, "family_id": family.family_id}
         dataset_adapter = get_dataset(config.dataset.dataset_id)
         with timed_phase(_LOGGER, "dataset_loading", **context):
             data = dataset_adapter.load_fusion_train_validation(config)
         _validate_source_dataset_lineage(data, source.manifest)
-        mlflow.set_tags(
-            {
-                "split_assignment_id": data.lineage.split_assignment_id,
-                "label_policy_version": data.lineage.label_policy_version,
-            }
-        )
-        mlflow.log_param("bundle_manifest_sha256", data.bundle_manifest_sha256)
+        if data.lineage.split_assignment_id != config.dataset.split_assignment_id:
+            raise ValueError("Loaded split assignment differs from the configuration")
         with timed_phase(_LOGGER, "fusion_runtime_preparation", **context):
             seed_neural_runtime(seed)
             preprocessor, contract, train_matrix, validation_matrix = _fit_structured(data)
@@ -215,7 +188,9 @@ def train_fusion_experiment(
                 transform=evaluation_transform,
             )
             source_authentication = resolved_cache.source_authentication.as_dict()
-            mlflow.set_tag("source_authentication_policy", source_authentication["policy_version"])
+            mlflow.log_param(
+                "source_authentication_policy", source_authentication["policy_version"]
+            )
             train_dataset = RsnaCachedFusionDataset(
                 data.train,
                 train_matrix,
@@ -263,7 +238,7 @@ def train_fusion_experiment(
             positive_count, negative_count, pos_weight = training_class_weight(
                 data.train["target"].to_numpy(dtype=np.int8)
             )
-        builder = cast(FusionConcatModel, get_model(family.family_id))
+        builder = cast(RsnaCxrMetadataConcatModel, get_model(family.family_id))
         model = builder.build(
             family,
             structured_dimension=int(contract["transformed_dimension"]),
@@ -274,7 +249,7 @@ def train_fusion_experiment(
         initialize_fusion_encoder(model, source_encoder_state(source))
         model.to(runtime.device)
 
-        def epoch_completed(record: EpochRecord) -> None:
+        def epoch_completed(record: TrainingEpochRecord) -> None:
             log_event(
                 _LOGGER,
                 "epoch_completed",
@@ -282,13 +257,13 @@ def train_fusion_experiment(
                 global_epoch=record.global_epoch,
                 stage_epoch=record.stage_epoch,
                 training_loss=record.training_loss,
-                validation_average_precision=record.validation_average_precision,
+                validation_average_precision=record.validation_metric,
                 selected_best=record.selected_best,
                 no_improvement_count=record.no_improvement_count,
                 **context,
             )
 
-        def epoch_throughput(record: EpochRecord, throughput: EpochThroughput) -> None:
+        def epoch_throughput(record: TrainingEpochRecord, throughput: EpochThroughput) -> None:
             log_event(
                 _LOGGER,
                 "epoch_throughput",
@@ -304,7 +279,7 @@ def train_fusion_experiment(
             )
 
         with timed_phase(_LOGGER, "fusion_training", **context):
-            fit = fit_two_stage_binary_model(
+            fit = fit_rsna_two_stage_binary_model(
                 model,
                 loaders.train,
                 loaders.validation,
@@ -312,7 +287,6 @@ def train_fusion_experiment(
                 config=neural,
                 runtime=runtime,
                 pos_weight=pos_weight,
-                selection_metric=config.training.selection_metric,
                 epoch_callback=epoch_completed,
                 throughput_callback=epoch_throughput,
             )
@@ -320,7 +294,7 @@ def train_fusion_experiment(
             fit.selected_state_dict,
             selected_epoch=fit.selected_epoch,
             selected_stage=fit.selected_stage,
-            validation_average_precision=fit.selected_validation_average_precision,
+            validation_average_precision=fit.selected_validation_metric,
         )
         strict_load_checkpoint(model, loaded)
         final_validation = deterministic_inference(
@@ -389,7 +363,7 @@ def train_fusion_experiment(
                     "loader_execution": loader_execution.provenance(),
                     "cxr_cache_id": resolved_cache.identity.cache_id,
                 },
-                source_lineage=source_lineage,
+                source_package_id=source_package_id,
                 source_pretrained_weight=dict(
                     source.manifest["model_identity"]["pretrained_weight"]
                 ),
@@ -403,15 +377,14 @@ def train_fusion_experiment(
                 fit=fit,
                 thresholds=thresholds,
             )
-            published = publish_neural_model_run(
+            published = publish_neural_model_package(
                 model_root=config.runtime.model_directory,
-                mlflow_run_id=run_id,
                 checkpoint_path=checkpoint_path,
                 source_config_bytes=config.source_bytes,
                 manifest=manifest,
                 structured_preprocessor_path=preprocessor_path,
             )
-            load_validated_rsna_fusion_preprocessor(published.run_directory, manifest)
+            load_validated_rsna_fusion_preprocessor(published.package_directory, manifest)
             write_run_reports(
                 report_stage,
                 model_name=family.family_id,
@@ -444,21 +417,18 @@ def train_fusion_experiment(
                     "structured_preprocessor_sha256": sha256_file(preprocessor_path),
                 }
             )
-            mlflow.set_tags(
+            mlflow.log_params(
                 {
-                    "model_package_id": published.model_package_id,
                     "checkpoint_sha256": published.checkpoint_sha256,
-                    "local_model_sha256": published.checkpoint_sha256,
-                    "local_model_path": published.model_path.as_posix(),
+                    "model_path": published.model_path.as_posix(),
                     "report_directory": report_directory.as_posix(),
-                    "threshold_youden_j": str(thresholds["youden_j"]),
-                    "threshold_target_sensitivity": str(thresholds["target_sensitivity"]),
+                    "threshold_youden_j": thresholds["youden_j"],
+                    "threshold_target_sensitivity": thresholds["target_sensitivity"],
                 }
             )
+            mlflow.set_tags({"package_kind": "model", "package_id": published.model_package_id})
             mlflow.set_tag("run_complete", "true")
         except BaseException:
-            if published is not None and published.run_directory.exists():
-                shutil.rmtree(published.run_directory)
             if report_directory.exists():
                 shutil.rmtree(report_directory)
             raise
@@ -468,7 +438,6 @@ def train_fusion_experiment(
                 shutil.rmtree(report_stage)
         log_event(_LOGGER, "publication_completed", artifact="fusion_package", **context)
     return FusionModelResult(
-        model_name=family.family_id,
         run_id=run_id,
         validation_probability=probability,
         validation_youden_j=youden,
@@ -504,7 +473,10 @@ def load_validated_rsna_fusion_preprocessor(
     manifest: Mapping[str, Any],
 ) -> Pipeline:
     """Load the package-bound fitted RSNA structured preprocessor."""
-    if manifest.get("modality") != "fusion":
+    if manifest.get("family_id") != "cxr_metadata_concat" or manifest.get("modalities") != [
+        "cxr",
+        "metadata",
+    ]:
         raise ValueError("RSNA structured preprocessing requires a fusion package")
     path = Path(package_directory) / STRUCTURED_PREPROCESSOR_FILENAME
     if path.is_symlink() or not path.is_file():
@@ -524,24 +496,24 @@ def _validate_source_dataset_lineage(data: FusionRunData, manifest: Mapping[str,
         data.lineage.bundle_id != manifest["bundle_id"]
         or data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
         or data.lineage.split_assignment_id != manifest["split_assignment_id"]
-        or data.lineage.task_id != manifest["task"]
+        or data.lineage.task_id != manifest["task_id"]
         or data.lineage.label_policy_version != manifest["label_policy_version"]
     ):
         raise ValueError("Fusion dataset lineage differs from the source CXR package")
 
 
 def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransform:
-    image = config.neural
-    if image is None:
-        raise ValueError("Fusion transform requires image configuration")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("Fusion transform requires CXR configuration")
     return StandardCxrTransform(
         training=training,
         policy_version=str(config.preprocessing["cxr_transform_policy"]),
         image_size=int(config.family.parameters["image_size"]),
-        rotation_degrees=image.rotation_degrees,
-        translation_fraction=image.translation_fraction,
-        brightness_jitter=image.brightness_jitter,
-        contrast_jitter=image.contrast_jitter,
+        rotation_degrees=neural.rotation_degrees,
+        translation_fraction=neural.translation_fraction,
+        brightness_jitter=neural.brightness_jitter,
+        contrast_jitter=neural.contrast_jitter,
     )
 
 
@@ -555,7 +527,7 @@ def _manifest(
     lock_hash: str,
     environment: dict[str, str],
     runtime: dict[str, Any],
-    source_lineage: SourceCxrLineage,
+    source_package_id: str,
     source_pretrained_weight: dict[str, Any],
     structured_contract: dict[str, Any],
     preprocessor_sha256: str,
@@ -567,13 +539,13 @@ def _manifest(
     fit,
     thresholds: dict[str, float],
 ) -> dict[str, Any]:
-    image = config.neural
-    if image is None:
-        raise ValueError("Fusion manifest requires image configuration")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("Fusion manifest requires CXR configuration")
     return {
-        "modality": "fusion",
-        "model": config.family.family_id,
-        "task": data.lineage.task_id,
+        "family_id": config.family.family_id,
+        "modalities": list(config.family.modalities),
+        "task_id": data.lineage.task_id,
         "positive_class": 1,
         "bundle_id": data.lineage.bundle_id,
         "bundle_manifest_sha256": data.bundle_manifest_sha256,
@@ -599,7 +571,7 @@ def _manifest(
             "classifier_output_dimension": 1,
             "pretrained_weight": source_pretrained_weight,
         },
-        "source_cxr_lineage": source_lineage.as_dict(),
+        "source_package_id": source_package_id,
         "structured_preprocessor_sha256": preprocessor_sha256,
         "structured_preprocessor_contract": structured_contract,
         "structured_input_conversion": fusion_structured_input_conversion_contract(),
@@ -622,45 +594,39 @@ def _manifest(
             },
             "optimizer": "AdamW",
             "warmup": {
-                "epochs": image.warmup_epochs,
-                "head_learning_rate": image.warmup_head_learning_rate,
+                "epochs": neural.warmup_epochs,
+                "head_learning_rate": neural.warmup_head_learning_rate,
                 "encoder_frozen": True,
             },
             "fine_tuning": {
-                "maximum_epochs": image.fine_tune_epochs,
-                "encoder_learning_rate": image.encoder_learning_rate,
-                "head_learning_rate": image.head_learning_rate,
+                "maximum_epochs": neural.fine_tune_epochs,
+                "encoder_learning_rate": neural.encoder_learning_rate,
+                "head_learning_rate": neural.head_learning_rate,
             },
-            "weight_decay": image.weight_decay,
-            "gradient_clip_norm": image.gradient_clip_norm,
+            "weight_decay": neural.weight_decay,
+            "gradient_clip_norm": neural.gradient_clip_norm,
             "scheduler": {
                 "name": "ReduceLROnPlateau",
                 "mode": "max",
-                "factor": image.scheduler_factor,
-                "patience": image.scheduler_patience,
-                "min_lr": image.scheduler_min_learning_rate,
+                "factor": neural.scheduler_factor,
+                "patience": neural.scheduler_patience,
+                "min_lr": neural.scheduler_min_learning_rate,
             },
             "early_stopping": {
                 "metric": "validation_average_precision",
-                "patience": image.early_stopping_patience,
-                "minimum_delta": image.early_stopping_min_delta,
+                "patience": neural.early_stopping_patience,
+                "minimum_delta": neural.early_stopping_min_delta,
             },
         },
         "selection": {
             "selected_epoch": fit.selected_epoch,
             "selected_stage": fit.selected_stage,
-            "validation_average_precision": fit.selected_validation_average_precision,
+            "validation_average_precision": fit.selected_validation_metric,
         },
         "thresholds": thresholds,
         "threshold_contract": threshold_contract(
             sensitivity_target=config.evaluation.sensitivity_target
         ),
-        "metrics_policy": {
-            "version": NEURAL_METRICS_POLICY_VERSION,
-            "calibration_bins": config.evaluation.calibration_bins,
-            "threshold_policy_version": NEURAL_THRESHOLD_POLICY_VERSION,
-            "sensitivity_target": config.evaluation.sensitivity_target,
-        },
         "source_authentication": source_authentication,
         "runtime_provenance": runtime,
     }

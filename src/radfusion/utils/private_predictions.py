@@ -1,12 +1,14 @@
-"""Publish validated patient-level neural predictions in private local storage."""
+"""Publish immutable private prediction-evidence objects."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import shutil
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,240 +16,291 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from radfusion.data.hashing import sha256_file
-from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.data.hashing import logical_arrow_sha256, sha256_file
+from radfusion.data.symile_schemas import OUTER_FOLDS, REPEAT_SEEDS
+from radfusion.utils.package_identity import canonical_scientific_id
+from radfusion.utils.publication import (
+    install_immutable_directory,
+    staging_directory,
+    validate_path_component,
+)
 
-PRIVATE_PREDICTION_SCHEMA_VERSION = 1
+PREDICTION_SCHEMA_VERSION = 1
+PREDICTION_PREFIX = "prediction-"
 PREDICTIONS_FILENAME = "predictions.parquet"
 PREDICTION_MANIFEST_FILENAME = "manifest.json"
-PRIVATE_PREDICTION_SCHEMA = pa.schema(
+PREDICTION_SCHEMA = pa.schema(
     [
         pa.field("sample_id", pa.string(), nullable=False),
-        pa.field("private_patient_key", pa.string(), nullable=False),
         pa.field("target", pa.int8(), nullable=False),
         pa.field("logit", pa.float64(), nullable=False),
         pa.field("probability", pa.float64(), nullable=False),
-        pa.field("split", pa.string(), nullable=False),
-        pa.field("training_run_id", pa.string(), nullable=False),
-        pa.field("test_evaluation_run_id", pa.string(), nullable=False),
-        pa.field("model_package_id", pa.string(), nullable=False),
-        pa.field("seed", pa.int64(), nullable=False),
     ]
 )
+_MANIFEST_FIELDS = {
+    "prediction_schema_version",
+    "prediction_id",
+    "dataset_id",
+    "model_package_id",
+    "task_id",
+    "bundle_id",
+    "split_assignment_id",
+    "scope",
+    "cv_assignment_id",
+    "repeat_seed",
+    "outer_fold",
+    "logical_arrow_sha256",
+    "row_count",
+    "prediction_file_sha256",
+}
 
 
-def private_root_for_reports(report_directory: str | Path) -> Path:
-    """Return the ignored private workspace adjacent to the public report root."""
-    return Path(report_directory).parent / "private"
+@dataclass(frozen=True)
+class ValidatedPredictionEvidence:
+    """Validated private logical prediction content and its identities."""
+
+    directory: Path
+    manifest: Mapping[str, Any]
+    manifest_sha256: str
+    predictions: pa.Table
+    created: bool = False
+
+    @property
+    def prediction_id(self) -> str:
+        """Return the validated semantic prediction identity."""
+        return str(self.manifest["prediction_id"])
 
 
-def publish_private_neural_predictions(
+def build_prediction_table(
+    sample_ids: Sequence[str],
+    targets: Sequence[int] | np.ndarray,
+    logits: Sequence[float] | np.ndarray,
+) -> pa.Table:
+    """Build canonical ordered sample-level prediction content."""
+    ids = list(sample_ids)
+    truth = np.asarray(targets).reshape(-1)
+    scores = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if (
+        not ids
+        or any(not isinstance(value, str) or not value for value in ids)
+        or len(ids) != len(set(ids))
+        or truth.shape != (len(ids),)
+        or scores.shape != (len(ids),)
+        or set(np.unique(truth).tolist()) - {0, 1}
+        or not np.isfinite(scores).all()
+    ):
+        raise ValueError("Prediction content is invalid")
+    probabilities = _sigmoid_array(scores)
+    rows = sorted(zip(ids, truth.astype(np.int8), scores, probabilities, strict=True))
+    return pa.Table.from_pylist(
+        [
+            {
+                "sample_id": sample_id,
+                "target": int(target),
+                "logit": float(logit),
+                "probability": float(probability),
+            }
+            for sample_id, target, logit, probability in rows
+        ],
+        schema=PREDICTION_SCHEMA,
+    )
+
+
+def publish_prediction_evidence(
     *,
     private_root: str | Path,
-    dataset: str,
-    training_run_id: str,
-    test_evaluation_run_id: str,
+    dataset_id: str,
     model_package_id: str,
-    seed: int,
+    task_id: str,
+    bundle_id: str,
+    split_assignment_id: str,
+    scope: str,
     sample_ids: Sequence[str],
-    patient_keys: Sequence[str],
-    targets: np.ndarray,
-    logits: np.ndarray,
-    probabilities: np.ndarray,
-) -> Path:
-    """Publish one immutable, aligned private neural test-prediction table."""
-    for value, name in (
-        (dataset, "dataset"),
-        (training_run_id, "training_run_id"),
-        (test_evaluation_run_id, "test_evaluation_run_id"),
-        (model_package_id, "model_package_id"),
-    ):
-        _safe_component(value, name)
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError("Private prediction seed must be an integer")
-    table = _prediction_table(
-        training_run_id=training_run_id,
-        test_evaluation_run_id=test_evaluation_run_id,
+    targets: Sequence[int] | np.ndarray,
+    logits: Sequence[float] | np.ndarray,
+    cv_assignment_id: str | None = None,
+    repeat_seed: int | None = None,
+    outer_fold: int | None = None,
+) -> ValidatedPredictionEvidence:
+    """Publish one immutable prediction object under logical scientific identity."""
+    _validate_prediction_coordinate(
+        dataset_id=dataset_id,
         model_package_id=model_package_id,
-        seed=seed,
-        sample_ids=sample_ids,
-        patient_keys=patient_keys,
-        targets=targets,
-        logits=logits,
-        probabilities=probabilities,
+        task_id=task_id,
+        bundle_id=bundle_id,
+        split_assignment_id=split_assignment_id,
+        scope=scope,
+        cv_assignment_id=cv_assignment_id,
+        repeat_seed=repeat_seed,
+        outer_fold=outer_fold,
     )
-    destination = Path(private_root) / "predictions" / dataset / test_evaluation_run_id
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"Private prediction artifact already exists: {destination}")
+    table = build_prediction_table(sample_ids, targets, logits)
+    _validate_dataset_sample_ids(dataset_id, table["sample_id"].to_pylist())
+    logical_hash = logical_arrow_sha256(table)
+    semantic = {
+        "dataset_id": dataset_id,
+        "model_package_id": model_package_id,
+        "task_id": task_id,
+        "bundle_id": bundle_id,
+        "split_assignment_id": split_assignment_id,
+        "scope": scope,
+        "cv_assignment_id": cv_assignment_id,
+        "repeat_seed": repeat_seed,
+        "outer_fold": outer_fold,
+        "logical_arrow_sha256": logical_hash,
+    }
+    prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
+    scope_root = Path(private_root) / "predictions" / dataset_id
+    if scope == "outer_fold_oof":
+        scope_root /= "oof"
+    destination = scope_root / prediction_id
     stage = staging_directory(destination)
     try:
         prediction_path = stage / PREDICTIONS_FILENAME
-        pq.write_table(
-            table,
-            prediction_path,
-            compression="zstd",
-            use_dictionary=False,
-            write_statistics=True,
-        )
+        pq.write_table(table, prediction_path, compression="zstd")
         manifest = {
-            "private_prediction_schema_version": PRIVATE_PREDICTION_SCHEMA_VERSION,
-            "dataset": dataset,
+            "prediction_schema_version": PREDICTION_SCHEMA_VERSION,
+            **semantic,
+            "prediction_id": prediction_id,
             "row_count": table.num_rows,
             "prediction_file_sha256": sha256_file(prediction_path),
-            "training_run_id": training_run_id,
-            "test_evaluation_run_id": test_evaluation_run_id,
-            "model_package_id": model_package_id,
-            "seed": seed,
         }
         (stage / PREDICTION_MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
-        validate_private_neural_predictions(stage)
-        publish_directory(stage, destination)
+        validate_prediction_evidence(stage, enforce_directory_name=False)
+        created = install_immutable_directory(stage, destination, validate_prediction_evidence)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    return destination
+    return replace(
+        validate_prediction_evidence(destination, expected_prediction_id=prediction_id),
+        created=created,
+    )
 
 
-def validate_private_neural_predictions(directory: str | Path) -> dict[str, Any]:
-    """Validate one exact private neural prediction artifact without exposing rows."""
+def validate_prediction_evidence(
+    directory: str | Path,
+    *,
+    expected_prediction_id: str | None = None,
+    expected_model_package_id: str | None = None,
+    enforce_directory_name: bool = True,
+) -> ValidatedPredictionEvidence:
+    """Validate physical integrity and canonical logical prediction identity."""
     root = Path(directory)
     if root.is_symlink() or not root.is_dir():
-        raise ValueError("Private prediction artifact must be a physical directory")
+        raise ValueError("Prediction evidence must be a physical directory")
     with os.scandir(root) as entries:
         inspected = list(entries)
     if {entry.name for entry in inspected} != {
         PREDICTIONS_FILENAME,
         PREDICTION_MANIFEST_FILENAME,
     } or any(entry.is_symlink() or not entry.is_file(follow_symlinks=False) for entry in inspected):
-        raise ValueError("Private prediction artifact has an invalid file set")
+        raise ValueError("Prediction evidence has an invalid file set")
+    manifest_bytes = (root / PREDICTION_MANIFEST_FILENAME).read_bytes()
     try:
-        manifest = json.loads((root / PREDICTION_MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Private prediction manifest is unreadable") from exc
-    fields = {
-        "private_prediction_schema_version",
-        "dataset",
-        "row_count",
-        "prediction_file_sha256",
-        "training_run_id",
-        "test_evaluation_run_id",
-        "model_package_id",
-        "seed",
-    }
-    if not isinstance(manifest, dict) or set(manifest) != fields:
-        raise ValueError("Private prediction manifest has an unexpected field set")
-    version = manifest["private_prediction_schema_version"]
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Prediction manifest is unreadable") from exc
+    if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_FIELDS:
+        raise ValueError("Prediction manifest has an unexpected field set")
+    schema_version = manifest["prediction_schema_version"]
     if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != PRIVATE_PREDICTION_SCHEMA_VERSION
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != PREDICTION_SCHEMA_VERSION
     ):
-        raise ValueError("Private prediction schema version is invalid")
-    for field in ("dataset", "training_run_id", "test_evaluation_run_id", "model_package_id"):
-        _safe_component(manifest[field], field)
-    row_count = manifest["row_count"]
-    seed = manifest["seed"]
-    if (
-        isinstance(row_count, bool)
-        or not isinstance(row_count, int)
-        or row_count <= 0
-        or isinstance(seed, bool)
-        or not isinstance(seed, int)
-    ):
-        raise ValueError("Private prediction manifest counts or seed are invalid")
+        raise ValueError("Prediction schema version is invalid")
+    _validate_prediction_coordinate(
+        dataset_id=manifest["dataset_id"],
+        model_package_id=manifest["model_package_id"],
+        task_id=manifest["task_id"],
+        bundle_id=manifest["bundle_id"],
+        split_assignment_id=manifest["split_assignment_id"],
+        scope=manifest["scope"],
+        cv_assignment_id=manifest["cv_assignment_id"],
+        repeat_seed=manifest["repeat_seed"],
+        outer_fold=manifest["outer_fold"],
+    )
     prediction_path = root / PREDICTIONS_FILENAME
     if sha256_file(prediction_path) != manifest["prediction_file_sha256"]:
-        raise ValueError("Private prediction file SHA-256 mismatch")
+        raise ValueError("Prediction file SHA-256 mismatch")
     table = pq.read_table(prediction_path)
-    if table.schema != PRIVATE_PREDICTION_SCHEMA or table.num_rows != row_count:
-        raise ValueError("Private prediction table schema or row count is invalid")
-    _validate_prediction_rows(table, manifest)
-    return manifest
-
-
-def _prediction_table(
-    *,
-    training_run_id: str,
-    test_evaluation_run_id: str,
-    model_package_id: str,
-    seed: int,
-    sample_ids: Sequence[str],
-    patient_keys: Sequence[str],
-    targets: np.ndarray,
-    logits: np.ndarray,
-    probabilities: np.ndarray,
-) -> pa.Table:
-    raw_targets = np.asarray(targets).reshape(-1)
-    if set(np.unique(raw_targets).tolist()) - {0, 1}:
-        raise ValueError("Private prediction targets must be binary")
-    target_values = raw_targets.astype(np.int8, copy=False)
-    logit_values = np.asarray(logits, dtype=np.float64).reshape(-1)
-    probability_values = np.asarray(probabilities, dtype=np.float64).reshape(-1)
-    lengths = {
-        len(sample_ids),
-        len(patient_keys),
-        len(target_values),
-        len(logit_values),
-        len(probability_values),
-    }
-    if lengths == {0} or len(lengths) != 1:
-        raise ValueError("Private prediction columns must have one equal non-zero length")
-    if list(sample_ids) != sorted(sample_ids) or len(set(sample_ids)) != len(sample_ids):
-        raise ValueError("Private prediction sample IDs must be unique and ordered")
-    if any(not isinstance(value, str) or not value for value in (*sample_ids, *patient_keys)):
-        raise ValueError("Private prediction identities must be non-empty strings")
-    if not np.isfinite(logit_values).all() or not np.isfinite(probability_values).all():
-        raise ValueError("Private prediction numeric values must be finite")
-    if ((probability_values < 0.0) | (probability_values > 1.0)).any():
-        raise ValueError("Private prediction probabilities must be within [0, 1]")
-    if any(
-        not math.isclose(probability, _sigmoid(logit), rel_tol=1e-12, abs_tol=1e-15)
-        for logit, probability in zip(logit_values, probability_values, strict=True)
+    _validate_table(table)
+    _validate_dataset_sample_ids(manifest["dataset_id"], table["sample_id"].to_pylist())
+    row_count = manifest["row_count"]
+    if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count <= 0:
+        raise ValueError("Prediction row count is invalid")
+    if (
+        table.num_rows != row_count
+        or logical_arrow_sha256(table) != manifest["logical_arrow_sha256"]
     ):
-        raise ValueError("Private prediction probabilities do not correspond to stored logits")
-    count = len(target_values)
-    return pa.Table.from_pydict(
-        {
-            "sample_id": list(sample_ids),
-            "private_patient_key": list(patient_keys),
-            "target": target_values,
-            "logit": logit_values,
-            "probability": probability_values,
-            "split": ["test"] * count,
-            "training_run_id": [training_run_id] * count,
-            "test_evaluation_run_id": [test_evaluation_run_id] * count,
-            "model_package_id": [model_package_id] * count,
-            "seed": [seed] * count,
-        },
-        schema=PRIVATE_PREDICTION_SCHEMA,
+        raise ValueError("Prediction logical content differs from its manifest")
+    semantic = {
+        key: manifest[key]
+        for key in _MANIFEST_FIELDS
+        if key
+        not in {
+            "prediction_schema_version",
+            "prediction_id",
+            "row_count",
+            "prediction_file_sha256",
+        }
+    }
+    prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
+    if manifest["prediction_id"] != prediction_id:
+        raise ValueError("Prediction identity differs from logical content")
+    if expected_prediction_id is not None and prediction_id != expected_prediction_id:
+        raise ValueError("Prediction evidence differs from the expected identity")
+    if (
+        expected_model_package_id is not None
+        and manifest["model_package_id"] != expected_model_package_id
+    ):
+        raise ValueError("Prediction evidence is bound to a different model package")
+    if enforce_directory_name and root.name != prediction_id:
+        raise ValueError("Prediction directory differs from its semantic identity")
+    return ValidatedPredictionEvidence(
+        root,
+        manifest,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        table,
     )
 
 
-def _validate_prediction_rows(table: pa.Table, manifest: dict[str, Any]) -> None:
+def _validate_table(table: pa.Table) -> None:
+    if table.schema != PREDICTION_SCHEMA or table.num_rows <= 0:
+        raise ValueError("Prediction table schema or size is invalid")
     rows = table.to_pylist()
-    sample_ids = [row["sample_id"] for row in rows]
-    if sample_ids != sorted(sample_ids) or len(sample_ids) != len(set(sample_ids)):
-        raise ValueError("Private prediction rows are not uniquely ordered")
+    ids = [row["sample_id"] for row in rows]
+    if (
+        any(not isinstance(value, str) or not value for value in ids)
+        or ids != sorted(ids)
+        or len(ids) != len(set(ids))
+    ):
+        raise ValueError("Prediction rows are not uniquely ordered")
     for row in rows:
         if (
-            not row["private_patient_key"]
-            or row["target"] not in {0, 1}
-            or row["split"] != "test"
-            or row["training_run_id"] != manifest["training_run_id"]
-            or row["test_evaluation_run_id"] != manifest["test_evaluation_run_id"]
-            or row["model_package_id"] != manifest["model_package_id"]
-            or row["seed"] != manifest["seed"]
+            row["target"] not in {0, 1}
             or not math.isfinite(row["logit"])
             or not math.isfinite(row["probability"])
-            or not 0.0 <= row["probability"] <= 1.0
             or not math.isclose(
-                row["probability"], _sigmoid(row["logit"]), rel_tol=1e-12, abs_tol=1e-15
+                row["probability"],
+                _sigmoid(row["logit"]),
+                rel_tol=1e-12,
+                abs_tol=1e-15,
             )
         ):
-            raise ValueError("Private prediction row violates its contract")
+            raise ValueError("Prediction row violates its numerical contract")
+
+
+def _sigmoid_array(values: np.ndarray) -> np.ndarray:
+    result = np.empty_like(values, dtype=np.float64)
+    positive = values >= 0
+    result[positive] = 1.0 / (1.0 + np.exp(-values[positive]))
+    exponential = np.exp(values[~positive])
+    result[~positive] = exponential / (1.0 + exponential)
+    return result
 
 
 def _sigmoid(value: float) -> float:
@@ -257,13 +310,74 @@ def _sigmoid(value: float) -> float:
     return exponential / (1.0 + exponential)
 
 
-def _safe_component(value: object, field: str) -> None:
+def _validate_prediction_coordinate(
+    *,
+    dataset_id: object,
+    model_package_id: object,
+    task_id: object,
+    bundle_id: object,
+    split_assignment_id: object,
+    scope: object,
+    cv_assignment_id: object,
+    repeat_seed: object,
+    outer_fold: object,
+) -> None:
+    validate_path_component(task_id, "prediction task_id")
+    _require_identity(bundle_id, ("bundle-",), "bundle")
+    _require_identity(split_assignment_id, ("split-assignment-",), "split assignment")
+    if dataset_id == "rsna":
+        if task_id != "pneumonia":
+            raise ValueError("RSNA prediction task is invalid")
+        _require_identity(model_package_id, ("model-package-",), "model package")
+        if scope != "test" or any(
+            value is not None for value in (cv_assignment_id, repeat_seed, outer_fold)
+        ):
+            raise ValueError("Held-out prediction coordinate is invalid")
+        return
+    if dataset_id != "symile":
+        raise ValueError("Prediction dataset_id is unsupported")
+    if task_id != "pneumonia_strict":
+        raise ValueError("Symile prediction task is invalid")
+    _require_identity(model_package_id, ("fold-package-",), "model package")
+    if scope != "outer_fold_oof":
+        raise ValueError("OOF prediction scope is invalid")
+    _require_identity(cv_assignment_id, ("cv-assignment-",), "CV assignment")
     if (
-        not isinstance(value, str)
-        or not value
-        or value in {".", ".."}
-        or Path(value).name != value
-        or "/" in value
-        or "\\" in value
+        isinstance(repeat_seed, bool)
+        or not isinstance(repeat_seed, int)
+        or repeat_seed not in REPEAT_SEEDS
+        or isinstance(outer_fold, bool)
+        or not isinstance(outer_fold, int)
+        or outer_fold not in OUTER_FOLDS
     ):
-        raise ValueError(f"Private prediction {field} must be one safe path component")
+        raise ValueError("OOF prediction coordinate is invalid")
+
+
+def _validate_dataset_sample_ids(dataset_id: str, sample_ids: Sequence[str]) -> None:
+    if dataset_id == "rsna":
+        valid = all(
+            value.startswith("rsna:")
+            and len(value) > len("rsna:")
+            and not any(character.isspace() for character in value)
+            for value in sample_ids
+        )
+    else:
+        valid = all(
+            value.startswith("symile:") and value[len("symile:") :].isdigit()
+            for value in sample_ids
+        )
+    if not valid:
+        raise ValueError("Prediction sample identity does not match its dataset contract")
+
+
+def _require_identity(value: object, prefixes: tuple[str, ...], name: str) -> str:
+    validate_path_component(value, f"prediction {name}")
+    assert isinstance(value, str)
+    if not any(
+        value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(character in "0123456789abcdef" for character in value[len(prefix) :])
+        for prefix in prefixes
+    ):
+        raise ValueError(f"Prediction {name} identity is invalid")
+    return value

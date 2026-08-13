@@ -1,4 +1,4 @@
-"""Run one experiment from a validated YAML configuration."""
+"""Train one RSNA family from a validated YAML configuration."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
 from radfusion.training.rsna_registry import RegistryError
-from radfusion.training.rsna_train_cxr import train_image_experiment
+from radfusion.training.rsna_train_cxr import train_cxr_experiment
 from radfusion.training.rsna_train_fusion import train_fusion_experiment
-from radfusion.training.rsna_train_metadata import train_configured_experiment
+from radfusion.training.rsna_train_metadata import train_metadata_experiment
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI
 from radfusion.utils.operational_logging import add_logging_argument, configure_logging
 
@@ -30,8 +30,8 @@ def _parser() -> argparse.ArgumentParser:
         help="MLflow SQLite tracking URI",
     )
     parser.add_argument(
-        "--source-training-run-id",
-        help="Explicit source CXR training run required by fusion experiments",
+        "--source-cxr-package-id",
+        help="Explicit source CXR model package required by fusion experiments",
     )
     add_logging_argument(parser)
     return parser
@@ -44,19 +44,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = with_runtime(load_experiment_config(args.config), seed=args.seed)
         if config.family.family_id == "cxr_metadata_concat":
-            if not args.source_training_run_id:
-                raise ValueError("Fusion training requires --source-training-run-id")
+            if not args.source_cxr_package_id:
+                raise ValueError("Fusion training requires --source-cxr-package-id")
             result = train_fusion_experiment(
                 config,
-                source_training_run_id=args.source_training_run_id,
+                source_cxr_package_id=args.source_cxr_package_id,
                 tracking_uri=args.tracking_uri,
             )
-        elif args.source_training_run_id:
-            raise ValueError("--source-training-run-id is accepted only for fusion training")
+        elif args.source_cxr_package_id:
+            raise ValueError("--source-cxr-package-id is accepted only for fusion training")
         elif config.family.family_id == "cxr_densenet":
-            result = train_image_experiment(config, tracking_uri=args.tracking_uri)
+            result = train_cxr_experiment(config, tracking_uri=args.tracking_uri)
         else:
-            result = train_configured_experiment(config, tracking_uri=args.tracking_uri)
+            result = train_metadata_experiment(config, tracking_uri=args.tracking_uri)
     except (
         ConfigError,
         RegistryError,
@@ -71,13 +71,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "experiment": config.family.family_id,
+                "family_id": config.family.family_id,
                 "config": config.source_path.as_posix(),
-                "model_name": result.model_name,
+                "model_package_id": result.model_package_id,
                 "mlflow_run_id": result.run_id,
                 "validation_average_precision": result.validation_probability.average_precision,
                 "model_path": result.model_path.as_posix(),
-                "artifact_directory": result.artifact_directory.as_posix(),
             },
             indent=2,
         )

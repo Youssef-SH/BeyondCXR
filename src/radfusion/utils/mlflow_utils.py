@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -9,7 +10,6 @@ import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -35,6 +35,13 @@ class SourceConfig(Protocol):
 DEFAULT_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_ARTIFACT_DIRECTORY = "mlartifacts"
 _LOGGER = get_operational_logger(__name__)
+
+
+def serialize_modalities(modalities: tuple[str, ...] | list[str]) -> str:
+    """Serialize ordered modality vocabulary consistently for searchable tags."""
+    if not modalities or any(not isinstance(value, str) or not value for value in modalities):
+        raise ValueError("MLflow modalities must be a non-empty ordered string sequence")
+    return json.dumps(list(modalities), separators=(",", ":"))
 
 
 def configure_mlflow(
@@ -78,17 +85,15 @@ def tracked_run(
     context: dict[str, object] | None = None
     try:
         with mlflow.start_run(run_name=run_name, tags=tags) as run:
-            seed = tags.get("seed")
+            seed = tags.get("seed") or tags.get("repeat_seed")
             context = {
                 "run_id": run.info.run_id,
                 "run_kind": tags.get("run_kind", "unknown"),
-                "experiment": tags.get("experiment_name", run_name),
-                "dataset": tags.get("dataset", "unknown"),
-                "model": tags.get("model", "unknown"),
+                "dataset": tags.get("dataset_id", "unknown"),
+                "family_id": tags.get("family_id", "unknown"),
                 "seed": _operational_seed(seed),
             }
             log_event(_LOGGER, "run_started", **context)
-            mlflow.set_tag("run_date", datetime.now(UTC).date().isoformat())
             mlflow.log_params({key: _parameter_value(value) for key, value in parameters.items()})
             yield run.info.run_id
     except BaseException as exc:

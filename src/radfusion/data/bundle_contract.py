@@ -7,7 +7,7 @@ from typing import Any
 
 from radfusion.data.errors import ManifestBuildError
 
-BUNDLE_MANIFEST_SCHEMA_VERSION = "1"
+BUNDLE_MANIFEST_SCHEMA_VERSION = 1
 BUNDLES_DIRECTORY = "bundles"
 BUNDLE_PREFIX = "bundle-"
 MANIFEST_FILENAME = "manifest.json"
@@ -41,7 +41,12 @@ def validate_common_bundle_envelope(
     """Validate the vocabulary shared by every dataset bundle manifest."""
     if not isinstance(manifest, dict) or set(manifest) != BUNDLE_MANIFEST_FIELDS:
         raise ManifestBuildError("Bundle manifest field set is invalid")
-    if manifest.get("bundle_manifest_schema_version") != BUNDLE_MANIFEST_SCHEMA_VERSION:
+    schema_version = manifest.get("bundle_manifest_schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != BUNDLE_MANIFEST_SCHEMA_VERSION
+    ):
         raise ManifestBuildError("Bundle manifest schema version is unsupported")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:

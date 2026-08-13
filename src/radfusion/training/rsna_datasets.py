@@ -73,8 +73,8 @@ class SourceInventoryIdentity:
 
 
 @dataclass(frozen=True)
-class ImageRunData:
-    """Train and validation rows for one cache-backed image-training run."""
+class CxrRunData:
+    """Train and validation rows for one cache-backed CXR training run."""
 
     train: pd.DataFrame
     validation: pd.DataFrame
@@ -84,8 +84,8 @@ class ImageRunData:
 
 
 @dataclass(frozen=True)
-class ImageTestData:
-    """Test rows for one explicit cache-backed image-evaluation run."""
+class CxrTestData:
+    """Test rows for one explicit cache-backed CXR evaluation run."""
 
     test: pd.DataFrame
     lineage: DatasetLineage
@@ -128,7 +128,7 @@ class FusionTestData:
 class LocalizationTestData:
     """Cache-backed image test rows with positive-case box geometry."""
 
-    images: ImageTestData
+    images: CxrTestData
     dimensions: pd.DataFrame
     annotations: pd.DataFrame
 
@@ -300,7 +300,7 @@ class RsnaDataset:
         )
         return frame.loc[:, _IMAGE_FRAME_COLUMNS].copy(), _lineage(config, metadata)
 
-    def load_image_train_validation(self, config: ExperimentConfig) -> ImageRunData:
+    def load_cxr_train_validation(self, config: ExperimentConfig) -> CxrRunData:
         """Load train and validation rows bound to the pinned source inventory."""
         bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
         frame = _task_frame(
@@ -310,7 +310,7 @@ class RsnaDataset:
             feature_columns=("image_path",),
         )
         manifest_sha256 = _required_manifest_sha256(bundle)
-        return ImageRunData(
+        return CxrRunData(
             train=_image_partition(frame, "train"),
             validation=_image_partition(frame, "validation"),
             lineage=_lineage(config, metadata),
@@ -329,12 +329,12 @@ class RsnaDataset:
             source_inventory=_source_inventory_identity(metadata),
         )
 
-    def load_image_test(
+    def load_cxr_test(
         self,
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
-    ) -> ImageTestData:
+    ) -> CxrTestData:
         """Load test image rows bound to the pinned source inventory."""
         bundle, metadata = _load_pinned_bundle(
             config,
@@ -348,7 +348,7 @@ class RsnaDataset:
             feature_columns=("image_path",),
         )
         manifest_sha256 = _required_manifest_sha256(bundle)
-        return ImageTestData(
+        return CxrTestData(
             test=_image_partition(frame, "test"),
             lineage=_lineage(config, metadata),
             bundle_manifest_sha256=manifest_sha256,
@@ -404,7 +404,7 @@ class RsnaDataset:
         expected_manifest_sha256: str,
     ) -> LocalizationTestData:
         """Load cache-backed test images and validated positive-box geometry."""
-        images = self.load_image_test(
+        images = self.load_cxr_test(
             config,
             expected_manifest_sha256=expected_manifest_sha256,
         )

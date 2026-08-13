@@ -1,11 +1,9 @@
-"""Define Arrow contracts for RadFusion data artifacts."""
+"""Define Arrow contracts for RSNA data artifacts."""
 
 from __future__ import annotations
 
 import pyarrow as pa
 
-# This development schema identifier changes through an explicit contract decision.
-# Bundle IDs and artifact hashes identify exact bundle content.
 DATASET_ID = "rsna"
 PNEUMONIA_TASK_ID = "pneumonia"
 PNEUMONIA_LABEL_SOURCE = "rsna-stage-2-challenge-target"
