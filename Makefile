@@ -1,6 +1,7 @@
-.PHONY: sync lock-check lint format format-check test check inspect rsna-manifest rsna-audit \
-	symile-manifest symile-audit symile-cv symile-develop symile-analyze train evaluate compare \
-	summarize-seeds localize rsna-gpu pre-commit clean purge-generated
+.PHONY: sync lock-check lint format format-check test check pre-commit clean purge-generated \
+	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-evaluate rsna-compare \
+	rsna-summarize rsna-localize rsna-campaign symile-manifest symile-audit symile-cv \
+	symile-develop symile-analyze
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -25,14 +26,16 @@ format-check:
 
 check: lock-check lint format-check test
 
-inspect:
+rsna-inspect:
 	uv run python scripts/inspect_dicom.py "$(FILE)"
 
 rsna-manifest:
-	uv run python -m radfusion.data.rsna_manifest
+	uv run python -m radfusion.data.rsna_manifest \
+		$(if $(SOURCE_ROOT),--source-root "$(SOURCE_ROOT)")
 
 rsna-audit:
-	uv run python -m radfusion.data.rsna_audit
+	uv run python -m radfusion.data.rsna_audit \
+		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
 
 symile-manifest:
 	uv run python -m radfusion.data.symile_manifest \
@@ -57,32 +60,36 @@ symile-analyze:
 		(echo 'DEVELOPMENT_IDS="<six development IDs>" is required'; exit 2)
 	uv run python -m radfusion.training.symile_analysis --development-ids $(DEVELOPMENT_IDS)
 
-train:
+rsna-train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
 	@test -n "$(SEED)" || (echo "SEED=<integer 0..2147483647> is required"; exit 2)
 	uv run python -m radfusion.training.rsna_train --config "$(CONFIG)" --seed "$(SEED)" \
-		$(if $(SOURCE_TRAINING_RUN_ID),--source-training-run-id "$(SOURCE_TRAINING_RUN_ID)")
+		$(if $(SOURCE_CXR_PACKAGE_ID),--source-cxr-package-id "$(SOURCE_CXR_PACKAGE_ID)")
 
-evaluate:
-	@test -n "$(RUN_ID)" || (echo "RUN_ID=<training-run-id> is required"; exit 2)
-	uv run python -m radfusion.training.evaluate --run-id "$(RUN_ID)"
+rsna-evaluate:
+	@test -n "$(PACKAGE_ID)" || (echo "PACKAGE_ID=<model-package-id> is required"; exit 2)
+	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
+	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
+	uv run python -m radfusion.training.rsna_evaluate \
+		--package-id "$(PACKAGE_ID)" --config "$(CONFIG)"
 
-compare:
-	uv run python -m radfusion.training.compare
+rsna-compare:
+	@test -n "$(EVALUATION_IDS)" || (echo 'EVALUATION_IDS="<evaluation-id> ..." is required'; exit 2)
+	uv run python -m radfusion.training.rsna_compare --evaluation-ids $(EVALUATION_IDS)
 
-summarize-seeds:
-	@test -n "$(TEST_RUN_IDS)" || \
-		(echo 'TEST_RUN_IDS="<test17> <test42> <test2026>" is required'; exit 2)
-	uv run python -m radfusion.training.summarize_seeds --test-run-ids $(TEST_RUN_IDS)
+rsna-summarize:
+	@test -n "$(EVALUATION_IDS)" || \
+		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
+	uv run python -m radfusion.training.rsna_seed_summary --evaluation-ids $(EVALUATION_IDS)
 
-localize:
-	@test -n "$(TEST_RUN_IDS)" || \
-		(echo 'TEST_RUN_IDS="<test17> <test42> <test2026>" is required'; exit 2)
-	uv run python -m radfusion.training.localize --test-run-ids $(TEST_RUN_IDS)
+rsna-localize:
+	@test -n "$(EVALUATION_IDS)" || \
+		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
+	uv run python -m radfusion.training.rsna_localize --evaluation-ids $(EVALUATION_IDS)
 
-rsna-gpu:
-	uv run --locked --no-dev python -m radfusion.training.rsna_gpu_cli
+rsna-campaign:
+	uv run --locked --no-dev python -m radfusion.training.rsna_campaign_cli
 
 pre-commit:
 	uv run pre-commit run --all-files
