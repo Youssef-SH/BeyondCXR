@@ -3,13 +3,13 @@
 ## Terminology
 
 - **Dataset:** an external source collection with a stable logical identity.
-- **Build:** one execution of bundle construction. A successful build publishes one bundle.
 - **Bundle:** an immutable, validated set of typed artifacts stored under `bundle-<sha256>`.
 - **Manifest:** the bundle's `manifest.json`, which declares identity, contents, hashes, policies,
   and provenance through the common bundle envelope.
 
-The lifecycle is: source dataset → build execution → immutable bundle → validated consumers.
-`CURRENT` selects the active bundle; published bundles remain immutable.
+The lifecycle is: authenticated source → immutable bundle publication → validated scientific
+consumer. `CURRENT` supports optional interactive discovery; scientific consumers pin explicit
+immutable bundle IDs.
 
 ## Component boundaries
 
@@ -22,22 +22,22 @@ The lifecycle is: source dataset → build execution → immutable bundle → va
 | Audit generator | Produce aggregate dataset reports from a validated bundle |
 | CXR cache | Publish validated deterministic images before live stochastic augmentation |
 | Dataset mapping | Resolve the built-in adapter for a pinned bundle |
-| Model mapping | Resolve a built-in metadata, image, or fusion model adapter |
+| Model mapping | Resolve a built-in metadata, CXR, or fusion model adapter |
 | Tabular runner | Fit a metadata model and select operating thresholds on validation |
 | Neural runner | Consume a validated CXR cache, train one seed, and select one validation state |
-| Test evaluator | Verify a completed package before applying it to the test partition |
-| Seed summarizer | Validate three explicit compatible image or fusion test runs and report aggregate statistics |
+| Test evaluator | Verify a completed package and explicit compatible evaluation config before applying them to the test partition |
+| Seed summarizer | Validate three package-compatible CXR or fusion evaluations and report complete aggregate claims |
 | Localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
-| RSNA campaign | Execute the complete ordered GPU workflow and pass exact run identities in process |
+| RSNA campaign | Execute the ordered CUDA-required campaign and pass exact package and evaluation identities in process |
 | Symile development data | Resolve the pinned bundle and CV reference, then expose only official train and validation rows and authenticated CXR tensors |
-| Symile fold runner | Execute one frozen outer fit with a deterministic patient-grouped inner split and publish private OOF evidence |
+| Symile fold runner | Execute one frozen outer fit, use inner selection where applicable, and publish private OOF evidence |
 | Symile development aggregator | Validate all 15 fold packages and publish repeat metrics and the median final-training budget |
 | Symile analysis | Align six explicit family authorities and publish paired and mean-logit ensemble development evidence |
-| Private analysis store | Retain aligned neural predictions and real-image localization overlays outside public outputs |
+| Private analysis store | Retain aligned private prediction evidence and real-image localization overlays outside public outputs |
 | Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
 
 Dataset adapters isolate source-specific behavior. Training reads validated bundle records through
-the dataset mapping. Cache construction authenticates and decodes raw DICOM bytes; image and fusion
+the dataset mapping. Cache construction authenticates and decodes raw DICOM bytes; CXR and fusion
 consumers verify that cache's exact identity and authorized sample coverage. Model adapters own
 estimator or neural architecture construction.
 
@@ -54,13 +54,14 @@ Model packages under `models/` and complete reports under `reports/` are the aut
 physical outputs. MLflow stores the run ledger and references to those outputs; see
 [`training.md`](training.md) for the experiment artifact contract.
 
-Patient-level neural predictions and real-image localization examples are written under the ignored
-`private/` workspace. Public reports contain aggregate results only; see [`privacy.md`](privacy.md).
+Sample-level private prediction evidence and real-image localization examples are written under the
+ignored `private/` workspace. Public reports contain aggregate results only; see
+[`privacy.md`](privacy.md).
 
 Selected execution facts such as loader policy are persisted as runtime provenance; transient
 operational measurements remain outside scientific identity.
 
-The canonical `make rsna-gpu` campaign writes one durable execution log, validates required output
+The canonical `make rsna-campaign` workflow writes one durable execution log, validates required output
 completeness and lineage, and exports the portable scientific/provenance surface with a checksum.
 The raw dataset and disposable deterministic image cache remain outside that archive. Detailed
 execution and ownership contracts are in [`training.md`](training.md).
@@ -81,15 +82,17 @@ RSNA source files
     → validated tables and manifest
     → immutable bundle
     → audit and deterministic CXR cache
-    → metadata, image, or fusion training
+    → metadata, CXR, or fusion training
     → explicit test evaluation and post-test analysis
-    → bundle-qualified audits or run-qualified experiment outputs
+    → bundle-qualified audits or operational experiment outputs
     → validated portable campaign archive
 ```
 
-RSNA artifact schemas are defined in [`data_contract.md`](data_contract.md). Experiment composition is
-defined in [`training.md`](training.md). Reconstruction and evaluation protocols are defined in
-[`reproducibility.md`](reproducibility.md).
+The common bundle envelope and RSNA artifact schemas are defined in
+[`data_contract.md`](data_contract.md). Dataset-specific source contracts are described in
+[`datasets/rsna.md`](datasets/rsna.md) and [`datasets/symile.md`](datasets/symile.md). Experiment
+composition is defined in [`training.md`](training.md). Reconstruction and evaluation protocols
+are defined in [`reproducibility.md`](reproducibility.md).
 
 Symile development follows a separate dataset-specific path after its validated bundle. The data
 layer has no official-test accessor:
@@ -97,17 +100,26 @@ layer has no official-test accessor:
 ```text
 pinned Symile bundle + pinned 3 x 5 CV assignment
     → official train + validation strict-pneumonia rows
-    → deterministic inner split per repeat and outer fold
-    → immutable fold package with private OOF predictions
+    → deterministic inner split per repeat and outer fold for selection families
+    → immutable fold package + separate private OOF prediction evidence
     → complete family development authority
     → explicit six-family aggregate analysis
 ```
 
-Fold packages retain the minimal patient-level OOF fields (`sample_id`, target, logit, and
-probability) under ignored `models/`. Family and cross-family reports contain aggregate values
-only. Fold validation reconstructs the configured fitted estimator or neural architecture,
+Fold packages contain only fitted model, preprocessing, configuration, and selection state. The
+minimal patient-level OOF fields (`sample_id`, target, logit, and probability) live in separate
+ignored prediction objects under `private/`. Family and cross-family reports contain aggregate
+values only. Fold validation reconstructs the configured fitted estimator or neural architecture,
 strict-loads safe state, and checks preprocessing and selection witnesses. Family validation
-re-derives repeat metrics and final-budget witnesses from all 15 folds; cross-family validation
+records the deterministic inner split for every fold. Because labs Logistic Regression fits the
+complete outer-training fold without inner selection, that record is audit-only for its package
+identity. Selection-family package identities bind `inner_split_id` because their selected fitted
+state depends on that partition. Family validation re-derives repeat metrics and final-budget
+witnesses from all 15 folds; cross-family validation
 re-derives paired and ensemble claims from the six family authorities. Each Markdown summary is a
 deterministic rendering of its manifest. Development performs no threshold selection, calibration,
 final full-development fitting, or official-test evaluation.
+
+Neural checkpoints are independently reconstructable persisted documents inside their containing
+packages. Each checkpoint therefore owns schema version `1` and is validated independently from
+the outer package manifest.

@@ -1,7 +1,7 @@
 [project]
 name = "radfusion-clinical"
 version = "0.1.0"
-description = "Reproducible multimodal benchmark for the RSNA radiographic challenge target."
+description = "Reproducible radiographic and multimodal clinical-AI research framework."
 readme = "README.md"
 authors = [
     { name = "Youssef Shili", email = "youssef.shili.contact@gmail.com" }

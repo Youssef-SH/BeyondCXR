@@ -81,7 +81,7 @@ only within the internal patient-disjoint RSNA challenge holdout.
 
 ## Known data-quality findings
 
-RSNA age values use bare integers interpreted as years under a compatibility rule. Standard DICOM
+RSNA age values use bare integers interpreted as years under the dataset contract. Standard DICOM
 day, week, month, and year forms are also supported. The bundle preserves five observed values
 above 120 years and marks them as implausible. Missing and malformed values remain distinct
 source-quality outcomes and produce null sample ages.

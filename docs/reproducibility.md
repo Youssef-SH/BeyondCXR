@@ -32,7 +32,7 @@ Custom paths and split recipes are available through the CLI:
 
 ```bash
 uv run python -m radfusion.data.rsna_manifest \
-  --dataset-root /approved/local/rsna/extracted \
+  --source-root /approved/local/rsna/extracted \
   --output-directory /approved/local/manifests \
   --split-seed 42 \
   --train-ratio 0.70 \
@@ -69,31 +69,36 @@ identity and acceptance rules are defined in [`data_contract.md`](data_contract.
 ## Generate audits and experiments
 
 ```bash
-make rsna-gpu
+make rsna-campaign
 ```
 
-The command runs the complete ordered RSNA campaign and transfers exact run identities directly
-between training, evaluation, summary, and localization functions. It crosses the test boundary
-only after both metadata packages and all six neural packages have frozen.
+The command runs the complete ordered RSNA campaign and transfers exact model-package and
+evaluation identities directly between training, evaluation, summary, and localization functions.
+It crosses the test boundary only after both metadata packages and all six neural packages have
+frozen.
 
 Audits are published under `reports/rsna/audit/<bundle-id>/`. Rebuilding one audit replaces only
 that bundle-qualified audit directory.
 
-Experiment configs pin the exact bundle ID and one training seed. Preprocessing is fitted on
+Experiment configs pin the exact bundle ID; the execution seed is a separate runtime coordinate.
+Preprocessing is fitted on
 training data. Validation selects the LightGBM stopping point and both operating thresholds.
-`make evaluate` verifies those choices against the source training run before applying them to
-test in a separate linked run.
+`make rsna-evaluate PACKAGE_ID=... CONFIG=...` verifies fitted choices and frozen thresholds from
+the explicit model package, verifies that the explicit config has identical package-scoped fitting
+semantics, and takes downstream calibration policy from that config before accessing test.
 
-Image experiment configurations pin the semantic bundle ID. Validation computes the observed
+CXR experiment configurations pin the semantic bundle ID. Validation computes the observed
 bundle-manifest SHA-256 and verifies the manifest's physical, logical, semantic, split, and source
 contracts. Training records the hash in its package and an MLflow parameter; linked test evaluation
 requires the same bundle-manifest SHA-256 and accesses only its authorized task-bearing partition.
 
 Training runs record the Git commit and dirty status, exact configuration bytes and hash,
-dependency-lock hash, environment, dataset identity, and model lineage. Formal test evaluation
-requires a package produced from the evaluator's clean Git commit and matching dependency lock.
-Test-evaluation runs record their own code and lock provenance and link the verified model package
-to its source training run.
+dependency-lock hash, environment, dataset identity, and model lineage. Git and lock identities are
+reproducibility witnesses outside scientific package identity. Formal test evaluation
+validates the package, prediction, and evaluation scientific contracts without requiring the
+evaluator to share the producer's Git or lock witness. Test-evaluation runs record their own code
+and lock provenance; MLflow run linkage remains operational provenance rather than scientific
+authority.
 
 The campaign materializes each source DICOM's bytes once, authenticates them against the bundle
 inventory, and decodes the same in-memory bytes while building an identity-addressed deterministic
@@ -118,39 +123,49 @@ carried in sampler requests, so worker startup, persistence, assignment, and pre
 change ordering or augmentation. The cache stores the resized canonical image before stochastic
 augmentation and XRV intensity normalization, preserving the established operation order.
 
-Image training fingerprints the materialized pretrained weight file immediately before and after
+CXR training fingerprints the materialized pretrained weight file immediately before and after
 model construction and requires exact equality. The selected CPU checkpoint may come from
 head-only warm-up or full fine-tuning. Explicit test evaluation verifies the package, checkpoint,
-code, lock, and model structure before loading test rows and applies the validation thresholds
-unchanged. It reconstructs the architecture without reading or downloading the original
+and model structure before loading test rows and applies the package-bound validation thresholds
+unchanged. Producer and evaluator code/lock identities remain separately recorded reproducibility
+witnesses. Evaluation reconstructs the architecture without reading or downloading the original
 pretrained cache.
 
 Train and validation loaders use the configured reused-loader worker count, which is 2 in the
 canonical RSNA configurations. Positive-worker loaders use `spawn`, persistent workers, and
 prefetch factor 2. One-shot test inference is synchronous and uses no worker processes,
 persistence, prefetch, or multiprocessing context. The actual lifecycle-specific loader policy is
-runtime provenance rather than a semantic compatibility input.
+runtime provenance outside semantic identity.
 
 Epoch records contain the learning rates used for that epoch. CUDA runtime, cuDNN, GPU identity,
 device index, and compute capability are recorded as runtime provenance and excluded from the model
 package ID.
 
-Neural package identity is an exact provenance identity over meaning-bearing image configuration
-and package lineage, including the selected checkpoint and observed bundle-manifest SHA-256.
-Runtime provenance, operational paths, and training-run ID remain outside this identity; the
-archived YAML is validated separately by its exact byte hash.
+Neural package identity binds the package-scoped configuration projection, semantic source-package
+lineage, and the canonical selected tensor/preprocessor state. The complete
+`config_semantic_sha256` remains a validated configuration witness but does not rename fitted state
+when only downstream evaluation policy changes. Serialized checkpoint bytes, observed
+bundle-manifest SHA-256, `config_source_sha256`, Git, lock, runtime, paths, and MLflow runs are
+validated separately as integrity, reproducibility, or operational witnesses.
+Frozen validation-derived thresholds and their selection contract are selected scientific package
+state and therefore participate in the package identity. Held-out evaluation derives its nested
+threshold-selection policy from that validated package contract and receives calibration policy
+from an explicit compatible evaluation config; equal numeric thresholds cannot mask a
+sensitivity-target, policy-version, or positive-class mismatch.
 
-Each training invocation runs one explicit seed. The RSNA image seed summarizer accepts only
-explicit linked test runs for seeds 17, 42, and 2026, verifies their stored compatibility, and
-reports individual metrics with arithmetic means and sample standard deviations. Thresholds remain
-seed-specific, and no favorable seed is selected as canonical.
+Each training invocation runs one explicit seed. The RSNA CXR seed summarizer accepts only
+explicit evaluation IDs for seeds 17, 42, and 2026, validates each package-to-prediction-to-
+evaluation chain, proves that the packages share one seed-neutral scientific family definition,
+and publishes a reusable `seed-summary-<sha256>` result. Its validator re-derives all six
+probability/calibration metrics and both operating-point metric/count surfaces, plus arithmetic
+means and sample standard deviations for non-threshold values. Thresholds remain seed-specific,
+and no favorable seed is selected as canonical.
 
 The same summary contract applies to fusion runs and additionally verifies the fixed fusion and
-structured-preprocessing contracts and compatible same-seed source CXR families. Fusion source run
-IDs are supplied at execution time; exact source package and checkpoint identities are package
-lineage.
+structured-preprocessing contracts and compatible same-seed source CXR families. Fusion receives
+the source package ID as its scientific lineage authority.
 
-RSNA localization reconstructs each of the three verified image packages, targets the final
+RSNA localization reconstructs each of the three verified CXR packages, targets the final
 DenseNet spatial feature sequence, and maps bounding boxes through the evaluation center crop and
 resize. Pointing-game ties use row-major order. Activation energy is the fraction of nonnegative
 heatmap mass inside the union box mask; a zero heatmap receives zero for both metrics. Qualitative
@@ -159,14 +174,15 @@ validation Youden threshold. All positives contribute to quantitative localizati
 computed for only the selected negative examples. Aggregate output is public-safe, while real-image
 overlays remain in the ignored private workspace.
 
-Each image and fusion test evaluation also publishes an aligned, validated private prediction table
-under `private/predictions/`. The table supports later aligned analyses and is excluded from public
-reports and MLflow artifacts.
+Each RSNA test evaluation also publishes an aligned, validated private prediction
+object under `private/predictions/rsna/prediction-<sha256>/`. Its logical content and package
+lineage define its identity; serialized Parquet bytes are an integrity witness.
 
 ## Reproduce Symile development evidence
 
 The six Symile configs pin the frozen bundle and 3-by-5 patient-grouped CV assignment. Rebuilding
-the M4 artifacts is not part of development execution. Run each family explicitly; fusion families
+the data-foundation artifacts is not part of development execution. Run each family explicitly;
+fusion families
 also receive the completed CXR development identity:
 
 ```bash
@@ -184,8 +200,8 @@ make symile-develop CONFIG=configs/symile_cxr_labs_gated_no_observedness.yaml \
 Each successful invocation produces 15 immutable fold packages and one complete family development
 authority. Every repeat must contain one OOF prediction for each of the 2,368 strict-pneumonia
 development admissions. Neural packages retain selected-epoch histories; LightGBM packages retain
-`best_iteration`. The family manifest records the ordered 15 values and their eighth ordered value
-as the frozen median final-training budget.
+`best_iteration`. The family manifest records the 15 selection budgets in deterministic
+fold-coordinate order and records their numeric median as the frozen final-training budget.
 
 After all six family identities exist, publish the aggregate analysis:
 
@@ -193,15 +209,17 @@ After all six family identities exist, publish the aggregate analysis:
 make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
 ```
 
-Identity validation covers exact config bytes, semantic configuration, bundle and CV lineage,
+Identity validation covers exact config bytes, fit-relevant configuration, bundle and CV lineage,
 inner-split identity, reconstructable fitted state, fitted ECDF and feature contracts, validated
-neural history, OOF logical and physical hashes, and exact fold coverage. Family authorities
-recompute each repeat metric and median budget from their 15 folds. Cross-family authorities
+neural history, separate OOF logical evidence, and exact fold coverage. Family authorities
+recompute each repeat metric and median final-training budget from 15 package/prediction pairs. Cross-family authorities
 recompute paired effects and mean-logit ensemble metrics from the six families, and summary text
 must equal the deterministic manifest rendering.
-MLflow records one `training`/`oof` run per fold and sets `run_complete=true` only after immutable
-fold publication and ledger updates succeed. Paths, MLflow run IDs, timestamps, and runtime
-hardware remain outside semantic artifact identity.
+MLflow records one `training`/`oof` run per fold and sets `run_complete=true` after immutable
+package and prediction publication plus operational completion bookkeeping succeeds. Complete
+family development publication and validation subsequently revalidate exact package/prediction
+membership against the pinned complete CV authority. Paths, MLflow run IDs, timestamps, and
+runtime hardware remain outside semantic artifact identity.
 
 The development reader requests only official train and validation rows and authenticates only the
 corresponding CXR tensors. It has no official-test accessor. Development produces no thresholds,
@@ -257,8 +275,8 @@ Model lineage, artifact ownership, and comparison-table roles are defined in
 [`training.md`](training.md).
 
 MLflow records exact loaded training configs, resolved parameters, scalar metrics, provenance,
-lineage, completion state, and project-output references. Linked test runs add evaluator
-provenance, test metrics, and their source package and training-run relationship.
+lineage, completion state, and project-output references. Held-out evaluation runs add evaluator
+provenance, test metrics, and the authoritative source model-package and evaluation identities.
 
 Operational logs describe the current execution and may contain environment-dependent elapsed
 times and heartbeat timing. They are not inputs to reproducibility, provenance, MLflow lineage,

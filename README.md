@@ -2,8 +2,8 @@
 
 RadFusion-Clinical is a reproducible machine-learning benchmark and experimentation framework for
 prediction of report-derived Pneumonia findings from chest radiographs and admission physiology.
-It contains the completed RSNA imaging benchmark and an authenticated Symile-MIMIC multimodal data
-layer.
+It contains an RSNA imaging benchmark and an authenticated Symile-MIMIC multimodal development
+track.
 
 > Research and educational prototype. Clinical decision-making lies outside its intended use.
 
@@ -20,14 +20,14 @@ layer.
   observedness-ablation families, with immutable OOF evidence and aggregate analysis
 - Metadata preprocessing fitted on the training split and fixed Logistic Regression and LightGBM
   baselines
-- A TorchXRayVision DenseNet121 image baseline with deterministic per-seed training
+- A TorchXRayVision DenseNet121 CXR baseline with deterministic per-seed training
 - Same-byte raw-DICOM authentication and decoding during deterministic cache construction
-- Observed bundle-manifest SHA-256 lineage for image training and linked evaluation
-- Separate validation and explicit test-evaluation runs with MLflow lineage
-- Explicit RSNA image and fusion three-seed summaries with individual, mean, and sample-SD results
-- Fixed image-metadata concat fusion with same-seed CXR package initialization
+- Observed bundle-manifest SHA-256 lineage for CXR training and linked evaluation
+- Separate immutable model packages, private prediction evidence, and aggregate evaluations
+- Explicit RSNA CXR and fusion three-seed summaries with individual, mean, and sample-SD results
+- Fixed CXR-metadata concat fusion with same-seed CXR package initialization
 - Post-training three-seed Grad-CAM localization against RSNA bounding boxes
-- Immutable run-qualified metadata and neural model packages
+- Immutable content-addressed metadata and neural model packages
 - Ruff, pytest, pre-commit, and continuous-integration checks
 
 ## Setup
@@ -63,25 +63,27 @@ development lifecycle.
 ## Commands
 
 ```bash
-make rsna-gpu        # run and export the complete authoritative RSNA campaign
+make rsna-campaign   # run and export the complete authoritative RSNA campaign
 make symile-manifest # authenticate Symile-MIMIC and publish its immutable bundle
 make symile-audit    # publish the bundle-qualified aggregate Symile audit
 make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
 make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
 make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
 
-# Lower-level inspection and debugging commands
-make rsna-manifest   # publish an RSNA bundle
-make rsna-audit      # generate reports under reports/rsna/audit/<bundle-id>
-make train CONFIG=configs/rsna_metadata_logistic.yaml SEED=42
-make train CONFIG=configs/rsna_cxr_densenet.yaml SEED=42
-make evaluate RUN_ID=<training-run-id>
-make compare         # regenerate CSV and Markdown comparison views from MLflow
+# Lower-level explicit scientific commands
+make rsna-inspect FILE=path/to/image.dcm
+make rsna-manifest SOURCE_ROOT=data/raw/rsna/extracted
+make rsna-audit BUNDLE_ID=bundle-...
+make rsna-train CONFIG=configs/rsna_metadata_logistic.yaml SEED=42
+make rsna-train CONFIG=configs/rsna_cxr_densenet.yaml SEED=42
+make rsna-evaluate PACKAGE_ID=model-package-... CONFIG=configs/rsna_metadata_logistic.yaml
+make rsna-compare EVALUATION_IDS="<evaluation-id> ..."
+make rsna-summarize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
+make rsna-localize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
 make clean           # remove tool caches and interrupted-publication staging state
 make purge-generated # deliberately remove all reproducible generated outputs
 make check           # lock consistency, Ruff checks, and unit/contract tests
 make pre-commit      # run repository hooks against all tracked files
-make inspect FILE=path/to/image.dcm
 ```
 
 `symile-audit` and `symile-cv` resolve `data/manifests/symile/CURRENT` once for interactive use.
@@ -94,10 +96,10 @@ not user controls. Concat and gated families additionally require
 development ID for each of the six families and validates family membership independently of CLI
 ordering. Neither command exposes or evaluates the official Symile test.
 
-After the raw dataset is in place, `make rsna-gpu` owns pretrained-weight readiness, bundle and
+After the raw dataset is in place, `make rsna-campaign` owns pretrained-weight readiness, bundle and
 audit generation, deterministic image caching, all eight
-training runs, all eight linked evaluations, both seed summaries, localization, comparison, final
-validation, and export. It requires no operator-supplied run IDs. The campaign log is written to
+training runs, all eight package-bound evaluations, both seed summaries, localization, comparison,
+final validation, and export. It requires no operator-supplied IDs. The campaign log is written to
 `reports/rsna/campaigns/<campaign-id>/execution.log`; the portable archive and checksum are written
 to `outbox/rsna-results-<campaign-id>.tar.gz` and `.tar.gz.sha256`.
 
@@ -116,22 +118,24 @@ examples.
 Every experiment is declared by a validated YAML file under `configs/`. See
 [`docs/training.md`](docs/training.md) for the training workflow.
 
-Image and fusion training execute one configured seed per invocation. Cache preparation
+CXR and fusion training execute one configured seed per invocation. Cache preparation
 materializes each source DICOM's bytes once, authenticates them, and decodes the same in-memory
 bytes. Neural consumers use a validated cache whose validation proves its identity, exact
-sample-to-partition mapping, and content integrity without reopening raw DICOMs. Image training
+sample-to-partition mapping, and content integrity without reopening raw DICOMs. CXR training
 fingerprints the pretrained weight file immediately before and after model construction and
 requires exact equality.
-`make evaluate` verifies the selected immutable package before accessing test data and reconstructs
-the model without the pretrained-weight cache.
+`make rsna-evaluate` verifies the selected immutable package and the explicitly supplied compatible
+evaluation config before accessing test data. The package owns fitted state and frozen thresholds;
+the explicit config owns downstream evaluation policy. Neural evaluation reconstructs the model
+without the pretrained-weight cache.
 
-Fusion training requires an explicit same-seed image training run at execution time. The committed
+Fusion training requires an explicit same-seed CXR package at execution time. The committed
 fusion YAML remains a stable scientific definition; the resulting package records the exact source
 CXR package and embeds its train-fitted structured preprocessor.
 
-The RSNA campaign owns the image and fusion seeds 17, 42, and 2026; seed is an execution
-coordinate rather than YAML content. Linked test runs for one modality can be
-summarized only by supplying all three run IDs explicitly. The summary retains individual results
+The RSNA campaign owns the CXR and fusion seeds 17, 42, and 2026; seed is an execution
+coordinate rather than YAML content. Evaluations for one modality can be
+summarized only by supplying all three evaluation IDs explicitly. The summary retains individual results
 and reports their mean and sample standard deviation without selecting a canonical seed or
 averaging models.
 
@@ -168,13 +172,14 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 
 ## Limitations
 
-- Implemented scope covers the completed RSNA Stage 2 metadata, image, fusion, and localization
-  campaign plus the authenticated Symile-MIMIC data layer and development-only repeated-CV
+- Implemented scope covers the RSNA Stage 2 metadata, CXR, fusion, and localization campaign
+  plus the authenticated Symile-MIMIC data layer and development-only repeated-CV
   lifecycle. No formal Symile development results or held-out-test results are reported here.
 - Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
   endpoint definition.
 
 See [`docs/architecture.md`](docs/architecture.md) for system structure,
-[`docs/data_contract.md`](docs/data_contract.md) for the RSNA artifact contract, and
+[`docs/data_contract.md`](docs/data_contract.md) for the shared bundle and RSNA artifact contract, and
 [`docs/reproducibility.md`](docs/reproducibility.md) for reconstruction details. RSNA-specific
-facts are documented in [`docs/datasets/rsna.md`](docs/datasets/rsna.md).
+facts are documented in [`docs/datasets/rsna.md`](docs/datasets/rsna.md); Symile-specific facts are
+documented in [`docs/datasets/symile.md`](docs/datasets/symile.md).
