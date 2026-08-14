@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from lightgbm import LGBMClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from radfusion.evaluation.probabilities import positive_class_probabilities
+from radfusion.evaluation.probabilities import (
+    canonical_binary_raw_scores,
+    positive_class_probabilities,
+)
 
 
 class _Estimator:
@@ -33,6 +40,57 @@ def test_positive_probability_forwards_lightgbm_best_iteration() -> None:
     estimator = IterationEstimator()
     positive_class_probabilities(estimator, ["a"], best_iteration=17)
     assert estimator.iteration == 17
+
+
+def test_logistic_raw_scores_are_true_margins_at_probability_boundaries() -> None:
+    features = np.asarray([[-1.0], [0.0], [1.0]])
+    classifier = LogisticRegression().fit(features, [0, 0, 1])
+    classifier.coef_[:] = 1000.0
+    classifier.intercept_[:] = 0.0
+    pipeline = Pipeline([("preprocess", "passthrough"), ("classifier", classifier)])
+
+    scores = canonical_binary_raw_scores(pipeline, features)
+
+    np.testing.assert_array_equal(scores, [-1000.0, 0.0, 1000.0])
+    probabilities = positive_class_probabilities(pipeline, features)
+    assert probabilities[0] == 0.0
+    assert probabilities[1] == 0.5
+    assert probabilities[2] == 1.0
+
+
+def test_lightgbm_raw_scores_match_selected_iteration_probabilities() -> None:
+    features = np.arange(16, dtype=np.float64).reshape(-1, 1)
+    pipeline = Pipeline(
+        [
+            ("preprocess", StandardScaler()),
+            (
+                "classifier",
+                LGBMClassifier(
+                    n_estimators=5,
+                    min_child_samples=1,
+                    num_leaves=4,
+                    random_state=42,
+                    verbosity=-1,
+                    n_jobs=1,
+                ),
+            ),
+        ]
+    ).fit(features, np.asarray([0] * 8 + [1] * 8))
+    classifier = pipeline.named_steps["classifier"]
+
+    scores = canonical_binary_raw_scores(pipeline, features, best_iteration=3)
+
+    transformed = pipeline.named_steps["preprocess"].transform(features)
+    expected = classifier.booster_.predict(transformed, raw_score=True, num_iteration=3)
+    np.testing.assert_allclose(scores, expected, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        1.0 / (1.0 + np.exp(-scores)),
+        positive_class_probabilities(pipeline, features, best_iteration=3),
+        rtol=1e-12,
+        atol=1e-15,
+    )
+    with pytest.raises(ValueError, match="selected best iteration"):
+        canonical_binary_raw_scores(pipeline, features)
 
 
 @pytest.mark.parametrize("classes", [[0], [0, 2], [0, 0], [[0, 1]]])

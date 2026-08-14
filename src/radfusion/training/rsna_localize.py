@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import statistics
@@ -15,8 +14,6 @@ from typing import Any, cast
 import matplotlib
 import numpy as np
 import torch
-from mlflow.exceptions import MlflowException
-from sqlalchemy.exc import SQLAlchemyError
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,8 +27,6 @@ from radfusion.evaluation.localization import (
     transform_rsna_box,
     union_box_mask,
 )
-from radfusion.models.cxr_baseline import ImageDenseNetModel
-from radfusion.training.completed_runs import has_matching_training_parent, require_completed_run
 from radfusion.training.config import (
     ExperimentConfig,
     load_experiment_config,
@@ -39,7 +34,6 @@ from radfusion.training.config import (
     with_runtime,
 )
 from radfusion.training.device import resolve_device
-from radfusion.training.evaluate_image import verify_image_training_package
 from radfusion.training.neural import seed_neural_runtime
 from radfusion.training.rsna_datasets import (
     RsnaCachedImageDataset,
@@ -47,20 +41,10 @@ from radfusion.training.rsna_datasets import (
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
+from radfusion.training.rsna_evaluation_result import validate_rsna_evaluation
+from radfusion.training.rsna_interfaces import RsnaCxrModelImplementation
 from radfusion.training.rsna_registry import get_dataset, get_model
-from radfusion.training.summarize_seeds import EXPECTED_SEEDS
-from radfusion.utils.mlflow_utils import (
-    DEFAULT_TRACKING_URI,
-    configure_mlflow,
-    git_revision,
-    uv_lock_sha256,
-)
-from radfusion.utils.neural_publication import (
-    CONFIG_FILENAME,
-    load_validated_neural_checkpoint,
-    strict_load_checkpoint,
-    validate_neural_package_metadata,
-)
+from radfusion.training.rsna_seed_summary import EXPECTED_SEEDS
 from radfusion.utils.operational_logging import (
     CountProgress,
     add_logging_argument,
@@ -68,110 +52,123 @@ from radfusion.utils.operational_logging import (
     get_operational_logger,
     timed_phase,
 )
+from radfusion.utils.package_identity import (
+    canonical_scientific_id,
+    package_scientific_config_payload,
+)
 from radfusion.utils.privacy import validate_public_reports
-from radfusion.utils.private_predictions import private_root_for_reports
-from radfusion.utils.publication import publish_directory, staging_directory
+from radfusion.utils.publication import (
+    install_immutable_directory,
+    staging_directory,
+    validate_path_component,
+)
+from radfusion.utils.rsna_neural_publication import (
+    CONFIG_FILENAME,
+    load_validated_neural_checkpoint,
+    strict_load_checkpoint,
+    validate_neural_package_metadata,
+)
 
 LOCALIZATION_POLICY_VERSION = "rsna-gradcam-union-box-v1"
+LOCALIZATION_SCHEMA_VERSION = 1
+PRIVATE_LOCALIZATION_SCHEMA_VERSION = 1
 QUALITATIVE_POLICY_VERSION = "sha256-stratum-order-v1"
+GRADCAM_TARGET = "encoder.backbone.features"
+LOCALIZATION_THRESHOLD_POLICY = "validation_youden_j_seed_specific"
 LOCALIZATION_FILENAMES = frozenset({"summary.json", "summary.md"})
 PRIVATE_LOCALIZATION_FILENAMES = frozenset({"qualitative_manifest.json", "examples"})
 _LOGGER = get_operational_logger(__name__)
 
 
 def generate_localization_report(
-    test_run_ids: Sequence[str],
+    evaluation_ids: Sequence[str],
     *,
-    tracking_uri: str = DEFAULT_TRACKING_URI,
     output_directory: str | Path = "reports",
+    model_directory: str | Path = "models/rsna",
+    private_directory: str | Path = "private",
     cache: ValidatedCxrCache | None = None,
 ) -> Path:
-    """Verify three explicit image test runs and publish localization results."""
-    run_ids = tuple(test_run_ids)
-    if len(run_ids) != 3 or len(set(run_ids)) != 3:
-        raise ValueError("Localization requires exactly three distinct test run IDs")
-    client = configure_mlflow(tracking_uri=tracking_uri)
-    commit, dirty = git_revision()
-    lock_hash = uv_lock_sha256()
+    """Verify three explicit CXR evaluation objects and publish localization results."""
+    identities = tuple(evaluation_ids)
+    if len(identities) != 3 or len(set(identities)) != 3:
+        raise ValueError("Localization requires exactly three distinct evaluation IDs")
     members = []
-    for test_run_id in run_ids:
-        test_run = client.get_run(test_run_id)
-        test = require_completed_run(test_run)
-        training_run = client.get_run(test.source_training_run_id)
-        training = require_completed_run(training_run)
-        if (
-            test.modality != "image"
-            or test.run_kind != "test_evaluation"
-            or test.evaluation_scope != "test"
-            or not has_matching_training_parent(test, training)
-        ):
-            raise ValueError("Localization members must be linked completed image test runs")
-        package = Path(training.local_model_path).parent
+    for evaluation_id in identities:
+        validate_path_component(evaluation_id, "evaluation ID")
+        evaluation = validate_rsna_evaluation(
+            Path(output_directory) / "rsna/evaluations" / evaluation_id,
+            private_root=private_directory,
+            model_root=model_directory,
+            expected_evaluation_id=evaluation_id,
+        )
+        package_id = str(evaluation.manifest["model_package_id"])
+        package = Path(model_directory) / "packages" / package_id
         manifest = validate_neural_package_metadata(package)
-        config = with_runtime(
-            load_experiment_config(package / CONFIG_FILENAME), seed=test.integer_seed()
-        )
-        verify_image_training_package(
-            training_run,
-            config,
-            manifest,
-            training_run_id=training.run_id,
-            evaluator_commit=commit,
-            evaluator_dirty=dirty,
-            evaluator_lock_hash=lock_hash,
-        )
-        members.append((test, training, package, manifest, config))
-    members.sort(key=lambda value: value[0].integer_seed())
-    if tuple(value[0].integer_seed() for value in members) != EXPECTED_SEEDS:
+        seed = manifest["training_policy"]["seed"]
+        config = with_runtime(load_experiment_config(package / CONFIG_FILENAME), seed=seed)
+        if config.family.family_id != "cxr_densenet":
+            raise ValueError("Localization requires CXR-only model packages")
+        members.append((evaluation_id, package_id, package, manifest, config))
+    members.sort(key=lambda value: require_runtime_seed(value[4]))
+    if tuple(require_runtime_seed(value[4]) for value in members) != EXPECTED_SEEDS:
         raise ValueError(f"Localization requires seeds {list(EXPECTED_SEEDS)}")
-    compatibility = {value[4].config_semantic_sha256 for value in members}
-    if len(compatibility) != 1:
-        raise ValueError("Localization image runs are not scientifically compatible")
+    package_configs = {
+        json.dumps(
+            package_scientific_config_payload(value[4]), sort_keys=True, separators=(",", ":")
+        )
+        for value in members
+    }
+    if len(package_configs) != 1:
+        raise ValueError("Localization CXR evaluations are not scientifically compatible")
     reference_config = members[0][4]
-    reference_image = reference_config.neural
-    if reference_image is None:
+    reference_neural = reference_config.neural
+    if reference_neural is None:
         raise ValueError("Localization package configuration is incomplete")
     reference_dataset = _rsna_localization_dataset(reference_config)
     reference_transform = StandardCxrTransform(
         training=False,
         policy_version=str(reference_config.preprocessing["cxr_transform_policy"]),
         image_size=int(reference_config.family.parameters["image_size"]),
-        rotation_degrees=reference_image.rotation_degrees,
-        translation_fraction=reference_image.translation_fraction,
-        brightness_jitter=reference_image.brightness_jitter,
-        contrast_jitter=reference_image.contrast_jitter,
+        rotation_degrees=reference_neural.rotation_degrees,
+        translation_fraction=reference_neural.translation_fraction,
+        brightness_jitter=reference_neural.brightness_jitter,
+        contrast_jitter=reference_neural.contrast_jitter,
     )
     resolved_cache = cache or prepare_rsna_cxr_cache(
         reference_dataset,
         reference_config,
         reference_transform,
     )
-    ordered_run_ids = tuple(value[0].run_id for value in members)
-    report_id = "localization-" + hashlib.sha256("\0".join(ordered_run_ids).encode()).hexdigest()
+    ordered_package_ids = tuple(value[1] for value in members)
+    report_id = _localization_id(ordered_package_ids)
     destination = Path(output_directory) / "rsna" / "localization" / report_id
-    private_destination = private_root_for_reports(output_directory) / "localization" / report_id
-    if destination.exists() or private_destination.exists():
-        raise FileExistsError("Localization outputs already exist")
+    private_destination = Path(private_directory) / "localization" / report_id
     stage = staging_directory(destination)
     private_stage = staging_directory(private_destination)
-    private_published = False
     try:
         with timed_phase(_LOGGER, "localization"):
             examples = private_stage / "examples"
             examples.mkdir(parents=True)
             results = [
                 _evaluate_member(
-                    test,
-                    training,
+                    package_id,
                     package,
                     manifest,
                     config,
                     examples=examples,
                     cache=resolved_cache,
                 )
-                for test, training, package, manifest, config in members
+                for _evaluation_id, package_id, package, manifest, config in members
             ]
-            document = _report_document(report_id, [result["public"] for result in results])
+            public_members = [result["public"] for result in results]
+            forbidden_source_values = {
+                value for result in results for value in result["forbidden_source_values"]
+            }
+            document = _report_document(
+                report_id,
+                ordered_package_ids,
+                public_members,
+            )
             (stage / "summary.json").write_text(
                 json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
                 encoding="utf-8",
@@ -181,7 +178,7 @@ def generate_localization_report(
             (private_stage / "qualitative_manifest.json").write_text(
                 json.dumps(
                     {
-                        "private_localization_schema_version": 1,
+                        "private_localization_schema_version": PRIVATE_LOCALIZATION_SCHEMA_VERSION,
                         "report_id": report_id,
                         "selection_policy": QUALITATIVE_POLICY_VERSION,
                         "examples": private_members,
@@ -197,17 +194,34 @@ def generate_localization_report(
                 stage,
                 private_stage,
                 private_members=private_members,
-                forbidden_source_values={
-                    value for result in results for value in result["forbidden_source_values"]
-                },
+                forbidden_source_values=forbidden_source_values,
+                expected_report_id=report_id,
+                expected_public_members=public_members,
             )
-            publish_directory(private_stage, private_destination)
-            private_published = True
-            publish_directory(stage, destination)
-    except BaseException:
-        if private_published and private_destination.exists():
-            shutil.rmtree(private_destination)
-        raise
+            install_immutable_directory(
+                private_stage,
+                private_destination,
+                lambda candidate, **_: _validate_localization_output_boundaries(
+                    stage,
+                    Path(candidate),
+                    private_members=private_members,
+                    forbidden_source_values=forbidden_source_values,
+                    expected_report_id=report_id,
+                    expected_public_members=public_members,
+                ),
+            )
+            install_immutable_directory(
+                stage,
+                destination,
+                lambda candidate, **_: _validate_localization_output_boundaries(
+                    Path(candidate),
+                    private_destination,
+                    private_members=private_members,
+                    forbidden_source_values=forbidden_source_values,
+                    expected_report_id=report_id,
+                    expected_public_members=public_members,
+                ),
+            )
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -217,10 +231,16 @@ def generate_localization_report(
 
 
 def _evaluate_member(
-    test, training, package, manifest, config, *, examples: Path, cache: ValidatedCxrCache
+    package_id,
+    package,
+    manifest,
+    config,
+    *,
+    examples: Path,
+    cache: ValidatedCxrCache,
 ):
     checkpoint = load_validated_neural_checkpoint(package, manifest)
-    builder = cast(ImageDenseNetModel, get_model(config.family.family_id))
+    builder = cast(RsnaCxrModelImplementation, get_model(config.family.family_id))
     model = builder.build_architecture(config.family)
     strict_load_checkpoint(model, checkpoint)
     dataset_adapter = _rsna_localization_dataset(config)
@@ -228,8 +248,8 @@ def _evaluate_member(
         config,
         expected_manifest_sha256=manifest["bundle_manifest_sha256"],
     )
-    image = config.neural
-    if image is None or config.runtime.source_root is None:
+    neural = config.neural
+    if neural is None or config.runtime.source_root is None:
         raise ValueError("Localization package configuration is incomplete")
     runtime = resolve_device(
         config.runtime.device,
@@ -242,10 +262,10 @@ def _evaluate_member(
         training=False,
         policy_version=str(config.preprocessing["cxr_transform_policy"]),
         image_size=int(config.family.parameters["image_size"]),
-        rotation_degrees=image.rotation_degrees,
-        translation_fraction=image.translation_fraction,
-        brightness_jitter=image.brightness_jitter,
-        contrast_jitter=image.contrast_jitter,
+        rotation_degrees=neural.rotation_degrees,
+        translation_fraction=neural.translation_fraction,
+        brightness_jitter=neural.brightness_jitter,
+        contrast_jitter=neural.contrast_jitter,
     )
     expected_cache_identity = expected_rsna_cxr_cache_identity(
         lineage=localization.images.lineage,
@@ -254,9 +274,9 @@ def _evaluate_member(
         transform=transform,
     )
     if cache.source_authentication.as_dict() != manifest["source_authentication"]:
-        raise ValueError("Validated cache source authentication differs from image package")
+        raise ValueError("Validated cache source authentication differs from CXR package")
     if manifest["runtime_provenance"]["cxr_cache_id"] != cache.identity.cache_id:
-        raise ValueError("Validated cache identity differs from the image package")
+        raise ValueError("Validated cache identity differs from the CXR package")
     dataset = RsnaCachedImageDataset(
         localization.images.test,
         cache=cache,
@@ -352,8 +372,7 @@ def _evaluate_member(
                     "seed": seed,
                     "stratum": stratum,
                     "sample_id": sample["sample_id"],
-                    "test_run_id": test.run_id,
-                    "training_run_id": training.run_id,
+                    "model_package_id": package_id,
                     "filename": filename,
                 }
             )
@@ -428,6 +447,8 @@ def _validate_localization_output_boundaries(
     *,
     private_members: Sequence[Mapping[str, object]],
     forbidden_source_values: set[str],
+    expected_report_id: str | None = None,
+    expected_public_members: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """Enforce aggregate-only public output and regular private qualitative files."""
     public_entries = list(public_stage.iterdir())
@@ -447,6 +468,85 @@ def _validate_localization_output_boundaries(
         or not examples.is_dir()
     ):
         raise ValueError("Private localization entries must be physical files and directories")
+    public_document = json.loads((public_stage / "summary.json").read_text(encoding="utf-8"))
+    private_document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _require_schema_version(
+        public_document,
+        "localization_schema_version",
+        LOCALIZATION_SCHEMA_VERSION,
+    )
+    _require_schema_version(
+        private_document,
+        "private_localization_schema_version",
+        PRIVATE_LOCALIZATION_SCHEMA_VERSION,
+    )
+    if not isinstance(private_document, dict) or set(private_document) != {
+        "private_localization_schema_version",
+        "report_id",
+        "selection_policy",
+        "examples",
+    }:
+        raise ValueError("Private localization manifest fields are invalid")
+    if private_document["examples"] != list(private_members):
+        raise ValueError("Private localization examples differ from the validated evidence")
+    expected_public_fields = {
+        "localization_schema_version",
+        "report_id",
+        "model_package_ids",
+        "policy_version",
+        "gradcam_target",
+        "threshold_policy",
+        "qualitative_selection_policy",
+        "interpretation",
+        "members",
+        "aggregates",
+    }
+    if not isinstance(public_document, dict) or set(public_document) != expected_public_fields:
+        raise ValueError("Public localization manifest fields are invalid")
+    model_package_ids = public_document["model_package_ids"]
+    if (
+        not isinstance(model_package_ids, list)
+        or len(model_package_ids) != 3
+        or not all(isinstance(value, str) for value in model_package_ids)
+        or len(set(model_package_ids)) != 3
+        or any(
+            validate_path_component(value, "localization model package ID") != value
+            or not value.startswith("model-package-")
+            or len(value) != len("model-package-") + 64
+            or any(character not in "0123456789abcdef" for character in value[14:])
+            for value in model_package_ids
+        )
+    ):
+        raise ValueError("Public localization model-package lineage is invalid")
+    computed_report_id = _localization_id(model_package_ids)
+    if expected_report_id is not None and expected_report_id != public_document["report_id"]:
+        raise ValueError("Localization output differs from the requested identity")
+    if (
+        public_document["report_id"] != computed_report_id
+        or private_document.get("report_id") != computed_report_id
+        or public_document["policy_version"] != LOCALIZATION_POLICY_VERSION
+        or public_document["gradcam_target"] != GRADCAM_TARGET
+        or public_document["threshold_policy"] != LOCALIZATION_THRESHOLD_POLICY
+        or public_document["qualitative_selection_policy"] != QUALITATIVE_POLICY_VERSION
+        or private_document.get("selection_policy") != QUALITATIVE_POLICY_VERSION
+    ):
+        raise ValueError("Localization identity or policy is invalid")
+    members = public_document["members"]
+    if (
+        not isinstance(members, list)
+        or len(members) != 3
+        or [member.get("seed") for member in members] != list(EXPECTED_SEEDS)
+    ):
+        raise ValueError("Public localization members are invalid")
+    if expected_public_members is not None and members != list(expected_public_members):
+        raise ValueError("Public localization members differ from the validated results")
+    expected_aggregates = _report_document(computed_report_id, model_package_ids, members)[
+        "aggregates"
+    ]
+    if public_document["aggregates"] != expected_aggregates:
+        raise ValueError("Public localization aggregates differ from their members")
+    if (public_stage / "summary.md").read_text(encoding="utf-8") != _markdown(public_document):
+        raise ValueError("Public localization Markdown differs from its manifest")
     expected_examples = {str(item["filename"]) for item in private_members}
     example_entries = list(examples.iterdir())
     if {path.name for path in example_entries} != expected_examples or any(
@@ -474,14 +574,19 @@ def _write_overlay(path: Path, image: torch.Tensor, heatmap: torch.Tensor) -> No
     plt.close(figure)
 
 
-def _report_document(report_id: str, members: list[dict[str, Any]]) -> dict[str, Any]:
+def _report_document(
+    report_id: str,
+    model_package_ids: Sequence[str],
+    members: list[dict[str, Any]],
+) -> dict[str, Any]:
     metrics = ("pointing_game_accuracy", "mean_activation_energy_inside_union")
     return {
-        "localization_schema_version": 1,
+        "localization_schema_version": LOCALIZATION_SCHEMA_VERSION,
         "report_id": report_id,
+        "model_package_ids": list(model_package_ids),
         "policy_version": LOCALIZATION_POLICY_VERSION,
-        "gradcam_target": "encoder.backbone.features",
-        "threshold_policy": "validation_youden_j_seed_specific",
+        "gradcam_target": GRADCAM_TARGET,
+        "threshold_policy": LOCALIZATION_THRESHOLD_POLICY,
         "qualitative_selection_policy": QUALITATIVE_POLICY_VERSION,
         "interpretation": (
             "Grad-CAM is a model-behavior localization sanity analysis, not a causal "
@@ -499,6 +604,31 @@ def _report_document(report_id: str, members: list[dict[str, Any]]) -> dict[str,
             for metric in metrics
         },
     }
+
+
+def _localization_id(model_package_ids: Sequence[str]) -> str:
+    return canonical_scientific_id(
+        "localization-",
+        {
+            "model_package_ids": list(model_package_ids),
+            "policy_version": LOCALIZATION_POLICY_VERSION,
+            "gradcam_target": GRADCAM_TARGET,
+            "threshold_policy": LOCALIZATION_THRESHOLD_POLICY,
+            "qualitative_selection_policy": QUALITATIVE_POLICY_VERSION,
+        },
+    )
+
+
+def _require_schema_version(
+    document: object,
+    field: str,
+    expected: int,
+) -> None:
+    if not isinstance(document, dict):
+        raise ValueError("Localization manifest must be a JSON object")
+    value = document.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise ValueError(f"Localization field {field} must be schema version {expected}")
 
 
 def _markdown(document: dict[str, Any]) -> str:
@@ -546,8 +676,7 @@ def _markdown(document: dict[str, Any]) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--test-run-ids", nargs=3, required=True)
-    parser.add_argument("--tracking-uri", default=DEFAULT_TRACKING_URI)
+    parser.add_argument("--evaluation-ids", nargs=3, required=True)
     parser.add_argument("--output-directory", type=Path, default=Path("reports"))
     add_logging_argument(parser)
     return parser
@@ -559,11 +688,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
     try:
         destination = generate_localization_report(
-            args.test_run_ids,
-            tracking_uri=args.tracking_uri,
+            args.evaluation_ids,
             output_directory=args.output_directory,
         )
-    except (MlflowException, SQLAlchemyError, OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError) as exc:
         print(f"Localization failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps({"report_directory": destination.as_posix()}, indent=2))

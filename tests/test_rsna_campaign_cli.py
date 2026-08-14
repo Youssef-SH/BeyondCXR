@@ -7,11 +7,11 @@ from types import ModuleType
 import pytest
 
 
-def test_rsna_gpu_cli_import_is_lazy_and_main_delegates(
+def test_rsna_campaign_cli_import_is_lazy_and_main_delegates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cli_name = "radfusion.training.rsna_gpu_cli"
-    campaign_name = "radfusion.training.rsna_gpu"
+    cli_name = "radfusion.training.rsna_campaign_cli"
+    campaign_name = "radfusion.training.rsna_campaign"
     monkeypatch.delitem(sys.modules, cli_name, raising=False)
     monkeypatch.delitem(sys.modules, campaign_name, raising=False)
 

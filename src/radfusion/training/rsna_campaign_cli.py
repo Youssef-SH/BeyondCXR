@@ -3,7 +3,7 @@
 
 def main() -> int:
     """Import and run the campaign only in the parent entry process."""
-    from radfusion.training.rsna_gpu import main as run_campaign
+    from radfusion.training.rsna_campaign import main as run_campaign
 
     return run_campaign()
 

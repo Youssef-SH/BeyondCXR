@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numbers
 from pathlib import Path
 from typing import Any
 
@@ -74,15 +75,23 @@ class RsnaMetadataFeatures(BaseEstimator, TransformerMixin):
     def fit(self, features: pd.DataFrame, target: object = None) -> RsnaMetadataFeatures:
         """Validate the input columns."""
         self._validate_columns(features)
+        self._validate_values(features)
         self.feature_names_in_ = np.asarray(SOURCE_FEATURES, dtype=object)
         return self
 
     def transform(self, features: pd.DataFrame) -> pd.DataFrame:
         """Derive model-ready metadata columns from a copy of the input."""
         self._validate_columns(features)
+        self._validate_values(features)
         transformed = features.loc[:, SOURCE_FEATURES].copy()
-        age = pd.to_numeric(transformed["age_years"], errors="coerce")
+        age = transformed["age_years"].map(
+            lambda value: np.nan if _missing_scalar(value) else float(value)
+        )
         transformed["age_model_years"] = age.clip(lower=0.0, upper=120.0)
+        for column in ("pixel_spacing_row_mm", "pixel_spacing_col_mm"):
+            transformed[column] = transformed[column].map(
+                lambda value: np.nan if _missing_scalar(value) else float(value)
+            )
         transformed["age_is_implausible"] = transformed["age_is_implausible"].astype("int8")
         for column in CATEGORICAL_FEATURES:
             values = transformed[column].astype(object)
@@ -111,6 +120,34 @@ class RsnaMetadataFeatures(BaseEstimator, TransformerMixin):
             raise ValueError(f"RSNA metadata contains unexpected columns: {unexpected}")
         if tuple(features.columns) != SOURCE_FEATURES:
             raise ValueError("RSNA metadata columns are not in the required order")
+
+    @staticmethod
+    def _validate_values(features: pd.DataFrame) -> None:
+        for column in ("age_years", "pixel_spacing_row_mm", "pixel_spacing_col_mm"):
+            for value in features[column].tolist():
+                if _missing_scalar(value):
+                    continue
+                if (
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, numbers.Real)
+                    or not np.isfinite(float(value))
+                ):
+                    raise ValueError(f"RSNA metadata {column} must contain finite numeric values")
+        for value in features["age_is_implausible"].tolist():
+            if not isinstance(value, (bool, np.bool_)):
+                raise ValueError("RSNA metadata age_is_implausible must contain booleans")
+        for column in CATEGORICAL_FEATURES:
+            for value in features[column].tolist():
+                if not _missing_scalar(value) and not isinstance(value, str):
+                    raise ValueError(
+                        f"RSNA metadata {column} must contain strings or missing values"
+                    )
+
+
+def _missing_scalar(value: object) -> bool:
+    if value is None or value is pd.NA:
+        return True
+    return isinstance(value, (float, np.floating)) and np.isnan(float(value))
 
 
 def validate_metadata_pipeline(model: object) -> Pipeline:

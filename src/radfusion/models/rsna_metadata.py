@@ -1,4 +1,4 @@
-"""Define fixed tabular baseline estimators."""
+"""Define fixed RSNA metadata baseline estimators."""
 
 from __future__ import annotations
 

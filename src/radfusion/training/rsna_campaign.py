@@ -1,4 +1,4 @@
-"""Execute the complete authoritative RSNA GPU campaign."""
+"""Execute the complete authoritative RSNA campaign."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from radfusion.data.rsna_artifacts import (
 from radfusion.data.rsna_audit import generate_rsna_audit
 from radfusion.data.rsna_cxr_cache import preprocessing_identity
 from radfusion.models.cxr_baseline import ensure_pretrained_weights
-from radfusion.training.compare import regenerate_comparison
 from radfusion.training.config import (
     ExperimentConfig,
     load_experiment_config,
@@ -36,28 +35,29 @@ from radfusion.training.config import (
     with_runtime,
 )
 from radfusion.training.device import ResolvedDevice, resolve_device
-from radfusion.training.evaluate import evaluate_training_run
 from radfusion.training.execution import (
     LoaderExecutionPolicy,
     one_shot_loader_policy,
     reused_loader_policy,
 )
-from radfusion.training.localize import generate_localization_report
+from radfusion.training.rsna_compare import regenerate_comparison
 from radfusion.training.rsna_datasets import RsnaDataset, prepare_rsna_cxr_cache
+from radfusion.training.rsna_evaluate import evaluate_model_package
+from radfusion.training.rsna_localize import generate_localization_report
 from radfusion.training.rsna_registry import get_dataset
-from radfusion.training.rsna_train_cxr import train_image_experiment
+from radfusion.training.rsna_seed_summary import publish_seed_summary
+from radfusion.training.rsna_train_cxr import train_cxr_experiment
 from radfusion.training.rsna_train_fusion import train_fusion_experiment
-from radfusion.training.rsna_train_metadata import ModelResult, train_configured_experiment
-from radfusion.training.summarize_seeds import summarize_seed_runs
+from radfusion.training.rsna_train_metadata import MetadataModelResult, train_metadata_experiment
 from radfusion.utils.mlflow_utils import DEFAULT_TRACKING_URI
-from radfusion.utils.model_publication import validate_published_model
-from radfusion.utils.neural_publication import validate_neural_package_metadata
 from radfusion.utils.operational_logging import (
     configure_logging,
     get_operational_logger,
     log_event,
     timed_phase,
 )
+from radfusion.utils.rsna_model_publication import validate_published_model
+from radfusion.utils.rsna_neural_publication import validate_neural_package_metadata
 
 EXPECTED_SEEDS = (17, 42, 2026)
 RAW_ROOT = Path("data/raw/rsna/extracted")
@@ -75,7 +75,7 @@ class CampaignConfigs:
 
     metadata_logistic: ExperimentConfig
     metadata_lightgbm: ExperimentConfig
-    images: tuple[ExperimentConfig, ...]
+    cxr: tuple[ExperimentConfig, ...]
     fusions: tuple[ExperimentConfig, ...]
 
 
@@ -84,6 +84,8 @@ class CampaignResult:
     """Exact produced identities and final transport artifacts."""
 
     campaign_id: str
+    model_package_ids: tuple[str, ...]
+    evaluation_ids: tuple[str, ...]
     training_run_ids: tuple[str, ...]
     evaluation_run_ids: tuple[str, ...]
     archive_path: Path
@@ -112,7 +114,7 @@ class _TeeStream:
             stream.flush()
 
 
-def run_rsna_gpu_campaign() -> CampaignResult:
+def execute_rsna_campaign() -> CampaignResult:
     """Run one fresh fail-fast RSNA campaign with direct identity handoff."""
     _require_fresh_output_surface()
     campaign_id = "campaign-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -142,66 +144,74 @@ def run_rsna_gpu_campaign() -> CampaignResult:
             dataset = get_dataset("rsna")
             if not isinstance(dataset, RsnaDataset):
                 raise TypeError("RSNA campaign requires the concrete RSNA dataset adapter")
-            image_reference = configs.images[0]
-            transform = _transform(image_reference, training=False)
+            cxr_reference = configs.cxr[0]
+            transform = _transform(cxr_reference, training=False)
             with timed_phase(_LOGGER, "cxr_cache_preparation"):
                 cache = prepare_rsna_cxr_cache(
-                    dataset, image_reference, transform, cache_root=CACHE_ROOT
+                    dataset, cxr_reference, transform, cache_root=CACHE_ROOT
                 )
-            runtime = _required_cuda_runtime(image_reference)
-            training_execution = _training_execution_policy(image_reference, runtime)
+            runtime = _required_cuda_runtime(cxr_reference)
+            training_execution = _training_execution_policy(cxr_reference, runtime)
             evaluation_execution = one_shot_loader_policy(pin_memory=runtime.pin_memory_effective)
             metadata_training = _train_metadata(configs)
-            image_training = tuple(
-                train_image_experiment(
+            cxr_training = tuple(
+                train_cxr_experiment(
                     config,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
                     execution=training_execution,
                 )
-                for config in configs.images
+                for config in configs.cxr
             )
             fusion_training = tuple(
                 train_fusion_experiment(
                     config,
-                    source_training_run_id=source.run_id,
+                    source_cxr_package_id=source.model_package_id,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
                     execution=training_execution,
                 )
-                for config, source in zip(configs.fusions, image_training, strict=True)
+                for config, source in zip(configs.fusions, cxr_training, strict=True)
             )
-            training_results = (*metadata_training, *image_training, *fusion_training)
+            training_results = (*metadata_training, *cxr_training, *fusion_training)
             _validate_frozen_training_packages(training_results)
             log_event(_LOGGER, "training_boundary_completed", total=len(training_results))
 
             evaluation_results = tuple(
-                evaluate_training_run(
-                    result.run_id,
+                evaluate_model_package(
+                    result.model_package_id,
+                    evaluation_config=config,
                     tracking_uri=DEFAULT_TRACKING_URI,
                     cache=cache,
                     execution=evaluation_execution,
                 )
-                for result in training_results
+                for result, config in zip(
+                    training_results,
+                    (
+                        configs.metadata_logistic,
+                        configs.metadata_lightgbm,
+                        *configs.cxr,
+                        *configs.fusions,
+                    ),
+                    strict=True,
+                )
             )
-            image_tests = evaluation_results[2:5]
+            cxr_tests = evaluation_results[2:5]
             fusion_tests = evaluation_results[5:]
-            cxr_test_ids = tuple(result.run_id for result in image_tests)
-            fusion_test_ids = tuple(result.run_id for result in fusion_tests)
-            cxr_summary = summarize_seed_runs(
-                cxr_test_ids, tracking_uri=DEFAULT_TRACKING_URI, output_directory=REPORT_ROOT
-            )
-            fusion_summary = summarize_seed_runs(
-                fusion_test_ids, tracking_uri=DEFAULT_TRACKING_URI, output_directory=REPORT_ROOT
+            cxr_evaluation_ids = tuple(result.evaluation_id for result in cxr_tests)
+            fusion_evaluation_ids = tuple(result.evaluation_id for result in fusion_tests)
+            cxr_summary = publish_seed_summary(cxr_evaluation_ids, output_directory=REPORT_ROOT)
+            fusion_summary = publish_seed_summary(
+                fusion_evaluation_ids, output_directory=REPORT_ROOT
             )
             localization = generate_localization_report(
-                cxr_test_ids,
-                tracking_uri=DEFAULT_TRACKING_URI,
+                cxr_evaluation_ids,
                 output_directory=REPORT_ROOT,
                 cache=cache,
             )
             comparison = regenerate_comparison(
-                tracking_uri=DEFAULT_TRACKING_URI, output_directory=REPORT_ROOT
+                tuple(result.evaluation_id for result in evaluation_results),
+                output_directory=REPORT_ROOT,
             )
             with timed_phase(_LOGGER, "output_validation"):
                 _validate_outputs(
@@ -248,18 +258,20 @@ def run_rsna_gpu_campaign() -> CampaignResult:
             raise
     return CampaignResult(
         campaign_id=campaign_id,
+        model_package_ids=tuple(result.model_package_id for result in training_results),
+        evaluation_ids=tuple(result.evaluation_id for result in evaluation_results),
         training_run_ids=tuple(result.run_id for result in training_results),
-        evaluation_run_ids=tuple(result.run_id for result in evaluation_results),
+        evaluation_run_ids=tuple(result.mlflow_run_id for result in evaluation_results),
         archive_path=archive,
         checksum_path=checksum,
         campaign_log_path=log_path,
     )
 
 
-def _train_metadata(configs: CampaignConfigs) -> tuple[ModelResult, ModelResult]:
+def _train_metadata(configs: CampaignConfigs) -> tuple[MetadataModelResult, MetadataModelResult]:
     return (
-        train_configured_experiment(configs.metadata_logistic, tracking_uri=DEFAULT_TRACKING_URI),
-        train_configured_experiment(configs.metadata_lightgbm, tracking_uri=DEFAULT_TRACKING_URI),
+        train_metadata_experiment(configs.metadata_logistic, tracking_uri=DEFAULT_TRACKING_URI),
+        train_metadata_experiment(configs.metadata_lightgbm, tracking_uri=DEFAULT_TRACKING_URI),
     )
 
 
@@ -276,7 +288,7 @@ def _validate_prerequisites() -> CampaignConfigs:
     paths = {
         "metadata_logistic": Path("configs/rsna_metadata_logistic.yaml"),
         "metadata_lightgbm": Path("configs/rsna_metadata_lightgbm.yaml"),
-        "image": Path("configs/rsna_cxr_densenet.yaml"),
+        "cxr": Path("configs/rsna_cxr_densenet.yaml"),
         "fusion": Path("configs/rsna_cxr_metadata_concat.yaml"),
     }
     if missing := [path for path in paths.values() if not path.is_file()]:
@@ -285,8 +297,7 @@ def _validate_prerequisites() -> CampaignConfigs:
         with_runtime(load_experiment_config(paths["metadata_logistic"]), seed=42),
         with_runtime(load_experiment_config(paths["metadata_lightgbm"]), seed=42),
         tuple(
-            with_runtime(load_experiment_config(paths["image"]), seed=seed)
-            for seed in EXPECTED_SEEDS
+            with_runtime(load_experiment_config(paths["cxr"]), seed=seed) for seed in EXPECTED_SEEDS
         ),
         tuple(
             with_runtime(load_experiment_config(paths["fusion"]), seed=seed)
@@ -310,51 +321,51 @@ def _validate_prerequisites() -> CampaignConfigs:
     if shutil.disk_usage(Path.cwd()).free < _MINIMUM_FREE_BYTES:
         raise OSError("RSNA campaign requires at least 16 GiB of free workspace storage")
     if not torch.cuda.is_available():
-        raise RuntimeError("RSNA GPU campaign requires CUDA")
+        raise RuntimeError("RSNA campaign requires CUDA")
     return configs
 
 
 def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
     """Validate all six neural configs against one campaign execution contract."""
     if (
-        len(configs.images) != len(EXPECTED_SEEDS)
+        len(configs.cxr) != len(EXPECTED_SEEDS)
         or len(configs.fusions) != len(EXPECTED_SEEDS)
-        or tuple(require_runtime_seed(config) for config in configs.images) != EXPECTED_SEEDS
+        or tuple(require_runtime_seed(config) for config in configs.cxr) != EXPECTED_SEEDS
         or tuple(require_runtime_seed(config) for config in configs.fusions) != EXPECTED_SEEDS
     ):
-        raise ValueError("RSNA campaign requires image and fusion seeds 17, 42, and 2026")
-    if len({config.config_semantic_sha256 for config in configs.images}) != 1:
-        raise ValueError("RSNA image configurations do not form one scientific family")
+        raise ValueError("RSNA campaign requires CXR and fusion seeds 17, 42, and 2026")
+    if len({config.config_semantic_sha256 for config in configs.cxr}) != 1:
+        raise ValueError("RSNA CXR configurations do not form one scientific family")
     if len({config.config_semantic_sha256 for config in configs.fusions}) != 1:
         raise ValueError("RSNA fusion configurations do not form one scientific family")
-    neural = (*configs.images, *configs.fusions)
-    images = tuple(config.neural for config in neural)
-    if any(image is None for image in images):
+    neural_configs = (*configs.cxr, *configs.fusions)
+    neural_settings = tuple(config.neural for config in neural_configs)
+    if any(neural is None for neural in neural_settings):
         raise ValueError("RSNA campaign requires six complete neural configurations")
-    resolved = cast(tuple[Any, ...], images)
+    resolved = cast(tuple[Any, ...], neural_settings)
     execution_contracts = {
         (
-            image.batch_size,
+            neural.batch_size,
             config.runtime.num_workers,
             config.runtime.device,
-            image.mixed_precision,
+            neural.mixed_precision,
             config.runtime.pin_memory_policy,
-            image.rotation_degrees,
-            image.translation_fraction,
-            image.brightness_jitter,
-            image.contrast_jitter,
+            neural.rotation_degrees,
+            neural.translation_fraction,
+            neural.brightness_jitter,
+            neural.contrast_jitter,
         )
-        for config, image in zip(neural, resolved, strict=True)
+        for config, neural in zip(neural_configs, resolved, strict=True)
     }
     cache_identities = {
-        preprocessing_identity(_transform(config, training=False)) for config in neural
+        preprocessing_identity(_transform(config, training=False)) for config in neural_configs
     }
     if (
         len(execution_contracts) != 1
         or len(cache_identities) != 1
         or resolved[0].batch_size != 32
-        or neural[0].runtime.device == "cpu"
-        or neural[0].runtime.pin_memory_policy == "disabled"
+        or neural_configs[0].runtime.device == "cpu"
+        or neural_configs[0].runtime.pin_memory_policy == "disabled"
     ):
         raise ValueError("RSNA neural configurations do not share the campaign execution contract")
 
@@ -363,7 +374,7 @@ def _validate_configured_bundle(configs: CampaignConfigs, bundle_id: str) -> Non
     all_configs = (
         configs.metadata_logistic,
         configs.metadata_lightgbm,
-        *configs.images,
+        *configs.cxr,
         *configs.fusions,
     )
     if any(config.dataset.bundle_id != bundle_id for config in all_configs):
@@ -375,12 +386,12 @@ def _validate_configured_bundle(configs: CampaignConfigs, bundle_id: str) -> Non
 
 
 def _required_cuda_runtime(config: ExperimentConfig) -> ResolvedDevice:
-    image = config.neural
-    if image is None:
-        raise ValueError("RSNA image configuration is incomplete")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("RSNA CXR configuration is incomplete")
     runtime = resolve_device(
         "cuda",
-        mixed_precision=image.mixed_precision,
+        mixed_precision=neural.mixed_precision,
         pin_memory_policy=config.runtime.pin_memory_policy,
     )
     if runtime.device.type != "cuda":
@@ -392,9 +403,9 @@ def _training_execution_policy(
     config: ExperimentConfig, runtime: ResolvedDevice
 ) -> LoaderExecutionPolicy:
     """Resolve the reviewed persistent policy for epoch-reused loaders."""
-    image = config.neural
-    if image is None:
-        raise ValueError("RSNA image configuration is incomplete")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("RSNA CXR configuration is incomplete")
     return reused_loader_policy(
         num_workers=config.runtime.num_workers,
         pin_memory=runtime.pin_memory_effective,
@@ -402,17 +413,17 @@ def _training_execution_policy(
 
 
 def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransform:
-    image = config.neural
-    if image is None:
-        raise ValueError("RSNA image configuration is incomplete")
+    neural = config.neural
+    if neural is None:
+        raise ValueError("RSNA CXR configuration is incomplete")
     return StandardCxrTransform(
         training=training,
         policy_version=str(config.preprocessing["cxr_transform_policy"]),
         image_size=int(config.family.parameters["image_size"]),
-        rotation_degrees=image.rotation_degrees,
-        translation_fraction=image.translation_fraction,
-        brightness_jitter=image.brightness_jitter,
-        contrast_jitter=image.contrast_jitter,
+        rotation_degrees=neural.rotation_degrees,
+        translation_fraction=neural.translation_fraction,
+        brightness_jitter=neural.brightness_jitter,
+        contrast_jitter=neural.contrast_jitter,
     )
 
 
@@ -420,7 +431,7 @@ def _validate_frozen_training_packages(results: Sequence[Any]) -> None:
     for result in results:
         path = Path(result.model_path)
         package = path.parent
-        if isinstance(result, ModelResult):
+        if isinstance(result, MetadataModelResult):
             validate_published_model(package)
         else:
             validate_neural_package_metadata(package)
@@ -457,12 +468,12 @@ def _validate_outputs(
 ) -> None:
     if len(training_results) != 8 or len(evaluation_results) != 8:
         raise ValueError("RSNA campaign requires eight training and eight evaluation results")
-    training_ids = tuple(result.run_id for result in training_results)
-    evaluation_sources = tuple(result.training_run_id for result in evaluation_results)
-    if len(set(training_ids)) != 8 or evaluation_sources != training_ids:
-        raise ValueError("RSNA evaluation lineage does not match the exact training family")
-    if len({result.run_id for result in evaluation_results}) != 8:
-        raise ValueError("RSNA evaluation run IDs must be unique")
+    package_ids = tuple(result.model_package_id for result in training_results)
+    evaluation_packages = tuple(result.model_package_id for result in evaluation_results)
+    if len(set(package_ids)) != 8 or evaluation_packages != package_ids:
+        raise ValueError("RSNA evaluation lineage does not match the exact package family")
+    if len({result.evaluation_id for result in evaluation_results}) != 8:
+        raise ValueError("RSNA evaluation IDs must be unique")
     required = [
         *(Path(result.model_path) for result in training_results),
         *(Path(result.artifact_directory) for result in training_results),
@@ -610,14 +621,16 @@ def _make_mlflow_snapshot_portable(database: sqlite3.Connection) -> None:
 def main() -> int:
     """Run the campaign and print its final transport paths."""
     try:
-        result = run_rsna_gpu_campaign()
+        result = execute_rsna_campaign()
     except Exception as exc:
-        print(f"RSNA GPU campaign failed: {exc}", file=sys.stderr)
+        print(f"RSNA campaign failed: {exc}", file=sys.stderr)
         return 1
     print(
         json.dumps(
             {
                 "campaign_id": result.campaign_id,
+                "model_package_ids": list(result.model_package_ids),
+                "evaluation_ids": list(result.evaluation_ids),
                 "training_run_ids": list(result.training_run_ids),
                 "evaluation_run_ids": list(result.evaluation_run_ids),
                 "archive": result.archive_path.as_posix(),

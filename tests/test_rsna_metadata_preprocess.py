@@ -134,6 +134,16 @@ def test_preprocessor_handles_unseen_categories_and_missing_values() -> None:
     assert np.isfinite(transformed.to_numpy()).all()
 
 
+@pytest.mark.parametrize("value", ["garbage", "1.2x", object(), True, np.inf, -np.inf])
+def test_metadata_preprocessor_rejects_malformed_numeric_values(value: object) -> None:
+    features = pd.DataFrame(
+        [[value, False, "M", "AP", 0.2, 0.2]],
+        columns=SOURCE_FEATURES,
+    )
+    with pytest.raises(ValueError, match="finite numeric"):
+        RsnaMetadataFeatures().fit(features)
+
+
 @pytest.mark.parametrize("missing", [None, np.nan, pd.NA])
 def test_categorical_missing_markers_share_one_representation(missing: object) -> None:
     training = pd.DataFrame(

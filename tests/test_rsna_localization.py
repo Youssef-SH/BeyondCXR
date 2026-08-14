@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import shlex
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,17 +23,26 @@ from radfusion.evaluation.localization import (
 )
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
 from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.localize import (
+from radfusion.training.rsna_datasets import RsnaDataset
+from radfusion.training.rsna_localize import (
+    QUALITATIVE_POLICY_VERSION,
     _evaluate_member,
     _gradcam_indices,
+    _localization_id,
     _markdown,
     _positive_localization_metrics,
+    _report_document,
     _rsna_localization_dataset,
     _validate_localization_output_boundaries,
     generate_localization_report,
 )
-from radfusion.training.rsna_datasets import RsnaDataset
 from radfusion.utils.operational_logging import configure_logging
+
+_PACKAGE_IDS = {
+    17: "model-package-" + "1" * 64,
+    42: "model-package-" + "2" * 64,
+    2026: "model-package-" + "3" * 64,
+}
 
 
 class _GradCamModel(nn.Module):
@@ -52,7 +62,7 @@ def test_localization_rejects_non_rsna_before_dataset_access(
     config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
     non_rsna = replace(config, dataset=replace(config.dataset, dataset_id="symile"))
     monkeypatch.setattr(
-        "radfusion.training.localize.get_dataset",
+        "radfusion.training.rsna_localize.get_dataset",
         lambda key: pytest.fail(f"dataset registry accessed for {key}"),
     )
 
@@ -64,46 +74,43 @@ def test_standalone_localization_resolves_one_shared_cache(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seeds = (17, 42, 2026)
-    configs = {
-        seed: with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=seed)
-        for seed in seeds
+    evaluation_ids_15 = {seed: "evaluation-" + format(seed, "064x") for seed in seeds}
+    evaluation_ids_20 = {seed: "evaluation-" + format(seed + 10_000, "064x") for seed in seeds}
+    evaluation_seeds = {
+        value: seed
+        for identities in (evaluation_ids_15, evaluation_ids_20)
+        for seed, value in identities.items()
     }
-    runs = {}
+    calibration_bins = {
+        **{value: 15 for value in evaluation_ids_15.values()},
+        **{value: 20 for value in evaluation_ids_20.values()},
+    }
+    configs = {seed: load_experiment_config("configs/rsna_cxr_densenet.yaml") for seed in seeds}
+    packages = {}
     for seed in seeds:
-        training_id = f"training-{seed}"
-        runs[f"test-{seed}"] = SimpleNamespace(
-            run_id=f"test-{seed}",
-            source_training_run_id=training_id,
-            modality="image",
-            run_kind="test_evaluation",
-            evaluation_scope="test",
-            integer_seed=lambda seed=seed: seed,
-        )
-        runs[training_id] = SimpleNamespace(
-            run_id=training_id,
-            local_model_path=str(tmp_path / f"seed-{seed}" / "model.pt"),
+        package_id = _PACKAGE_IDS[seed]
+        packages[package_id] = (
+            {"training_policy": {"seed": seed}},
+            configs[seed],
         )
     monkeypatch.setattr(
-        "radfusion.training.localize.configure_mlflow",
-        lambda **kwargs: SimpleNamespace(get_run=runs.__getitem__),
-    )
-    monkeypatch.setattr("radfusion.training.localize.require_completed_run", lambda run: run)
-    monkeypatch.setattr(
-        "radfusion.training.localize.has_matching_training_parent", lambda *args: True
-    )
-    monkeypatch.setattr("radfusion.training.localize.git_revision", lambda: ("commit", False))
-    monkeypatch.setattr("radfusion.training.localize.uv_lock_sha256", lambda: "a" * 64)
-    monkeypatch.setattr(
-        "radfusion.training.localize.validate_neural_package_metadata", lambda package: {}
+        "radfusion.training.rsna_localize.validate_rsna_evaluation",
+        lambda path, **kwargs: SimpleNamespace(
+            manifest={
+                "model_package_id": _PACKAGE_IDS[evaluation_seeds[path.name]],
+                "evaluation_policy": {"calibration_bins": calibration_bins[path.name]},
+            }
+        ),
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.load_experiment_config",
-        lambda path: configs[int(path.parent.name.removeprefix("seed-"))],
+        "radfusion.training.rsna_localize.validate_neural_package_metadata",
+        lambda package: packages[package.name][0],
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.verify_image_training_package", lambda *a, **k: None
+        "radfusion.training.rsna_localize.load_experiment_config",
+        lambda path: packages[path.parent.name][1],
     )
-    monkeypatch.setattr("radfusion.training.localize.get_dataset", lambda key: RsnaDataset())
+    monkeypatch.setattr("radfusion.training.rsna_localize.get_dataset", lambda key: RsnaDataset())
     prepared: list[object] = []
     shared_cache = object()
 
@@ -111,11 +118,11 @@ def test_standalone_localization_resolves_one_shared_cache(
         prepared.append((args, kwargs))
         return shared_cache
 
-    monkeypatch.setattr("radfusion.training.localize.prepare_rsna_cxr_cache", prepare)
+    monkeypatch.setattr("radfusion.training.rsna_localize.prepare_rsna_cxr_cache", prepare)
     observed_caches: list[object] = []
 
-    def evaluate(test, training, package, manifest, config, *, examples, cache):
-        del test, training, package, manifest, examples
+    def evaluate(package_id, package, manifest, config, *, examples, cache):
+        del package_id, package, manifest, examples
         observed_caches.append(cache)
         return {
             "public": {
@@ -136,13 +143,15 @@ def test_standalone_localization_resolves_one_shared_cache(
             "forbidden_source_values": set(),
         }
 
-    monkeypatch.setattr("radfusion.training.localize._evaluate_member", evaluate)
+    monkeypatch.setattr("radfusion.training.rsna_localize._evaluate_member", evaluate)
     log_stream = io.StringIO()
     configure_logging("INFO", stream=log_stream)
 
     result = generate_localization_report(
-        [f"test-{seed}" for seed in seeds],
+        list(evaluation_ids_15.values()),
         output_directory=tmp_path / "reports",
+        model_directory=tmp_path / "models",
+        private_directory=tmp_path / "private",
     )
 
     assert result.is_dir()
@@ -150,6 +159,30 @@ def test_standalone_localization_resolves_one_shared_cache(
     assert observed_caches == [shared_cache, shared_cache, shared_cache]
     assert "event=phase_started phase=localization" in log_stream.getvalue()
     assert "event=phase_completed" in log_stream.getvalue()
+    public_inode = (result / "summary.json").stat().st_ino
+    private_inode = (
+        (tmp_path / "private" / "localization" / result.name / "qualitative_manifest.json")
+        .stat()
+        .st_ino
+    )
+
+    repeated = generate_localization_report(
+        list(reversed(evaluation_ids_20.values())),
+        output_directory=tmp_path / "reports",
+        model_directory=tmp_path / "models",
+        private_directory=tmp_path / "private",
+    )
+    assert repeated == result
+    assert (result / "summary.json").stat().st_ino == public_inode
+    assert (
+        tmp_path / "private" / "localization" / result.name / "qualitative_manifest.json"
+    ).stat().st_ino == private_inode
+
+
+def test_localization_identity_binds_source_model_packages() -> None:
+    changed = [_PACKAGE_IDS[17], _PACKAGE_IDS[42], "model-package-" + "4" * 64]
+
+    assert _localization_id(changed) != _localization_id(list(_PACKAGE_IDS.values()))
 
 
 def test_localization_member_emits_generic_operation_completion(
@@ -220,30 +253,33 @@ def test_localization_member_emits_generic_operation_completion(
         ),
     )
     adapter.load_localization_test = lambda *args, **kwargs: localization  # type: ignore[method-assign]
-    monkeypatch.setattr("radfusion.training.localize.get_dataset", lambda key: adapter)
+    monkeypatch.setattr("radfusion.training.rsna_localize.get_dataset", lambda key: adapter)
     monkeypatch.setattr(
-        "radfusion.training.localize.load_validated_neural_checkpoint", lambda *args: {}
+        "radfusion.training.rsna_localize.load_validated_neural_checkpoint", lambda *args: {}
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.get_model",
+        "radfusion.training.rsna_localize.get_model",
         lambda key: SimpleNamespace(build_architecture=lambda model_config: model),
     )
-    monkeypatch.setattr("radfusion.training.localize.strict_load_checkpoint", lambda *args: None)
     monkeypatch.setattr(
-        "radfusion.training.localize.standard_cxr_gradcam_target", lambda value: value.encoder
+        "radfusion.training.rsna_localize.strict_load_checkpoint", lambda *args: None
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.expected_rsna_cxr_cache_identity", lambda **kwargs: object()
+        "radfusion.training.rsna_localize.standard_cxr_gradcam_target", lambda value: value.encoder
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.RsnaCachedImageDataset",
+        "radfusion.training.rsna_localize.expected_rsna_cxr_cache_identity",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "radfusion.training.rsna_localize.RsnaCachedImageDataset",
         lambda *args, **kwargs: ControlledDataset(),
     )
     monkeypatch.setattr(
-        "radfusion.training.localize.gradcam_heatmaps",
+        "radfusion.training.rsna_localize.gradcam_heatmaps",
         lambda *args, **kwargs: torch.ones((1, 224, 224)),
     )
-    monkeypatch.setattr("radfusion.training.localize._write_overlay", lambda *args: None)
+    monkeypatch.setattr("radfusion.training.rsna_localize._write_overlay", lambda *args: None)
     authentication = {"policy_version": "test"}
     cache = SimpleNamespace(
         source_authentication=SimpleNamespace(as_dict=lambda: authentication),
@@ -255,8 +291,7 @@ def test_localization_member_emits_generic_operation_completion(
     configure_logging("INFO", stream=stream)
 
     _evaluate_member(
-        SimpleNamespace(run_id="test-run"),
-        SimpleNamespace(run_id="training-run"),
+        _PACKAGE_IDS[42],
         tmp_path,
         {
             "bundle_manifest_sha256": "b" * 64,
@@ -524,13 +559,44 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
     examples = private / "examples"
     public.mkdir()
     examples.mkdir(parents=True)
-    (public / "summary.json").write_text('{"aggregate": true}\n', encoding="utf-8")
-    (public / "summary.md").write_text("# Aggregate localization\n", encoding="utf-8")
-    (private / "qualitative_manifest.json").write_text(
-        '{"sample_id": "synthetic-sample"}\n', encoding="utf-8"
-    )
     (examples / "seed-42-example-01-tp.png").write_bytes(b"synthetic")
     members = [{"filename": "seed-42-example-01-tp.png"}]
+    package_ids = [_PACKAGE_IDS[seed] for seed in (17, 42, 2026)]
+    report_id = _localization_id(package_ids)
+    public_members = [
+        {
+            "seed": seed,
+            "positive_test_sample_count": 1,
+            "localization_evaluated_count": 1,
+            "zero_heatmap_count": 0,
+            "pointing_game_accuracy": 1.0,
+            "mean_activation_energy_inside_union": 0.5,
+            "qualitative_strata_present": {
+                "TP": True,
+                "FN": False,
+                "FP": False,
+                "TN": True,
+            },
+        }
+        for seed in (17, 42, 2026)
+    ]
+    document = _report_document(report_id, package_ids, public_members)
+    (public / "summary.json").write_text(
+        json.dumps(document, sort_keys=True),
+        encoding="utf-8",
+    )
+    (public / "summary.md").write_text(_markdown(document), encoding="utf-8")
+    (private / "qualitative_manifest.json").write_text(
+        json.dumps(
+            {
+                "private_localization_schema_version": 1,
+                "report_id": report_id,
+                "selection_policy": QUALITATIVE_POLICY_VERSION,
+                "examples": members,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     _validate_localization_output_boundaries(
         public,
@@ -538,6 +604,18 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
         private_members=members,
         forbidden_source_values={"synthetic-sample"},
     )
+
+    (public / "summary.json").write_text(
+        '{"localization_schema_version": true}\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="schema version"):
+        _validate_localization_output_boundaries(
+            public,
+            private,
+            private_members=members,
+            forbidden_source_values={"synthetic-sample"},
+        )
+    (public / "summary.json").write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
 
     leaked = public / "patient-overlay.png"
     leaked.write_bytes(b"pixels")
