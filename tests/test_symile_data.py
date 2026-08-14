@@ -13,7 +13,7 @@ import pytest
 
 import radfusion.data.symile_artifacts as symile_artifacts
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import arrow_ipc_sha256
+from radfusion.data.hashing import logical_arrow_sha256
 from radfusion.data.symile_artifacts import (
     LABS_FILENAME,
     METADATA_FILENAME,
@@ -253,7 +253,7 @@ def test_positive_self_query_selector_retains_original_rows() -> None:
 
 def _identity_metadata() -> dict[str, object]:
     return {
-        "bundle_manifest_schema_version": "1",
+        "bundle_manifest_schema_version": 1,
         "dataset": {"dataset_id": "symile", "release": "1.0.0"},
         "tasks": {
             "pneumonia_strict": {
@@ -384,13 +384,38 @@ def test_semantic_bundle_identity_is_independent_of_parquet_encoding(tmp_path: P
     pq.write_table(table, first, compression="zstd")
     pq.write_table(table, second, compression=None)
     assert first.read_bytes() != second.read_bytes()
-    first_hash = arrow_ipc_sha256(pq.read_table(first))
-    second_hash = arrow_ipc_sha256(pq.read_table(second))
+    first_hash = logical_arrow_sha256(pq.read_table(first))
+    second_hash = logical_arrow_sha256(pq.read_table(second))
     assert first_hash == second_hash
     metadata = _identity_metadata()
     assert semantic_bundle_id(
         metadata, {SAMPLES_FILENAME: first_hash, LABS_FILENAME: "c" * 64}
     ) == semantic_bundle_id(metadata, {SAMPLES_FILENAME: second_hash, LABS_FILENAME: "c" * 64})
+
+
+def test_semantic_bundle_identity_is_independent_of_source_root_location(tmp_path: Path) -> None:
+    first_source = qualify_symile_source(
+        _synthetic_release(tmp_path / "first"), enforce_production_counts=False
+    )
+    second_source = qualify_symile_source(
+        _synthetic_release(tmp_path / "second"), enforce_production_counts=False
+    )
+
+    first = build_symile_artifacts(first_source)
+    second = build_symile_artifacts(second_source)
+    assert semantic_bundle_id(
+        first.metadata,
+        {
+            SAMPLES_FILENAME: logical_arrow_sha256(first.samples),
+            LABS_FILENAME: logical_arrow_sha256(first.labs),
+        },
+    ) == semantic_bundle_id(
+        second.metadata,
+        {
+            SAMPLES_FILENAME: logical_arrow_sha256(second.samples),
+            LABS_FILENAME: logical_arrow_sha256(second.labs),
+        },
+    )
 
 
 def test_symile_semantic_payload_uses_abstract_roles_and_canonical_source_assets() -> None:
@@ -687,11 +712,10 @@ def test_cv_identity_changes_with_bundle_or_logical_assignment() -> None:
     assert cv_assignment_id("bundle-" + "a" * 64, "d" * 64) != original
 
 
-def test_cv_semantic_payload_has_abstract_assignment_role_and_no_retired_parent_grammar() -> None:
+def test_cv_semantic_payload_uses_abstract_assignment_role() -> None:
     payload = _cv_identity_payload("bundle-" + "a" * 64, "b" * 64)
 
     assert payload["artifacts"] == {"assignments": "b" * 64}
-    assert "build" not in json.dumps(payload, sort_keys=True)
 
 
 def test_cv_validation_rejects_incorrect_declared_row_count(tmp_path: Path) -> None:

@@ -13,9 +13,10 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.rsna_artifacts import load_current_bundle
+from radfusion.data.hashing import sha256_file
+from radfusion.data.rsna_artifacts import resolve_bundle
 from radfusion.data.rsna_source import RSNA_CLASS_VALUES
-from radfusion.data.splitting import SPLIT_NAMES
+from radfusion.data.rsna_splitting import SPLIT_NAMES
 from radfusion.utils.operational_logging import (
     add_logging_argument,
     configure_logging,
@@ -44,18 +45,22 @@ _LOGGER = get_operational_logger(__name__)
 def generate_rsna_audit(
     manifest_directory: str | Path = "data/manifests",
     output_directory: str | Path = "reports/rsna/audit",
+    *,
+    bundle_id: str | None = None,
 ) -> dict[str, object]:
-    """Generate deterministic aggregate reports for the current RSNA bundle."""
+    """Generate deterministic aggregate reports for one validated RSNA bundle."""
     with timed_phase(_LOGGER, "audit_generation"):
-        return _generate_rsna_audit(manifest_directory, output_directory)
+        return _generate_rsna_audit(manifest_directory, output_directory, bundle_id=bundle_id)
 
 
 def _generate_rsna_audit(
     manifest_directory: str | Path,
     output_directory: str | Path,
+    *,
+    bundle_id: str | None,
 ) -> dict[str, object]:
     with timed_phase(_LOGGER, "audit_bundle_loading"):
-        bundle = load_current_bundle(manifest_directory)
+        bundle = resolve_bundle(manifest_directory, bundle_id=bundle_id)
         samples = pq.read_table(bundle.samples_path)
         labels = pq.read_table(bundle.labels_path)
         annotations = pq.read_table(bundle.annotations_path)
@@ -104,6 +109,7 @@ def _generate_rsna_audit(
 
     return {
         "bundle_id": bundle.bundle_id,
+        "bundle_manifest_sha256": sha256_file(bundle.metadata_path),
         "split_recipe_id": str(metadata["membership"]["split"]["split_recipe_id"]),
         "split_assignment_id": str(metadata["membership"]["split"]["split_assignment_id"]),
         "report_directory": output.as_posix(),
@@ -338,6 +344,10 @@ def _source_identifiers(samples: pd.DataFrame) -> set[str]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--bundle-id",
+        help="Immutable bundle identifier; omit only to resolve CURRENT interactively",
+    )
+    parser.add_argument(
         "--manifest-directory",
         type=Path,
         default=Path("data/manifests"),
@@ -358,7 +368,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
-        summary = generate_rsna_audit(args.manifest_directory, args.output_directory)
+        summary = generate_rsna_audit(
+            args.manifest_directory,
+            args.output_directory,
+            bundle_id=args.bundle_id,
+        )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
         print(f"RSNA audit failed: {exc}", file=sys.stderr)
         return 1

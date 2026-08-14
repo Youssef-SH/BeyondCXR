@@ -1,7 +1,20 @@
-# RSNA data contract
+# Data bundle contract
 
-The common bundle manifest schema version `1` defines the current development contract. Bundle IDs
-and declared hashes identify exact content.
+The common bundle manifest uses schema version `1`. Bundle IDs and declared hashes identify exact
+content.
+
+Both dataset tracks publish immutable `bundle-<sha256>` directories with `manifest.json` and typed
+Parquet artifacts. Their manifests use the common envelope `dataset`, `tasks`, `membership`,
+`source`, `modalities`, `privacy`, `bundle`, `artifacts`, `provenance`, `generation`, and
+`qualification`. Arrow artifacts declare `logical_arrow_sha256`, `physical_file_sha256`, and
+`row_count`. Dataset-specific scientific sections remain explicit.
+
+`CURRENT` is an optional interactive discovery pointer. Scientific configurations and consumers
+pin explicit bundle IDs and exact manifest-byte witnesses. Symile CV assignments are separate
+immutable experimental-design objects under `data/manifests/symile/cv/`; they are not dataset
+bundles.
+
+## RSNA bundle
 
 An RSNA bundle contains five Parquet artifacts and one JSON manifest. Column order, Arrow types,
 nullability, and deterministic row order are contractual.
@@ -127,18 +140,23 @@ rejected.
 
 ## Identity and publication
 
-The logical Arrow hash covers canonical ordered typed content and the exact schema. It participates
-in bundle identity and is independent of Parquet encoding and null-buffer representation.
+The logical Arrow hash covers canonical ordered typed content and the exact schema. Its type-aware
+scalar encoding is independent of Arrow IPC serialization, chunking, Parquet encoding, file
+metadata, source paths, and null-buffer representation.
 
 The physical Parquet SHA-256 covers serialized bytes. It detects corruption or replacement but
 does not participate in bundle identity.
 
-Bundle identity covers the existing identity-policy and schema versions, dataset and source
-release, task definitions, split source and compact recipe metadata, authoritative CSV hashes, and
-the five ordered logical artifact hashes. It excludes physical hashes, generated summaries,
-timestamps, commands, paths, tool diagnostics, and `CURRENT`.
+Bundle identity covers dataset and source release, task and interpretation policies, split source
+and compact recipe metadata, authoritative CSV hashes, and the five ordered logical artifact
+hashes. Representation-only schema discriminators, physical hashes, generated summaries,
+timestamps, commands, paths, tool diagnostics, and `CURRENT` are excluded.
 
 Publication validates a complete sibling staging directory once, atomically renames it to its
 immutable `bundle-<sha256>` directory, then atomically updates `CURRENT`. Independent consumers
 perform complete validation when loading a bundle. Scientific runs should record an explicit
 bundle ID; `CURRENT` is the interactive selection pointer.
+
+Symile source-asset paths are canonical names within the authenticated official release, not local
+filesystem locations. Relocating the complete source root leaves semantic bundle identity
+unchanged.

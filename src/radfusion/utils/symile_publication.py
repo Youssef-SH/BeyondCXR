@@ -1,4 +1,4 @@
-"""Publish and validate the three immutable Symile M5 artifact levels."""
+"""Publish and validate immutable Symile core-development artifacts."""
 
 from __future__ import annotations
 
@@ -9,23 +9,28 @@ import os
 import pickle
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 
-from radfusion.data.cxr_transforms import StandardCxrTransform
+from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, StandardCxrTransform
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
+from radfusion.data.hashing import sha256_file
+from radfusion.data.symile_artifacts import (
+    read_symile_samples,
+    resolve_symile_bundle,
+    strict_pneumonia_rows,
+    validate_symile_bundle_reference,
+)
+from radfusion.data.symile_cv import CV_DIRECTORY, validate_cv_table, validate_symile_cv_reference
 from radfusion.data.symile_preprocess import (
     LAB_FEATURE_COLUMNS,
     SymileLabEcdfTransformer,
@@ -33,63 +38,70 @@ from radfusion.data.symile_preprocess import (
     save_symile_lab_preprocessor,
     validate_symile_lab_preprocessor,
 )
+from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, OUTER_FOLDS, REPEAT_SEEDS
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
 from radfusion.models.symile_fusion import build_symile_concat_model, build_symile_gated_model
 from radfusion.models.symile_tabular import symile_tabular_logits
-from radfusion.training.config import (
-    SYMILE_M5_FAMILIES,
-    ExperimentConfig,
-    load_symile_development_config,
+from radfusion.training.config import ExperimentConfig, load_symile_development_config
+from radfusion.training.neural import candidate_is_improvement
+from radfusion.training.symile_data import (
+    DEVELOPMENT_COUNT,
+    INNER_SPLIT_POLICY_VERSION,
+    derive_inner_seed,
 )
-from radfusion.training.symile_data import DEVELOPMENT_COUNT
+from radfusion.training.symile_families import (
+    SYMILE_CORE_DEVELOPMENT_FAMILIES,
+    SYMILE_FUSION_FAMILIES,
+    SYMILE_NEURAL_FAMILIES,
+    SYMILE_TABULAR_FAMILIES,
+)
+from radfusion.utils.package_identity import (
+    canonical_scientific_id,
+    fitted_object_state_sha256,
+    package_scientific_config_payload,
+    pretrained_weight_semantic_identity,
+    tensor_state_sha256,
+)
 from radfusion.utils.privacy import validate_public_reports
-from radfusion.utils.publication import staging_directory
+from radfusion.utils.private_predictions import (
+    PREDICTION_PREFIX,
+    ValidatedPredictionEvidence,
+    validate_prediction_evidence,
+)
+from radfusion.utils.publication import install_immutable_directory, staging_directory
 from radfusion.utils.skops_io import load_skops, save_skops
 
-FOLD_SCHEMA_VERSION = 1
+FOLD_PACKAGE_SCHEMA_VERSION = 1
 DEVELOPMENT_SCHEMA_VERSION = 1
 ANALYSIS_SCHEMA_VERSION = 1
+SYMILE_CHECKPOINT_SCHEMA_VERSION = 1
 FOLD_PREFIX = "fold-package-"
 DEVELOPMENT_PREFIX = "development-"
 ANALYSIS_PREFIX = "analysis-"
-FOLD_MANIFEST_FILENAME = "fold_manifest.json"
+FOLD_MANIFEST_FILENAME = "manifest.json"
 CONFIG_FILENAME = "resolved_config.yaml"
-OOF_FILENAME = "oof_predictions.parquet"
 TABULAR_MODEL_FILENAME = "model.skops"
 NEURAL_MODEL_FILENAME = "model.pt"
 LAB_PREPROCESSOR_FILENAME = "lab_preprocessor.skops"
 TRAINING_HISTORY_FILENAME = "training_history.json"
-DEVELOPMENT_MANIFEST_FILENAME = "development_manifest.json"
-ANALYSIS_MANIFEST_FILENAME = "analysis_manifest.json"
+DEVELOPMENT_MANIFEST_FILENAME = "manifest.json"
+ANALYSIS_MANIFEST_FILENAME = "manifest.json"
 SUMMARY_FILENAME = "summary.md"
-OOF_SCHEMA = pa.schema(
-    [
-        pa.field("sample_id", pa.string(), nullable=False),
-        pa.field("target", pa.int8(), nullable=False),
-        pa.field("logit", pa.float64(), nullable=False),
-        pa.field("probability", pa.float64(), nullable=False),
-    ]
-)
-TABULAR_FAMILIES = frozenset({"labs_logistic", "labs_lightgbm"})
-NEURAL_FAMILIES = frozenset(
-    {
-        "cxr_densenet",
-        "cxr_labs_concat",
-        "cxr_labs_gated",
-        "cxr_labs_gated_no_observedness",
-    }
-)
-FUSION_FAMILIES = frozenset({"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"})
 _FOLD_FIELDS = {
-    "fold_schema_version",
+    "fold_package_schema_version",
     "fold_package_id",
-    "family",
+    "dataset_id",
+    "task_id",
+    "family_id",
+    "modalities",
     "repeat_seed",
     "outer_fold",
     "config",
     "lineage",
     "inner_split",
     "selection",
+    "model_state_sha256",
+    "preprocessor_state_sha256",
     "source_cxr",
     "artifacts",
     "operational",
@@ -107,8 +119,8 @@ _LINEAGE_FIELDS = {
     "transform_contract",
     "pretrained_weight",
 }
-_ANALYSIS_POLICY = {
-    "policy_version": "symile-m5-development-analysis-v1",
+SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY = {
+    "policy_version": "symile-core-development-analysis-v1",
     "alignment": ["sample_id", "repeat_seed"],
     "metrics": ["roc_auc", "average_precision", "brier_score"],
     "paired_comparisons": {
@@ -124,12 +136,12 @@ _ANALYSIS_POLICY = {
 
 @dataclass(frozen=True)
 class ValidatedFoldPackage:
-    """Validated fold package metadata and private OOF content."""
+    """Validated fold package metadata and fitted model content."""
 
     directory: Path
     manifest: Mapping[str, Any]
     manifest_sha256: str
-    oof: pa.Table
+    created: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,43 +153,6 @@ class ValidatedDevelopmentResult:
     manifest_sha256: str
 
 
-def build_oof_table(
-    sample_ids: Sequence[str],
-    targets: Sequence[int] | np.ndarray,
-    logits: Sequence[float] | np.ndarray,
-) -> pa.Table:
-    """Build the canonical minimal private OOF table."""
-    ids = [str(value) for value in sample_ids]
-    truth = np.asarray(targets)
-    scores = np.asarray(logits, dtype=np.float64)
-    if (
-        not ids
-        or len(ids) != len(set(ids))
-        or truth.shape != (len(ids),)
-        or scores.shape != (len(ids),)
-        or not set(truth.tolist()) <= {0, 1}
-        or not np.isfinite(scores).all()
-    ):
-        raise ManifestBuildError("Symile OOF predictions are invalid")
-    probabilities = _sigmoid(scores)
-    records = sorted(
-        zip(ids, truth.astype(np.int8), scores, probabilities, strict=True),
-        key=lambda row: row[0],
-    )
-    return pa.Table.from_pylist(
-        [
-            {
-                "sample_id": sample_id,
-                "target": int(target),
-                "logit": float(logit),
-                "probability": float(probability),
-            }
-            for sample_id, target, logit, probability in records
-        ],
-        schema=OOF_SCHEMA,
-    )
-
-
 def neural_checkpoint_document(
     state_dict: Mapping[str, torch.Tensor],
     *,
@@ -185,9 +160,9 @@ def neural_checkpoint_document(
     selected_stage: str,
     selected_validation_roc_auc: float,
 ) -> dict[str, object]:
-    """Create the safe M5 neural checkpoint document."""
+    """Create the safe core-development neural checkpoint document."""
     document: dict[str, object] = {
-        "checkpoint_schema_version": 1,
+        "checkpoint_schema_version": SYMILE_CHECKPOINT_SCHEMA_VERSION,
         "model_state_dict": {
             key: value.detach().cpu().clone() for key, value in state_dict.items()
         },
@@ -201,7 +176,7 @@ def neural_checkpoint_document(
 
 
 def load_symile_neural_checkpoint(path: str | Path) -> dict[str, object]:
-    """Safely load one exact M5 neural checkpoint."""
+    """Safely load one exact core-development neural checkpoint."""
     try:
         document = torch.load(Path(path), map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, TypeError, ValueError, pickle.UnpicklingError) as exc:
@@ -222,24 +197,21 @@ def publish_fold_package(
     lineage: Mapping[str, object],
     inner_split: Mapping[str, object],
     selection: Mapping[str, object],
-    oof: pa.Table,
     model: object,
     lab_preprocessor: object | None = None,
     training_history: Sequence[Mapping[str, object]] | None = None,
     source_cxr: Mapping[str, object] | None = None,
     operational: Mapping[str, object] | None = None,
 ) -> ValidatedFoldPackage:
-    """Stage, validate, and immutably publish one M5 outer-fold package."""
+    """Stage, validate, and immutably publish one outer-fold package."""
     _validate_family(family)
-    _validate_oof(oof)
     _validate_fold_contents(family, lab_preprocessor, training_history, source_cxr)
-    folds_root = Path(model_root) / "folds"
+    folds_root = Path(model_root) / "packages"
     provisional = folds_root / "fold-package-pending"
     stage = staging_directory(provisional)
     try:
         (stage / CONFIG_FILENAME).write_bytes(config_bytes)
-        pq.write_table(oof, stage / OOF_FILENAME, compression="zstd")
-        if family in TABULAR_FAMILIES:
+        if family in SYMILE_TABULAR_FAMILIES:
             save_skops(model, stage / TABULAR_MODEL_FILENAME)
         else:
             _validate_neural_checkpoint(model)
@@ -250,36 +222,66 @@ def publish_fold_package(
                 + "\n",
                 encoding="utf-8",
             )
-        if family in FUSION_FAMILIES:
+        if family in SYMILE_FUSION_FAMILIES:
             if not isinstance(lab_preprocessor, SymileLabEcdfTransformer):
                 raise ManifestBuildError("Fusion fold lab preprocessor has the wrong type")
             save_symile_lab_preprocessor(lab_preprocessor, stage / LAB_PREPROCESSOR_FILENAME)
-        artifacts = _artifact_declarations(stage, oof)
+        artifacts = _artifact_declarations(stage)
+        config = load_symile_development_config(stage / CONFIG_FILENAME)
+        if (
+            config_sha256 != config.config_source_sha256
+            or config_semantic_sha256 != config.config_semantic_sha256
+        ):
+            raise ManifestBuildError("Symile fold config identities differ from archived config")
+        model_state_sha256 = (
+            fitted_object_state_sha256(
+                load_skops(stage / TABULAR_MODEL_FILENAME),
+                selected_iteration=selection.get("best_iteration"),
+            )
+            if family in SYMILE_TABULAR_FAMILIES
+            else tensor_state_sha256(
+                load_symile_neural_checkpoint(stage / NEURAL_MODEL_FILENAME)["model_state_dict"]
+            )
+        )
+        preprocessor_state_sha256 = (
+            fitted_object_state_sha256(
+                load_symile_lab_preprocessor(stage / LAB_PREPROCESSOR_FILENAME)
+            )
+            if family in SYMILE_FUSION_FAMILIES
+            else None
+        )
         identity_payload = _fold_identity_payload(
             family=family,
             repeat_seed=repeat_seed,
             outer_fold=outer_fold,
-            config_semantic_sha256=config_semantic_sha256,
+            fit_config=package_scientific_config_payload(config),
             lineage=lineage,
             inner_split=inner_split,
-            selection=selection,
+            model_state_sha256=model_state_sha256,
+            preprocessor_state_sha256=preprocessor_state_sha256,
             source_cxr=source_cxr,
-            artifacts=artifacts,
+            selection=selection,
         )
-        fold_id = FOLD_PREFIX + _canonical_sha256(identity_payload)
+        fold_id = canonical_scientific_id(FOLD_PREFIX, identity_payload)
         document = {
-            "fold_schema_version": FOLD_SCHEMA_VERSION,
+            "fold_package_schema_version": FOLD_PACKAGE_SCHEMA_VERSION,
             "fold_package_id": fold_id,
-            "family": family,
+            "dataset_id": "symile",
+            "task_id": lineage["task_id"],
+            "family_id": family,
+            "modalities": list(config.family.modalities),
             "repeat_seed": repeat_seed,
             "outer_fold": outer_fold,
             "config": {
                 "config_source_sha256": config_sha256,
                 "config_semantic_sha256": config_semantic_sha256,
+                "fit_config": package_scientific_config_payload(config),
             },
             "lineage": dict(lineage),
             "inner_split": dict(inner_split),
             "selection": dict(selection),
+            "model_state_sha256": model_state_sha256,
+            "preprocessor_state_sha256": preprocessor_state_sha256,
             "source_cxr": dict(source_cxr) if source_cxr is not None else None,
             "artifacts": artifacts,
             "operational": dict(operational or {}),
@@ -289,11 +291,14 @@ def publish_fold_package(
             encoding="utf-8",
         )
         destination = folds_root / fold_id
-        _publish_immutable(stage, destination, validate_fold_package)
+        created = _publish_immutable(stage, destination, validate_fold_package)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    return validate_fold_package(destination, expected_fold_package_id=fold_id)
+    return replace(
+        validate_fold_package(destination, expected_fold_package_id=fold_id),
+        created=created,
+    )
 
 
 def validate_fold_package(
@@ -302,7 +307,7 @@ def validate_fold_package(
     expected_fold_package_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedFoldPackage:
-    """Validate exact files, identities, safe model state, and OOF content."""
+    """Validate exact files, identities, and safe fitted model state."""
     root = Path(directory)
     _require_physical_directory(root)
     manifest_path = root / FOLD_MANIFEST_FILENAME
@@ -319,15 +324,13 @@ def validate_fold_package(
         raise ManifestBuildError("Symile fold package differs from the expected identity")
     if enforce_directory_name and root.name != fold_id:
         raise ManifestBuildError("Symile fold directory differs from its identity")
-    expected_files = _fold_files(document["family"])
+    expected_files = _fold_files(document["family_id"])
     _require_exact_regular_files(root, expected_files)
     artifacts = document["artifacts"]
     if set(artifacts) != expected_files - {FOLD_MANIFEST_FILENAME}:
         raise ManifestBuildError("Symile fold artifact declarations are invalid")
     for filename, declaration in artifacts.items():
         expected_declaration_fields = {"physical_sha256"}
-        if filename == OOF_FILENAME:
-            expected_declaration_fields |= {"logical_arrow_sha256", "row_count"}
         if (
             not isinstance(declaration, dict)
             or set(declaration) != expected_declaration_fields
@@ -343,17 +346,15 @@ def validate_fold_package(
     except (OSError, ValueError, TypeError) as exc:
         raise ManifestBuildError("Symile fold resolved configuration is invalid") from exc
     _validate_fold_config(config, document)
-    oof = pq.read_table(root / OOF_FILENAME)
-    _validate_oof(oof)
-    if (
-        artifacts[OOF_FILENAME].get("logical_arrow_sha256") != arrow_ipc_sha256(oof)
-        or artifacts[OOF_FILENAME].get("row_count") != oof.num_rows
-    ):
-        raise ManifestBuildError("Symile fold OOF identity is invalid")
-    if document["family"] in TABULAR_FAMILIES:
+    if document["family_id"] in SYMILE_TABULAR_FAMILIES:
         _validate_tabular_reconstruction(root, config, document)
+        observed_model_state = fitted_object_state_sha256(
+            load_skops(root / TABULAR_MODEL_FILENAME),
+            selected_iteration=document["selection"].get("best_iteration"),
+        )
     else:
         checkpoint = load_symile_neural_checkpoint(root / NEURAL_MODEL_FILENAME)
+        observed_model_state = tensor_state_sha256(checkpoint["model_state_dict"])
         if (
             checkpoint["selected_epoch"] != document["selection"].get("selected_epoch")
             or checkpoint["selected_stage"] != document["selection"].get("selected_stage")
@@ -364,78 +365,127 @@ def validate_fold_package(
         _validate_neural_reconstruction(config, checkpoint)
         history = _load_json_list(root / TRAINING_HISTORY_FILENAME)
         _validate_training_history(history, document["selection"], config)
-    if document["family"] in FUSION_FAMILIES:
+    if document["family_id"] in SYMILE_FUSION_FAMILIES:
         try:
-            load_symile_lab_preprocessor(root / LAB_PREPROCESSOR_FILENAME)
+            preprocessor = load_symile_lab_preprocessor(root / LAB_PREPROCESSOR_FILENAME)
         except (OSError, ValueError, TypeError) as exc:
             raise ManifestBuildError("Symile fold lab preprocessor is invalid") from exc
+        observed_preprocessor_state = fitted_object_state_sha256(preprocessor)
+    else:
+        observed_preprocessor_state = None
+    if (
+        observed_model_state != document["model_state_sha256"]
+        or observed_preprocessor_state != document["preprocessor_state_sha256"]
+    ):
+        raise ManifestBuildError("Symile fold fitted-state identity is invalid")
     expected_id = FOLD_PREFIX + _canonical_sha256(_fold_payload_from_manifest(document))
     if expected_id != fold_id:
         raise ManifestBuildError("Symile fold semantic identity is invalid")
-    return ValidatedFoldPackage(
-        root,
-        document,
-        hashlib.sha256(manifest_bytes).hexdigest(),
-        oof,
-    )
+    _validate_source_cxr_fold(root, document)
+    return ValidatedFoldPackage(root, document, hashlib.sha256(manifest_bytes).hexdigest())
 
 
 def publish_development_result(
     *,
     report_root: str | Path,
     model_root: str | Path,
+    prediction_root: str | Path,
+    manifest_root: str | Path = "data/manifests",
     family: str,
     config_semantic_sha256: str,
     folds: Sequence[ValidatedFoldPackage],
-    repeat_metrics: Mapping[str, Mapping[str, float]],
-    selected_values: Sequence[int] | None,
-    median_m6_budget: int | None,
+    predictions: Sequence[ValidatedPredictionEvidence],
 ) -> ValidatedDevelopmentResult:
     """Publish the complete 15-fold family development authority."""
     _validate_family(family)
     ordered = sorted(
         folds, key=lambda item: (item.manifest["repeat_seed"], item.manifest["outer_fold"])
     )
+    ordered_predictions = sorted(
+        predictions,
+        key=lambda item: (item.manifest["repeat_seed"], item.manifest["outer_fold"]),
+    )
     coordinates = [(item.manifest["repeat_seed"], item.manifest["outer_fold"]) for item in ordered]
-    if coordinates != [(seed, fold) for seed in (17, 42, 2026) for fold in range(5)]:
+    if coordinates != [(seed, fold) for seed in REPEAT_SEEDS for fold in OUTER_FOLDS]:
         raise ManifestBuildError("Symile family development does not contain exact 3 x 5 folds")
+    if len(ordered_predictions) != 15:
+        raise ManifestBuildError("Symile development package/evidence pairing is invalid")
+    authority = _load_cv_authority(ordered[0].manifest["lineage"], manifest_root)
+    for package, evidence in zip(ordered, ordered_predictions, strict=True):
+        _validate_fold_prediction_pair(package, evidence, authority)
+    if any(item.manifest["family_id"] != family for item in ordered):
+        raise ManifestBuildError("Symile family fold compatibility is invalid")
+    fit_config = ordered[0].manifest["config"]["fit_config"]
+    if any(item.manifest["config"]["fit_config"] != fit_config for item in ordered):
+        raise ManifestBuildError("Symile development folds use mixed scientific fit configs")
     if any(
-        item.manifest["family"] != family
-        or item.manifest["config"]["config_semantic_sha256"] != config_semantic_sha256
+        item.manifest["config"]["config_semantic_sha256"] != config_semantic_sha256
         for item in ordered
     ):
-        raise ManifestBuildError("Symile family fold compatibility is invalid")
-    _validate_repeat_metrics(repeat_metrics)
-    derived_metrics = _fold_repeat_metrics(ordered)
-    if not _nested_metrics_close(repeat_metrics, derived_metrics):
-        raise ManifestBuildError("Symile family repeat metrics differ from fold OOF content")
-    expected_selected = None
+        raise ManifestBuildError("Symile development folds use mixed scientific configs")
+    repeat_metrics = _prediction_repeat_metrics(ordered_predictions)
+    selection_budget_values = None
     if family != "labs_logistic":
         field = "best_iteration" if family == "labs_lightgbm" else "selected_epoch"
-        expected_selected = [int(item.manifest["selection"][field]) for item in ordered]
-    if (list(selected_values) if selected_values is not None else None) != expected_selected:
-        raise ManifestBuildError("Symile family selected-budget evidence differs from folds")
-    _validate_budget(family, selected_values, median_m6_budget)
+        selection_budget_values = [int(item.manifest["selection"][field]) for item in ordered]
+    final_training_budget = (
+        int(np.median(np.asarray(selection_budget_values, dtype=np.int64)))
+        if selection_budget_values is not None
+        else None
+    )
+    _validate_budget(family, selection_budget_values, final_training_budget)
     fold_refs = [
         {
             "fold_package_id": item.manifest["fold_package_id"],
             "fold_manifest_sha256": item.manifest_sha256,
+            "prediction_id": evidence.prediction_id,
+            "prediction_manifest_sha256": evidence.manifest_sha256,
             "repeat_seed": item.manifest["repeat_seed"],
             "outer_fold": item.manifest["outer_fold"],
         }
-        for item in ordered
+        for item, evidence in zip(ordered, ordered_predictions, strict=True)
     ]
+    lineage = ordered[0].manifest["lineage"]
+    scientific_context = {
+        "fit_config": fit_config,
+        "bundle_id": lineage["bundle_id"],
+        "split_assignment_id": lineage["split_assignment_id"],
+        "cv_assignment_id": lineage["cv_assignment_id"],
+        "task_id": lineage["task_id"],
+    }
     identity_payload = {
-        "development_schema_version": DEVELOPMENT_SCHEMA_VERSION,
-        "family": family,
+        "dataset_id": "symile",
+        "task_id": lineage["task_id"],
+        "family_id": family,
+        "modalities": list(ordered[0].manifest["modalities"]),
         "config_semantic_sha256": config_semantic_sha256,
+        "scientific_context": scientific_context,
+        "package_prediction_pairs": [
+            [
+                item["repeat_seed"],
+                item["outer_fold"],
+                item["fold_package_id"],
+                item["prediction_id"],
+            ]
+            for item in fold_refs
+        ],
+    }
+    development_id = canonical_scientific_id(DEVELOPMENT_PREFIX, identity_payload)
+    document = {
+        "development_schema_version": DEVELOPMENT_SCHEMA_VERSION,
+        "development_id": development_id,
+        "dataset_id": "symile",
+        "task_id": lineage["task_id"],
+        "family_id": family,
+        "modalities": list(ordered[0].manifest["modalities"]),
+        "config_semantic_sha256": config_semantic_sha256,
+        "scientific_context": scientific_context,
         "fold_packages": fold_refs,
         "repeat_metrics": repeat_metrics,
-        "selected_values": list(selected_values) if selected_values is not None else None,
-        "median_m6_budget": median_m6_budget,
+        "selection_budget_values": selection_budget_values,
+        "final_training_budget": final_training_budget,
+        "completeness": "passed",
     }
-    development_id = DEVELOPMENT_PREFIX + _canonical_sha256(identity_payload)
-    document = {"development_id": development_id, **identity_payload, "completeness": "passed"}
     destination = Path(report_root) / "families" / development_id
     stage = staging_directory(destination)
     try:
@@ -448,8 +498,8 @@ def publish_development_result(
             [stage / SUMMARY_FILENAME],
             forbidden_source_values={
                 str(sample_id)
-                for item in ordered
-                for sample_id in item.oof["sample_id"].to_pylist()
+                for item in ordered_predictions
+                for sample_id in item.predictions["sample_id"].to_pylist()
             },
         )
         _publish_immutable(
@@ -458,6 +508,8 @@ def publish_development_result(
             lambda path, **kwargs: validate_development_result(
                 path,
                 model_root=model_root,
+                prediction_root=prediction_root,
+                manifest_root=manifest_root,
                 **kwargs,
             ),
         )
@@ -467,6 +519,8 @@ def publish_development_result(
     return validate_development_result(
         destination,
         model_root=model_root,
+        prediction_root=prediction_root,
+        manifest_root=manifest_root,
         expected_development_id=development_id,
     )
 
@@ -475,6 +529,8 @@ def validate_development_result(
     directory: str | Path,
     *,
     model_root: str | Path = "models/symile/development",
+    prediction_root: str | Path = "private",
+    manifest_root: str | Path = "data/manifests",
     expected_development_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedDevelopmentResult:
@@ -489,49 +545,110 @@ def validate_development_result(
     expected_fields = {
         "development_schema_version",
         "development_id",
-        "family",
+        "dataset_id",
+        "task_id",
+        "family_id",
+        "modalities",
         "config_semantic_sha256",
+        "scientific_context",
         "fold_packages",
         "repeat_metrics",
-        "selected_values",
-        "median_m6_budget",
+        "selection_budget_values",
+        "final_training_budget",
         "completeness",
     }
     if not isinstance(document, dict) or set(document) != expected_fields:
         raise ManifestBuildError("Symile development manifest fields are invalid")
-    _validate_family(document["family"])
-    if document["development_schema_version"] != DEVELOPMENT_SCHEMA_VERSION:
+    _validate_family(document["family_id"])
+    if document["dataset_id"] != "symile" or document["task_id"] != "pneumonia_strict":
+        raise ManifestBuildError("Symile development dataset/task contract is invalid")
+    schema_version = document["development_schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != DEVELOPMENT_SCHEMA_VERSION
+    ):
         raise ManifestBuildError("Symile development schema version is invalid")
     if document["completeness"] != "passed" or len(document["fold_packages"]) != 15:
         raise ManifestBuildError("Symile development completeness declaration is invalid")
     coordinates = [
         (item.get("repeat_seed"), item.get("outer_fold")) for item in document["fold_packages"]
     ]
-    if coordinates != [(seed, fold) for seed in (17, 42, 2026) for fold in range(5)]:
+    if coordinates != [(seed, fold) for seed in REPEAT_SEEDS for fold in OUTER_FOLDS]:
         raise ManifestBuildError("Symile development fold references are invalid")
     if any(
-        set(item) != {"fold_package_id", "fold_manifest_sha256", "repeat_seed", "outer_fold"}
+        set(item)
+        != {
+            "fold_package_id",
+            "fold_manifest_sha256",
+            "prediction_id",
+            "prediction_manifest_sha256",
+            "repeat_seed",
+            "outer_fold",
+        }
         or not _identity(item["fold_package_id"], FOLD_PREFIX)
         or not _sha256(item["fold_manifest_sha256"])
+        or not _identity(item["prediction_id"], PREDICTION_PREFIX)
+        or not _sha256(item["prediction_manifest_sha256"])
         for item in document["fold_packages"]
     ):
         raise ManifestBuildError("Symile development fold lineage is invalid")
     _validate_repeat_metrics(document["repeat_metrics"])
     folds = _resolve_family_folds(document, model_root)
-    derived_metrics = _fold_repeat_metrics(folds)
+    predictions = _resolve_family_predictions(document, prediction_root)
+    authority = _load_cv_authority(folds[0].manifest["lineage"], manifest_root)
+    for package, evidence in zip(folds, predictions, strict=True):
+        _validate_fold_prediction_pair(package, evidence, authority)
+    if any(package.manifest["modalities"] != document["modalities"] for package in folds):
+        raise ManifestBuildError("Symile development modalities differ from fold packages")
+    _validate_source_cxr_development(
+        root,
+        document,
+        folds,
+        model_root=model_root,
+        prediction_root=prediction_root,
+        manifest_root=manifest_root,
+    )
+    first_lineage = folds[0].manifest["lineage"]
+    expected_context = {
+        "fit_config": folds[0].manifest["config"]["fit_config"],
+        "bundle_id": first_lineage["bundle_id"],
+        "split_assignment_id": first_lineage["split_assignment_id"],
+        "cv_assignment_id": first_lineage["cv_assignment_id"],
+        "task_id": first_lineage["task_id"],
+    }
+    if document["scientific_context"] != expected_context:
+        raise ManifestBuildError("Symile development scientific context differs from packages")
+    if document["config_semantic_sha256"] != folds[0].manifest["config"]["config_semantic_sha256"]:
+        raise ManifestBuildError("Symile development config identity differs from fold packages")
+    derived_metrics = _prediction_repeat_metrics(predictions)
     if not _nested_metrics_close(document["repeat_metrics"], derived_metrics):
         raise ManifestBuildError("Symile development metrics differ from fold evidence")
     selected = None
-    if document["family"] != "labs_logistic":
-        field = "best_iteration" if document["family"] == "labs_lightgbm" else "selected_epoch"
+    if document["family_id"] != "labs_logistic":
+        field = "best_iteration" if document["family_id"] == "labs_lightgbm" else "selected_epoch"
         selected = [int(item.manifest["selection"][field]) for item in folds]
-    if document["selected_values"] != selected:
+    if document["selection_budget_values"] != selected:
         raise ManifestBuildError("Symile development budget evidence differs from fold packages")
-    _validate_budget(document["family"], selected, document["median_m6_budget"])
+    _validate_budget(document["family_id"], selected, document["final_training_budget"])
     identity_payload = {
-        key: document[key] for key in document if key not in {"development_id", "completeness"}
+        "dataset_id": document["dataset_id"],
+        "task_id": document["task_id"],
+        "family_id": document["family_id"],
+        "modalities": document["modalities"],
+        "config_semantic_sha256": document["config_semantic_sha256"],
+        "scientific_context": document["scientific_context"],
+        "package_prediction_pairs": [
+            [
+                item["repeat_seed"],
+                item["outer_fold"],
+                item["fold_package_id"],
+                item["prediction_id"],
+            ]
+            for item in document["fold_packages"]
+        ],
     }
-    development_id = DEVELOPMENT_PREFIX + _canonical_sha256(identity_payload)
+    development_id = canonical_scientific_id(DEVELOPMENT_PREFIX, identity_payload)
     if document["development_id"] != development_id:
         raise ManifestBuildError("Symile development identity is invalid")
     if expected_development_id is not None and development_id != expected_development_id:
@@ -544,7 +661,9 @@ def validate_development_result(
     validate_public_reports(
         [root / SUMMARY_FILENAME],
         forbidden_source_values={
-            str(sample_id) for item in folds for sample_id in item.oof["sample_id"].to_pylist()
+            str(sample_id)
+            for item in predictions
+            for sample_id in item.predictions["sample_id"].to_pylist()
         },
     )
     return ValidatedDevelopmentResult(root, document, hashlib.sha256(manifest_bytes).hexdigest())
@@ -554,27 +673,36 @@ def publish_analysis_result(
     *,
     report_root: str | Path,
     model_root: str | Path,
+    prediction_root: str | Path,
+    manifest_root: str | Path = "data/manifests",
     family_development_ids: Mapping[str, str],
-    repeat_metrics: Mapping[str, Mapping[str, Mapping[str, float]]],
-    paired_effects: Mapping[str, Mapping[str, Mapping[str, float]]],
-    ensemble_metrics: Mapping[str, Mapping[str, float]],
-    observedness_ablation: Mapping[str, Mapping[str, float]],
-    policy: Mapping[str, object],
 ) -> tuple[str, Path]:
-    """Publish one aggregate, privacy-safe cross-family M5 analysis."""
-    if set(family_development_ids) != set(SYMILE_M5_FAMILIES):
+    """Publish one aggregate, privacy-safe cross-family development analysis."""
+    if set(family_development_ids) != set(SYMILE_CORE_DEVELOPMENT_FAMILIES):
         raise ManifestBuildError("Symile analysis requires exactly six family authorities")
-    payload = {
-        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+    derived = _derive_analysis(
+        family_development_ids,
+        report_root,
+        model_root,
+        prediction_root,
+        manifest_root,
+    )
+    identity_payload = {
+        "dataset_id": "symile",
+        "task_id": "pneumonia_strict",
         "family_development_ids": dict(sorted(family_development_ids.items())),
-        "repeat_metrics": repeat_metrics,
-        "paired_effects": paired_effects,
-        "ensemble_metrics": ensemble_metrics,
-        "observedness_ablation": observedness_ablation,
-        "policy": dict(policy),
+        "policy": SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY,
     }
-    analysis_id = ANALYSIS_PREFIX + _canonical_sha256(payload)
-    document = {"analysis_id": analysis_id, **payload}
+    payload = {
+        **identity_payload,
+        **derived,
+    }
+    analysis_id = canonical_scientific_id(ANALYSIS_PREFIX, identity_payload)
+    document = {
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "analysis_id": analysis_id,
+        **payload,
+    }
     destination = Path(report_root) / "analyses" / analysis_id
     stage = staging_directory(destination)
     try:
@@ -591,6 +719,8 @@ def publish_analysis_result(
                 path,
                 report_root=report_root,
                 model_root=model_root,
+                prediction_root=prediction_root,
+                manifest_root=manifest_root,
                 **kwargs,
             ),
         )
@@ -605,10 +735,12 @@ def validate_analysis_result(
     *,
     report_root: str | Path = "reports/symile/development",
     model_root: str | Path = "models/symile/development",
+    prediction_root: str | Path = "private",
+    manifest_root: str | Path = "data/manifests",
     expected_analysis_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> dict[str, Any]:
-    """Validate one aggregate cross-family M5 analysis."""
+    """Validate one aggregate cross-family development analysis."""
     root = Path(directory)
     _require_exact_regular_files(root, {ANALYSIS_MANIFEST_FILENAME, SUMMARY_FILENAME})
     try:
@@ -618,6 +750,8 @@ def validate_analysis_result(
     expected = {
         "analysis_schema_version",
         "analysis_id",
+        "dataset_id",
+        "task_id",
         "family_development_ids",
         "repeat_metrics",
         "paired_effects",
@@ -627,26 +761,48 @@ def validate_analysis_result(
     }
     if not isinstance(document, dict) or set(document) != expected:
         raise ManifestBuildError("Symile analysis manifest fields are invalid")
+    schema_version = document["analysis_schema_version"]
     if (
-        document["analysis_schema_version"] != ANALYSIS_SCHEMA_VERSION
-        or set(document["family_development_ids"]) != set(SYMILE_M5_FAMILIES)
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != ANALYSIS_SCHEMA_VERSION
+    ):
+        raise ManifestBuildError("Symile analysis schema version is invalid")
+    if (
+        document["dataset_id"] != "symile"
+        or document["task_id"] != "pneumonia_strict"
+        or set(document["family_development_ids"]) != set(SYMILE_CORE_DEVELOPMENT_FAMILIES)
         or any(
             not _identity(value, DEVELOPMENT_PREFIX)
             for value in document["family_development_ids"].values()
         )
     ):
         raise ManifestBuildError("Symile analysis lineage is invalid")
-    if document["policy"] != _ANALYSIS_POLICY:
+    if document["policy"] != SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY:
         raise ManifestBuildError("Symile analysis policy is invalid")
-    payload = {key: document[key] for key in document if key != "analysis_id"}
-    analysis_id = ANALYSIS_PREFIX + _canonical_sha256(payload)
+    identity_payload = {
+        key: document[key]
+        for key in (
+            "dataset_id",
+            "task_id",
+            "family_development_ids",
+            "policy",
+        )
+    }
+    analysis_id = canonical_scientific_id(ANALYSIS_PREFIX, identity_payload)
     if document["analysis_id"] != analysis_id:
         raise ManifestBuildError("Symile analysis identity is invalid")
     if expected_analysis_id is not None and analysis_id != expected_analysis_id:
         raise ManifestBuildError("Symile analysis differs from the expected identity")
     if enforce_directory_name and root.name != analysis_id:
         raise ManifestBuildError("Symile analysis directory differs from its identity")
-    derived = _derive_analysis(document["family_development_ids"], report_root, model_root)
+    derived = _derive_analysis(
+        document["family_development_ids"],
+        report_root,
+        model_root,
+        prediction_root,
+        manifest_root,
+    )
     for field in (
         "repeat_metrics",
         "paired_effects",
@@ -666,47 +822,60 @@ def _fold_identity_payload(
     family: str,
     repeat_seed: int,
     outer_fold: int,
-    config_semantic_sha256: str,
+    fit_config: Mapping[str, object],
     lineage: Mapping[str, object],
     inner_split: Mapping[str, object],
-    selection: Mapping[str, object],
+    model_state_sha256: str,
+    preprocessor_state_sha256: str | None,
     source_cxr: Mapping[str, object] | None,
-    artifacts: Mapping[str, Mapping[str, object]],
+    selection: Mapping[str, object],
 ) -> dict[str, object]:
-    return {
-        "fold_schema_version": FOLD_SCHEMA_VERSION,
-        "family": family,
+    semantic_lineage = {
+        key: lineage[key]
+        for key in ("bundle_id", "split_assignment_id", "cv_assignment_id", "task_id")
+    }
+    payload = {
+        "dataset_id": "symile",
+        "task_id": semantic_lineage["task_id"],
+        "family_id": family,
+        "modalities": list(fit_config["family"]["modalities"]),
         "repeat_seed": repeat_seed,
         "outer_fold": outer_fold,
-        "config_semantic_sha256": config_semantic_sha256,
-        "lineage": dict(lineage),
-        "inner_split": dict(inner_split),
-        "selection": dict(selection),
-        "source_cxr": dict(source_cxr) if source_cxr is not None else None,
-        "artifacts": artifacts,
+        "fit_config": dict(fit_config),
+        "lineage": semantic_lineage,
+        "model_state_sha256": model_state_sha256,
+        "preprocessor_state_sha256": preprocessor_state_sha256,
+        "source_package_id": source_cxr["fold_package_id"] if source_cxr is not None else None,
+        "selected_state": _selected_state(family, selection),
     }
+    if family != "labs_logistic":
+        payload["inner_split_id"] = inner_split["inner_split_id"]
+    if family == "cxr_densenet":
+        payload["pretrained_weight"] = pretrained_weight_semantic_identity(
+            lineage["pretrained_weight"]
+        )
+    return payload
 
 
 def _fold_payload_from_manifest(document: Mapping[str, Any]) -> dict[str, object]:
     return _fold_identity_payload(
-        family=document["family"],
+        family=document["family_id"],
         repeat_seed=document["repeat_seed"],
         outer_fold=document["outer_fold"],
-        config_semantic_sha256=document["config"]["config_semantic_sha256"],
+        fit_config=document["config"]["fit_config"],
         lineage=document["lineage"],
         inner_split=document["inner_split"],
-        selection=document["selection"],
+        model_state_sha256=document["model_state_sha256"],
+        preprocessor_state_sha256=document["preprocessor_state_sha256"],
         source_cxr=document["source_cxr"],
-        artifacts=document["artifacts"],
+        selection=document["selection"],
     )
 
 
-def _artifact_declarations(stage: Path, oof: pa.Table) -> dict[str, dict[str, object]]:
+def _artifact_declarations(stage: Path) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
     for path in sorted(stage.iterdir()):
         declaration: dict[str, object] = {"physical_sha256": sha256_file(path)}
-        if path.name == OOF_FILENAME:
-            declaration.update(logical_arrow_sha256=arrow_ipc_sha256(oof), row_count=oof.num_rows)
         result[path.name] = declaration
     return result
 
@@ -714,26 +883,42 @@ def _artifact_declarations(stage: Path, oof: pa.Table) -> dict[str, dict[str, ob
 def _validate_fold_manifest(document: object) -> None:
     if not isinstance(document, dict) or set(document) != _FOLD_FIELDS:
         raise ManifestBuildError("Symile fold manifest fields are invalid")
-    _validate_family(document.get("family"))
-    if document.get("fold_schema_version") != FOLD_SCHEMA_VERSION:
+    _validate_family(document.get("family_id"))
+    schema_version = document.get("fold_package_schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != FOLD_PACKAGE_SCHEMA_VERSION
+    ):
         raise ManifestBuildError("Symile fold schema version is invalid")
     if not _identity(document.get("fold_package_id"), FOLD_PREFIX):
         raise ManifestBuildError("Symile fold identity declaration is invalid")
-    if document.get("repeat_seed") not in {17, 42, 2026} or document.get("outer_fold") not in range(
-        5
+    if (
+        document.get("repeat_seed") not in REPEAT_SEEDS
+        or document.get("outer_fold") not in OUTER_FOLDS
     ):
         raise ManifestBuildError("Symile fold coordinates are invalid")
     config = document.get("config")
     if (
         not isinstance(config, dict)
-        or set(config) != {"config_source_sha256", "config_semantic_sha256"}
-        or not all(_sha256(value) for value in config.values())
+        or set(config) != {"config_source_sha256", "config_semantic_sha256", "fit_config"}
+        or not all(
+            _sha256(config[key]) for key in ("config_source_sha256", "config_semantic_sha256")
+        )
+        or not isinstance(config["fit_config"], dict)
     ):
         raise ManifestBuildError("Symile fold config identity is invalid")
     if not isinstance(document.get("lineage"), dict) or not isinstance(
         document.get("inner_split"), dict
     ):
         raise ManifestBuildError("Symile fold provenance is invalid")
+    if (
+        document.get("dataset_id") != "symile"
+        or document.get("task_id") != document["lineage"].get("task_id")
+        or document.get("modalities")
+        != document.get("config", {}).get("fit_config", {}).get("family", {}).get("modalities")
+    ):
+        raise ManifestBuildError("Symile fold dataset/task/modalities contract is invalid")
     lineage = document["lineage"]
     if (
         set(lineage) != _LINEAGE_FIELDS
@@ -748,7 +933,7 @@ def _validate_fold_manifest(document: object) -> None:
         or not _sha256(lineage.get("dependency_lock_sha256"))
     ):
         raise ManifestBuildError("Symile fold data/code lineage is invalid")
-    if document["family"] in NEURAL_FAMILIES:
+    if document["family_id"] in SYMILE_NEURAL_FAMILIES:
         encoder = lineage.get("encoder_identity")
         if (
             not isinstance(encoder, dict)
@@ -759,11 +944,10 @@ def _validate_fold_manifest(document: object) -> None:
             or isinstance(encoder.get("embedding_dimension"), bool)
             or not isinstance(encoder.get("embedding_dimension"), int)
             or not isinstance(lineage.get("transform_contract"), dict)
-            or lineage["transform_contract"].get("policy_version")
-            != ("torchxrayvision-densenet121-res224-v1")
+            or lineage["transform_contract"].get("policy_version") != CXR_TRANSFORM_POLICY_VERSION
         ):
             raise ManifestBuildError("Symile neural fold encoder/transform lineage is invalid")
-        if document["family"] == "cxr_densenet":
+        if document["family_id"] == "cxr_densenet":
             weight = lineage.get("pretrained_weight")
             if (
                 not isinstance(weight, dict)
@@ -786,7 +970,10 @@ def _validate_fold_manifest(document: object) -> None:
                 or not _sha256(weight.get("sha256"))
             ):
                 raise ManifestBuildError("Symile CXR fold lacks pretrained-weight lineage")
-        if document["family"] in FUSION_FAMILIES and lineage.get("pretrained_weight") is not None:
+        if (
+            document["family_id"] in SYMILE_FUSION_FAMILIES
+            and lineage.get("pretrained_weight") is not None
+        ):
             raise ManifestBuildError("Symile fusion fold duplicates pretrained-weight lineage")
     elif any(
         lineage.get(field) is not None
@@ -803,6 +990,7 @@ def _validate_fold_manifest(document: object) -> None:
     ):
         raise ManifestBuildError("Symile inner split identity is invalid")
     policy = inner["policy"]
+    canonical_inner_seed = derive_inner_seed(document["repeat_seed"], document["outer_fold"])
     if (
         set(policy)
         != {
@@ -817,7 +1005,7 @@ def _validate_fold_manifest(document: object) -> None:
             "outer_fold",
             "inner_seed",
         }
-        or policy.get("policy_version") != "symile-inner-stratified-group-five-fold-v1"
+        or policy.get("policy_version") != INNER_SPLIT_POLICY_VERSION
         or policy.get("algorithm") != "sklearn.model_selection.StratifiedGroupKFold"
         or policy.get("n_splits") != 5
         or policy.get("shuffle") is not True
@@ -826,26 +1014,32 @@ def _validate_fold_manifest(document: object) -> None:
         or policy.get("stratification_target") != "pneumonia_strict"
         or policy.get("repeat_seed") != document["repeat_seed"]
         or policy.get("outer_fold") != document["outer_fold"]
-        or policy.get("inner_seed") != inner["inner_seed"]
+        or inner["inner_seed"] != canonical_inner_seed
+        or policy.get("inner_seed") != canonical_inner_seed
     ):
         raise ManifestBuildError("Symile inner split policy is invalid")
     if not isinstance(document.get("selection"), dict) or not isinstance(
         document.get("artifacts"), dict
     ):
         raise ManifestBuildError("Symile fold selection or artifacts are invalid")
+    if not _sha256(document.get("model_state_sha256")) or (
+        document["preprocessor_state_sha256"] is not None
+        and not _sha256(document["preprocessor_state_sha256"])
+    ):
+        raise ManifestBuildError("Symile fold fitted-state declaration is invalid")
     selection = document["selection"]
     expected_selection = {"metric", "selected_epoch", "best_iteration"}
-    if document["family"] in NEURAL_FAMILIES:
+    if document["family_id"] in SYMILE_NEURAL_FAMILIES:
         expected_selection |= {"selected_stage", "selected_validation_metric"}
     if set(selection) != expected_selection:
         raise ManifestBuildError("Symile fold selection fields are invalid")
-    if document["family"] == "labs_logistic" and selection != {
+    if document["family_id"] == "labs_logistic" and selection != {
         "metric": "none",
         "selected_epoch": None,
         "best_iteration": None,
     }:
         raise ManifestBuildError("Symile Logistic Regression selection is invalid")
-    if document["family"] == "labs_lightgbm" and (
+    if document["family_id"] == "labs_lightgbm" and (
         selection.get("metric") != "roc_auc"
         or selection.get("selected_epoch") is not None
         or isinstance(selection.get("best_iteration"), bool)
@@ -853,17 +1047,17 @@ def _validate_fold_manifest(document: object) -> None:
         or selection["best_iteration"] <= 0
     ):
         raise ManifestBuildError("Symile LightGBM selection is invalid")
-    if document["family"] in NEURAL_FAMILIES and (
+    if document["family_id"] in SYMILE_NEURAL_FAMILIES and (
         selection.get("metric") != "roc_auc"
         or isinstance(selection.get("selected_epoch"), bool)
         or not isinstance(selection.get("selected_epoch"), int)
-        or not 1 <= selection["selected_epoch"] <= 30
+        or selection["selected_epoch"] <= 0
         or selection.get("best_iteration") is not None
         or selection.get("selected_stage") not in {"warmup", "fine_tune"}
         or not _finite(selection.get("selected_validation_metric"))
     ):
         raise ManifestBuildError("Symile neural selection is invalid")
-    if document["family"] in FUSION_FAMILIES:
+    if document["family_id"] in SYMILE_FUSION_FAMILIES:
         source = document.get("source_cxr")
         if (
             not isinstance(source, dict)
@@ -882,34 +1076,15 @@ def _validate_fold_manifest(document: object) -> None:
         or not isinstance(operational.get("mlflow_run_id"), str)
         or not operational["mlflow_run_id"]
         or (
-            document["family"] in NEURAL_FAMILIES
+            document["family_id"] in SYMILE_NEURAL_FAMILIES
             and not isinstance(operational.get("runtime_provenance"), dict)
         )
         or (
-            document["family"] in TABULAR_FAMILIES
+            document["family_id"] in SYMILE_TABULAR_FAMILIES
             and operational.get("runtime_provenance") is not None
         )
     ):
         raise ManifestBuildError("Symile fold operational provenance is invalid")
-
-
-def _validate_oof(table: pa.Table) -> None:
-    if table.schema != OOF_SCHEMA or table.num_rows == 0:
-        raise ManifestBuildError("Symile OOF schema or row count is invalid")
-    frame = table.to_pandas()
-    if (
-        frame["sample_id"].duplicated().any()
-        or frame["sample_id"].tolist() != sorted(frame["sample_id"])
-        or set(frame["target"]) != {0, 1}
-        or not np.isfinite(frame[["logit", "probability"]].to_numpy()).all()
-        or not np.allclose(
-            frame["probability"].to_numpy(dtype=np.float64),
-            _sigmoid(frame["logit"].to_numpy(dtype=np.float64)),
-            rtol=0.0,
-            atol=1e-12,
-        )
-    ):
-        raise ManifestBuildError("Symile OOF prediction content is invalid")
 
 
 def _validate_neural_checkpoint(document: object) -> None:
@@ -924,9 +1099,15 @@ def _validate_neural_checkpoint(document: object) -> None:
     if not isinstance(document, dict) or set(document) != fields:
         raise ManifestBuildError("Symile neural checkpoint fields are invalid")
     state = document["model_state_dict"]
+    schema_version = document["checkpoint_schema_version"]
     if (
-        document["checkpoint_schema_version"] != 1
-        or not isinstance(state, dict)
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SYMILE_CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ManifestBuildError("Symile neural checkpoint schema version is invalid")
+    if (
+        not isinstance(state, dict)
         or not state
         or any(
             not isinstance(key, str) or not isinstance(value, torch.Tensor)
@@ -935,7 +1116,7 @@ def _validate_neural_checkpoint(document: object) -> None:
         or any(not torch.isfinite(value).all() for value in state.values())
         or isinstance(document["selected_epoch"], bool)
         or not isinstance(document["selected_epoch"], int)
-        or not 1 <= document["selected_epoch"] <= 30
+        or document["selected_epoch"] <= 0
         or document["selected_stage"] not in {"warmup", "fine_tune"}
         or document["selection_metric"] != "roc_auc"
         or not _finite(document["selected_validation_metric"])
@@ -953,19 +1134,20 @@ def _validate_fold_config(config: ExperimentConfig, document: Mapping[str, Any])
             "weights": config.family.parameters["weights"],
             "embedding_dimension": config.family.parameters["embedding_dimension"],
         }
-        if config.family.family_id in NEURAL_FAMILIES
+        if config.family.family_id in SYMILE_NEURAL_FAMILIES
         else None
     )
     transform_contract = (
         _evaluation_transform_contract(config)
-        if config.family.family_id in NEURAL_FAMILIES
+        if config.family.family_id in SYMILE_NEURAL_FAMILIES
         else None
     )
     pretrained = lineage["pretrained_weight"]
     if (
-        config.family.family_id != document["family"]
+        config.family.family_id != document["family_id"]
         or config.config_source_sha256 != document["config"]["config_source_sha256"]
         or config.config_semantic_sha256 != document["config"]["config_semantic_sha256"]
+        or package_scientific_config_payload(config) != document["config"]["fit_config"]
         or config.dataset.bundle_id != lineage["bundle_id"]
         or config.dataset.bundle_manifest_sha256 != lineage["bundle_manifest_sha256"]
         or config.dataset.split_assignment_id != lineage["split_assignment_id"]
@@ -987,7 +1169,7 @@ def _validate_fold_config(config: ExperimentConfig, document: Mapping[str, Any])
 
 def _evaluation_transform_contract(config: ExperimentConfig) -> dict[str, object]:
     if config.neural is None:
-        raise ManifestBuildError("Symile neural config lacks image settings")
+        raise ManifestBuildError("Symile neural config lacks neural settings")
     return StandardCxrTransform(
         training=False,
         policy_version=str(config.preprocessing["cxr_transform_policy"]),
@@ -1131,8 +1313,9 @@ def _validate_training_history(
     stages: dict[int, str] = {}
     metrics: dict[int, float] = {}
     if config.neural is None:
-        raise ManifestBuildError("Symile neural history lacks image configuration")
-    if len(history) > config.neural.warmup_epochs + config.neural.fine_tune_epochs:
+        raise ManifestBuildError("Symile neural history lacks neural configuration")
+    maximum_epochs = config.neural.warmup_epochs + config.neural.fine_tune_epochs
+    if len(history) > maximum_epochs:
         raise ManifestBuildError("Symile training history exceeds the configured lifecycle")
     for ordinal, entry in enumerate(history, start=1):
         if not isinstance(entry, dict) or set(entry) != fields:
@@ -1164,6 +1347,38 @@ def _validate_training_history(
         epochs.append(epoch)
         stages[epoch] = str(entry["stage"])
         metrics[epoch] = float(entry["validation_metric"])
+    if len(epochs) < config.neural.warmup_epochs:
+        raise ManifestBuildError("Symile training history omits configured warmup epochs")
+    best_metric = float("-inf")
+    recomputed_epoch = 0
+    recomputed_stage = ""
+    fine_tune_no_improvement = 0
+    early_stopping_epoch: int | None = None
+    for epoch in epochs:
+        metric = metrics[epoch]
+        selected = candidate_is_improvement(
+            metric,
+            best_metric,
+            config.neural.early_stopping_min_delta,
+        )
+        if selected:
+            best_metric = metric
+            recomputed_epoch = epoch
+            recomputed_stage = stages[epoch]
+            if stages[epoch] == "fine_tune":
+                fine_tune_no_improvement = 0
+        elif stages[epoch] == "fine_tune":
+            fine_tune_no_improvement += 1
+            if fine_tune_no_improvement >= config.neural.early_stopping_patience:
+                early_stopping_epoch = epoch
+                if epoch != epochs[-1]:
+                    raise ManifestBuildError(
+                        "Symile training history continues after deterministic early stopping"
+                    )
+    if len(epochs) < maximum_epochs and early_stopping_epoch != epochs[-1]:
+        raise ManifestBuildError(
+            "Symile training history terminates before its configured lifecycle"
+        )
     selected_epoch = selection["selected_epoch"]
     if (
         len(epochs) != len(set(epochs))
@@ -1175,8 +1390,13 @@ def _validate_training_history(
             rtol=0.0,
             atol=1e-15,
         )
+        or selected_epoch != recomputed_epoch
+        or selection["selected_stage"] != recomputed_stage
+        or not np.isclose(
+            selection["selected_validation_metric"], best_metric, rtol=0.0, atol=1e-15
+        )
     ):
-        raise ManifestBuildError("Symile selected epoch is absent or inconsistent in history")
+        raise ManifestBuildError("Symile selected checkpoint differs from deterministic history")
 
 
 def _validate_fold_contents(
@@ -1185,12 +1405,12 @@ def _validate_fold_contents(
     training_history: Sequence[Mapping[str, object]] | None,
     source_cxr: Mapping[str, object] | None,
 ) -> None:
-    if family in TABULAR_FAMILIES:
+    if family in SYMILE_TABULAR_FAMILIES:
         if lab_preprocessor is not None or training_history is not None:
             raise ManifestBuildError("Tabular fold received neural-only artifacts")
     elif not training_history:
         raise ManifestBuildError("Neural fold requires a training history")
-    if family in FUSION_FAMILIES:
+    if family in SYMILE_FUSION_FAMILIES:
         if lab_preprocessor is None or source_cxr is None:
             raise ManifestBuildError("Fusion fold requires preprocessing and CXR lineage")
     elif source_cxr is not None:
@@ -1198,11 +1418,11 @@ def _validate_fold_contents(
 
 
 def _fold_files(family: str) -> set[str]:
-    common = {CONFIG_FILENAME, FOLD_MANIFEST_FILENAME, OOF_FILENAME}
-    if family in TABULAR_FAMILIES:
+    common = {CONFIG_FILENAME, FOLD_MANIFEST_FILENAME}
+    if family in SYMILE_TABULAR_FAMILIES:
         return common | {TABULAR_MODEL_FILENAME}
     files = common | {NEURAL_MODEL_FILENAME, TRAINING_HISTORY_FILENAME}
-    return files | ({LAB_PREPROCESSOR_FILENAME} if family in FUSION_FAMILIES else set())
+    return files | ({LAB_PREPROCESSOR_FILENAME} if family in SYMILE_FUSION_FAMILIES else set())
 
 
 def _validate_repeat_metrics(value: object) -> None:
@@ -1219,13 +1439,17 @@ def _validate_repeat_metrics(value: object) -> None:
             raise ManifestBuildError("Symile repeat metrics are invalid")
 
 
-def _fold_repeat_metrics(
-    folds: Sequence[ValidatedFoldPackage],
+def _prediction_repeat_metrics(
+    predictions: Sequence[ValidatedPredictionEvidence],
 ) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     canonical_targets: pd.Series | None = None
-    for seed in (17, 42, 2026):
-        scoped = [item.oof.to_pandas() for item in folds if item.manifest["repeat_seed"] == seed]
+    for seed in REPEAT_SEEDS:
+        scoped = [
+            item.predictions.to_pandas()
+            for item in predictions
+            if item.manifest["repeat_seed"] == seed
+        ]
         if len(scoped) != 5:
             raise ManifestBuildError("Symile development repeat lacks five OOF folds")
         frame = pd.concat(scoped, ignore_index=True)
@@ -1250,14 +1474,184 @@ def _fold_repeat_metrics(
     return result
 
 
+def _resolve_family_predictions(
+    document: Mapping[str, Any], private_root: str | Path
+) -> list[ValidatedPredictionEvidence]:
+    root = Path(private_root) / "predictions" / "symile" / "oof"
+    predictions: list[ValidatedPredictionEvidence] = []
+    for reference in document["fold_packages"]:
+        evidence = validate_prediction_evidence(
+            root / reference["prediction_id"],
+            expected_prediction_id=reference["prediction_id"],
+            expected_model_package_id=reference["fold_package_id"],
+        )
+        if (
+            evidence.manifest_sha256 != reference["prediction_manifest_sha256"]
+            or evidence.manifest["repeat_seed"] != reference["repeat_seed"]
+            or evidence.manifest["outer_fold"] != reference["outer_fold"]
+        ):
+            raise ManifestBuildError("Symile development prediction reference is inconsistent")
+        predictions.append(evidence)
+    return predictions
+
+
+def _load_cv_authority(lineage: Mapping[str, Any], manifest_root: str | Path) -> pd.DataFrame:
+    bundle = resolve_symile_bundle(
+        manifest_root,
+        bundle_id=lineage["bundle_id"],
+        full_validation=False,
+    )
+    validate_symile_bundle_reference(
+        bundle.bundle_directory,
+        expected_bundle_id=lineage["bundle_id"],
+        expected_manifest_sha256=lineage["bundle_manifest_sha256"],
+    )
+    reference = validate_symile_cv_reference(
+        Path(manifest_root) / "symile" / CV_DIRECTORY / lineage["cv_assignment_id"],
+        bundle_id=lineage["bundle_id"],
+        expected_assignment_id=lineage["cv_assignment_id"],
+        expected_manifest_sha256=lineage["cv_manifest_sha256"],
+    )
+    samples = strict_pneumonia_rows(read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS))
+    validate_cv_table(reference.assignments, samples)
+    authority = reference.assignments.to_pandas().merge(
+        samples[["sample_id", "target"]], on="sample_id", validate="many_to_one"
+    )
+    if len(authority) != reference.assignments.num_rows:
+        raise ManifestBuildError("Symile CV authority does not resolve exact development targets")
+    return authority
+
+
+def _validate_fold_prediction_pair(
+    package: ValidatedFoldPackage,
+    evidence: ValidatedPredictionEvidence,
+    authority: pd.DataFrame,
+) -> None:
+    manifest = package.manifest
+    lineage = manifest["lineage"]
+    expected = {
+        "dataset_id": manifest["dataset_id"],
+        "task_id": manifest["task_id"],
+        "bundle_id": lineage["bundle_id"],
+        "split_assignment_id": lineage["split_assignment_id"],
+        "cv_assignment_id": lineage["cv_assignment_id"],
+        "model_package_id": manifest["fold_package_id"],
+        "repeat_seed": manifest["repeat_seed"],
+        "outer_fold": manifest["outer_fold"],
+        "scope": "outer_fold_oof",
+    }
+    if any(evidence.manifest[field] != value for field, value in expected.items()):
+        raise ManifestBuildError("Symile fold and prediction scientific lineage differ")
+    scoped = authority.loc[
+        (authority["repeat_seed"] == manifest["repeat_seed"])
+        & (authority["outer_fold"] == manifest["outer_fold"]),
+        ["sample_id", "target"],
+    ].sort_values("sample_id", kind="stable")
+    observed = evidence.predictions.to_pandas()[["sample_id", "target"]].sort_values(
+        "sample_id", kind="stable"
+    )
+    observed = observed.reset_index(drop=True)
+    scoped = scoped.reset_index(drop=True)
+    if (
+        observed["sample_id"].tolist() != scoped["sample_id"].tolist()
+        or observed["target"].astype(int).tolist() != scoped["target"].astype(int).tolist()
+    ):
+        raise ManifestBuildError("Symile OOF evidence differs from the immutable CV authority")
+
+
+def _validate_source_cxr_fold(root: Path, document: Mapping[str, Any]) -> None:
+    source_reference = document["source_cxr"]
+    if source_reference is None:
+        return
+    source_id = source_reference["fold_package_id"]
+    try:
+        source = validate_fold_package(
+            root.parent / source_id,
+            expected_fold_package_id=source_id,
+        )
+    except (OSError, ManifestBuildError) as exc:
+        raise ManifestBuildError("Symile source CXR fold is missing or invalid") from exc
+    source_manifest = source.manifest
+    source_lineage = source_manifest["lineage"]
+    lineage = document["lineage"]
+    expected = {
+        "dataset_id": document["dataset_id"],
+        "task_id": document["task_id"],
+        "family_id": "cxr_densenet",
+        "modalities": ["cxr"],
+        "repeat_seed": document["repeat_seed"],
+        "outer_fold": document["outer_fold"],
+    }
+    if (
+        source.manifest_sha256 != source_reference["fold_manifest_sha256"]
+        or any(source_manifest[field] != value for field, value in expected.items())
+        or any(
+            source_lineage[field] != lineage[field]
+            for field in (
+                "bundle_id",
+                "bundle_manifest_sha256",
+                "split_assignment_id",
+                "cv_assignment_id",
+                "cv_manifest_sha256",
+                "task_id",
+                "encoder_identity",
+                "transform_contract",
+            )
+        )
+        or source_manifest["inner_split"]["inner_split_id"]
+        != document["inner_split"]["inner_split_id"]
+    ):
+        raise ManifestBuildError("Symile source CXR fold scientific lineage is incompatible")
+
+
+def _validate_source_cxr_development(
+    root: Path,
+    document: Mapping[str, Any],
+    folds: Sequence[ValidatedFoldPackage],
+    *,
+    model_root: str | Path,
+    prediction_root: str | Path,
+    manifest_root: str | Path,
+) -> None:
+    if document["family_id"] not in SYMILE_FUSION_FAMILIES:
+        return
+    source_ids = {package.manifest["source_cxr"]["development_id"] for package in folds}
+    if len(source_ids) != 1:
+        raise ManifestBuildError("Symile fusion folds use different source developments")
+    source_id = source_ids.pop()
+    source = validate_development_result(
+        root.parent / source_id,
+        model_root=model_root,
+        prediction_root=prediction_root,
+        manifest_root=manifest_root,
+        expected_development_id=source_id,
+    )
+    if source.manifest["family_id"] != "cxr_densenet" or source.manifest["modalities"] != ["cxr"]:
+        raise ManifestBuildError("Symile source development is not the CXR family authority")
+    source_references = {
+        (reference["repeat_seed"], reference["outer_fold"]): reference
+        for reference in source.manifest["fold_packages"]
+    }
+    for package in folds:
+        coordinate = (package.manifest["repeat_seed"], package.manifest["outer_fold"])
+        reference = source_references[coordinate]
+        declared = package.manifest["source_cxr"]
+        if (
+            declared["fold_package_id"] != reference["fold_package_id"]
+            or declared["fold_manifest_sha256"] != reference["fold_manifest_sha256"]
+        ):
+            raise ManifestBuildError("Symile fusion source development fold lineage differs")
+
+
 def _resolve_family_folds(
     document: Mapping[str, Any], model_root: str | Path
 ) -> list[ValidatedFoldPackage]:
-    folds_root = Path(model_root) / "folds"
+    folds_root = Path(model_root) / "packages"
     folds: list[ValidatedFoldPackage] = []
     baseline_lineage: Mapping[str, Any] | None = None
-    baseline_source_sha256: str | None = None
     baseline_source_development: str | None = None
+    baseline_fit_config: Mapping[str, Any] | None = None
+    baseline_config_semantic_sha256: str | None = None
     for reference in document["fold_packages"]:
         package = validate_fold_package(
             folds_root / reference["fold_package_id"],
@@ -1267,13 +1661,10 @@ def _resolve_family_folds(
             package.manifest_sha256 != reference["fold_manifest_sha256"]
             or package.manifest["repeat_seed"] != reference["repeat_seed"]
             or package.manifest["outer_fold"] != reference["outer_fold"]
-            or package.manifest["family"] != document["family"]
-            or package.manifest["config"]["config_semantic_sha256"]
-            != document["config_semantic_sha256"]
+            or package.manifest["family_id"] != document["family_id"]
         ):
             raise ManifestBuildError("Symile development fold reference is inconsistent")
         lineage = package.manifest["lineage"]
-        source_sha256 = package.manifest["config"]["config_source_sha256"]
         source_development = (
             package.manifest["source_cxr"]["development_id"]
             if package.manifest["source_cxr"] is not None
@@ -1288,27 +1679,29 @@ def _resolve_family_folds(
                 "cv_assignment_id",
                 "cv_manifest_sha256",
                 "task_id",
-                "git_commit",
-                "dependency_lock_sha256",
                 "encoder_identity",
                 "transform_contract",
                 "pretrained_weight",
             )
         }
+        fit_config = package.manifest["config"]["fit_config"]
+        config_semantic_sha256 = package.manifest["config"]["config_semantic_sha256"]
         if baseline_lineage is None:
             baseline_lineage = frozen
-            baseline_source_sha256 = source_sha256
             baseline_source_development = source_development
+            baseline_fit_config = fit_config
+            baseline_config_semantic_sha256 = config_semantic_sha256
         elif frozen != baseline_lineage:
             raise ManifestBuildError("Symile development folds have inconsistent frozen lineage")
-        elif (
-            source_sha256 != baseline_source_sha256
-            or source_development != baseline_source_development
-        ):
+        elif source_development != baseline_source_development:
             raise ManifestBuildError("Symile development folds have inconsistent config lineage")
+        elif fit_config != baseline_fit_config:
+            raise ManifestBuildError("Symile development folds use mixed scientific fit configs")
+        elif config_semantic_sha256 != baseline_config_semantic_sha256:
+            raise ManifestBuildError("Symile development folds use mixed scientific configs")
         folds.append(package)
     coordinates = [(item.manifest["repeat_seed"], item.manifest["outer_fold"]) for item in folds]
-    if coordinates != [(seed, fold) for seed in (17, 42, 2026) for fold in range(5)]:
+    if coordinates != [(seed, fold) for seed in REPEAT_SEEDS for fold in OUTER_FOLDS]:
         raise ManifestBuildError("Symile development does not resolve exact unique folds")
     return folds
 
@@ -1341,12 +1734,12 @@ def _validate_budget(family: str, selected: object, budget: object) -> None:
         or not isinstance(budget, int)
         or budget != int(np.median(np.asarray(selected, dtype=np.int64)))
     ):
-        raise ManifestBuildError("Symile median M6 budget is invalid")
+        raise ManifestBuildError("Symile final training budget is invalid")
 
 
 def _development_summary(document: Mapping[str, Any]) -> str:
     lines = [
-        f"# Symile development result: {document['family']}",
+        f"# Symile development result: {document['family_id']}",
         "",
         f"- Development ID: `{document['development_id']}`",
         "- Complete outer folds: 15",
@@ -1355,14 +1748,14 @@ def _development_summary(document: Mapping[str, Any]) -> str:
         "| Repeat | AUROC | Average Precision | Brier |",
         "| ---: | ---: | ---: | ---: |",
     ]
-    for seed in (17, 42, 2026):
+    for seed in REPEAT_SEEDS:
         metrics = document["repeat_metrics"][str(seed)]
         lines.append(
             f"| {seed} | {metrics['roc_auc']:.6f} | {metrics['average_precision']:.6f} | "
             f"{metrics['brier_score']:.6f} |"
         )
-    if document["median_m6_budget"] is not None:
-        lines.extend(["", f"- Frozen median M6 budget: {document['median_m6_budget']}"])
+    if document["final_training_budget"] is not None:
+        lines.extend(["", f"- Final training budget: {document['final_training_budget']}"])
     return "\n".join(lines) + "\n"
 
 
@@ -1419,6 +1812,8 @@ def _derive_analysis(
     family_ids: Mapping[str, str],
     report_root: str | Path,
     model_root: str | Path,
+    prediction_root: str | Path,
+    manifest_root: str | Path,
 ) -> dict[str, object]:
     frames: dict[str, pd.DataFrame] = {}
     family_folds: dict[str, dict[tuple[int, int], ValidatedFoldPackage]] = {}
@@ -1426,18 +1821,21 @@ def _derive_analysis(
         result = validate_development_result(
             Path(report_root) / "families" / development_id,
             model_root=model_root,
+            prediction_root=prediction_root,
+            manifest_root=manifest_root,
             expected_development_id=development_id,
         )
-        if result.manifest["family"] != family:
+        if result.manifest["family_id"] != family:
             raise ManifestBuildError("Symile analysis family authority is mislabeled")
         fold_frames = []
         resolved = _resolve_family_folds(result.manifest, model_root)
         family_folds[family] = {
             (fold.manifest["repeat_seed"], fold.manifest["outer_fold"]): fold for fold in resolved
         }
-        for fold in resolved:
-            frame = fold.oof.to_pandas()
-            frame["repeat_seed"] = fold.manifest["repeat_seed"]
+        predictions = _resolve_family_predictions(result.manifest, prediction_root)
+        for evidence in predictions:
+            frame = evidence.predictions.to_pandas()
+            frame["repeat_seed"] = evidence.manifest["repeat_seed"]
             fold_frames.append(frame)
         frames[family] = pd.concat(fold_frames, ignore_index=True).sort_values(
             ["repeat_seed", "sample_id"], kind="stable"
@@ -1446,15 +1844,11 @@ def _derive_analysis(
     _validate_cross_family_oof(frames)
     repeat_metrics = {
         family: {
-            str(seed): _metrics(frame.loc[frame["repeat_seed"] == seed]) for seed in (17, 42, 2026)
+            str(seed): _metrics(frame.loc[frame["repeat_seed"] == seed]) for seed in REPEAT_SEEDS
         }
         for family, frame in frames.items()
     }
-    comparisons = {
-        "concat_minus_cxr": ("cxr_labs_concat", "cxr_densenet"),
-        "gated_minus_cxr": ("cxr_labs_gated", "cxr_densenet"),
-        "gated_minus_concat": ("cxr_labs_gated", "cxr_labs_concat"),
-    }
+    comparisons = SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY["paired_comparisons"]
     paired = {
         name: _paired_effects(frames[left], frames[right])
         for name, (left, right) in comparisons.items()
@@ -1489,7 +1883,7 @@ def _validate_cross_family_fold_lineage(
     families: Mapping[str, Mapping[tuple[int, int], ValidatedFoldPackage]],
     family_ids: Mapping[str, str],
 ) -> None:
-    coordinates = {(seed, fold) for seed in (17, 42, 2026) for fold in range(5)}
+    coordinates = {(seed, fold) for seed in REPEAT_SEEDS for fold in OUTER_FOLDS}
     data_fields = (
         "bundle_id",
         "bundle_manifest_sha256",
@@ -1499,8 +1893,14 @@ def _validate_cross_family_fold_lineage(
         "task_id",
     )
     for coordinate in coordinates:
-        packages = [families[family][coordinate] for family in SYMILE_M5_FAMILIES]
-        if len({item.manifest["inner_split"]["inner_split_id"] for item in packages}) != 1:
+        packages = [families[family][coordinate] for family in SYMILE_CORE_DEVELOPMENT_FAMILIES]
+        selection_packages = [
+            item for item in packages if item.manifest["family_id"] != "labs_logistic"
+        ]
+        if (
+            len({item.manifest["inner_split"]["inner_split_id"] for item in selection_packages})
+            != 1
+        ):
             raise ManifestBuildError("Symile analysis families use different inner splits")
         if any(
             len({item.manifest["lineage"][field] for item in packages}) != 1
@@ -1508,7 +1908,7 @@ def _validate_cross_family_fold_lineage(
         ):
             raise ManifestBuildError("Symile analysis families use different frozen data lineage")
         cxr = families["cxr_densenet"][coordinate]
-        for family in FUSION_FAMILIES:
+        for family in SYMILE_FUSION_FAMILIES:
             source = families[family][coordinate].manifest["source_cxr"]
             if (
                 source["development_id"] != family_ids["cxr_densenet"]
@@ -1519,9 +1919,9 @@ def _validate_cross_family_fold_lineage(
 
 
 def _validate_cross_family_oof(frames: Mapping[str, pd.DataFrame]) -> None:
-    for seed in (17, 42, 2026):
+    for seed in REPEAT_SEEDS:
         reference: pd.Series | None = None
-        for family in SYMILE_M5_FAMILIES:
+        for family in SYMILE_CORE_DEVELOPMENT_FAMILIES:
             scoped = frames[family].loc[frames[family]["repeat_seed"] == seed]
             targets = scoped.set_index("sample_id")["target"].sort_index()
             if reference is None:
@@ -1544,7 +1944,7 @@ def _metrics(frame: pd.DataFrame) -> dict[str, float]:
 
 def _paired_effects(left: pd.DataFrame, right: pd.DataFrame) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
-    for seed in (17, 42, 2026):
+    for seed in REPEAT_SEEDS:
         left_seed = left.loc[left["repeat_seed"] == seed]
         right_seed = right.loc[right["repeat_seed"] == seed]
         aligned = left_seed.merge(
@@ -1575,10 +1975,10 @@ def _ensemble_metrics(frame: pd.DataFrame) -> dict[str, float]:
     logits = frame.pivot(index="sample_id", columns="repeat_seed", values="logit")
     targets = frame.pivot(index="sample_id", columns="repeat_seed", values="target")
     if (
-        list(logits.columns) != [17, 42, 2026]
+        list(logits.columns) != list(REPEAT_SEEDS)
         or len(logits) != DEVELOPMENT_COUNT
         or logits.isna().any().any()
-        or list(targets.columns) != [17, 42, 2026]
+        or list(targets.columns) != list(REPEAT_SEEDS)
         or not targets.nunique(axis=1).eq(1).all()
     ):
         raise ManifestBuildError("Symile analysis neural repeat evidence is misaligned")
@@ -1601,13 +2001,19 @@ def _nested_numeric_close(left: object, right: object) -> bool:
     )
 
 
-def _publish_immutable(stage: Path, destination: Path, validator: Any) -> None:
-    validator(stage, enforce_directory_name=False)
-    if destination.exists():
-        validator(destination)
-        shutil.rmtree(stage)
-    else:
-        os.replace(stage, destination)
+def _publish_immutable(stage: Path, destination: Path, validator: Any) -> bool:
+    return install_immutable_directory(stage, destination, validator)
+
+
+def _selected_state(family: str, selection: Mapping[str, object]) -> dict[str, object]:
+    if family == "labs_logistic":
+        return {}
+    if family == "labs_lightgbm":
+        return {"best_iteration": selection["best_iteration"]}
+    return {
+        "selected_epoch": selection["selected_epoch"],
+        "selected_stage": selection["selected_stage"],
+    }
 
 
 def _require_physical_directory(root: Path) -> None:
@@ -1645,8 +2051,8 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
 
 
 def _validate_family(value: object) -> None:
-    if value not in SYMILE_M5_FAMILIES:
-        raise ManifestBuildError("Symile M5 family is invalid")
+    if value not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
+        raise ManifestBuildError("Symile core-development family is invalid")
 
 
 def _sha256(value: object) -> bool:

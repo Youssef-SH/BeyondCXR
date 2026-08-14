@@ -14,6 +14,7 @@ from radfusion.models.symile_fusion import (
     SymileConcatFusionModel,
     SymileGatedFusionHead,
     SymileGatedFusionModel,
+    gated_fusion_core,
 )
 from radfusion.models.symile_tabular import (
     fit_symile_labs_lightgbm,
@@ -220,8 +221,59 @@ def test_gated_observedness_zeroing_occurs_at_both_consumers() -> None:
 
 
 @pytest.mark.parametrize("modalities", [1, 3, 4])
-def test_gated_model_rejects_unfrozen_modality_counts(modalities: int) -> None:
+def test_symile_gated_wrapper_requires_two_modalities(modalities: int) -> None:
     config = load_symile_development_config("configs/symile_cxr_labs_gated.yaml")
     parameters = {**dict(config.family.parameters), "modality_count": modalities}
     with pytest.raises(ValueError):
         SymileGatedFusionHead(parameters)
+
+
+def test_gated_fusion_core_accepts_two_modalities() -> None:
+    modality_count = 2
+    representations = tuple(
+        torch.arange(6, dtype=torch.float32).reshape(2, 3) + index
+        for index in range(modality_count)
+    )
+    gate_logits = torch.arange(2 * modality_count * 3, dtype=torch.float32).reshape(
+        2, modality_count * 3
+    )
+
+    fused, weights = gated_fusion_core(representations, gate_logits)
+
+    expected_weights = torch.softmax(gate_logits.reshape(2, modality_count, 3), dim=1)
+    expected_fused = torch.sum(expected_weights * torch.stack(representations, dim=1), dim=1)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(fused, expected_fused, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("modality_count", [0, 1, 3, 4, 5])
+def test_gated_fusion_core_rejects_other_modality_counts(modality_count: int) -> None:
+    representations = tuple(torch.ones((2, 3)) for _ in range(modality_count))
+    with pytest.raises(ValueError, match="exactly two modalities"):
+        gated_fusion_core(representations, torch.ones((2, max(modality_count, 1) * 3)))
+
+
+def test_gated_fusion_core_rejects_mixed_representation_dtypes() -> None:
+    representations = (
+        torch.ones((2, 3), dtype=torch.float32),
+        torch.ones((2, 3), dtype=torch.float64),
+    )
+    with pytest.raises(ValueError, match="shared dtype"):
+        gated_fusion_core(representations, torch.ones((2, 6), dtype=torch.float32))
+
+
+def test_gated_fusion_core_rejects_gate_dtype_mismatch() -> None:
+    representations = (torch.ones((2, 3), dtype=torch.float32),) * 2
+    with pytest.raises(ValueError, match="representation dtype"):
+        gated_fusion_core(representations, torch.ones((2, 6), dtype=torch.float64))
+
+
+def test_gated_fusion_core_rejects_cross_device_inputs_when_cuda_is_available() -> None:
+    if not torch.cuda.is_available():
+        return
+    cpu = torch.ones((2, 3), dtype=torch.float32)
+    cuda = cpu.to("cuda")
+    with pytest.raises(ValueError, match="one device"):
+        gated_fusion_core((cpu, cuda), torch.ones((2, 6), dtype=torch.float32))
+    with pytest.raises(ValueError, match="representation device"):
+        gated_fusion_core((cpu, cpu), torch.ones((2, 6), dtype=torch.float32, device="cuda"))

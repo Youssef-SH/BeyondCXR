@@ -16,8 +16,11 @@ from yaml.nodes import MappingNode
 
 from radfusion.data.bundle_contract import valid_bundle_id
 from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, STANDARD_CXR_IMAGE_SIZE
+from radfusion.data.rsna_metadata_preprocess import METADATA_INPUT_POLICY_VERSION
 from radfusion.data.symile_preprocess import LAB_ECDF_POLICY_VERSION
-from radfusion.data.tabular_preprocess import METADATA_INPUT_POLICY_VERSION
+from radfusion.training.symile_families import (
+    SYMILE_NEURAL_FAMILIES,
+)
 
 
 class ConfigError(ValueError):
@@ -202,16 +205,7 @@ _TABULAR_TRAINING_FIELDS = MappingProxyType(
     }
 )
 
-_NEURAL_FAMILIES = frozenset(
-    {
-        "cxr_densenet",
-        "cxr_metadata_concat",
-        "cxr_labs_concat",
-        "cxr_labs_gated",
-        "cxr_labs_gated_no_observedness",
-    }
-)
-_SYMILE_FAMILIES = frozenset(family for dataset, family in FAMILY_MODALITIES if dataset == "symile")
+_NEURAL_FAMILIES = frozenset({"cxr_densenet", "cxr_metadata_concat", *SYMILE_NEURAL_FAMILIES})
 
 
 @dataclass(frozen=True)
@@ -312,7 +306,7 @@ class NeuralConfig:
 class ExperimentConfig:
     """Validated science plus separately owned runtime coordinates."""
 
-    config_version: int
+    config_schema_version: int
     dataset: DatasetConfig
     task: TaskConfig
     family: FamilyConfig
@@ -327,22 +321,19 @@ class ExperimentConfig:
     config_semantic_sha256: str
 
 
-SYMILE_M5_FAMILIES = tuple(sorted(_SYMILE_FAMILIES))
-
-
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    """Load one strict canonical version-1 experiment YAML."""
+    """Load one strict canonical schema-version-1 experiment YAML."""
     source = Path(path)
     source_bytes, root = _read_yaml(source)
     _keys(
         root,
-        required={"config_version", "dataset", "task", "family", "training"},
+        required={"config_schema_version", "dataset", "task", "family", "training"},
         optional={"preprocessing", "evaluation"},
         context="config",
     )
-    version = _integer(root["config_version"], "config_version")
+    version = _integer(root["config_schema_version"], "config_schema_version")
     if version != 1:
-        raise ConfigError(f"Unsupported config_version: {version}")
+        raise ConfigError(f"Unsupported config_schema_version: {version}")
     dataset = _dataset_config(root["dataset"])
     task = _task_config(root["task"], dataset.dataset_id)
     family = _family_config(root["family"], dataset.dataset_id)
@@ -352,9 +343,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     _validate_section_applicability(dataset, family, training, evaluation)
     runtime = _default_runtime(dataset.dataset_id)
     neural = _neural_config(training) if family.family_id in _NEURAL_FAMILIES else None
-    semantic = _semantic_payload(
-        version, dataset, task, family, preprocessing, training, evaluation
-    )
+    semantic = _semantic_payload(dataset, task, family, preprocessing, training, evaluation)
     return ExperimentConfig(
         version,
         dataset,
@@ -405,6 +394,10 @@ def with_runtime(
         raise ConfigError("Runtime num_workers must be a non-negative integer")
     if pin_memory_policy is not None and pin_memory_policy not in {"auto", "enabled", "disabled"}:
         raise ConfigError("Runtime pin_memory_policy is unsupported")
+    if device is not None and device not in {"auto", "cpu", "cuda"}:
+        raise ConfigError("Runtime device is unsupported")
+    if experiment_name is not None:
+        experiment_name = _text(experiment_name, "Runtime experiment_name")
     runtime = replace(
         config.runtime,
         seed=seed if seed is not None else config.runtime.seed,
@@ -427,10 +420,14 @@ def with_runtime(
             if private_output_directory is not None
             else config.runtime.private_output_directory
         ),
-        experiment_name=experiment_name or config.runtime.experiment_name,
-        device=device or config.runtime.device,
+        experiment_name=(
+            experiment_name if experiment_name is not None else config.runtime.experiment_name
+        ),
+        device=device if device is not None else config.runtime.device,
         num_workers=num_workers if num_workers is not None else config.runtime.num_workers,
-        pin_memory_policy=pin_memory_policy or config.runtime.pin_memory_policy,
+        pin_memory_policy=(
+            pin_memory_policy if pin_memory_policy is not None else config.runtime.pin_memory_policy
+        ),
     )
     return replace(config, runtime=runtime)
 
@@ -566,7 +563,7 @@ def _training_config(value: object, dataset_id: str, family_id: str) -> Training
         if not required <= set(parameters):
             raise ConfigError("Neural training weighting or fine-tuning policy is missing")
         _validate_neural_training(parameters, loader, augmentation)
-        _validate_scientific_training_policy(dataset_id, family_id, parameters)
+        _validate_scientific_training_policy(dataset_id, parameters)
     else:
         expected = _TABULAR_TRAINING_FIELDS.get(family_id)
         if expected is None or set(parameters) != expected or loader or augmentation:
@@ -586,8 +583,9 @@ def _evaluation_config(value: object) -> EvaluationConfig:
     _keys(data, required=required, context="evaluation")
     target = _number(data["sensitivity_target"], "evaluation.sensitivity_target")
     bins = _integer(data["calibration_bins"], "evaluation.calibration_bins")
-    if not 0 < target <= 1 or bins <= 1:
+    if not 0 < target <= 1 or not 2 <= bins <= 1000:
         raise ConfigError("evaluation values are outside supported ranges")
+    data["sensitivity_target"] = target
     return EvaluationConfig(MappingProxyType(dict(data)))
 
 
@@ -639,11 +637,15 @@ def _validate_family_parameters(family_id: str, values: dict[str, Any]) -> None:
         or values.get("embedding_dimension") != 1024
     ):
         raise ConfigError("Only the frozen standard CXR encoder identity is supported")
-    if "dropout" in values and not 0 <= _number(values["dropout"], "family.parameters.dropout") < 1:
-        raise ConfigError("family.parameters.dropout must be in [0, 1)")
+    if "dropout" in values:
+        values["dropout"] = _number(values["dropout"], "family.parameters.dropout")
+        if not 0 <= values["dropout"] < 1:
+            raise ConfigError("family.parameters.dropout must be in [0, 1)")
     if family_id.endswith("lightgbm"):
         if values.get("objective") != "binary":
             raise ConfigError("LightGBM families require the binary objective")
+        if not 2 <= values["num_leaves"] <= 131072:
+            raise ConfigError("LightGBM num_leaves must be in [2, 131072]")
     if family_id in {"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"}:
         if values.get("lab_input_dimension") != 100:
             raise ConfigError("Symile laboratory models require the 100-column lab contract")
@@ -652,9 +654,9 @@ def _validate_family_parameters(family_id: str, values: dict[str, Any]) -> None:
         if values.get("use_observedness") is not expected_observedness:
             raise ConfigError("Gated-family observedness policy is inconsistent")
         if values.get("modality_count") != 2:
-            raise ConfigError("Current gated families require modality_count=2")
+            raise ConfigError("Gated fusion families require modality_count=2")
         if values.get("observedness_dimension") != 50:
-            raise ConfigError("Current gated families require 50 observedness indicators")
+            raise ConfigError("Gated fusion families require 50 observedness indicators")
 
 
 def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str, Any]) -> None:
@@ -662,10 +664,12 @@ def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str
         if isinstance(value, float) and not math.isfinite(value):
             raise ConfigError(f"training.parameters.{key} must be finite")
     if family_id.endswith("logistic"):
+        values["l1_ratio"] = _number(values["l1_ratio"], "training.parameters.l1_ratio")
+        values["C"] = _number(values["C"], "training.parameters.C")
         if (
-            not 0.0 <= _number(values["l1_ratio"], "training.parameters.l1_ratio") <= 1.0
+            values["l1_ratio"] != 0.0
             or values["solver"] != "liblinear"
-            or _number(values["C"], "training.parameters.C") <= 0.0
+            or values["C"] <= 0.0
             or _integer(values["max_iter"], "training.parameters.max_iter") <= 0
         ):
             raise ConfigError("Logistic Regression fitting policy is unsupported")
@@ -676,13 +680,15 @@ def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str
     for key in {"n_estimators", "subsample_freq", "early_stopping_rounds"}:
         if _integer(values[key], f"training.parameters.{key}") <= 0:
             raise ConfigError(f"training.parameters.{key} must be a positive integer")
-    if _number(values["learning_rate"], "training.parameters.learning_rate") <= 0:
+    values["learning_rate"] = _number(values["learning_rate"], "training.parameters.learning_rate")
+    if values["learning_rate"] <= 0:
         raise ConfigError("training.parameters.learning_rate must be positive")
     for key in {"subsample", "colsample_bytree"}:
-        value = _number(values[key], f"training.parameters.{key}")
-        if not 0 < value <= 1:
+        values[key] = _number(values[key], f"training.parameters.{key}")
+        if not 0 < values[key] <= 1:
             raise ConfigError(f"training.parameters.{key} must be in (0, 1]")
-    if _number(values["reg_lambda"], "training.parameters.reg_lambda") < 0:
+    values["reg_lambda"] = _number(values["reg_lambda"], "training.parameters.reg_lambda")
+    if values["reg_lambda"] < 0:
         raise ConfigError("training.parameters.reg_lambda must be non-negative")
     if dataset_id == "rsna":
         if values["class_weighting"] != "train_neg_pos_ratio":
@@ -691,17 +697,15 @@ def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str
         raise ConfigError("Symile LightGBM does not use class weighting")
 
 
-def _validate_scientific_training_policy(
-    dataset_id: str, family_id: str, values: dict[str, Any]
-) -> None:
-    del family_id
+def _validate_scientific_training_policy(dataset_id: str, values: dict[str, Any]) -> None:
     if dataset_id == "rsna":
         if values["class_weighting"] != "train_pos_weight":
             raise ConfigError("RSNA neural families require train-derived positive weighting")
         if values["fine_tune_scope"] != "all":
             raise ConfigError("RSNA neural families require full encoder fine-tuning")
     else:
-        if _number(values["pos_weight"], "training.parameters.pos_weight") != 1.0:
+        values["pos_weight"] = _number(values["pos_weight"], "training.parameters.pos_weight")
+        if values["pos_weight"] != 1.0:
             raise ConfigError("Symile neural families require pos_weight=1")
         if values["fine_tune_scope"] != "terminal":
             raise ConfigError("Symile neural families require terminal encoder fine-tuning")
@@ -765,7 +769,8 @@ def _validate_neural_training(
             raise ConfigError(f"training.parameters.{key} must be {qualifier}")
     numeric_fields = shared_parameter_fields - integer_fields - {"optimizer", "mixed_precision"}
     for key in numeric_fields:
-        if _number(parameters[key], f"training.parameters.{key}") < 0:
+        parameters[key] = _number(parameters[key], f"training.parameters.{key}")
+        if parameters[key] < 0:
             raise ConfigError(f"training.parameters.{key} must be non-negative")
     for key in {
         "warmup_head_learning_rate",
@@ -798,8 +803,8 @@ def _validate_neural_training(
         "contrast_jitter": 1.0,
     }
     for key, upper in augmentation_limits.items():
-        value = _number(augmentation[key], f"training.augmentation.{key}")
-        if not 0 <= value <= upper:
+        augmentation[key] = _number(augmentation[key], f"training.augmentation.{key}")
+        if not 0 <= augmentation[key] <= upper:
             raise ConfigError(f"training.augmentation.{key} must be in [0, {upper:g}]")
 
 
@@ -847,7 +852,7 @@ def _default_runtime(dataset_id: str) -> RuntimeConfig:
         Path("models/symile/development"),
         Path("reports/symile/development"),
         Path("private"),
-        "radfusion-symile-development",
+        "radfusion-symile",
         "cuda",
         2,
         "enabled",
@@ -855,7 +860,6 @@ def _default_runtime(dataset_id: str) -> RuntimeConfig:
 
 
 def _semantic_payload(
-    version: int,
     dataset: DatasetConfig,
     task: TaskConfig,
     family: FamilyConfig,
@@ -864,7 +868,6 @@ def _semantic_payload(
     evaluation: EvaluationConfig | None,
 ) -> dict[str, Any]:
     return {
-        "config_version": version,
         "dataset": {
             "dataset_id": dataset.dataset_id,
             "bundle_id": dataset.bundle_id,
@@ -936,9 +939,15 @@ def _integer(value: object, context: str) -> int:
 
 
 def _number(value: object, context: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(f"{context} must be a finite number")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ConfigError(f"{context} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ConfigError(f"{context} must be a finite number")
+    return 0.0 if number == 0.0 else number
 
 
 def _boolean(value: object, context: str) -> bool:

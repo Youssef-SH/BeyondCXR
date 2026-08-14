@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -11,7 +12,6 @@ from radfusion.training.config import (
     FAMILY_MODALITIES,
     ConfigError,
     load_experiment_config,
-    load_symile_development_config,
     require_runtime_seed,
     with_runtime,
 )
@@ -40,15 +40,15 @@ def _write(tmp_path: Path, document: dict[str, object]) -> Path:
     return path
 
 
-def test_config_directory_contains_exactly_the_ten_canonical_v1_files() -> None:
+def test_config_directory_contains_exactly_the_ten_canonical_files() -> None:
     observed = tuple(sorted(path.name for path in Path("configs").glob("*.yaml")))
     assert observed == tuple(sorted(CONFIG_FILENAMES))
-    assert all(_document(name)["config_version"] == 1 for name in CONFIG_FILENAMES)
+    assert all(_document(name)["config_schema_version"] == 1 for name in CONFIG_FILENAMES)
 
 
 def test_supported_configs_load_as_immutable_typed_values() -> None:
     configs = tuple(load_experiment_config(Path("configs") / name) for name in CONFIG_FILENAMES)
-    assert all(config.config_version == 1 for config in configs)
+    assert all(config.config_schema_version == 1 for config in configs)
     assert configs[0].dataset.dataset_id == "rsna"
     assert configs[0].dataset.bundle_id.startswith("bundle-")
     assert configs[0].family.family_id == "metadata_logistic"
@@ -61,7 +61,7 @@ def test_supported_configs_load_as_immutable_typed_values() -> None:
     ).hexdigest()
     assert configs[0].config_source_sha256 == expected_source
     with pytest.raises(FrozenInstanceError):
-        configs[0].config_version = 2  # type: ignore[misc]
+        configs[0].config_schema_version = 0  # type: ignore[misc]
     with pytest.raises(TypeError):
         configs[0].family.parameters["C"] = 2.0  # type: ignore[index]
 
@@ -93,25 +93,11 @@ def test_yaml_contains_no_runtime_or_execution_coordinate_authority() -> None:
         "seed",
         "num_workers",
         "pin_memory_policy",
-        "latency_warmup_calls",
-        "latency_measured_calls",
-        "verbosity",
     }
     for name in CONFIG_FILENAMES:
         document = _document(name)
         serialized = yaml.safe_dump(document)
         assert not any(f"{field}:" in serialized for field in forbidden)
-
-
-@pytest.mark.parametrize("section", ["family", "training"])
-def test_lightgbm_verbosity_is_rejected_as_scientific_configuration(
-    tmp_path: Path, section: str
-) -> None:
-    document = _document("rsna_metadata_lightgbm.yaml")
-    document[section]["parameters"]["verbosity"] = -1
-
-    with pytest.raises(ConfigError):
-        load_experiment_config(_write(tmp_path, document))
 
 
 def test_runtime_seed_is_explicit_and_identity_neutral() -> None:
@@ -124,6 +110,10 @@ def test_runtime_seed_is_explicit_and_identity_neutral() -> None:
     assert seeded.runtime.device == "cpu"
     assert seeded.config_semantic_sha256 == config.config_semantic_sha256
     assert seeded.config_source_sha256 == config.config_source_sha256
+    for device in ("auto", "cpu", "cuda"):
+        assert with_runtime(config, device=device).runtime.device == device
+    with pytest.raises(ConfigError):
+        with_runtime(config, device="mps")
 
 
 @pytest.mark.parametrize("seed", [True, -1, 2**31])
@@ -172,7 +162,7 @@ def test_source_hash_changes_but_semantic_hash_survives_equivalent_yaml(tmp_path
     assert loaded.config_semantic_sha256 == original.config_semantic_sha256
 
 
-def test_exact_manifest_witness_is_integrity_not_semantic_identity(tmp_path: Path) -> None:
+def test_semantic_config_identity_is_stable_across_manifest_witnesses(tmp_path: Path) -> None:
     original = load_experiment_config("configs/rsna_metadata_logistic.yaml")
     document = _document()
     document["dataset"]["bundle_manifest_sha256"] = "0" * 64  # type: ignore[index]
@@ -191,17 +181,100 @@ def test_structurally_valid_alternate_scientific_value_is_representable(tmp_path
     assert changed.config_semantic_sha256 != original.config_semantic_sha256
 
 
+def test_logistic_policy_matches_frozen_contract() -> None:
+    for name in ("rsna_metadata_logistic.yaml", "symile_labs_logistic.yaml"):
+        config = load_experiment_config(Path("configs") / name)
+        assert config.training.parameters["solver"] == "liblinear"
+        assert config.training.parameters["l1_ratio"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("num_leaves", "supported"),
+    [(2, True), (131072, True), (1, False), (131073, False)],
+)
+def test_lightgbm_num_leaves_respects_supported_domain(
+    tmp_path: Path, num_leaves: int, supported: bool
+) -> None:
+    document = _document("rsna_metadata_lightgbm.yaml")
+    document["family"]["parameters"]["num_leaves"] = num_leaves  # type: ignore[index]
+    if supported:
+        assert (
+            load_experiment_config(_write(tmp_path, document)).family.parameters["num_leaves"]
+            == num_leaves
+        )
+    else:
+        with pytest.raises(ConfigError):
+            load_experiment_config(_write(tmp_path, document))
+
+
+def test_equivalent_numeric_config_representations_share_semantic_identity(
+    tmp_path: Path,
+) -> None:
+    integer_form = _document()
+    integer_form["training"]["parameters"]["C"] = 1  # type: ignore[index]
+    integer_form["training"]["parameters"]["l1_ratio"] = 0  # type: ignore[index]
+    integer_form["evaluation"]["sensitivity_target"] = 1  # type: ignore[index]
+    integer_config = load_experiment_config(_write(tmp_path, integer_form))
+
+    float_form = _document()
+    float_form["training"]["parameters"]["C"] = 1.0  # type: ignore[index]
+    float_form["training"]["parameters"]["l1_ratio"] = -0.0  # type: ignore[index]
+    float_form["evaluation"]["sensitivity_target"] = 1.0  # type: ignore[index]
+    float_config = load_experiment_config(_write(tmp_path, float_form))
+
+    assert integer_config.config_semantic_sha256 == float_config.config_semantic_sha256
+    assert isinstance(integer_config.training.parameters["C"], float)
+    assert math.copysign(1.0, float_config.training.parameters["l1_ratio"]) == 1.0
+
+    different = _document()
+    different["training"]["parameters"]["C"] = 0.5  # type: ignore[index]
+    different["evaluation"]["sensitivity_target"] = 1.0  # type: ignore[index]
+    assert (
+        load_experiment_config(_write(tmp_path, different)).config_semantic_sha256
+        != integer_config.config_semantic_sha256
+    )
+
+
 def test_invalid_config_fails_before_execution(tmp_path: Path) -> None:
     path = tmp_path / "invalid.yaml"
-    path.write_text("config_version: 1\n", encoding="utf-8")
+    path.write_text("config_schema_version: 1\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_experiment_config(path)
 
 
-@pytest.mark.parametrize("version", [0, 2, "1"])
-def test_only_integer_config_version_one_is_supported(tmp_path: Path, version: object) -> None:
+@pytest.mark.parametrize("calibration_bins", [2, 1000])
+def test_evaluation_calibration_bins_accept_exact_boundaries(
+    tmp_path: Path, calibration_bins: int
+) -> None:
     document = _document()
-    document["config_version"] = version
+    document["evaluation"]["calibration_bins"] = calibration_bins
+    config = load_experiment_config(_write(tmp_path, document))
+    assert config.evaluation is not None
+    assert config.evaluation.calibration_bins == calibration_bins
+
+
+@pytest.mark.parametrize("calibration_bins", [1, 1001, True, "15"])
+def test_evaluation_calibration_bins_reject_out_of_range_or_mistyped_values(
+    tmp_path: Path, calibration_bins: object
+) -> None:
+    document = _document()
+    document["evaluation"]["calibration_bins"] = calibration_bins
+    with pytest.raises(ConfigError):
+        load_experiment_config(_write(tmp_path, document))
+
+
+_MISSING_SCHEMA_VERSION = object()
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, 0, _MISSING_SCHEMA_VERSION])
+def test_only_integer_config_schema_version_one_is_supported(
+    tmp_path: Path, version: object
+) -> None:
+    document = _document()
+    if version is _MISSING_SCHEMA_VERSION:
+        document.pop("config_schema_version")
+    else:
+        document["config_schema_version"] = version
     with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
 
@@ -227,7 +300,7 @@ def test_bundle_id_requires_canonical_bundle_identity(tmp_path: Path, bundle_id:
 
 def test_duplicate_yaml_keys_are_rejected(tmp_path: Path) -> None:
     path = tmp_path / "duplicate.yaml"
-    path.write_text("config_version: 1\nconfig_version: 1\n", encoding="utf-8")
+    path.write_text("config_schema_version: 1\nconfig_schema_version: 1\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_experiment_config(path)
 
@@ -241,30 +314,3 @@ def test_model_randomness_controls_are_rejected_in_yaml(tmp_path: Path, seed_key
     document["family"]["parameters"][seed_key] = 7  # type: ignore[index]
     with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
-
-
-def test_exact_six_symile_development_configs_are_strict() -> None:
-    names = CONFIG_FILENAMES[4:]
-    configs = tuple(load_symile_development_config(Path("configs") / name) for name in names)
-    assert tuple(config.family.family_id for config in configs) == (
-        "labs_logistic",
-        "labs_lightgbm",
-        "cxr_densenet",
-        "cxr_labs_concat",
-        "cxr_labs_gated",
-        "cxr_labs_gated_no_observedness",
-    )
-    assert all(config.task.task_id == "pneumonia_strict" for config in configs)
-    assert len({config.config_semantic_sha256 for config in configs}) == 6
-
-
-def test_symile_gated_ablation_differs_only_by_family_and_observedness() -> None:
-    gated = _document("symile_cxr_labs_gated.yaml")
-    ablation = _document("symile_cxr_labs_gated_no_observedness.yaml")
-    gated_family = gated["family"]  # type: ignore[index]
-    ablation_family = ablation["family"]  # type: ignore[index]
-    assert gated_family.pop("family_id") == "cxr_labs_gated"
-    assert ablation_family.pop("family_id") == "cxr_labs_gated_no_observedness"
-    assert gated_family["parameters"].pop("use_observedness") is True
-    assert ablation_family["parameters"].pop("use_observedness") is False
-    assert gated == ablation

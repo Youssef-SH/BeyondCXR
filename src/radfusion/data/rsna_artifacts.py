@@ -22,11 +22,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pydicom
 
-from radfusion.data.artifact_validation import (
-    validate_annotation_table,
-    validate_label_table,
-    validate_sample_table,
-)
 from radfusion.data.bundle_contract import (
     BUNDLE_MANIFEST_SCHEMA_VERSION,
     BUNDLE_PREFIX,
@@ -38,20 +33,9 @@ from radfusion.data.bundle_contract import (
     validate_common_bundle_envelope,
 )
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
+from radfusion.data.hashing import logical_arrow_sha256, sha256_file
 from radfusion.data.rsna_dicom import AuditAccumulator, read_dicom_metadata
-from radfusion.data.rsna_source import (
-    RSNA_CLASS_VALUES,
-    BoundingBox,
-    RsnaPaths,
-    canonical_image_path,
-    discover_dicoms,
-    load_source_samples,
-    resolve_image_path,
-    validate_box_bounds,
-    validate_identifier_sets,
-)
-from radfusion.data.schemas import (
+from radfusion.data.rsna_schemas import (
     DATASET_ID,
     PNEUMONIA_LABEL_POLICY_VERSION,
     PNEUMONIA_LABEL_SOURCE,
@@ -66,7 +50,18 @@ from radfusion.data.schemas import (
     RSNA_SPLIT_SCHEMA,
     require_exact_schema,
 )
-from radfusion.data.splitting import (
+from radfusion.data.rsna_source import (
+    RSNA_CLASS_VALUES,
+    BoundingBox,
+    RsnaPaths,
+    canonical_image_path,
+    discover_dicoms,
+    load_source_samples,
+    resolve_image_path,
+    validate_box_bounds,
+    validate_identifier_sets,
+)
+from radfusion.data.rsna_splitting import (
     PATIENT_GROUPING_RULE,
     PATIENT_HASH_ALGORITHM,
     PATIENT_HASH_INPUT_ENCODING,
@@ -82,6 +77,11 @@ from radfusion.data.splitting import (
     create_patient_stratified_splits,
     split_assignment_id,
     validate_split_table,
+)
+from radfusion.data.rsna_validation import (
+    validate_annotation_table,
+    validate_label_table,
+    validate_sample_table,
 )
 from radfusion.utils.operational_logging import CountProgress, get_operational_logger
 from radfusion.utils.publication import update_current_marker
@@ -330,11 +330,11 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
     current_path = dataset_bundle_root / CURRENT_FILENAME
 
     logical_hashes = {
-        SAMPLES_FILENAME: arrow_ipc_sha256(result.samples),
-        LABELS_FILENAME: arrow_ipc_sha256(result.labels),
-        ANNOTATIONS_FILENAME: arrow_ipc_sha256(result.annotations),
-        SPLITS_FILENAME: arrow_ipc_sha256(result.splits),
-        SOURCE_INVENTORY_FILENAME: arrow_ipc_sha256(result.source_inventory),
+        SAMPLES_FILENAME: logical_arrow_sha256(result.samples),
+        LABELS_FILENAME: logical_arrow_sha256(result.labels),
+        ANNOTATIONS_FILENAME: logical_arrow_sha256(result.annotations),
+        SPLITS_FILENAME: logical_arrow_sha256(result.splits),
+        SOURCE_INVENTORY_FILENAME: logical_arrow_sha256(result.source_inventory),
     }
     stage_directory = Path(tempfile.mkdtemp(prefix=".staging-", dir=bundles_root))
 
@@ -385,15 +385,20 @@ def build_and_write(
     return write_bundle(build_rsna_artifacts(dataset_root, split_config), output_directory)
 
 
-def load_current_bundle(output_directory: str | Path) -> BundlePaths:
-    """Resolve CURRENT and verify metadata plus every declared artifact hash."""
+def resolve_bundle(
+    output_directory: str | Path,
+    *,
+    bundle_id: str | None = None,
+) -> BundlePaths:
+    """Resolve an explicit immutable bundle or the interactive CURRENT selection."""
     dataset_bundle_root = Path(output_directory) / DATASET_ID
     current_path = dataset_bundle_root / CURRENT_FILENAME
-    if not current_path.is_file():
-        raise ManifestBuildError(f"Missing CURRENT marker: {current_path}")
-    bundle_id = current_path.read_text(encoding="utf-8").strip()
+    if bundle_id is None:
+        if not current_path.is_file():
+            raise ManifestBuildError(f"Missing CURRENT marker: {current_path}")
+        bundle_id = current_path.read_text(encoding="utf-8").strip()
     if not valid_bundle_id(bundle_id):
-        raise ManifestBuildError("CURRENT contains an invalid bundle identifier")
+        raise ManifestBuildError("Invalid RSNA bundle identifier")
     bundle_directory = dataset_bundle_root / BUNDLES_DIRECTORY / bundle_id
     validate_bundle_directory(bundle_directory, expected_bundle_id=bundle_id)
     return _bundle_paths(bundle_id, bundle_directory, current_path)
@@ -405,7 +410,7 @@ def validate_bundle_directory(
     expected_bundle_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> dict[str, Any]:
-    """Require complete metadata plus matching file and Arrow IPC hashes for a bundle."""
+    """Require complete metadata plus matching physical and logical hashes for a bundle."""
     validated = validate_bundle_reference(
         bundle_directory,
         expected_bundle_id=expected_bundle_id,
@@ -422,10 +427,10 @@ def validate_bundle_directory(
         path = directory / filename
         declared = hashes.get(filename)
         table = pq.read_table(path)
-        actual_arrow_hash = arrow_ipc_sha256(table)
+        actual_arrow_hash = logical_arrow_sha256(table)
         actual_arrow_hashes[filename] = actual_arrow_hash
         if actual_arrow_hash != declared.get("logical_arrow_sha256"):
-            raise ManifestBuildError(f"Arrow IPC hash mismatch for {filename}")
+            raise ManifestBuildError(f"Logical Arrow hash mismatch for {filename}")
         if table.num_rows != declared.get("row_count"):
             raise ManifestBuildError(f"Row count mismatch for {filename}")
     try:
@@ -501,9 +506,11 @@ def validate_bundle_reference(
             raise ManifestBuildError(f"File hash mismatch for {filename}")
         if pq.read_schema(path) != schema:
             raise ManifestBuildError(f"{filename} schema mismatch")
+        if pq.read_metadata(path).num_rows != declared.get("row_count"):
+            raise ManifestBuildError(f"Row count mismatch for {filename}")
         arrow_hash = declared.get("logical_arrow_sha256")
         if not _sha256_text(arrow_hash):
-            raise ManifestBuildError(f"Arrow IPC hash declaration is invalid for {filename}")
+            raise ManifestBuildError(f"Logical Arrow hash declaration is invalid for {filename}")
         declared_arrow_hashes[filename] = arrow_hash
     try:
         computed_bundle_id = _bundle_id(declared_arrow_hashes, metadata)

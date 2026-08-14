@@ -49,7 +49,7 @@ archive can be downloaded with the command in
 [`docs/datasets/rsna.md`](../docs/datasets/rsna.md). Extract it into the layout above and run:
 
 ```bash
-make rsna-manifest
+make rsna-manifest SOURCE_ROOT=data/raw/rsna/extracted
 ```
 
 The CXR cache is a disposable memory-mapped deterministic derivative used by neural workflows.
@@ -78,9 +78,9 @@ identities. Official CXR, ECG, lab-percentile, missingness, and identifier NPY a
 external restricted source assets authenticated through the bundle-bound release checksum manifest.
 
 Supervised development reads only strict-pneumonia rows from official train and validation and
-consumes the immutable CV assignment without regenerating it. Its patient-level OOF tables are
-stored in ignored model packages rather than in `data/manifests/`. The official test rows are not
-available through the development data layer.
+consumes the immutable CV assignment without regenerating it. Each fold model package has a
+separate patient-level OOF prediction object under the ignored `private/` tree. The official test
+rows are not available through the development data layer.
 
 Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
 control. These files contain patient-level information even when public identifiers are

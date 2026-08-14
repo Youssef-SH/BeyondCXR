@@ -151,8 +151,8 @@ class CxrBinaryClassifier(nn.Module):
         set_cxr_encoder_trainability(self.encoder, "all")
 
 
-class ImageDenseNetModel:
-    """Build the fixed image-only DenseNet121 classifier."""
+class CxrDenseNetModel:
+    """Build the fixed CXR-only DenseNet121 classifier."""
 
     def __init__(
         self,
@@ -170,7 +170,7 @@ class ImageDenseNetModel:
 
     def _build(self, config: FamilyConfig, *, weights: str | None) -> CxrBinaryClassifier:
         if config.family_id != "cxr_densenet" or config.modalities != ("cxr",):
-            raise ValueError("Image DenseNet requires the registered image model configuration")
+            raise ValueError("CXR DenseNet requires the registered CXR model configuration")
         parameters = dict(config.parameters)
         expected = {
             "encoder_name",
@@ -179,20 +179,20 @@ class ImageDenseNetModel:
             "embedding_dimension",
         }
         if set(parameters) != expected:
-            raise ValueError(f"Image DenseNet parameters must be exactly {sorted(expected)}")
+            raise ValueError(f"CXR DenseNet parameters must be exactly {sorted(expected)}")
         if parameters["encoder_name"] != "densenet121":
-            raise ValueError("Image DenseNet requires encoder_name='densenet121'")
+            raise ValueError("CXR DenseNet requires encoder_name='densenet121'")
         if parameters["weights"] != "densenet121-res224-chex":
-            raise ValueError("Image DenseNet requires the fixed pretrained weights")
+            raise ValueError("CXR DenseNet requires the fixed pretrained weights")
         if parameters["image_size"] != 224 or parameters["embedding_dimension"] != 1024:
-            raise ValueError("Image DenseNet requires dimensions 224 and 1024")
+            raise ValueError("CXR DenseNet requires dimensions 224 and 1024")
         encoder = self._encoder_factory(
             weights=weights,
             expected_embedding_dimension=parameters["embedding_dimension"],
             image_size=parameters["image_size"],
         )
         if not isinstance(encoder, nn.Module):
-            raise TypeError("Image encoder factory must return a torch.nn.Module")
+            raise TypeError("CXR encoder factory must return a torch.nn.Module")
         return CxrBinaryClassifier(
             encoder,
             embedding_dimension=parameters["embedding_dimension"],

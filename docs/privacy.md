@@ -32,9 +32,9 @@ requires the dataset terms and project data-handling policy to permit the destin
 
 ## Private analysis workspace
 
-The ignored `private/` directory stores patient-level neural prediction tables and real-image
-localization overlays. Prediction tables contain sample and private patient keys, targets, logits,
-probabilities, and exact run/package lineage. Localization manifests contain the internal sample
+The ignored `private/` directory stores sample-level prediction evidence and real-image
+localization overlays. Prediction evidence contains sample keys, targets, logits, probabilities,
+and exact package/scientific lineage. Localization manifests contain the internal sample
 identity needed to trace mechanically selected overlays.
 
 Only aggregate localization metrics, counts, and methodological text are published under

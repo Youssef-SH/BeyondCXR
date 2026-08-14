@@ -13,6 +13,7 @@ from radfusion.data.symile_preprocess import (
     SymileLabEcdfTransformer,
     load_symile_lab_preprocessor,
     save_symile_lab_preprocessor,
+    validate_symile_lab_preprocessor,
 )
 
 
@@ -56,6 +57,50 @@ def test_zero_observed_or_nonfinite_observed_value_fails() -> None:
         SymileLabEcdfTransformer().fit(invalid)
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["garbage", "1.2x", object(), True, np.inf, -np.inf],
+)
+def test_laboratory_values_reject_malformed_present_content(value: object) -> None:
+    invalid = _lab_frame([1.0])
+    column = LAB_VALUE_COLUMNS[0]
+    invalid[column] = invalid[column].astype(object)
+    invalid.at[0, column] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        SymileLabEcdfTransformer().fit(invalid)
+
+
+@pytest.mark.parametrize("value", [None, np.nan])
+def test_observed_laboratory_value_cannot_be_missing(value: object) -> None:
+    invalid = _lab_frame([1.0])
+    invalid.at[0, LAB_VALUE_COLUMNS[0]] = value
+    invalid.at[0, LAB_OBSERVED_COLUMNS[0]] = True
+
+    with pytest.raises(ValueError, match="cannot be missing"):
+        SymileLabEcdfTransformer().fit(invalid)
+
+
+def test_unobserved_laboratory_value_must_be_missing() -> None:
+    invalid = _lab_frame([1.0])
+    invalid.at[0, LAB_OBSERVED_COLUMNS[0]] = False
+
+    with pytest.raises(ValueError, match="must be missing"):
+        SymileLabEcdfTransformer().fit(invalid)
+
+
+@pytest.mark.parametrize("value", [None, np.nan])
+def test_missing_unobserved_laboratory_value_is_valid(value: object) -> None:
+    frame = _lab_frame([1.0, 2.0])
+    frame.at[0, LAB_VALUE_COLUMNS[0]] = value
+    frame.at[0, LAB_OBSERVED_COLUMNS[0]] = False
+
+    transformed = SymileLabEcdfTransformer().fit(frame).transform(frame)
+
+    assert np.isfinite(transformed).all()
+    assert transformed[0, 50] == 0.0
+
+
 def test_fitted_transform_is_unchanged_and_round_trips(tmp_path: Path) -> None:
     training = _lab_frame([1.0, 2.0, 3.0])
     outer_holdout = _lab_frame([100.0, None])
@@ -70,3 +115,11 @@ def test_fitted_transform_is_unchanged_and_round_trips(tmp_path: Path) -> None:
         for left, right in zip(before, transformer.sorted_observed_values_, strict=True)
     )
     assert np.array_equal(restored.transform(outer_holdout), expected)
+
+
+def test_preprocessor_rejects_incorrect_finite_missing_replacement() -> None:
+    transformer = SymileLabEcdfTransformer().fit(_lab_frame([1.0, 2.0, 3.0]))
+    transformer.missing_replacements_[0] += 0.01
+
+    with pytest.raises(TypeError, match="missing replacement is not canonical"):
+        validate_symile_lab_preprocessor(transformer)

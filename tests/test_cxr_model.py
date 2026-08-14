@@ -10,7 +10,7 @@ from torch import nn
 
 from radfusion.models.cxr_baseline import (
     CxrBinaryClassifier,
-    ImageDenseNetModel,
+    CxrDenseNetModel,
     StandardCxrEncoder,
     ensure_pretrained_weights,
     fingerprint_pretrained_weights,
@@ -18,7 +18,7 @@ from radfusion.models.cxr_baseline import (
     set_cxr_encoder_training_mode,
 )
 from radfusion.training.config import load_experiment_config
-from radfusion.training.registry import MODELS, get_model
+from radfusion.training.rsna_registry import MODELS, get_model
 
 
 class _TinyEncoder(nn.Module):
@@ -74,19 +74,25 @@ def test_standard_encoder_terminal_trainability_is_exact() -> None:
     assert trainable == expected
     set_cxr_encoder_training_mode(encoder, "terminal")
     modules = dict(encoder.named_modules())
-    assert modules["backbone.features.denseblock4"].training
-    assert modules["backbone.features.norm5"].training
-    assert not modules["backbone.features.denseblock3"].training
-    assert not modules["backbone.features.transition3"].training
+    terminal_modules = {
+        name
+        for name in modules
+        if name == "backbone.features.denseblock4"
+        or name.startswith("backbone.features.denseblock4.")
+        or name == "backbone.features.norm5"
+        or name.startswith("backbone.features.norm5.")
+    }
+    assert terminal_modules
+    assert {name for name, module in modules.items() if module.training} == terminal_modules
     set_cxr_encoder_trainability(encoder, "all")
     set_cxr_encoder_training_mode(encoder, "all")
     assert all(parameter.requires_grad for parameter in encoder.parameters())
     assert all(module.training for module in encoder.modules())
 
 
-def test_image_registry_builds_with_injected_encoder_without_weights() -> None:
+def test_cxr_registry_builds_with_injected_encoder_without_weights() -> None:
     config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
-    model = ImageDenseNetModel(encoder_factory=_TinyEncoder).build(config.family)
+    model = CxrDenseNetModel(encoder_factory=_TinyEncoder).build(config.family)
 
     assert get_model("cxr_densenet") is MODELS["cxr_densenet"]
     assert tuple(MODELS).count("cxr_densenet") == 1
@@ -142,11 +148,11 @@ def test_cxr_classifier_requires_module_encoder() -> None:
         CxrBinaryClassifier(object())  # type: ignore[arg-type]
 
 
-def test_image_builder_rejects_non_module_factory_output() -> None:
+def test_cxr_builder_rejects_non_module_factory_output() -> None:
     config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
 
     with pytest.raises(TypeError):
-        ImageDenseNetModel(encoder_factory=lambda **_: object()).build(config.family)
+        CxrDenseNetModel(encoder_factory=lambda **_: object()).build(config.family)
 
 
 def test_pretrained_weight_identity_fingerprints_materialized_file_bytes(
@@ -265,7 +271,7 @@ def test_evaluation_architecture_is_built_without_pretrained_cache_access() -> N
         return _TinyEncoder(**kwargs)
 
     config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
-    model = ImageDenseNetModel(encoder_factory=factory).build_architecture(config.family)
+    model = CxrDenseNetModel(encoder_factory=factory).build_architecture(config.family)
 
     assert isinstance(model, CxrBinaryClassifier)
     assert observed_weights == [None]

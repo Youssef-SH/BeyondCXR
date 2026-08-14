@@ -25,7 +25,7 @@ class AgeParseResult:
 
 
 def parse_dicom_age(raw_value: str | None) -> AgeParseResult:
-    """Parse standard DICOM age strings and RSNA's bare-year compatibility format."""
+    """Parse standard DICOM age strings and RSNA's bare-year source format."""
     if raw_value is None or not raw_value.strip():
         return AgeParseResult(None, "missing", "missing", "age value is missing")
 

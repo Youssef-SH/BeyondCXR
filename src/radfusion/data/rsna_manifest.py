@@ -10,7 +10,7 @@ from pathlib import Path
 
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.rsna_artifacts import build_rsna_artifacts, write_bundle
-from radfusion.data.splitting import SplitConfig
+from radfusion.data.rsna_splitting import SplitConfig
 from radfusion.utils.operational_logging import (
     add_logging_argument,
     configure_logging,
@@ -24,7 +24,7 @@ _LOGGER = get_operational_logger(__name__)
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--dataset-root",
+        "--source-root",
         type=Path,
         default=Path("data/raw/rsna/extracted"),
         help="Directory containing the extracted RSNA Stage 2 files",
@@ -69,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_ratio=args.test_ratio,
         )
         with timed_phase(_LOGGER, "manifest_construction"):
-            result = build_rsna_artifacts(args.dataset_root, split_config)
+            result = build_rsna_artifacts(args.source_root, split_config)
         with timed_phase(_LOGGER, "bundle_publication"):
             written = write_bundle(result, args.output_directory)
     except (ManifestBuildError, OSError) as exc:

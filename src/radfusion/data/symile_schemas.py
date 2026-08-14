@@ -11,6 +11,7 @@ LABEL_POLICY_VERSION = "symile-pneumonia-strict-v1"
 OFFICIAL_SPLITS = ("train", "validation", "test")
 DEVELOPMENT_SPLITS = ("train", "validation")
 REPEAT_SEEDS = (17, 42, 2026)
+OUTER_FOLDS = tuple(range(5))
 LAB_ITEM_IDS = (
     "50802",
     "50804",

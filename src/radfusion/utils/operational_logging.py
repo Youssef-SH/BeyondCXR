@@ -64,7 +64,7 @@ _TOKEN_FIELDS = frozenset(
         "device",
         "error_type",
         "experiment",
-        "model",
+        "family_id",
         "operation",
         "partition",
         "phase",

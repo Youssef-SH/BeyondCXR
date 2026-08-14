@@ -17,8 +17,8 @@ from radfusion.data.rsna_audit import (
     _label_distribution,
     generate_rsna_audit,
 )
-from radfusion.data.schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from radfusion.data.splitting import SplitConfig, split_assignment_id
+from radfusion.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
+from radfusion.data.rsna_splitting import SplitConfig, split_assignment_id
 
 
 def _audit_bundle(tmp_path: Path) -> SimpleNamespace:
@@ -192,7 +192,7 @@ def test_audit_publication_owns_only_the_bundle_specific_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle = _audit_bundle(tmp_path)
-    monkeypatch.setattr("radfusion.data.rsna_audit.load_current_bundle", lambda _: bundle)
+    monkeypatch.setattr("radfusion.data.rsna_audit.resolve_bundle", lambda *args, **kwargs: bundle)
     output = tmp_path / "reports" / "rsna"
     other_bundle = output / "bundle-other"
     other_bundle.mkdir(parents=True)
@@ -211,7 +211,7 @@ def test_audit_failure_preserves_previous_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle = _audit_bundle(tmp_path)
-    monkeypatch.setattr("radfusion.data.rsna_audit.load_current_bundle", lambda _: bundle)
+    monkeypatch.setattr("radfusion.data.rsna_audit.resolve_bundle", lambda *args, **kwargs: bundle)
     monkeypatch.setattr(
         "radfusion.data.rsna_audit._missingness_report",
         lambda _: (_ for _ in ()).throw(RuntimeError("report failed")),

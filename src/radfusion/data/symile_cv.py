@@ -24,7 +24,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 from radfusion.data.bundle_contract import BUNDLE_PREFIX, valid_bundle_id
 from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import arrow_ipc_sha256, sha256_file
+from radfusion.data.hashing import logical_arrow_sha256, sha256_file
 from radfusion.data.symile_artifacts import (
     SymileBundlePaths,
     read_symile_samples,
@@ -35,6 +35,7 @@ from radfusion.data.symile_schemas import (
     CV_SCHEMA,
     DEVELOPMENT_SPLITS,
     LABEL_POLICY_VERSION,
+    OUTER_FOLDS,
     REPEAT_SEEDS,
     TASK_ID,
 )
@@ -106,7 +107,7 @@ def validate_cv_table(assignments: pa.Table, samples: pd.DataFrame) -> None:
     if (
         frame[["sample_id", "repeat_seed"]].duplicated().any()
         or set(frame["repeat_seed"]) != set(REPEAT_SEEDS)
-        or set(frame["outer_fold"]) != set(range(5))
+        or set(frame["outer_fold"]) != set(OUTER_FOLDS)
     ):
         raise ManifestBuildError("Symile CV assignment key or domain is invalid")
     eligible = strict_pneumonia_rows(samples)
@@ -124,7 +125,7 @@ def validate_cv_table(assignments: pa.Table, samples: pd.DataFrame) -> None:
         patient_folds = scoped.groupby("subject_id")["outer_fold"].nunique()
         if not patient_folds.eq(1).all():
             raise ManifestBuildError("Symile CV repeat splits a patient across folds")
-        for fold in range(5):
+        for fold in OUTER_FOLDS:
             fold_rows = scoped.loc[scoped["outer_fold"] == fold]
             if fold_rows.empty or set(fold_rows["target"]) != {0, 1}:
                 raise ManifestBuildError("Symile CV fold is empty or lacks one target class")
@@ -150,7 +151,7 @@ def publish_symile_cv(
     """Generate, validate, and immutably publish the bundle-bound CV artifact."""
     samples = read_symile_samples(bundle)
     assignments = generate_cv_assignments(samples)
-    logical_hash = arrow_ipc_sha256(assignments)
+    logical_hash = logical_arrow_sha256(assignments)
     assignment_id = cv_assignment_id(bundle.bundle_id, logical_hash)
     destination = Path(manifest_directory) / "symile" / CV_DIRECTORY / assignment_id
     stage = staging_directory(destination)
@@ -225,7 +226,7 @@ def validate_symile_cv_reference(
     assignments = pq.read_table(path)
     if artifact["row_count"] != assignments.num_rows:
         raise ManifestBuildError("Symile CV artifact row count does not match")
-    logical_hash = arrow_ipc_sha256(assignments)
+    logical_hash = logical_arrow_sha256(assignments)
     if (
         logical_hash != artifact["logical_arrow_sha256"]
         or cv_assignment_id(bundle_id, logical_hash) != assignment_id

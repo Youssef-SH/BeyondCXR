@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from radfusion.training.train import main as train_main
+from radfusion.training.rsna_train import main as train_main
 from radfusion.utils.operational_logging import (
     CountProgress,
     configure_logging,
@@ -20,11 +20,12 @@ from radfusion.utils.operational_logging import (
 
 
 def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsys) -> None:
+    package_id = "model-package-" + "a" * 64
     result = type(
         "Result",
         (),
         {
-            "model_name": "metadata_logistic_regression",
+            "model_package_id": package_id,
             "run_id": "run-test",
             "validation_probability": type("Metrics", (), {"average_precision": 0.4})(),
             "model_path": type("PathValue", (), {"as_posix": lambda self: "model.skops"})(),
@@ -39,7 +40,7 @@ def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsy
         log_event(get_operational_logger("test"), "test_progress")
         return result
 
-    monkeypatch.setattr("radfusion.training.train.train_configured_experiment", fake_train)
+    monkeypatch.setattr("radfusion.training.rsna_train.train_metadata_experiment", fake_train)
 
     for _ in range(2):
         assert train_main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
