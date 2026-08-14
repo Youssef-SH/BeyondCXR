@@ -62,7 +62,7 @@ class SymileGatedFusionHead(nn.Module):
         if not isinstance(use_observedness, bool):
             raise TypeError("use_observedness must be Boolean")
         if modality_count != 2:
-            raise ValueError("M5 gated fusion requires exactly CXR and laboratories")
+            raise ValueError("Symile gated fusion head requires exactly CXR and laboratories")
         self.use_observedness = use_observedness
         self.modality_count = modality_count
         self.lab_input_dimension = int(parameters["lab_input_dimension"])
@@ -138,12 +138,7 @@ class SymileGatedFusionHead(nn.Module):
             self.lab_projection(self.lab_core(lab_input)),
         ]
         gate_input = torch.cat((*representations, observedness), dim=1)
-        weights = torch.softmax(
-            self.gate(gate_input).reshape(-1, self.modality_count, self.latent_dimension),
-            dim=1,
-        )
-        stacked = torch.stack(representations, dim=1)
-        fused = torch.sum(weights * stacked, dim=1)
+        fused, weights = gated_fusion_core(representations, self.gate(gate_input))
         logits = self.output(fused).squeeze(1)
         if logits.shape != (len(image_embedding),):
             raise ValueError("Gated fusion produced invalid logits")
@@ -200,11 +195,51 @@ def build_symile_gated_model(
     )
 
 
+def gated_fusion_core(
+    representations: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    gate_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-feature softmax gating to exactly two modalities."""
+    modality_count = len(representations)
+    if modality_count != 2:
+        raise ValueError("Gated fusion supports exactly two modalities")
+    first = representations[0]
+    if not isinstance(first, torch.Tensor) or first.ndim != 2 or not first.is_floating_point():
+        raise ValueError("Gated representations must be floating matrices")
+    if any(
+        not isinstance(value, torch.Tensor)
+        or value.shape != first.shape
+        or not value.is_floating_point()
+        for value in representations[1:]
+    ):
+        raise ValueError("Gated representations must have one shared floating matrix shape")
+    if any(value.dtype != first.dtype for value in representations[1:]):
+        raise ValueError("Gated representations must have one shared dtype")
+    if any(value.device != first.device for value in representations[1:]):
+        raise ValueError("Gated representations must be on one device")
+    expected_gate_shape = (first.shape[0], modality_count * first.shape[1])
+    if (
+        not isinstance(gate_logits, torch.Tensor)
+        or gate_logits.shape != expected_gate_shape
+        or not gate_logits.is_floating_point()
+    ):
+        raise ValueError("Gated fusion logits have an invalid shape or dtype")
+    if gate_logits.dtype != first.dtype:
+        raise ValueError("Gated fusion logits must match the representation dtype")
+    if gate_logits.device != first.device:
+        raise ValueError("Gated fusion logits must be on the representation device")
+    weights = torch.softmax(
+        gate_logits.reshape(-1, modality_count, first.shape[1]),
+        dim=1,
+    )
+    fused = torch.sum(weights * torch.stack(tuple(representations), dim=1), dim=1)
+    return fused, weights
+
+
 def _validate_matrix(value: object, rows: int, columns: int, name: str) -> None:
     if (
         not isinstance(value, torch.Tensor)
         or value.shape != (rows, columns)
         or not value.is_floating_point()
-        or not torch.isfinite(value).all()
     ):
-        raise ValueError(f"{name} must be a finite floating matrix shaped {rows} x {columns}")
+        raise ValueError(f"{name} must be a floating matrix shaped {rows} x {columns}")

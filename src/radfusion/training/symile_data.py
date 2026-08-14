@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from radfusion.data.symile_cv import (
     validate_symile_cv_reference,
 )
 from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
-from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, REPEAT_SEEDS
+from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, OUTER_FOLDS, REPEAT_SEEDS
 from radfusion.training.config import ExperimentConfig
 
 DEVELOPMENT_COUNT = 2_368
@@ -44,7 +45,7 @@ _IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(3, 1
 
 @dataclass(frozen=True)
 class SymileDevelopmentData:
-    """Validated development rows and immutable M4 lineage."""
+    """Own validated development rows and bind their data-foundation lineage."""
 
     bundle: SymileBundlePaths
     bundle_manifest_sha256: str
@@ -54,7 +55,7 @@ class SymileDevelopmentData:
 
 @dataclass(frozen=True)
 class SymileOuterFold:
-    """One frozen outer-training/OOF partition."""
+    """Own the model-facing frames for one fixed outer-training/OOF partition."""
 
     repeat_seed: int
     outer_fold: int
@@ -68,7 +69,7 @@ class SymileInnerSplit:
 
     inner_seed: int
     inner_split_id: str
-    policy: dict[str, object]
+    policy: Mapping[str, object]
     training_indices: np.ndarray
     validation_indices: np.ndarray
 
@@ -117,7 +118,9 @@ def load_symile_development(
         or positives != DEVELOPMENT_POSITIVES
         or len(frame) - positives != DEVELOPMENT_NEGATIVES
     ):
-        raise ManifestBuildError("Symile development cohort differs from the frozen M5 contract")
+        raise ManifestBuildError(
+            "Symile development cohort differs from the frozen core-development contract"
+        )
     return SymileDevelopmentData(
         bundle,
         bundle_reference.manifest_sha256,
@@ -129,8 +132,8 @@ def load_symile_development(
 def materialize_outer_fold(
     data: SymileDevelopmentData, *, repeat_seed: int, outer_fold: int
 ) -> SymileOuterFold:
-    """Materialize one exact frozen outer fold from the M4 assignment."""
-    if repeat_seed not in REPEAT_SEEDS or outer_fold not in range(5):
+    """Materialize one exact frozen outer fold from the experimental-design assignment."""
+    if repeat_seed not in REPEAT_SEEDS or outer_fold not in OUTER_FOLDS:
         raise ManifestBuildError("Symile outer-fold coordinates are invalid")
     assignments = data.cv_reference.assignments.to_pandas()
     scoped = assignments.loc[assignments["repeat_seed"] == repeat_seed, ["sample_id", "outer_fold"]]
@@ -155,8 +158,7 @@ def materialize_outer_fold(
 def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
     """Derive the frozen deterministic patient-grouped inner split."""
     frame = outer.training.sort_values("sample_id", kind="stable").reset_index(drop=True)
-    seed_payload = f"symile-inner-split\0{outer.repeat_seed}\0{outer.outer_fold}".encode()
-    inner_seed = int.from_bytes(hashlib.sha256(seed_payload).digest()[:4], "big", signed=False)
+    inner_seed = derive_inner_seed(outer.repeat_seed, outer.outer_fold)
     splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=inner_seed)
     generated = list(
         splitter.split(
@@ -206,6 +208,14 @@ def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
     )
 
 
+def derive_inner_seed(repeat_seed: int, outer_fold: int) -> int:
+    """Derive the canonical inner-split seed for one frozen outer coordinate."""
+    if repeat_seed not in REPEAT_SEEDS or outer_fold not in OUTER_FOLDS:
+        raise ManifestBuildError("Symile inner-split coordinates are invalid")
+    payload = f"symile-inner-split\0{repeat_seed}\0{outer_fold}".encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big", signed=False)
+
+
 class SymileCxrStore:
     """Authenticate and expose read-only official train/validation CXR tensors."""
 
@@ -231,7 +241,7 @@ class SymileCxrStore:
     def canonical_image(self, official_split: str, source_row: int) -> np.ndarray:
         """Reconstruct one finite repeated-grayscale CXR in [0, 1]."""
         if official_split not in DEVELOPMENT_SPLITS:
-            raise ManifestBuildError("M5 CXR access is limited to development splits")
+            raise ManifestBuildError("CXR access is limited to Symile development splits")
         array = self._arrays[official_split]
         if (
             isinstance(source_row, bool)

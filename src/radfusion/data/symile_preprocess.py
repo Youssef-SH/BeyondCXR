@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +114,7 @@ def validate_symile_lab_preprocessor(value: object) -> SymileLabEcdfTransformer:
         not isinstance(fitted, tuple)
         or len(fitted) != len(LAB_ITEM_IDS)
         or replacements.shape != (len(LAB_ITEM_IDS),)
+        or not np.issubdtype(replacements.dtype, np.floating)
         or not np.isfinite(replacements).all()
         or getattr(value, "n_features_in_", None) != LAB_TRANSFORMED_DIMENSION
         or tuple(getattr(value, "feature_names_in_", ())) != LAB_FEATURE_COLUMNS
@@ -120,7 +122,7 @@ def validate_symile_lab_preprocessor(value: object) -> SymileLabEcdfTransformer:
         != tuple(f"lab_{item}_ecdf" for item in LAB_ITEM_IDS) + LAB_OBSERVED_COLUMNS
     ):
         raise TypeError("Symile laboratory preprocessor contract is invalid")
-    for observed in fitted:
+    for index, observed in enumerate(fitted):
         array = np.asarray(observed)
         if (
             array.ndim != 1
@@ -130,6 +132,10 @@ def validate_symile_lab_preprocessor(value: object) -> SymileLabEcdfTransformer:
             or np.any(array[1:] < array[:-1])
         ):
             raise TypeError("Symile laboratory fitted ECDF state is invalid")
+        ranks = np.searchsorted(array, array, side="right") / len(array)
+        expected_replacement = float(np.mean(ranks))
+        if not np.isclose(replacements[index], expected_replacement, rtol=0.0, atol=1e-15):
+            raise TypeError("Symile laboratory missing replacement is not canonical")
     return value
 
 
@@ -138,13 +144,38 @@ def _validated_frame(values: object) -> pd.DataFrame:
         raise TypeError("Symile laboratory features must be a pandas DataFrame")
     if tuple(values.columns) != LAB_FEATURE_COLUMNS or values.columns.duplicated().any():
         raise ValueError("Symile laboratory columns must match the exact frozen order")
+    validated = values.copy()
     for value_column, observed_column in zip(LAB_VALUE_COLUMNS, LAB_OBSERVED_COLUMNS, strict=True):
         observed = values[observed_column]
         boolean = observed.map(lambda value: isinstance(value, (bool, np.bool_)))
         if observed.isna().any() or not boolean.all():
             raise ValueError("Symile laboratory observedness must be Boolean and non-null")
-        raw = pd.to_numeric(values[value_column], errors="coerce").to_numpy(dtype=np.float64)
         mask = observed.to_numpy(dtype=bool)
-        if np.any(mask != ~np.isnan(raw)):
-            raise ValueError("Symile laboratory observedness differs from raw nullity")
-    return values
+        raw = np.empty(len(values), dtype=np.float64)
+        for index, (value, is_observed) in enumerate(
+            zip(values[value_column].tolist(), mask, strict=True)
+        ):
+            if _is_missing_lab_value(value):
+                if is_observed:
+                    raise ValueError("Observed Symile laboratory values cannot be missing")
+                raw[index] = np.nan
+                continue
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                raise TypeError("Symile laboratory values must be numeric or missing")
+            numeric = float(value)
+            if not np.isfinite(numeric):
+                raise ValueError("Symile laboratory values must be finite when present")
+            if not is_observed:
+                raise ValueError("Unobserved Symile laboratory values must be missing")
+            raw[index] = numeric
+        validated[value_column] = raw
+        validated[observed_column] = mask
+    return validated
+
+
+def _is_missing_lab_value(value: object) -> bool:
+    return (
+        value is None
+        or value is pd.NA
+        or (isinstance(value, (float, np.floating)) and np.isnan(value))
+    )
