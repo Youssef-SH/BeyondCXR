@@ -181,7 +181,7 @@ def evaluate_cxr_model_package(
         )
         test_loader = build_evaluation_loader(
             test_dataset,
-            config=neural,
+            batch_size=neural.batch_size,
             runtime=runtime,
             execution=loader_execution,
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 import mlflow
 import pytest
 
-from radfusion.utils.mlflow_utils import configure_mlflow, uv_lock_sha256
+from radfusion.utils.mlflow_utils import configure_mlflow, discover_repository_root, uv_lock_sha256
 
 
 def test_uv_lock_hash_uses_exact_file_bytes(tmp_path: Path) -> None:
@@ -14,6 +14,12 @@ def test_uv_lock_hash_uses_exact_file_bytes(tmp_path: Path) -> None:
     content = b"version = 1\n"
     lock.write_bytes(content)
     assert uv_lock_sha256(lock) == hashlib.sha256(content).hexdigest()
+
+
+def test_repository_discovery_validates_the_project_identity(tmp_path: Path) -> None:
+    assert (discover_repository_root() / "pyproject.toml").is_file()
+    with pytest.raises(ValueError, match="cannot be discovered"):
+        discover_repository_root(tmp_path)
 
 
 def test_mlflow_initialization_uses_isolated_sqlite_and_local_artifacts(tmp_path: Path) -> None:

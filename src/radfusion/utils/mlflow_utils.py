@@ -8,6 +8,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,6 +36,7 @@ class SourceConfig(Protocol):
 DEFAULT_TRACKING_URI = "sqlite:///mlflow.db"
 MLFLOW_ARTIFACT_DIRECTORY = "mlartifacts"
 _LOGGER = get_operational_logger(__name__)
+_PROJECT_NAME = "radfusion-clinical"
 
 
 def serialize_modalities(modalities: tuple[str, ...] | list[str]) -> str:
@@ -111,23 +113,41 @@ def tracked_run(
             log_event(_LOGGER, "run_finished", **context)
 
 
-def git_revision() -> tuple[str, bool]:
+def git_revision(repository_root: str | Path = ".") -> tuple[str, bool]:
     """Return the current Git commit and dirty-worktree flag."""
     commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
     dirty = bool(
         subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "-C", str(repository_root), "status", "--porcelain"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
     )
     return commit, dirty
+
+
+def discover_repository_root(start: str | Path = ".") -> Path:
+    """Discover and validate the ordinary RadFusion repository root."""
+    try:
+        output = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        root = Path(output).resolve(strict=True)
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, subprocess.SubprocessError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError("RadFusion repository root cannot be discovered") from exc
+    if project.get("project", {}).get("name") != _PROJECT_NAME:
+        raise ValueError("Discovered Git root is not the RadFusion repository")
+    return root
 
 
 def _operational_seed(value: object) -> int | None:

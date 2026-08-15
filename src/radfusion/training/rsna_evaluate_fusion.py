@@ -198,7 +198,10 @@ def evaluate_fusion_model_package(
             pin_memory=runtime.pin_memory_effective
         )
         loader = build_evaluation_loader(
-            test_dataset, config=neural, runtime=runtime, execution=loader_execution
+            test_dataset,
+            batch_size=neural.batch_size,
+            runtime=runtime,
+            execution=loader_execution,
         )
         model.to(runtime.device)
         inference = deterministic_inference(

@@ -449,7 +449,7 @@ def _fit_neural_outer_fold(
     )
     holdout_loader = build_evaluation_loader(
         holdout_dataset,
-        config=config.neural,
+        batch_size=config.neural.batch_size,
         runtime=context.runtime,
     )
     inference = deterministic_inference(
