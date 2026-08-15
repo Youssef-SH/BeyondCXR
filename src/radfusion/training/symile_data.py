@@ -18,7 +18,6 @@ from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.symile_artifacts import (
     SymileBundlePaths,
-    authenticate_source_asset,
     read_symile_labs,
     read_symile_samples,
     resolve_symile_bundle,
@@ -33,6 +32,12 @@ from radfusion.data.symile_cv import (
 )
 from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
 from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, OUTER_FOLDS, REPEAT_SEEDS
+from radfusion.data.symile_source import (
+    AuthenticatedReleaseAsset,
+    establish_authenticated_release_asset,
+    modality_asset_path,
+    reopen_authenticated_release_memmap,
+)
 from radfusion.training.config import ExperimentConfig
 
 DEVELOPMENT_COUNT = 2_368
@@ -220,15 +225,21 @@ class SymileCxrStore:
     """Authenticate and expose read-only official train/validation CXR tensors."""
 
     def __init__(self, bundle: SymileBundlePaths, source_root: str | Path) -> None:
+        reference = validate_symile_bundle_reference(
+            bundle.bundle_directory, expected_bundle_id=bundle.bundle_id
+        )
+        self._source_root = Path(source_root).absolute()
+        self._checksum_sha256 = reference.manifest["source"]["checksum_manifest_sha256"]
         self._arrays: dict[str, np.memmap] = {}
+        self._authorities: dict[str, AuthenticatedReleaseAsset] = {}
         for split in DEVELOPMENT_SPLITS:
-            path = authenticate_source_asset(
-                bundle,
-                source_root,
-                official_split=split,
-                modality="cxr",
+            path = modality_asset_path(self._source_root, split, "cxr")
+            authority = establish_authenticated_release_asset(
+                self._source_root,
+                checksum_manifest_sha256=self._checksum_sha256,
+                relative_path=path.absolute().relative_to(self._source_root).as_posix(),
             )
-            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            array = reopen_authenticated_release_memmap(authority)
             if (
                 not isinstance(array, np.memmap)
                 or array.dtype != np.float32
@@ -237,6 +248,30 @@ class SymileCxrStore:
             ):
                 raise ManifestBuildError("Symile development CXR tensor header is invalid")
             self._arrays[split] = array
+            self._authorities[split] = authority
+
+    def __getstate__(self) -> dict[str, object]:
+        """Send authenticated file references, not tensor contents, to spawned workers."""
+        return {
+            "source_root": self._source_root,
+            "checksum_sha256": self._checksum_sha256,
+            "arrays": {
+                split: (self._authorities[split], array.shape, array.dtype.str)
+                for split, array in self._arrays.items()
+            },
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self._source_root = state["source_root"]
+        self._checksum_sha256 = state["checksum_sha256"]
+        self._arrays = {}
+        self._authorities = {}
+        for split, (authority, shape, dtype) in state["arrays"].items():
+            array = reopen_authenticated_release_memmap(authority)
+            if not isinstance(array, np.memmap) or array.shape != shape or array.dtype.str != dtype:
+                raise ManifestBuildError("Symile CXR tensor header changed before worker access")
+            self._arrays[split] = array
+            self._authorities[split] = authority
 
     def canonical_image(self, official_split: str, source_row: int) -> np.ndarray:
         """Reconstruct one finite repeated-grayscale CXR in [0, 1]."""
