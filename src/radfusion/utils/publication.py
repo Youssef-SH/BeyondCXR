@@ -18,6 +18,16 @@ def staging_directory(destination: str | Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f".{target.name}-staging-", dir=target.parent))
 
 
+def is_publication_staging_directory(path: Path) -> bool:
+    """Identify unpublished sibling directories, including interrupted publications."""
+    return (
+        path.name.startswith(".")
+        and "-staging-" in path.name
+        and not path.is_symlink()
+        and path.is_dir()
+    )
+
+
 def install_immutable_directory(
     stage: str | Path,
     destination: str | Path,
@@ -78,6 +88,37 @@ def update_current_marker(current_path: str | Path, immutable_id: str) -> None:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def publish_bytes_no_replace(destination: str | Path, content: bytes) -> bool:
+    """Atomically publish complete bytes without replacing an existing pathname."""
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}-", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return False
+        _fsync_directory(target.parent)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def publish_directory(stage: str | Path, destination: str | Path) -> None:
