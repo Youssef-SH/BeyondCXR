@@ -188,11 +188,11 @@ def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
     policy: dict[str, object] = {
         "policy_version": INNER_SPLIT_POLICY_VERSION,
         "algorithm": "sklearn.model_selection.StratifiedGroupKFold",
-        "n_splits": 5,
+        "n_splits": len(OUTER_FOLDS),
         "shuffle": True,
         "generated_validation_fold": 0,
         "group_field": "subject_id",
-        "stratification_target": "pneumonia_strict",
+        "stratification_target": TASK_ID,
         "repeat_seed": outer.repeat_seed,
         "outer_fold": outer.outer_fold,
         "inner_seed": inner_seed,

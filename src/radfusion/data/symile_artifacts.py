@@ -39,6 +39,7 @@ from radfusion.data.symile_schemas import (
     LAB_SCHEMA,
     OFFICIAL_SPLITS,
     SAMPLE_SCHEMA,
+    TASK_ID,
     task_contract,
 )
 from radfusion.data.symile_source import (
@@ -381,7 +382,7 @@ def _base_metadata(source: QualifiedSymileSource, samples: pa.Table) -> dict[str
     return {
         "bundle_manifest_schema_version": BUNDLE_MANIFEST_SCHEMA_VERSION,
         "dataset": {"dataset_id": DATASET_ID, "release": DATASET_RELEASE},
-        "tasks": {"pneumonia_strict": task_contract()},
+        "tasks": {TASK_ID: task_contract()},
         "membership": {
             "source": _OFFICIAL_MEMBERSHIP_SOURCE,
             "test_selector": "label == 1 and label_hadm_id == hadm_id",
@@ -466,7 +467,7 @@ def _validate_manifest(metadata: object) -> None:
     assert isinstance(metadata, dict)
     if metadata["dataset"] != {"dataset_id": DATASET_ID, "release": DATASET_RELEASE} or metadata[
         "tasks"
-    ] != {"pneumonia_strict": task_contract()}:
+    ] != {TASK_ID: task_contract()}:
         raise ManifestBuildError("Symile manifest dataset/task contract is invalid")
     if metadata["privacy"] != {
         "classification": "restricted patient-level data",

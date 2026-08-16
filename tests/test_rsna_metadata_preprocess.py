@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pytest
 import skops.io as sio
 
@@ -10,7 +9,6 @@ from radfusion.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     RsnaMetadataFeatures,
     build_rsna_preprocessor,
-    fit_rsna_preprocessor,
     fitted_rsna_preprocessor_contract,
     load_preprocessor,
     save_preprocessor,
@@ -18,50 +16,32 @@ from radfusion.data.rsna_metadata_preprocess import (
     transformed_rsna_feature_names,
     validate_fitted_rsna_preprocessor,
 )
-from radfusion.data.rsna_schemas import RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
+from radfusion.models.rsna_metadata import MetadataLogisticModel
+from radfusion.training.config import load_experiment_config
 
 
-def _tables() -> tuple[pa.Table, pa.Table]:
-    samples = []
-    splits = []
-    values = (
-        ("train-a", 10.0, "F", "PA", 0.1, "train"),
-        ("train-b", 20.0, None, "AP", 0.2, "train"),
-        ("validation", 100.0, "M", "LL", 5.0, "validation"),
-    )
-    for name, age, sex, view, spacing, split_name in values:
-        sample_id = f"rsna:{name}"
-        samples.append(
-            {
-                "sample_id": sample_id,
-                "patient_id": name,
-                "image_id": name,
-                "image_path": f"stage_2_train_images/{name}.dcm",
-                "image_rows": 1024,
-                "image_columns": 1024,
-                "age_years": age,
-                "age_is_implausible": False,
-                "sex": sex,
-                "view_position": view,
-                "pixel_spacing_row_mm": spacing,
-                "pixel_spacing_col_mm": spacing,
-            }
-        )
-        splits.append(
-            {
-                "sample_id": sample_id,
-                "split_name": split_name,
-            }
-        )
+def _frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     return (
-        pa.Table.from_pylist(samples, RSNA_SAMPLE_SCHEMA),
-        pa.Table.from_pylist(splits, RSNA_SPLIT_SCHEMA),
+        pd.DataFrame(
+            [[10.0, False, "F", "PA", 0.1, 0.1], [20.0, False, None, "AP", 0.2, 0.2]],
+            columns=SOURCE_FEATURES,
+        ),
+        pd.DataFrame([[100.0, False, "M", "LL", 5.0, 5.0]], columns=SOURCE_FEATURES),
     )
 
 
 def test_preprocessor_fits_statistics_and_categories_on_training_only(tmp_path) -> None:
-    samples, splits = _tables()
-    preprocessor = fit_rsna_preprocessor(samples, splits)
+    training, validation = _frames()
+    fitted = MetadataLogisticModel().fit(
+        load_experiment_config("configs/rsna_metadata_logistic.yaml"),
+        42,
+        training,
+        np.asarray([0, 1]),
+        validation,
+        np.asarray([1]),
+    )
+    preprocessor = fitted.pipeline.named_steps["preprocess"]
+    features = pd.concat([training, validation], ignore_index=True)
     columns = preprocessor.named_steps["columns"]
     numeric = columns.named_transformers_["continuous"]
     categorical = columns.named_transformers_["categorical"]
@@ -72,21 +52,21 @@ def test_preprocessor_fits_statistics_and_categories_on_training_only(tmp_path) 
     assert None not in categories[0]
     assert "M" not in categories[0]
     assert "LL" not in categories[1]
-    transformed = preprocessor.transform(samples.to_pandas().loc[:, SOURCE_FEATURES])
+    transformed = preprocessor.transform(features)
     assert np.isfinite(transformed.to_numpy()).all()
 
     destination = save_preprocessor(preprocessor, tmp_path / "preprocessor.skops")
     restored = load_preprocessor(destination)
     np.testing.assert_allclose(
-        restored.transform(samples.to_pandas().loc[:, SOURCE_FEATURES]),
+        restored.transform(features),
         transformed,
     )
 
 
 def test_fitted_preprocessor_contract_and_transform_are_deterministic() -> None:
-    samples, splits = _tables()
-    preprocessor = fit_rsna_preprocessor(samples, splits)
-    features = samples.to_pandas().loc[:, SOURCE_FEATURES]
+    training, validation = _frames()
+    preprocessor = build_rsna_preprocessor().fit(training)
+    features = pd.concat([training, validation], ignore_index=True)
     first = transform_rsna_metadata(preprocessor, features)
     second = transform_rsna_metadata(preprocessor, features)
     names = transformed_rsna_feature_names(preprocessor)
@@ -119,8 +99,8 @@ def test_fitted_preprocessor_contract_and_transform_are_deterministic() -> None:
 
 
 def test_preprocessor_handles_unseen_categories_and_missing_values() -> None:
-    samples, splits = _tables()
-    preprocessor = fit_rsna_preprocessor(samples, splits)
+    training, _ = _frames()
+    preprocessor = build_rsna_preprocessor().fit(training)
     features = pd.DataFrame(
         [[None, False, "M", "LL", None, None]],
         columns=SOURCE_FEATURES,
@@ -178,8 +158,8 @@ def test_preprocessor_serialization_rejects_unfitted_or_malformed_state(tmp_path
     with pytest.raises(ValueError):
         load_preprocessor(destination)
 
-    samples, splits = _tables()
-    malformed = fit_rsna_preprocessor(samples, splits)
+    training, _ = _frames()
+    malformed = build_rsna_preprocessor().fit(training)
     categorical = malformed.named_steps["columns"].named_transformers_["categorical"]
     categorical.named_steps["encode"].handle_unknown = "error"
     with pytest.raises(ValueError):
@@ -207,8 +187,8 @@ def test_preprocessor_rejects_meaning_changing_sklearn_settings(
     attribute: str,
     value: object,
 ) -> None:
-    samples, splits = _tables()
-    preprocessor = fit_rsna_preprocessor(samples, splits)
+    training, _ = _frames()
+    preprocessor = build_rsna_preprocessor().fit(training)
     columns = preprocessor.named_steps["columns"]
     numeric = columns.named_transformers_["continuous"]
     categorical = columns.named_transformers_["categorical"]
@@ -226,15 +206,15 @@ def test_preprocessor_rejects_meaning_changing_sklearn_settings(
 
 
 def test_preprocessor_transform_rejects_nonfinite_output() -> None:
-    samples, splits = _tables()
-    preprocessor = fit_rsna_preprocessor(samples, splits)
+    training, validation = _frames()
+    preprocessor = build_rsna_preprocessor().fit(training)
     numeric = preprocessor.named_steps["columns"].named_transformers_["continuous"]
     numeric.named_steps["scale"].scale_[0] = np.nan
 
     with pytest.raises(ValueError):
         transform_rsna_metadata(
             preprocessor,
-            samples.to_pandas().loc[:, SOURCE_FEATURES],
+            pd.concat([training, validation], ignore_index=True),
         )
 
 

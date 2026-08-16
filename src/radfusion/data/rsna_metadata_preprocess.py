@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.exceptions import NotFittedError
@@ -17,7 +16,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from radfusion.data.errors import ManifestBuildError
 from radfusion.utils.skops_io import load_skops, save_skops
 
 CONTINUOUS_FEATURES = (
@@ -199,20 +197,6 @@ def build_rsna_preprocessor(
         verbose_feature_names_out=True,
     ).set_output(transform="pandas")
     return Pipeline([("metadata", RsnaMetadataFeatures()), ("columns", columns)])
-
-
-def fit_rsna_preprocessor(samples: pa.Table, splits: pa.Table) -> Pipeline:
-    """Fit preprocessing exclusively on samples assigned to the training split."""
-    sample_frame = samples.to_pandas()
-    split_frame = splits.to_pandas()
-    assignments = split_frame.loc[split_frame["split_name"] == "train", ["sample_id"]]
-    training = sample_frame.merge(assignments, on="sample_id", validate="one_to_one")
-    if training.empty:
-        raise ManifestBuildError("Cannot fit metadata preprocessing without training samples")
-    training = training.loc[:, SOURCE_FEATURES]
-    pipeline = build_rsna_preprocessor()
-    pipeline.fit(training)
-    return validate_fitted_rsna_preprocessor(pipeline)
 
 
 def validate_fitted_rsna_preprocessor(preprocessor: object) -> Pipeline:

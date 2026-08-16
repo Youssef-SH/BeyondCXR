@@ -283,23 +283,6 @@ class RsnaDataset:
         test = _partition(frame, "test")
         return test, _lineage(config, metadata)
 
-    def load_image_partition_frame(
-        self,
-        config: ExperimentConfig,
-        partition: str,
-    ) -> tuple[pd.DataFrame, DatasetLineage]:
-        """Load approved image rows without decoding DICOM pixels."""
-        if partition not in {"train", "validation", "test"}:
-            raise ManifestBuildError(f"Unsupported RSNA image partition: {partition!r}")
-        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
-        frame = _task_frame(
-            bundle,
-            config.task.task_id,
-            partitions=(partition,),
-            feature_columns=("image_path",),
-        )
-        return frame.loc[:, _IMAGE_FRAME_COLUMNS].copy(), _lineage(config, metadata)
-
     def load_cxr_train_validation(self, config: ExperimentConfig) -> CxrRunData:
         """Load train and validation rows bound to the pinned source inventory."""
         bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
