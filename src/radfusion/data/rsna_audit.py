@@ -374,7 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle_id=args.bundle_id,
         )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
-        print(f"RSNA audit failed: {exc}", file=sys.stderr)
+        print(f"RSNA audit failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(json.dumps(summary, indent=2))
     return 0

@@ -624,7 +624,7 @@ def main() -> int:
     try:
         result = execute_rsna_campaign()
     except Exception as exc:
-        print(f"RSNA campaign failed: {exc}", file=sys.stderr)
+        print(f"RSNA campaign failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

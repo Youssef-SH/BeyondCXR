@@ -380,7 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_directory=args.manifest_directory,
             )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
-        print(f"Symile CV generation failed: {exc}", file=sys.stderr)
+        print(f"Symile CV generation failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(
