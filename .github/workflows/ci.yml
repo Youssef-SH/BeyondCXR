@@ -20,6 +20,9 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
+      - name: Verify dependency lock
+        run: uv lock --check
+
       - name: Install locked dependencies
         run: uv sync --locked
 
@@ -31,3 +34,6 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      - name: Build package
+        run: uv build

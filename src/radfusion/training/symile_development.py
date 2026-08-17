@@ -449,7 +449,7 @@ def _fit_neural_outer_fold(
     )
     holdout_loader = build_evaluation_loader(
         holdout_dataset,
-        config=config.neural,
+        batch_size=config.neural.batch_size,
         runtime=context.runtime,
     )
     inference = deterministic_inference(
@@ -639,15 +639,11 @@ def _probability_metrics(targets: object, probabilities: object) -> dict[str, fl
     scores = np.asarray(probabilities, dtype=np.float64)
     if truth.shape != scores.shape or truth.ndim != 1 or set(truth.tolist()) != {0, 1}:
         raise ManifestBuildError("Symile metric inputs are invalid")
-    return {
-        "roc_auc": float(roc_auc_score(truth, scores)),
-        "average_precision": float(average_precision_score(truth, scores)),
-        "brier_score": float(brier_score_loss(truth, scores)),
-    }
+    return symile_headline_metrics(truth, scores)
 
 
 def _validate_source_argument(family: str, development_id: str | None) -> None:
-    if family in SYMILE_FUSION_FAMILIES:
+    if family in SYMILE_ALL_FUSION_FAMILIES:
         if development_id is None:
             raise ConfigError("Symile fusion development requires a source CXR development ID")
     elif development_id is not None:

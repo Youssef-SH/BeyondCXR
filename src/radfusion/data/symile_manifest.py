@@ -51,7 +51,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         with timed_phase(_LOGGER, "bundle_publication"):
             paths = write_symile_bundle(result, args.output_directory)
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
-        print(f"Symile manifest build failed: {exc}", file=sys.stderr)
+        print(f"Symile manifest build failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

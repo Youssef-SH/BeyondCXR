@@ -235,24 +235,6 @@ def validate_symile_cv_reference(
     return ValidatedSymileCvReference(dict(manifest), manifest_sha256, assignments)
 
 
-def resolve_symile_cv(
-    manifest_directory: str | Path,
-    *,
-    bundle: SymileBundlePaths,
-    cv_assignment_id_value: str,
-) -> Path:
-    """Resolve and validate one explicit immutable CV identity."""
-    if not _identity(cv_assignment_id_value):
-        raise ManifestBuildError("Symile CV assignment identity is invalid")
-    directory = Path(manifest_directory) / "symile" / CV_DIRECTORY / cv_assignment_id_value
-    validate_symile_cv(
-        directory,
-        bundle=bundle,
-        expected_assignment_id=cv_assignment_id_value,
-    )
-    return directory
-
-
 def _cv_identity_payload(bundle_id: str, logical_hash: str) -> dict[str, object]:
     return {
         "bundle_id": bundle_id,
@@ -398,7 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_directory=args.manifest_directory,
             )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
-        print(f"Symile CV generation failed: {exc}", file=sys.stderr)
+        print(f"Symile CV generation failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

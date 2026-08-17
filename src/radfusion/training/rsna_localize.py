@@ -692,7 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_directory=args.output_directory,
         )
     except (OSError, ValueError, KeyError) as exc:
-        print(f"Localization failed: {exc}", file=sys.stderr)
+        print(f"Localization failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(json.dumps({"report_directory": destination.as_posix()}, indent=2))
     return 0

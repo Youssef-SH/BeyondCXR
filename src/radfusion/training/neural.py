@@ -147,6 +147,14 @@ class EpochPermutationSampler(Sampler[tuple[int, int]]):
         return iter((epoch, index) for index in order)
 
 
+def configure_neural_determinism() -> None:
+    """Establish the deterministic backend state shared by training and inference."""
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def seed_neural_runtime(seed: int) -> None:
     """Seed Python, NumPy, PyTorch CPU/CUDA, and deterministic kernels."""
     _validate_seed(seed)
@@ -155,10 +163,7 @@ def seed_neural_runtime(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    configure_neural_determinism()
 
 
 def dataloader_generator(seed: int) -> torch.Generator:
@@ -212,11 +217,13 @@ def build_image_loaders(
 def build_evaluation_loader(
     dataset: Dataset[Any],
     *,
-    config: NeuralConfig,
+    batch_size: int,
     runtime: ResolvedDevice,
     execution: LoaderExecutionPolicy | None = None,
 ) -> DataLoader[Any]:
     """Construct one deterministic, ordered image-evaluation loader."""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("Evaluation batch size must be a positive integer")
     policy = execution or one_shot_loader_policy(pin_memory=runtime.pin_memory_effective)
     if policy.lifecycle != "one_shot":
         raise ValueError("Evaluation requires a one-shot DataLoader execution policy")

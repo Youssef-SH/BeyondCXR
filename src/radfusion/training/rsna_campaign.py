@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import time
 from collections.abc import Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -558,8 +559,8 @@ def _write_checksum(archive: Path) -> Path:
 def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
     """Create one consistent snapshot with archive-relative artifact URIs."""
     source_uri = f"file:{source.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(source_uri, uri=True) as input_database:
-        with sqlite3.connect(destination) as output_database:
+    with closing(sqlite3.connect(source_uri, uri=True)) as input_database:
+        with closing(sqlite3.connect(destination)) as output_database, output_database:
             input_database.backup(output_database)
             _make_mlflow_snapshot_portable(output_database)
             result = output_database.execute("PRAGMA integrity_check").fetchone()
@@ -569,7 +570,7 @@ def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
 
 def _validate_sqlite_integrity(database: Path) -> None:
     uri = f"file:{database.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
         result = connection.execute("PRAGMA integrity_check").fetchone()
     if result != ("ok",):
         raise RuntimeError("MLflow SQLite database failed integrity validation")
@@ -623,7 +624,7 @@ def main() -> int:
     try:
         result = execute_rsna_campaign()
     except Exception as exc:
-        print(f"RSNA campaign failed: {exc}", file=sys.stderr)
+        print(f"RSNA campaign failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

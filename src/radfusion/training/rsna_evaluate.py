@@ -264,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ValueError,
         KeyError,
     ) as exc:
-        print(f"Test evaluation failed: {exc}", file=sys.stderr)
+        print(f"Test evaluation failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

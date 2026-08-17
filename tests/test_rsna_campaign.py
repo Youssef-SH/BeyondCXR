@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import sqlite3
 import tarfile
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -392,7 +393,7 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
         log_text = archived_log.read().decode()
     assert "event=campaign_ready_for_export" in log_text
     assert "event=campaign_succeeded" not in log_text
-    with sqlite3.connect(exported_database) as database:
+    with closing(sqlite3.connect(exported_database)) as database:
         location = database.execute(
             "SELECT artifact_location FROM experiments WHERE name = 'radfusion-rsna'"
         ).fetchone()

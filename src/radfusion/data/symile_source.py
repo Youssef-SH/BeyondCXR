@@ -6,7 +6,9 @@ import ast
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -70,6 +72,7 @@ _IMAGENET_MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 3,
 _IMAGENET_STD = np.array((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 3, 1, 1)
 _SPLIT_SOURCE_NAMES = {"train": "train", "validation": "val", "test": "test"}
 _LOGGER = get_operational_logger(__name__)
+_AUTHENTICATED_RELEASE_ASSETS: dict[tuple[str, str, str], AuthenticatedReleaseAsset] = {}
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,17 @@ class SourceAsset:
             "expected_sha256": self.expected_sha256,
             "observed_sha256": self.observed_sha256,
         }
+
+
+@dataclass(frozen=True)
+class AuthenticatedReleaseAsset:
+    """Process-transferable capability for one byte-authenticated physical asset."""
+
+    source_root: Path
+    checksum_manifest_sha256: str
+    relative_path: str
+    expected_sha256: str
+    physical_identity: tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -183,6 +197,101 @@ def authenticate_release_asset(
     if sha256_file(path) != expected[relative_path]:
         raise ManifestBuildError("Requested source asset does not match SHA256SUMS")
     return path
+
+
+def establish_authenticated_release_asset(
+    source_root: str | Path,
+    *,
+    checksum_manifest_sha256: str,
+    relative_path: str,
+) -> AuthenticatedReleaseAsset:
+    """Authenticate expensive asset bytes once and return their physical authority."""
+    root = Path(source_root).absolute()
+    expected = _authenticated_checksum_map(root, checksum_manifest_sha256)
+    if relative_path not in expected:
+        raise ManifestBuildError("Requested source asset is absent from SHA256SUMS")
+    path = root / Path(*PurePosixPath(relative_path).parts)
+    key = (root.as_posix(), checksum_manifest_sha256, relative_path)
+    cached = _AUTHENTICATED_RELEASE_ASSETS.get(key)
+    if cached is not None:
+        descriptor = _open_authenticated_asset(cached)
+        os.close(descriptor)
+        return cached
+    descriptor = _open_physical_asset(path)
+    try:
+        before = _physical_identity(os.fstat(descriptor))
+        observed = _sha256_descriptor(descriptor)
+        after = _physical_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+    if before != after or observed != expected[relative_path]:
+        raise ManifestBuildError("Requested source asset does not match SHA256SUMS")
+    authority = AuthenticatedReleaseAsset(
+        source_root=root,
+        checksum_manifest_sha256=checksum_manifest_sha256,
+        relative_path=relative_path,
+        expected_sha256=expected[relative_path],
+        physical_identity=after,
+    )
+    _AUTHENTICATED_RELEASE_ASSETS[key] = authority
+    return authority
+
+
+def reopen_authenticated_release_memmap(authority: AuthenticatedReleaseAsset) -> np.memmap:
+    """Reopen a previously byte-authenticated asset without hashing it again."""
+    descriptor = _open_authenticated_asset(authority)
+    try:
+        array = np.load(f"/proc/self/fd/{descriptor}", mmap_mode="r", allow_pickle=False)
+        if _physical_identity(os.fstat(descriptor)) != authority.physical_identity:
+            raise ManifestBuildError("Authenticated source asset changed before worker access")
+        if not isinstance(array, np.memmap) or array.flags.writeable:
+            raise ManifestBuildError("Authenticated source asset did not open read-only")
+        array.filename = str(
+            authority.source_root / Path(*PurePosixPath(authority.relative_path).parts)
+        )
+        return array
+    finally:
+        os.close(descriptor)
+
+
+def _open_authenticated_asset(authority: AuthenticatedReleaseAsset) -> int:
+    if (
+        not isinstance(authority, AuthenticatedReleaseAsset)
+        or not _is_sha256(authority.checksum_manifest_sha256)
+        or not _is_sha256(authority.expected_sha256)
+        or PurePosixPath(authority.relative_path).as_posix() != authority.relative_path
+        or len(authority.physical_identity) != 5
+    ):
+        raise ManifestBuildError("Authenticated source authority is invalid")
+    path = authority.source_root / Path(*PurePosixPath(authority.relative_path).parts)
+    descriptor = _open_physical_asset(path)
+    if _physical_identity(os.fstat(descriptor)) != authority.physical_identity:
+        os.close(descriptor)
+        raise ManifestBuildError("Authenticated source asset changed before worker access")
+    return descriptor
+
+
+def _open_physical_asset(path: Path) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ManifestBuildError("Requested source asset is not a physical regular file") from exc
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ManifestBuildError("Requested source asset is not a physical regular file")
+    return descriptor
+
+
+def _physical_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _authenticated_checksum_map(root: Path, expected_sha256: str) -> dict[str, str]:

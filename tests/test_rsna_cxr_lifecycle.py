@@ -719,6 +719,13 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
     assert setup.seed_calls == [setup.config.runtime.seed]
     assert setup.build_calls == ["cxr_densenet"]
     assert setup.construction_events == ["fingerprint", "build", "fingerprint"]
+    report_directory = setup.config.runtime.report_directory / "rsna" / "runs" / training.run_id
+    report = json.loads((report_directory / "metrics.json").read_bytes())
+    assert report["cxr_training"]["source_authentication"]["file_count"] == 12
+    assert report["cxr_training"]["limitations"][-1] == (
+        "The shared CXR cache authenticates and decodes all partitions; "
+        "test samples are not used for fitting, selection, or threshold derivation."
+    )
     assert training.model_path.name == "model.pt"
     package_manifest = validate_published_neural_model(training.model_path.parent)
     assert package_manifest["model_package_schema_version"] == 1

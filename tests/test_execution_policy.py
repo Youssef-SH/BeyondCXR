@@ -51,7 +51,9 @@ def test_loader_builders_apply_distinct_lifecycle_topologies() -> None:
             pin_memory=runtime.pin_memory_effective,
         ),
     )
-    one_shot = build_evaluation_loader(dataset, config=config.neural, runtime=runtime)
+    one_shot = build_evaluation_loader(
+        dataset, batch_size=config.neural.batch_size, runtime=runtime
+    )
 
     assert reused.train.num_workers == config.runtime.num_workers
     assert reused.train.persistent_workers is True

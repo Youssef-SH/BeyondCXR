@@ -201,7 +201,7 @@ def test_fusion_config_rejects_unknown_missing_and_nonfixed_fields(
 
 def test_fusion_training_requires_explicit_runtime_source_package(capsys) -> None:
     assert train_main(["--config", "configs/rsna_cxr_metadata_concat.yaml", "--seed", "42"]) == 1
-    assert "--source-cxr-package-id" in capsys.readouterr().err
+    assert "Experiment failed: ValueError" in capsys.readouterr().err
 
 
 def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership() -> None:

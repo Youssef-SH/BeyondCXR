@@ -66,7 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ValueError,
         KeyError,
     ) as exc:
-        print(f"Experiment failed: {exc}", file=sys.stderr)
+        print(f"Experiment failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(

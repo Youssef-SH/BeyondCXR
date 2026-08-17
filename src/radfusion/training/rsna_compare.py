@@ -165,7 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_directory=args.model_directory,
         )
     except (OSError, ValueError, KeyError) as exc:
-        print(f"Comparison failed: {exc}", file=sys.stderr)
+        print(f"Comparison failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(f"Wrote {count} rows to {csv_path} and {markdown_path}")
     return 0

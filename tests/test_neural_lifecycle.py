@@ -22,6 +22,7 @@ from radfusion.training.neural import (
     NeuralTrainingError,
     build_evaluation_loader,
     candidate_is_improvement,
+    configure_neural_determinism,
     deterministic_inference,
     fit_rsna_cxr_model,
     fit_rsna_two_stage_binary_model,
@@ -174,10 +175,39 @@ def test_loaders_reject_pin_memory_policy_that_differs_from_runtime() -> None:
     with pytest.raises(ValueError):
         build_evaluation_loader(
             dataset,
-            config=_rsna_cxr_neural_config(),
+            batch_size=_rsna_cxr_neural_config().batch_size,
             runtime=runtime,
             execution=evaluation_execution,
         )
+
+
+def test_neural_determinism_configures_algorithms_and_cudnn(monkeypatch) -> None:
+    calls: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(
+        torch,
+        "use_deterministic_algorithms",
+        lambda enabled, *, warn_only: calls.append((enabled, warn_only)),
+    )
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", False)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", True)
+
+    configure_neural_determinism()
+
+    assert calls == [(True, True)]
+    assert torch.backends.cudnn.deterministic is True
+    assert torch.backends.cudnn.benchmark is False
+
+
+def test_seed_neural_runtime_uses_shared_determinism_configurator(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "radfusion.training.neural.configure_neural_determinism",
+        lambda: calls.append("configured"),
+    )
+
+    seed_neural_runtime(42)
+
+    assert calls == ["configured"]
 
 
 def test_repeated_tiny_training_is_deterministic() -> None:

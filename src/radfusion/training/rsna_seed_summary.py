@@ -609,7 +609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             private_directory=args.private_directory,
         )
     except (OSError, ValueError) as exc:
-        print(f"Seed summary failed: {exc}", file=sys.stderr)
+        print(f"Seed summary failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(json.dumps({"seed_summary_id": result.seed_summary_id}, indent=2))
     return 0

@@ -101,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest_root=args.manifest_root,
         )
     except (ManifestBuildError, OSError, ValueError) as exc:
-        print(f"Symile development analysis failed: {exc}", file=sys.stderr)
+        print(f"Symile development analysis failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps({"analysis_id": analysis_id, "report_directory": directory.as_posix()}, indent=2)
