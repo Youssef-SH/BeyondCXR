@@ -43,3 +43,14 @@ def test_report_renders_configured_sensitivity_target_and_exact_metric_names(
     assert "Youden-J operating point" in report
     assert "Target-sensitivity operating point" in report
     assert "validation evaluation" in report
+
+    document["cxr_training"] = {
+        "selection": {"selected_stage": "warmup", "selected_epoch": 1},
+        "source_authentication": {"file_count": 12},
+    }
+    _write_evaluation_report(path, "test_model", document)
+    report = path.read_text(encoding="utf-8")
+    assert "Authenticated cache files (all partitions): 12" in report
+    assert "includes decoded test images" in report
+    assert "not used for fitting, selection, or threshold derivation" in report
+    assert "Test data were not loaded" not in report

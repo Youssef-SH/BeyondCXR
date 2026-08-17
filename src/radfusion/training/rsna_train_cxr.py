@@ -463,7 +463,8 @@ def train_cxr_experiment(
             },
             "limitations": [
                 "The challenge target is radiology-derived.",
-                "Test data were not loaded, decoded, authenticated, or evaluated.",
+                "The shared CXR cache authenticates and decodes all partitions; "
+                "test samples are not used for fitting, selection, or threshold derivation.",
             ],
         }
         report_directory = (

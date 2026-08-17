@@ -453,8 +453,9 @@ def _write_evaluation_report(path: Path, model_name: str, document: dict[str, An
                 "",
                 f"- Selected state: {selection['selected_stage']} epoch "
                 f"{selection['selected_epoch']}",
-                f"- Authenticated train/validation files: {authentication['file_count']}",
-                "- Test data were not loaded, decoded, authenticated, or evaluated.",
+                f"- Authenticated cache files (all partitions): {authentication['file_count']}",
+                "- The shared CXR cache includes decoded test images; test samples are not "
+                "used for fitting, selection, or threshold derivation.",
             ]
         )
     if cxr_evaluation := document.get("cxr_evaluation"):
