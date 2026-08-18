@@ -8,8 +8,17 @@ from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 from torch import nn
 
+from radfusion.data.errors import ManifestBuildError
 from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
 from radfusion.models.fusion_concat import initialize_fusion_encoder
+from radfusion.models.symile_ecg_fusion import (
+    ECG_ENCODER_PARAMETER_COUNT,
+    TRIMODAL_EXCLUDING_CXR_ENCODER_PARAMETER_COUNT,
+    SymileEcgEncoder,
+    SymileTriModalGatedHead,
+    SymileTriModalGatedModel,
+    parameter_count,
+)
 from radfusion.models.symile_fusion import (
     SymileConcatFusionModel,
     SymileGatedFusionHead,
@@ -23,6 +32,8 @@ from radfusion.models.symile_tabular import (
 )
 from radfusion.training.config import load_symile_development_config
 from radfusion.training.neural import seed_neural_runtime
+from radfusion.training.symile_data import validated_symile_lab_matrix
+from radfusion.training.symile_ecg_data import SymileEcgStore
 
 
 class _TinyEncoder(nn.Module):
@@ -55,7 +66,7 @@ def test_symile_logistic_is_exact_unweighted_and_produces_logits() -> None:
         parameters=config.training.parameters,
         selection_metric=config.training.selection_metric,
         lab_policy=str(config.preprocessing["lab_policy"]),
-        repeat_seed=17,
+        training_seed=17,
     )
     classifier = fit.pipeline.named_steps["classifier"]
 
@@ -80,7 +91,7 @@ def test_symile_lightgbm_is_exact_unweighted_and_seed_owned() -> None:
         lab_policy=str(config.preprocessing["lab_policy"]),
         inner_training_indices=training,
         inner_validation_indices=validation,
-        repeat_seed=42,
+        training_seed=42,
     )
     classifier = fit.pipeline.named_steps["classifier"]
     parameters = classifier.get_params()
@@ -106,7 +117,7 @@ def test_symile_tabular_builders_consume_canonical_selection_metric() -> None:
             parameters=logistic.training.parameters,
             selection_metric="roc_auc",
             lab_policy=str(logistic.preprocessing["lab_policy"]),
-            repeat_seed=17,
+            training_seed=17,
         )
 
     lightgbm = load_symile_development_config("configs/symile_labs_lightgbm.yaml")
@@ -119,7 +130,7 @@ def test_symile_tabular_builders_consume_canonical_selection_metric() -> None:
             lab_policy=str(lightgbm.preprocessing["lab_policy"]),
             inner_training_indices=np.arange(16, dtype=np.int64),
             inner_validation_indices=np.arange(16, 20, dtype=np.int64),
-            repeat_seed=17,
+            training_seed=17,
         )
 
 
@@ -132,7 +143,7 @@ def test_symile_tabular_builder_consumes_lab_preprocessing_policy() -> None:
             parameters=config.training.parameters,
             selection_metric=config.training.selection_metric,
             lab_policy="unsupported-policy",
-            repeat_seed=17,
+            training_seed=17,
         )
 
 
@@ -277,3 +288,178 @@ def test_gated_fusion_core_rejects_cross_device_inputs_when_cuda_is_available() 
         gated_fusion_core((cpu, cuda), torch.ones((2, 6), dtype=torch.float32))
     with pytest.raises(ValueError, match="representation device"):
         gated_fusion_core((cpu, cpu), torch.ones((2, 6), dtype=torch.float32, device="cuda"))
+
+
+def test_ecg_encoder_exact_shape_count_and_seeded_initialization() -> None:
+    seed_neural_runtime(17)
+    first = SymileEcgEncoder().eval()
+    seed_neural_runtime(17)
+    second = SymileEcgEncoder().eval()
+
+    assert parameter_count(first) == ECG_ENCODER_PARAMETER_COUNT
+    output = first(torch.ones((2, 12, 5000), dtype=torch.float32))
+    assert output.shape == (2, 256)
+    assert torch.isfinite(output).all()
+    for name, value in first.state_dict().items():
+        torch.testing.assert_close(value, second.state_dict()[name])
+    with pytest.raises(ValueError, match="B x 12 x 5000"):
+        first(torch.zeros((2, 1, 5000, 12), dtype=torch.float32))
+    with pytest.raises(ValueError, match="B x 12 x 5000"):
+        first(torch.zeros((2, 12, 5000), dtype=torch.float64))
+
+
+@pytest.mark.parametrize("value", [0.0, 1.1, -1.1, float("nan")])
+def test_ecg_store_enforces_source_value_contract_before_model_access(value: float) -> None:
+    store = object.__new__(SymileEcgStore)
+    store._arrays = {  # type: ignore[attr-defined]
+        "train": np.full((1, 1, 5000, 12), 0.25, dtype=np.float32)
+    }
+
+    signal = store.signal("train", 0)
+
+    assert signal.shape == (12, 5000)
+    assert signal.dtype == np.float32
+    assert np.allclose(signal, 0.25)
+
+    store._arrays = {  # type: ignore[attr-defined]
+        "train": np.full((1, 1, 5000, 12), value, dtype=np.float32)
+    }
+    with pytest.raises(ManifestBuildError, match="frozen contract"):
+        store.signal("train", 0)
+
+
+def test_tri_modal_gate_is_separate_from_core_and_normalizes_three_modalities() -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    head = SymileTriModalGatedHead(config.family.parameters).eval()
+    embedding = torch.ones((2, 1024), dtype=torch.float32)
+    labs = torch.cat((torch.full((2, 50), 0.5), torch.ones((2, 50))), dim=1)
+    ecg = torch.ones((2, 12, 5000), dtype=torch.float32)
+
+    logits, weights = head.forward_with_gates(embedding, labs, ecg)
+
+    assert logits.shape == (2,)
+    assert weights.shape == (2, 3, 256)
+    torch.testing.assert_close(weights.sum(dim=1), torch.ones((2, 256)), rtol=0, atol=1e-6)
+    assert parameter_count(head) == TRIMODAL_EXCLUDING_CXR_ENCODER_PARAMETER_COUNT
+    assert SymileGatedFusionHead is not type(head)
+    assert head.gate[0].in_features == 818
+    assert head.gate[-1].out_features == 768
+
+
+def test_tri_modal_gate_appends_exact_lab_observedness_context() -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    head = SymileTriModalGatedHead(config.family.parameters).eval()
+    observedness = (torch.arange(50) % 2).reshape(1, 50).to(torch.float32)
+    labs = torch.cat((torch.full((1, 50), 0.25), observedness), dim=1)
+    captured: list[torch.Tensor] = []
+    hook = head.gate[0].register_forward_pre_hook(
+        lambda _module, inputs: captured.append(inputs[0].detach().clone())
+    )
+    try:
+        head.forward_with_gates(
+            torch.ones((1, 1024), dtype=torch.float32),
+            labs,
+            torch.ones((1, 12, 5000), dtype=torch.float32),
+        )
+    finally:
+        hook.remove()
+
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0][:, -50:], observedness)
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_tri_modal_autocast_forward_backward(device_type: str) -> None:
+    if device_type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    dtype = torch.bfloat16 if device_type == "cpu" else torch.float16
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    model = SymileTriModalGatedModel(_TinyEncoder(), config.family.parameters).to(device_type)
+    images = torch.ones(2, 1, 16, 16, device=device_type)
+    labs = torch.ones(2, 100, device=device_type)
+    ecg = torch.ones(2, 12, 5000, device=device_type)
+    # Some CPU oneDNN builds lack reduced-precision convolution backward.
+    # Change only backend availability; mkldnn.flags() also changes TF32 policy.
+    with pytest.MonkeyPatch.context() as backend:
+        if device_type == "cpu":
+            backend.setattr(torch.backends.mkldnn, "enabled", False)
+        with torch.autocast(device_type, dtype=dtype):
+            embedding = model.encoder.encode(images)
+            assert embedding.dtype == dtype
+            logits, weights = model.classifier.forward_with_gates(embedding, labs, ecg)
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, torch.tensor([0.0, 1.0], device=device_type)
+            )
+        assert logits.shape == (2,)
+        assert weights.shape == (2, 3, 256)
+        assert torch.isfinite(logits).all() and torch.isfinite(loss)
+        torch.testing.assert_close(
+            weights.float().sum(1),
+            torch.ones(2, 256, device=device_type),
+            rtol=0,
+            atol=torch.finfo(dtype).eps / 2,
+        )
+        loss.backward()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters()
+        )
+        with torch.no_grad(), torch.autocast(device_type, dtype=dtype):
+            assert torch.isfinite(model(images, labs, ecg)).all()
+    if device_type == "cuda":
+        with pytest.raises(ValueError, match="laboratory input"):
+            model.classifier(embedding, labs.cpu(), ecg)
+        with pytest.raises(ValueError, match="share the fusion input device"):
+            model.classifier(embedding, labs, ecg.cpu())
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "shape", "labs"])
+def test_tri_modal_autocast_preserves_structural_input_rejections(invalid: str) -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    head = SymileTriModalGatedHead(config.family.parameters)
+    embedding = torch.ones(1, 1024, dtype=torch.bfloat16)
+    labs = torch.ones(1, 100)
+    ecg = torch.ones(1, 12, 5000)
+    if invalid == "dtype":
+        ecg = ecg.bfloat16()
+    elif invalid == "shape":
+        ecg = ecg.transpose(1, 2)
+    else:
+        labs = labs[:, :99]
+    with (
+        torch.autocast("cpu", dtype=torch.bfloat16),
+        pytest.raises(ValueError, match="ECG input|laboratory input"),
+    ):
+        head(embedding, labs, ecg)
+
+
+@pytest.mark.parametrize("value", [0.5, 1.0001, -0.1, float("nan"), float("inf")])
+def test_transformed_lab_boundary_rejects_invalid_observedness(value: float) -> None:
+    labs = np.zeros((1, 100), dtype=np.float32)
+    labs[0, -1] = value
+
+    with pytest.raises(ManifestBuildError, match="laboratory matrix"):
+        validated_symile_lab_matrix(labs, rows=1)
+
+
+def test_tri_modal_freeze_changes_only_the_cxr_encoder() -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    model = SymileTriModalGatedModel(_TinyEncoder(), config.family.parameters)
+
+    model.freeze_encoder()
+
+    assert all(not parameter.requires_grad for parameter in model.encoder.parameters())
+    assert all(parameter.requires_grad for parameter in model.classifier.parameters())
+    model.unfreeze_encoder()
+    assert all(parameter.requires_grad for parameter in model.encoder.parameters())
+
+
+def test_tri_modal_non_cxr_initialization_is_training_seed_deterministic() -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    seed_neural_runtime(42)
+    first = SymileTriModalGatedModel(_TinyEncoder(), config.family.parameters)
+    seed_neural_runtime(42)
+    second = SymileTriModalGatedModel(_TinyEncoder(), config.family.parameters)
+
+    for name, value in first.classifier.state_dict().items():
+        torch.testing.assert_close(value, second.classifier.state_dict()[name])

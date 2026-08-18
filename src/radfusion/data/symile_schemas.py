@@ -8,6 +8,7 @@ DATASET_ID = "symile"
 DATASET_RELEASE = "1.0.0"
 TASK_ID = "pneumonia_strict"
 LABEL_POLICY_VERSION = "symile-pneumonia-strict-v1"
+ECG_TENSOR_POLICY_VERSION = "symile-ecg-tensor-v1"
 OFFICIAL_SPLITS = ("train", "validation", "test")
 DEVELOPMENT_SPLITS = ("train", "validation")
 REPEAT_SEEDS = (17, 42, 2026)

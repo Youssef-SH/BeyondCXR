@@ -27,6 +27,7 @@ CONFIG_FILENAMES = (
     "symile_cxr_labs_concat.yaml",
     "symile_cxr_labs_gated.yaml",
     "symile_cxr_labs_gated_no_observedness.yaml",
+    "symile_cxr_labs_ecg_gated.yaml",
 )
 
 
@@ -40,7 +41,7 @@ def _write(tmp_path: Path, document: dict[str, object]) -> Path:
     return path
 
 
-def test_config_directory_contains_exactly_the_ten_canonical_files() -> None:
+def test_config_directory_contains_exactly_the_eleven_canonical_files() -> None:
     observed = tuple(sorted(path.name for path in Path("configs").glob("*.yaml")))
     assert observed == tuple(sorted(CONFIG_FILENAMES))
     assert all(_document(name)["config_schema_version"] == 1 for name in CONFIG_FILENAMES)
@@ -77,6 +78,7 @@ def test_family_and_modality_vocabulary_is_exact() -> None:
         "cxr",
         "metadata",
         "labs",
+        "ecg",
     }
 
 
@@ -141,6 +143,7 @@ def test_selection_metric_is_canonical_for_all_families() -> None:
         "symile_cxr_labs_concat.yaml": "roc_auc",
         "symile_cxr_labs_gated.yaml": "roc_auc",
         "symile_cxr_labs_gated_no_observedness.yaml": "roc_auc",
+        "symile_cxr_labs_ecg_gated.yaml": "roc_auc",
     }
     assert {
         name: load_experiment_config(Path("configs") / name).training.selection_metric
