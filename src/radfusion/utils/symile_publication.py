@@ -18,7 +18,6 @@ import pandas as pd
 import torch
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 
 from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, StandardCxrTransform
@@ -38,8 +37,14 @@ from radfusion.data.symile_preprocess import (
     save_symile_lab_preprocessor,
     validate_symile_lab_preprocessor,
 )
-from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS, OUTER_FOLDS, REPEAT_SEEDS
+from radfusion.data.symile_schemas import (
+    DEVELOPMENT_SPLITS,
+    OUTER_FOLDS,
+    REPEAT_SEEDS,
+    TASK_ID,
+)
 from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
+from radfusion.models.symile_ecg_fusion import build_symile_trimodal_gated_model
 from radfusion.models.symile_fusion import build_symile_concat_model, build_symile_gated_model
 from radfusion.models.symile_tabular import symile_tabular_logits
 from radfusion.training.config import ExperimentConfig, load_symile_development_config
@@ -50,10 +55,19 @@ from radfusion.training.symile_data import (
     derive_inner_seed,
 )
 from radfusion.training.symile_families import (
+    SYMILE_ALL_FUSION_FAMILIES,
+    SYMILE_ALL_NEURAL_FAMILIES,
     SYMILE_CORE_DEVELOPMENT_FAMILIES,
+    SYMILE_ECG_GATED_FAMILY,
     SYMILE_FUSION_FAMILIES,
-    SYMILE_NEURAL_FAMILIES,
     SYMILE_TABULAR_FAMILIES,
+)
+from radfusion.training.symile_statistics import (
+    METRIC_POLICY,
+    headline_metric_names,
+)
+from radfusion.training.symile_statistics import (
+    metrics as symile_headline_metrics,
 )
 from radfusion.utils.package_identity import (
     canonical_scientific_id,
@@ -122,7 +136,7 @@ _LINEAGE_FIELDS = {
 SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY = {
     "policy_version": "symile-core-development-analysis-v1",
     "alignment": ["sample_id", "repeat_seed"],
-    "metrics": ["roc_auc", "average_precision", "brier_score"],
+    "metric_policy": METRIC_POLICY,
     "paired_comparisons": {
         "concat_minus_cxr": ["cxr_labs_concat", "cxr_densenet"],
         "gated_minus_cxr": ["cxr_labs_gated", "cxr_densenet"],
@@ -222,7 +236,7 @@ def publish_fold_package(
                 + "\n",
                 encoding="utf-8",
             )
-        if family in SYMILE_FUSION_FAMILIES:
+        if family in SYMILE_ALL_FUSION_FAMILIES:
             if not isinstance(lab_preprocessor, SymileLabEcdfTransformer):
                 raise ManifestBuildError("Fusion fold lab preprocessor has the wrong type")
             save_symile_lab_preprocessor(lab_preprocessor, stage / LAB_PREPROCESSOR_FILENAME)
@@ -247,7 +261,7 @@ def publish_fold_package(
             fitted_object_state_sha256(
                 load_symile_lab_preprocessor(stage / LAB_PREPROCESSOR_FILENAME)
             )
-            if family in SYMILE_FUSION_FAMILIES
+            if family in SYMILE_ALL_FUSION_FAMILIES
             else None
         )
         identity_payload = _fold_identity_payload(
@@ -365,7 +379,7 @@ def validate_fold_package(
         _validate_neural_reconstruction(config, checkpoint)
         history = _load_json_list(root / TRAINING_HISTORY_FILENAME)
         _validate_training_history(history, document["selection"], config)
-    if document["family_id"] in SYMILE_FUSION_FAMILIES:
+    if document["family_id"] in SYMILE_ALL_FUSION_FAMILIES:
         try:
             preprocessor = load_symile_lab_preprocessor(root / LAB_PREPROCESSOR_FILENAME)
         except (OSError, ValueError, TypeError) as exc:
@@ -560,7 +574,7 @@ def validate_development_result(
     if not isinstance(document, dict) or set(document) != expected_fields:
         raise ManifestBuildError("Symile development manifest fields are invalid")
     _validate_family(document["family_id"])
-    if document["dataset_id"] != "symile" or document["task_id"] != "pneumonia_strict":
+    if document["dataset_id"] != "symile" or document["task_id"] != TASK_ID:
         raise ManifestBuildError("Symile development dataset/task contract is invalid")
     schema_version = document["development_schema_version"]
     if (
@@ -689,7 +703,7 @@ def publish_analysis_result(
     )
     identity_payload = {
         "dataset_id": "symile",
-        "task_id": "pneumonia_strict",
+        "task_id": TASK_ID,
         "family_development_ids": dict(sorted(family_development_ids.items())),
         "policy": SYMILE_CORE_DEVELOPMENT_ANALYSIS_POLICY,
     }
@@ -770,7 +784,7 @@ def validate_analysis_result(
         raise ManifestBuildError("Symile analysis schema version is invalid")
     if (
         document["dataset_id"] != "symile"
-        or document["task_id"] != "pneumonia_strict"
+        or document["task_id"] != TASK_ID
         or set(document["family_development_ids"]) != set(SYMILE_CORE_DEVELOPMENT_FAMILIES)
         or any(
             not _identity(value, DEVELOPMENT_PREFIX)
@@ -927,13 +941,13 @@ def _validate_fold_manifest(document: object) -> None:
         or not _identity(lineage.get("split_assignment_id"), "split-assignment-")
         or not _identity(lineage.get("cv_assignment_id"), "cv-assignment-")
         or not _sha256(lineage.get("cv_manifest_sha256"))
-        or lineage.get("task_id") != "pneumonia_strict"
+        or lineage.get("task_id") != TASK_ID
         or not isinstance(lineage.get("git_commit"), str)
         or not lineage["git_commit"]
         or not _sha256(lineage.get("dependency_lock_sha256"))
     ):
         raise ManifestBuildError("Symile fold data/code lineage is invalid")
-    if document["family_id"] in SYMILE_NEURAL_FAMILIES:
+    if document["family_id"] in SYMILE_ALL_NEURAL_FAMILIES:
         encoder = lineage.get("encoder_identity")
         if (
             not isinstance(encoder, dict)
@@ -971,7 +985,7 @@ def _validate_fold_manifest(document: object) -> None:
             ):
                 raise ManifestBuildError("Symile CXR fold lacks pretrained-weight lineage")
         if (
-            document["family_id"] in SYMILE_FUSION_FAMILIES
+            document["family_id"] in SYMILE_ALL_FUSION_FAMILIES
             and lineage.get("pretrained_weight") is not None
         ):
             raise ManifestBuildError("Symile fusion fold duplicates pretrained-weight lineage")
@@ -1011,7 +1025,7 @@ def _validate_fold_manifest(document: object) -> None:
         or policy.get("shuffle") is not True
         or policy.get("generated_validation_fold") != 0
         or policy.get("group_field") != "subject_id"
-        or policy.get("stratification_target") != "pneumonia_strict"
+        or policy.get("stratification_target") != TASK_ID
         or policy.get("repeat_seed") != document["repeat_seed"]
         or policy.get("outer_fold") != document["outer_fold"]
         or inner["inner_seed"] != canonical_inner_seed
@@ -1029,7 +1043,7 @@ def _validate_fold_manifest(document: object) -> None:
         raise ManifestBuildError("Symile fold fitted-state declaration is invalid")
     selection = document["selection"]
     expected_selection = {"metric", "selected_epoch", "best_iteration"}
-    if document["family_id"] in SYMILE_NEURAL_FAMILIES:
+    if document["family_id"] in SYMILE_ALL_NEURAL_FAMILIES:
         expected_selection |= {"selected_stage", "selected_validation_metric"}
     if set(selection) != expected_selection:
         raise ManifestBuildError("Symile fold selection fields are invalid")
@@ -1047,7 +1061,7 @@ def _validate_fold_manifest(document: object) -> None:
         or selection["best_iteration"] <= 0
     ):
         raise ManifestBuildError("Symile LightGBM selection is invalid")
-    if document["family_id"] in SYMILE_NEURAL_FAMILIES and (
+    if document["family_id"] in SYMILE_ALL_NEURAL_FAMILIES and (
         selection.get("metric") != "roc_auc"
         or isinstance(selection.get("selected_epoch"), bool)
         or not isinstance(selection.get("selected_epoch"), int)
@@ -1057,7 +1071,7 @@ def _validate_fold_manifest(document: object) -> None:
         or not _finite(selection.get("selected_validation_metric"))
     ):
         raise ManifestBuildError("Symile neural selection is invalid")
-    if document["family_id"] in SYMILE_FUSION_FAMILIES:
+    if document["family_id"] in SYMILE_ALL_FUSION_FAMILIES:
         source = document.get("source_cxr")
         if (
             not isinstance(source, dict)
@@ -1076,7 +1090,7 @@ def _validate_fold_manifest(document: object) -> None:
         or not isinstance(operational.get("mlflow_run_id"), str)
         or not operational["mlflow_run_id"]
         or (
-            document["family_id"] in SYMILE_NEURAL_FAMILIES
+            document["family_id"] in SYMILE_ALL_NEURAL_FAMILIES
             and not isinstance(operational.get("runtime_provenance"), dict)
         )
         or (
@@ -1134,12 +1148,12 @@ def _validate_fold_config(config: ExperimentConfig, document: Mapping[str, Any])
             "weights": config.family.parameters["weights"],
             "embedding_dimension": config.family.parameters["embedding_dimension"],
         }
-        if config.family.family_id in SYMILE_NEURAL_FAMILIES
+        if config.family.family_id in SYMILE_ALL_NEURAL_FAMILIES
         else None
     )
     transform_contract = (
         _evaluation_transform_contract(config)
-        if config.family.family_id in SYMILE_NEURAL_FAMILIES
+        if config.family.family_id in SYMILE_ALL_NEURAL_FAMILIES
         else None
     )
     pretrained = lineage["pretrained_weight"]
@@ -1284,6 +1298,8 @@ def _validate_neural_reconstruction(
             )
         elif config.family.family_id == "cxr_labs_concat":
             model = build_symile_concat_model(parameters, weights=None)
+        elif config.family.family_id == SYMILE_ECG_GATED_FAMILY:
+            model = build_symile_trimodal_gated_model(parameters, weights=None)
         else:
             model = build_symile_gated_model(parameters, weights=None)
         state = checkpoint["model_state_dict"]
@@ -1410,7 +1426,7 @@ def _validate_fold_contents(
             raise ManifestBuildError("Tabular fold received neural-only artifacts")
     elif not training_history:
         raise ManifestBuildError("Neural fold requires a training history")
-    if family in SYMILE_FUSION_FAMILIES:
+    if family in SYMILE_ALL_FUSION_FAMILIES:
         if lab_preprocessor is None or source_cxr is None:
             raise ManifestBuildError("Fusion fold requires preprocessing and CXR lineage")
     elif source_cxr is not None:
@@ -1422,18 +1438,14 @@ def _fold_files(family: str) -> set[str]:
     if family in SYMILE_TABULAR_FAMILIES:
         return common | {TABULAR_MODEL_FILENAME}
     files = common | {NEURAL_MODEL_FILENAME, TRAINING_HISTORY_FILENAME}
-    return files | ({LAB_PREPROCESSOR_FILENAME} if family in SYMILE_FUSION_FAMILIES else set())
+    return files | ({LAB_PREPROCESSOR_FILENAME} if family in SYMILE_ALL_FUSION_FAMILIES else set())
 
 
 def _validate_repeat_metrics(value: object) -> None:
     if not isinstance(value, Mapping) or set(value) != {"17", "42", "2026"}:
         raise ManifestBuildError("Symile repeat metric set is invalid")
     for metrics in value.values():
-        if not isinstance(metrics, Mapping) or set(metrics) != {
-            "roc_auc",
-            "average_precision",
-            "brier_score",
-        }:
+        if not isinstance(metrics, Mapping) or set(metrics) != set(headline_metric_names()):
             raise ManifestBuildError("Symile repeat metric fields are invalid")
         if not all(_finite(metric) and 0.0 <= float(metric) <= 1.0 for metric in metrics.values()):
             raise ManifestBuildError("Symile repeat metrics are invalid")
@@ -1466,12 +1478,53 @@ def _prediction_repeat_metrics(
             raise ManifestBuildError("Symile development targets differ across repeats")
         truth = frame["target"].to_numpy(dtype=np.int8)
         scores = frame["probability"].to_numpy(dtype=np.float64)
-        result[str(seed)] = {
-            "roc_auc": float(roc_auc_score(truth, scores)),
-            "average_precision": float(average_precision_score(truth, scores)),
-            "brier_score": float(brier_score_loss(truth, scores)),
-        }
+        result[str(seed)] = symile_headline_metrics(truth, scores)
     return result
+
+
+def validated_development_repeat_oof(
+    development: ValidatedDevelopmentResult, prediction_root: str | Path
+) -> pd.DataFrame:
+    """Reopen one validated family's evidence as complete, ordered repeat-level OOF rows."""
+    document = development.manifest
+    context = document["scientific_context"]
+    if document["family_id"] != context["fit_config"]["family"]["family_id"]:
+        raise ManifestBuildError("Symile development family differs from its fit authority")
+    predictions = _resolve_family_predictions(document, prediction_root)
+    frames = []
+    for evidence in predictions:
+        if any(
+            evidence.manifest[field] != expected
+            for field, expected in {
+                "dataset_id": document["dataset_id"],
+                "task_id": context["task_id"],
+                "bundle_id": context["bundle_id"],
+                "split_assignment_id": context["split_assignment_id"],
+                "cv_assignment_id": context["cv_assignment_id"],
+                "scope": "outer_fold_oof",
+            }.items()
+        ):
+            raise ManifestBuildError("Symile development prediction authority differs")
+        frame = evidence.predictions.to_pandas()
+        frame["repeat_seed"] = evidence.manifest["repeat_seed"]
+        frames.append(frame.loc[:, ["sample_id", "target", "logit", "repeat_seed"]])
+    if not frames:
+        raise ManifestBuildError("Symile development OOF evidence is empty")
+    combined = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["sample_id", "repeat_seed"], kind="stable")
+        .reset_index(drop=True)
+    )
+    if (
+        set(combined["repeat_seed"].unique()) != set(REPEAT_SEEDS)
+        or combined.groupby("sample_id")["repeat_seed"].nunique().ne(len(REPEAT_SEEDS)).any()
+        or combined.groupby(["sample_id", "repeat_seed"]).size().ne(1).any()
+        or combined.groupby("sample_id")["target"].nunique().ne(1).any()
+    ):
+        raise ManifestBuildError(
+            "Development authority does not contain three complete OOF repeats"
+        )
+    return combined
 
 
 def _resolve_family_predictions(
@@ -1613,7 +1666,7 @@ def _validate_source_cxr_development(
     prediction_root: str | Path,
     manifest_root: str | Path,
 ) -> None:
-    if document["family_id"] not in SYMILE_FUSION_FAMILIES:
+    if document["family_id"] not in SYMILE_ALL_FUSION_FAMILIES:
         return
     source_ids = {package.manifest["source_cxr"]["development_id"] for package in folds}
     if len(source_ids) != 1:
@@ -1866,7 +1919,7 @@ def _derive_analysis(
     ablation_ensemble = {
         metric: ensemble["cxr_labs_gated"][metric]
         - ensemble["cxr_labs_gated_no_observedness"][metric]
-        for metric in ("roc_auc", "average_precision", "brier_score")
+        for metric in headline_metric_names()
     }
     return {
         "repeat_metrics": repeat_metrics,
@@ -1935,11 +1988,7 @@ def _metrics(frame: pd.DataFrame) -> dict[str, float]:
     scores = frame["probability"].to_numpy(dtype=np.float64)
     if len(frame) != DEVELOPMENT_COUNT or set(truth.tolist()) != {0, 1}:
         raise ManifestBuildError("Symile analysis family evidence is incomplete")
-    return {
-        "roc_auc": float(roc_auc_score(truth, scores)),
-        "average_precision": float(average_precision_score(truth, scores)),
-        "brier_score": float(brier_score_loss(truth, scores)),
-    }
+    return symile_headline_metrics(truth, scores)
 
 
 def _paired_effects(left: pd.DataFrame, right: pd.DataFrame) -> dict[str, dict[str, float]]:
@@ -1966,7 +2015,7 @@ def _paired_effects(left: pd.DataFrame, right: pd.DataFrame) -> dict[str, dict[s
         )
         result[str(seed)] = {
             metric: left_metrics[metric] - right_metrics[metric]
-            for metric in ("roc_auc", "average_precision", "brier_score")
+            for metric in headline_metric_names()
         }
     return result
 
@@ -2051,8 +2100,8 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
 
 
 def _validate_family(value: object) -> None:
-    if value not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
-        raise ManifestBuildError("Symile core-development family is invalid")
+    if value not in {*SYMILE_CORE_DEVELOPMENT_FAMILIES, SYMILE_ECG_GATED_FAMILY}:
+        raise ManifestBuildError("Symile development family is invalid")
 
 
 def _sha256(value: object) -> bool:

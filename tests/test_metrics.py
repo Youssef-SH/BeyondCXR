@@ -120,6 +120,30 @@ def test_calibration_coefficients_reference_and_clipping() -> None:
     assert intercept == pytest.approx(0.0, abs=1e-12)
 
 
+def test_calibration_coefficients_clip_exact_probability_boundaries(monkeypatch) -> None:
+    captured: dict[str, np.ndarray] = {}
+
+    class _CalibrationFit:
+        coef_ = np.asarray([[2.0]])
+        intercept_ = np.asarray([-1.0])
+
+        def __init__(self, **parameters) -> None:
+            assert parameters == {"C": 1e6, "solver": "lbfgs", "max_iter": 2_000}
+
+        def fit(self, values, targets):
+            captured["values"] = np.asarray(values)
+            captured["targets"] = np.asarray(targets)
+            return self
+
+    monkeypatch.setattr("radfusion.evaluation.metrics.LogisticRegression", _CalibrationFit)
+
+    assert calibration_coefficients([0, 1], [0.0, 1.0]) == (2.0, -1.0)
+    clipped = np.asarray([1e-6, 1.0 - 1e-6])
+    expected_logits = np.log(clipped / (1.0 - clipped)).reshape(-1, 1)
+    np.testing.assert_allclose(captured["values"], expected_logits, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(captured["targets"], [0, 1])
+
+
 def test_configurable_calibration_bins_keep_generic_metric_name() -> None:
     metrics = evaluate_binary(
         [0, 0, 1, 1], [0.1, 0.3, 0.6, 0.9], threshold=0.5, calibration_bins=10

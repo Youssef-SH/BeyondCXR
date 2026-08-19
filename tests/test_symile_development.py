@@ -2,53 +2,74 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
+import pickle
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
 import torch
+from neural_test_support import cpu_runtime
 from sklearn.linear_model import LogisticRegression
+from symile_development_test_support import (
+    _assignments,
+    _development_frame,
+    _family_config_path,
+    _inner_split,
+    _lineage,
+    _neural_history,
+    _publish_family_folds,
+)
 
+import radfusion.data.symile_source as symile_source
 import radfusion.training.symile_analysis as symile_analysis
 import radfusion.training.symile_data as symile_data
 import radfusion.training.symile_development as symile_development
+import radfusion.training.symile_ecg_data as symile_ecg_data
 import radfusion.utils.symile_publication as symile_publication
-from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.errors import ManifestBuildError
 from radfusion.data.symile_artifacts import (
     SymileBundlePaths,
     ValidatedSymileBundleReference,
 )
 from radfusion.data.symile_cv import ValidatedSymileCvReference
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS, SymileLabEcdfTransformer
-from radfusion.data.symile_schemas import CV_SCHEMA
+from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
+from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS
+from radfusion.data.symile_source import EXPECTED_RELEASE_ASSETS, modality_asset_path
 from radfusion.models.symile_tabular import (
-    fit_symile_labs_lightgbm,
     fit_symile_labs_logistic,
 )
-from radfusion.training.config import load_symile_development_config, with_runtime
+from radfusion.training.config import (
+    load_symile_development_config,
+    with_runtime,
+)
+from radfusion.training.execution import reused_loader_policy
 from radfusion.training.symile_analysis import analyze_symile_development
 from radfusion.training.symile_data import (
     SymileCxrStore,
+    SymileDevelopmentCohort,
     SymileDevelopmentData,
-    derive_inner_seed,
+    derive_augmentation_seed,
     derive_inner_split,
     load_symile_development,
     materialize_outer_fold,
 )
 from radfusion.training.symile_development import CompletedSymileFold
+from radfusion.training.symile_ecg_data import SymileEcgStore
 from radfusion.utils.package_identity import (
     canonical_scientific_id,
     package_scientific_config_payload,
 )
 from radfusion.utils.private_predictions import (
     PREDICTION_SCHEMA,
-    build_prediction_table,
     publish_prediction_evidence,
     validate_prediction_evidence,
 )
@@ -63,44 +84,79 @@ from radfusion.utils.symile_publication import (
 )
 
 
-def _development_frame(rows: int = 50) -> pd.DataFrame:
-    records: list[dict[str, object]] = []
-    for index in range(rows):
-        record: dict[str, object] = {
-            "sample_id": f"symile:{index:03d}",
-            "subject_id": 10_000 + index,
-            "hadm_id": 20_000 + index,
-            "official_split": "train" if index < rows - 10 else "validation",
-            "source_row": index if index < rows - 10 else index - (rows - 10),
-            "pneumonia_state": index % 2,
-            "age_years": 50,
-            "sex": "F" if index % 2 else "M",
-            "view_position": "AP" if index % 2 else "PA",
-            "target": index % 2,
-        }
-        for column_index, column in enumerate(LAB_FEATURE_COLUMNS[:50]):
-            record[column] = float(index + column_index + 1)
-        for column in LAB_FEATURE_COLUMNS[50:]:
-            record[column] = True
-        records.append(record)
-    if rows > 5:
-        records[5]["subject_id"] = records[0]["subject_id"]
-    return pd.DataFrame(records)
-
-
-def _assignments(frame: pd.DataFrame) -> pa.Table:
-    records = [
+@pytest.mark.parametrize("defect", [None, "missing", "duplicate", "target", "reference", "family"])
+def test_development_repeat_oof_has_one_ordered_complete_authority(tmp_path, defect):
+    config = load_symile_development_config("configs/symile_labs_logistic.yaml")
+    context = {
+        "fit_config": {"family": {"family_id": "labs_logistic"}},
+        "task_id": config.task.task_id,
+        "bundle_id": config.dataset.bundle_id,
+        "split_assignment_id": config.dataset.split_assignment_id,
+        "cv_assignment_id": config.dataset.cv_assignment_id,
+    }
+    references = []
+    for index, seed in enumerate((2026, 17, 42)):
+        targets = [1, 0] if defect == "target" and seed == 42 else [0, 1]
+        evidence = publish_prediction_evidence(
+            private_root=tmp_path,
+            dataset_id="symile",
+            model_package_id="fold-package-" + f"{index:064x}",
+            task_id=config.task.task_id,
+            bundle_id=config.dataset.bundle_id,
+            split_assignment_id=config.dataset.split_assignment_id,
+            cv_assignment_id=config.dataset.cv_assignment_id,
+            scope="outer_fold_oof",
+            repeat_seed=seed,
+            outer_fold=0,
+            sample_ids=["symile:001", "symile:002"],
+            targets=targets,
+            logits=[-1.0, 1.0],
+        )
+        references.append(
+            {
+                "prediction_id": evidence.prediction_id,
+                "prediction_manifest_sha256": evidence.manifest_sha256,
+                "fold_package_id": evidence.manifest["model_package_id"],
+                "repeat_seed": seed,
+                "outer_fold": 0,
+            }
+        )
+    if defect == "missing":
+        references.pop()
+    elif defect == "duplicate":
+        references.append(references[0])
+    elif defect == "reference":
+        references[0]["fold_package_id"] = "fold-package-" + "9" * 64
+    development = ValidatedDevelopmentResult(
+        tmp_path,
         {
-            "sample_id": sample_id,
-            "repeat_seed": seed,
-            "outer_fold": index % 5,
-        }
-        for seed in (17, 42, 2026)
-        for index, sample_id in enumerate(frame["sample_id"])
-    ]
-    return pa.Table.from_pylist(records, schema=CV_SCHEMA).sort_by(
-        [("repeat_seed", "ascending"), ("sample_id", "ascending")]
+            "dataset_id": "symile",
+            "family_id": "cxr_densenet" if defect == "family" else "labs_logistic",
+            "scientific_context": context,
+            "fold_packages": references,
+        },
+        "a" * 64,
     )
+    if defect is not None:
+        with pytest.raises((ManifestBuildError, ValueError)):
+            symile_publication.validated_development_repeat_oof(development, tmp_path)
+    else:
+        result = symile_publication.validated_development_repeat_oof(development, tmp_path)
+        assert list(result.itertuples(index=False, name=None)) == [
+            (sample, target, logit, seed)
+            for sample, target, logit in (("symile:001", 0, -1.0), ("symile:002", 1, 1.0))
+            for seed in (17, 42, 2026)
+        ]
+
+
+def test_neutral_training_seed_accepts_a_nonprotocol_integer() -> None:
+    training_seed = 314_159
+    epoch = 7
+    sample_id = "symile:admission"
+    payload = f"radfusion-symile-augmentation\0{training_seed}\0{epoch}\0{sample_id}".encode()
+    expected = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63)
+
+    assert derive_augmentation_seed(training_seed, epoch, sample_id) == expected
 
 
 def _bundle(tmp_path: Path) -> SymileBundlePaths:
@@ -119,7 +175,64 @@ def _bundle(tmp_path: Path) -> SymileBundlePaths:
 def _data(tmp_path: Path) -> SymileDevelopmentData:
     frame = _development_frame()
     reference = ValidatedSymileCvReference({}, "b" * 64, _assignments(frame))
-    return SymileDevelopmentData(_bundle(tmp_path), "c" * 64, reference, frame)
+    return SymileDevelopmentData(
+        SymileDevelopmentCohort(_bundle(tmp_path), "c" * 64, frame), reference
+    )
+
+
+@pytest.mark.parametrize("family", ["cxr_densenet", "cxr_labs_concat", "cxr_labs_ecg_gated"])
+def test_neural_fold_delivers_inner_partitions_to_shared_training_loaders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    config = load_symile_development_config(f"configs/symile_{family}.yaml")
+    data = _data(tmp_path)
+    outer = materialize_outer_fold(data, repeat_seed=42, outer_fold=2)
+    inner = derive_inner_split(outer)
+    runtime = cpu_runtime()
+    context = symile_development.SymileFoldExecutionContext(
+        data=data,
+        cxr_store=SimpleNamespace(
+            canonical_image=lambda split, row: np.full((224, 224), 0.5, dtype=np.float32)
+        ),
+        runtime=runtime,
+        loader_execution=reused_loader_policy(num_workers=0, pin_memory=False),
+        git_commit="a" * 40,
+        dependency_lock_sha256="b" * 64,
+        source_cxr_folds={},
+        source_cxr_development_id=None,
+        ecg_store=SimpleNamespace(
+            signal=lambda split, row: np.full((12, 5000), 0.5, dtype=np.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        symile_development, "_build_neural_model", lambda *args: (torch.nn.Identity(), None)
+    )
+
+    class TrainingReached(Exception):
+        pass
+
+    def train(model, training, validation, **kwargs):
+        expected_keys = {"image", "target", "sample_id", "patient_id"}
+        if family != "cxr_densenet":
+            expected_keys.add("structured")
+        if family == "cxr_labs_ecg_gated":
+            expected_keys.add("ecg")
+        for loader, indices in (
+            (training, inner.training_indices),
+            (validation, inner.validation_indices),
+        ):
+            assert loader.batch_size == config.neural.batch_size
+            observed = []
+            for batch in loader:
+                assert set(batch) == expected_keys
+                observed.extend(batch["sample_id"])
+            assert sorted(observed) == sorted(outer.training.iloc[indices]["sample_id"])
+        assert set(kwargs["input_keys"]) == expected_keys - {"target", "sample_id", "patient_id"}
+        raise TrainingReached
+
+    monkeypatch.setattr(symile_development, "fit_two_stage_binary_model", train)
+    with pytest.raises(TrainingReached):
+        symile_development._fit_neural_outer_fold(config, context, outer, inner, None)
 
 
 def test_outer_fold_and_inner_split_are_deterministic_and_patient_isolated(
@@ -186,6 +299,22 @@ def test_development_loader_requests_only_train_and_validation(
     assert set(loaded.frame["official_split"]) == {"train", "validation"}
 
 
+def _store_checksum_authority(tmp_path, monkeypatch, module, paths):
+    entries = {name: "0" * 64 for name in EXPECTED_RELEASE_ASSETS}
+    for path in paths.values():
+        entries[path.relative_to(tmp_path).as_posix()] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    encoded = "".join(f"{digest} {name}\n" for name, digest in sorted(entries.items())).encode()
+    (tmp_path / "SHA256SUMS.txt").write_bytes(encoded)
+    reference = SimpleNamespace(
+        manifest={"source": {"checksum_manifest_sha256": hashlib.sha256(encoded).hexdigest()}}
+    )
+    monkeypatch.setattr(
+        module, "validate_symile_bundle_reference", lambda *args, **kwargs: reference
+    )
+
+
 def test_cxr_store_resolves_rows_and_rejects_test_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -194,14 +323,11 @@ def test_cxr_store_resolves_rows_and_rejects_test_access(
     std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 3, 1, 1)
     paths: dict[str, Path] = {}
     for split in ("train", "validation"):
-        path = tmp_path / f"cxr_{split}.npy"
+        path = modality_asset_path(tmp_path, split, "cxr")
+        path.parent.mkdir(parents=True, exist_ok=True)
         np.save(path, ((raw - mean) / std).astype(np.float32))
         paths[split] = path
-    monkeypatch.setattr(
-        symile_data,
-        "authenticate_source_asset",
-        lambda *args, official_split, **kwargs: paths[official_split],
-    )
+    _store_checksum_authority(tmp_path, monkeypatch, symile_data, paths)
     store = SymileCxrStore(_bundle(tmp_path), tmp_path)
 
     assert store.canonical_image("validation", 1).shape == (320, 320)
@@ -210,94 +336,118 @@ def test_cxr_store_resolves_rows_and_rejects_test_access(
         store.canonical_image("test", 0)
 
 
-def _lab_preprocessor() -> SymileLabEcdfTransformer:
-    return SymileLabEcdfTransformer().fit(_development_frame(2)[list(LAB_FEATURE_COLUMNS)])
-
-
-def _lineage(family: str) -> dict[str, object]:
-    config = load_symile_development_config(_family_config_path(family))
-    neural = family in {
-        "cxr_densenet",
-        "cxr_labs_concat",
-        "cxr_labs_gated",
-        "cxr_labs_gated_no_observedness",
-    }
-    return {
-        "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
-        "cv_assignment_id": config.dataset.cv_assignment_id,
-        "cv_manifest_sha256": "e" * 64,
-        "task_id": config.task.task_id,
-        "git_commit": "f" * 40,
-        "dependency_lock_sha256": "1" * 64,
-        "encoder_identity": (
-            {
-                "library": "torchxrayvision",
-                "architecture": "densenet121",
-                "weights": "densenet121-res224-chex",
-                "embedding_dimension": 1024,
-            }
-            if neural
-            else None
-        ),
-        "transform_contract": (
-            StandardCxrTransform(
-                training=False,
-                image_size=int(config.family.parameters["image_size"]),
-                rotation_degrees=config.neural.rotation_degrees,
-                translation_fraction=config.neural.translation_fraction,
-                brightness_jitter=config.neural.brightness_jitter,
-                contrast_jitter=config.neural.contrast_jitter,
-            ).contract()
-            if neural and config.neural is not None
-            else None
-        ),
-        "pretrained_weight": (
-            {
-                "declared_name": "densenet121-res224-chex",
-                "stable_identifier": "https://example.test/weights.pt",
-                "cache_filename": "weights.pt",
-                "byte_size": 1,
-                "sha256": "2" * 64,
-            }
-            if family == "cxr_densenet"
-            else None
-        ),
-    }
-
-
-def _family_config_path(family: str) -> str:
-    names = {
-        "labs_logistic": "symile_labs_logistic",
-        "labs_lightgbm": "symile_labs_lightgbm",
-        "cxr_densenet": "symile_cxr_densenet",
-        "cxr_labs_concat": "symile_cxr_labs_concat",
-        "cxr_labs_gated": "symile_cxr_labs_gated",
-        "cxr_labs_gated_no_observedness": "symile_cxr_labs_gated_no_observedness",
-    }
-    return f"configs/{names[family]}.yaml"
-
-
-def _inner_split(seed: int, fold: int) -> dict[str, object]:
-    inner_seed = derive_inner_seed(seed, fold)
-    split_digest = hashlib.sha256(f"synthetic-inner-split\0{seed}\0{fold}".encode()).hexdigest()
-    return {
-        "inner_split_id": "inner-split-" + split_digest,
-        "inner_seed": inner_seed,
-        "policy": {
-            "policy_version": "symile-inner-stratified-group-five-fold-v1",
-            "algorithm": "sklearn.model_selection.StratifiedGroupKFold",
-            "n_splits": 5,
-            "shuffle": True,
-            "generated_validation_fold": 0,
-            "group_field": "subject_id",
-            "stratification_target": "pneumonia_strict",
-            "repeat_seed": seed,
-            "outer_fold": fold,
-            "inner_seed": inner_seed,
+def _spawned_store_values(store):
+    arrays = store._arrays
+    read = store.canonical_image if isinstance(store, SymileCxrStore) else store.signal
+    return (
+        {split: read(split, 0) for split in arrays},
+        {
+            split: (str(array.filename), array.mode, array.flags.writeable)
+            for split, array in arrays.items()
         },
+    )
+
+
+def _spawned_unpickle_store(encoded: bytes):
+    return _spawned_store_values(pickle.loads(encoded))
+
+
+def _spawned_unpickle_without_source_hashing(encoded: bytes):
+    def reject_hash(descriptor: int) -> str:
+        del descriptor
+        raise AssertionError("spawned workers must not hash established source assets")
+
+    symile_source._sha256_descriptor = reject_hash
+    return _spawned_unpickle_store(encoded)
+
+
+@pytest.mark.parametrize("modality", ["cxr", "ecg"])
+def test_development_stores_reopen_readonly_maps_in_spawned_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modality: str
+) -> None:
+    if modality == "cxr":
+        raw = np.full((2, 3, 320, 320), 0.5, dtype=np.float32)
+        mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 3, 1, 1)
+        raw = (raw - mean) / std
+        module, store_type = symile_data, SymileCxrStore
+    else:
+        raw = np.full((2, 1, 5000, 12), 0.25, dtype=np.float32)
+        module, store_type = symile_ecg_data, SymileEcgStore
+    paths = {
+        split: modality_asset_path(tmp_path, split, modality) for split in ("train", "validation")
     }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, raw)
+    _store_checksum_authority(tmp_path, monkeypatch, module, paths)
+    store = store_type(_bundle(tmp_path), tmp_path)
+    assert len(pickle.dumps(store)) < 4096
+    expected_values, expected_maps = _spawned_store_values(store)
+    with ProcessPoolExecutor(
+        max_workers=2, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        futures = [pool.submit(_spawned_store_values, store) for _ in range(2)]
+        results = [future.result(timeout=60) for future in futures]
+    for values, maps in results:
+        assert maps == expected_maps
+        for split, value in values.items():
+            np.testing.assert_array_equal(value, expected_values[split])
+            assert maps[split] == (str(paths[split]), "r", False)
+    changed = raw.copy()
+    changed.flat[0] += np.float32(0.01)
+    np.save(paths["train"], changed)
+    encoded = pickle.dumps(store)
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        future = pool.submit(_spawned_unpickle_store, encoded)
+        with pytest.raises(ManifestBuildError, match="changed before worker access"):
+            future.result(timeout=60)
+
+
+@pytest.mark.parametrize("modality", ["cxr", "ecg"])
+def test_development_store_full_hashing_is_bounded_to_each_source_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, modality: str
+) -> None:
+    if modality == "cxr":
+        raw = np.full((2, 3, 320, 320), 0.5, dtype=np.float32)
+        mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 3, 1, 1)
+        raw = (raw - mean) / std
+        module, store_type = symile_data, SymileCxrStore
+    else:
+        raw = np.full((2, 1, 5000, 12), 0.25, dtype=np.float32)
+        module, store_type = symile_ecg_data, SymileEcgStore
+    paths = {
+        split: modality_asset_path(tmp_path, split, modality) for split in ("train", "validation")
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, raw)
+    _store_checksum_authority(tmp_path, monkeypatch, module, paths)
+    hashed: list[str] = []
+    original = symile_source._sha256_descriptor
+
+    def count_hash(descriptor: int) -> str:
+        hashed.append(os.readlink(f"/proc/self/fd/{descriptor}"))
+        return original(descriptor)
+
+    monkeypatch.setattr(symile_source, "_sha256_descriptor", count_hash)
+    store = store_type(_bundle(tmp_path), tmp_path)
+    store_type(_bundle(tmp_path), tmp_path)
+    pickle.loads(pickle.dumps(store))
+    pickle.loads(pickle.dumps(store))
+
+    assert hashed == [str(paths["train"]), str(paths["validation"])]
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        values, maps = pool.submit(
+            _spawned_unpickle_without_source_hashing, pickle.dumps(store)
+        ).result(timeout=60)
+    assert set(values) == set(DEVELOPMENT_SPLITS)
+    assert all(mode == "r" and not writeable for _, mode, writeable in maps.values())
 
 
 def _cv_authority() -> pd.DataFrame:
@@ -313,159 +463,6 @@ def _cv_authority() -> pd.DataFrame:
 def _synthetic_cv_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     authority = _cv_authority()
     monkeypatch.setattr(symile_publication, "_load_cv_authority", lambda *args: authority.copy())
-
-
-def _neural_history(config, selected_epoch: int) -> list[dict[str, object]]:
-    assert config.neural is not None
-    final_epoch = max(
-        config.neural.warmup_epochs + config.neural.early_stopping_patience,
-        selected_epoch + config.neural.early_stopping_patience,
-    )
-    return [
-        {
-            "epoch": epoch,
-            "stage": "warmup" if epoch <= config.neural.warmup_epochs else "fine_tune",
-            "training_loss": 0.5,
-            "validation_metric": 0.8 if epoch == selected_epoch else 0.7,
-            "encoder_learning_rate": (None if epoch <= config.neural.warmup_epochs else 1e-5),
-            "head_learning_rate": 1e-3 if epoch <= config.neural.warmup_epochs else 1e-4,
-        }
-        for epoch in range(1, final_epoch + 1)
-    ]
-
-
-def _publish_family_folds(
-    tmp_path: Path,
-    family: str,
-    *,
-    offset: float,
-    source_cxr_folds: list[CompletedSymileFold] | None = None,
-    source_cxr_development_id: str | None = None,
-) -> tuple[list[CompletedSymileFold], str]:
-    config = load_symile_development_config(_family_config_path(family))
-    semantic_hash = config.config_semantic_sha256
-    neural_family = family in {
-        "cxr_densenet",
-        "cxr_labs_concat",
-        "cxr_labs_gated",
-        "cxr_labs_gated_no_observedness",
-    }
-    lineage = _lineage(family)
-    folds: list[CompletedSymileFold] = []
-    for seed_index, seed in enumerate((17, 42, 2026)):
-        for fold in range(5):
-            indices = range(fold, 20, 5)
-            logits = np.asarray(
-                [(-1.0 if index % 2 == 0 else 1.0) + offset + seed_index * 0.1 for index in indices]
-            )
-            oof = build_prediction_table(
-                [f"symile:{index:03d}" for index in indices],
-                [index % 2 for index in indices],
-                logits,
-            )
-            neural = neural_family
-            selection = {
-                "metric": "roc_auc" if family != "labs_logistic" else "none",
-                "selected_epoch": fold + 1 if neural else None,
-                "best_iteration": fold + 1 if family == "labs_lightgbm" else None,
-            }
-            if neural:
-                selected_stage = "warmup" if fold + 1 <= 2 else "fine_tune"
-                selection.update(
-                    selected_stage=selected_stage,
-                    selected_validation_metric=0.8,
-                )
-                model: object = neural_checkpoint_document(
-                    {"encoder.weight": torch.ones((1, 1))},
-                    selected_epoch=fold + 1,
-                    selected_stage=selected_stage,
-                    selected_validation_roc_auc=0.8,
-                )
-            else:
-                features = _development_frame(20)[list(LAB_FEATURE_COLUMNS)]
-                targets = np.tile(np.array([0, 1], dtype=np.int8), 10)
-                if family == "labs_logistic":
-                    fitted = fit_symile_labs_logistic(
-                        features,
-                        targets,
-                        parameters=config.training.parameters,
-                        selection_metric=config.training.selection_metric,
-                        lab_policy=str(config.preprocessing["lab_policy"]),
-                        repeat_seed=seed,
-                    )
-                else:
-                    fitted = fit_symile_labs_lightgbm(
-                        features,
-                        targets,
-                        parameters={**config.family.parameters, **config.training.parameters},
-                        selection_metric=config.training.selection_metric,
-                        lab_policy=str(config.preprocessing["lab_policy"]),
-                        inner_training_indices=np.arange(16, dtype=np.int64),
-                        inner_validation_indices=np.arange(16, 20, dtype=np.int64),
-                        repeat_seed=seed,
-                    )
-                    selection["best_iteration"] = fitted.best_iteration
-                model = fitted.pipeline
-            fusion = family in {
-                "cxr_labs_concat",
-                "cxr_labs_gated",
-                "cxr_labs_gated_no_observedness",
-            }
-            source_fold = (
-                next(
-                    item
-                    for item in source_cxr_folds or ()
-                    if item.package.manifest["repeat_seed"] == seed
-                    and item.package.manifest["outer_fold"] == fold
-                )
-                if fusion
-                else None
-            )
-            package = publish_fold_package(
-                model_root=tmp_path / "models/symile/development",
-                family=config.family.family_id,
-                repeat_seed=seed,
-                outer_fold=fold,
-                config_bytes=config.source_bytes,
-                config_sha256=config.config_source_sha256,
-                config_semantic_sha256=semantic_hash,
-                lineage=lineage,
-                inner_split=_inner_split(seed, fold),
-                selection=selection,
-                model=model,
-                lab_preprocessor=_lab_preprocessor() if fusion else None,
-                training_history=(_neural_history(config, fold + 1) if neural else None),
-                source_cxr=(
-                    {
-                        "development_id": source_cxr_development_id,
-                        "fold_package_id": source_fold.package.manifest["fold_package_id"],
-                        "fold_manifest_sha256": source_fold.package.manifest_sha256,
-                    }
-                    if fusion
-                    else None
-                ),
-                operational={
-                    "mlflow_run_id": f"run-{family}-{seed}-{fold}",
-                    "runtime_provenance": {} if neural else None,
-                },
-            )
-            prediction = publish_prediction_evidence(
-                private_root=tmp_path / "private",
-                dataset_id="symile",
-                model_package_id=package.manifest["fold_package_id"],
-                task_id=config.task.task_id,
-                bundle_id=config.dataset.bundle_id,
-                split_assignment_id=config.dataset.split_assignment_id,
-                scope="outer_fold_oof",
-                sample_ids=oof["sample_id"].to_pylist(),
-                targets=oof["target"].to_pylist(),
-                logits=oof["logit"].to_pylist(),
-                cv_assignment_id=config.dataset.cv_assignment_id,
-                repeat_seed=seed,
-                outer_fold=fold,
-            )
-            folds.append(CompletedSymileFold(package, prediction))
-    return folds, semantic_hash
 
 
 def test_fold_package_reconstructs_tabular_pipeline_and_validates_oof(tmp_path: Path) -> None:
@@ -1394,10 +1391,12 @@ def test_operational_completion_failure_preserves_fold_package_and_prediction(
     )
     data = _data(tmp_path)
     data = SymileDevelopmentData(
-        data.bundle,
-        config.dataset.bundle_manifest_sha256,
+        SymileDevelopmentCohort(
+            data.bundle,
+            config.dataset.bundle_manifest_sha256,
+            data.frame,
+        ),
         data.cv_reference,
-        data.frame,
     )
     context = symile_development.SymileFoldExecutionContext(
         data,
@@ -1435,7 +1434,7 @@ def test_operational_completion_failure_preserves_fold_package_and_prediction(
             parameters=config.training.parameters,
             selection_metric=config.training.selection_metric,
             lab_policy=str(config.preprocessing["lab_policy"]),
-            repeat_seed=outer.repeat_seed,
+            training_seed=outer.repeat_seed,
         )
         return {
             "model": fitted.pipeline,
@@ -1473,6 +1472,7 @@ def test_operational_completion_failure_preserves_fold_package_and_prediction(
         "evaluation_scope",
         "dataset_id",
         "task_id",
+        "label_policy_version",
         "family_id",
         "modalities",
         "bundle_id",
@@ -1485,6 +1485,25 @@ def test_operational_completion_failure_preserves_fold_package_and_prediction(
         "config_source_sha256",
         "config_semantic_sha256",
         "git_commit",
+        "git_dirty",
         "dependency_lock_sha256",
         "run_complete",
     }
+
+
+def test_public_development_cli_rejects_separate_ecg_family(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = SimpleNamespace(family=SimpleNamespace(family_id="cxr_labs_ecg_gated"))
+    calls: list[str] = []
+    monkeypatch.setattr(symile_development, "load_symile_development_config", lambda path: config)
+    monkeypatch.setattr(
+        symile_development,
+        "run_symile_development",
+        lambda *args, **kwargs: calls.append("development"),
+    )
+
+    assert symile_development.main(["--config", "unused.yaml"]) == 1
+    assert calls == []
+    assert "Symile development failed: ConfigError" in capsys.readouterr().err
