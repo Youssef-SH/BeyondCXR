@@ -101,3 +101,19 @@ def resolve_device(
             tuple(torch.cuda.get_device_capability(device_index)) if use_cuda else None
         ),
     )
+
+
+def neural_inference_runtime_policy(runtime: ResolvedDevice) -> dict[str, Any]:
+    """Return the numerical execution properties that determine neural inference outputs."""
+    return {
+        "device_type": runtime.device.type,
+        "autocast_dtype": "float16" if runtime.mixed_precision_effective else None,
+        "cuda_runtime_version": runtime.cuda_runtime_version,
+        "cudnn_version": runtime.cudnn_version,
+        "gpu_device_name": runtime.gpu_device_name,
+        "gpu_compute_capability": (
+            list(runtime.gpu_compute_capability)
+            if runtime.gpu_compute_capability is not None
+            else None
+        ),
+    }
