@@ -108,6 +108,13 @@ class SelectedTrainingResult:
 
 
 @dataclass(frozen=True)
+class TerminalTrainingResult:
+    """Terminal full-development state with no validation-derived selection."""
+
+    state_dict: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
 class ImageLoaders:
     """Deterministic train and evaluation DataLoaders."""
 
@@ -231,7 +238,7 @@ def build_evaluation_loader(
         raise ValueError("DataLoader pin-memory policy differs from the resolved runtime")
     arguments: dict[str, Any] = {
         "dataset": dataset,
-        "batch_size": config.batch_size,
+        "batch_size": batch_size,
         "shuffle": False,
         "drop_last": False,
         "num_workers": policy.num_workers,
@@ -709,6 +716,131 @@ def fit_two_stage_binary_model(
         selected_validation_metric=best_metric,
         history=tuple(history),
     )
+
+
+def build_terminal_training_loader(
+    dataset: Dataset[Any],
+    *,
+    config: NeuralConfig,
+    runtime: ResolvedDevice,
+    seed: int,
+    execution: LoaderExecutionPolicy,
+) -> DataLoader[Any]:
+    """Build the one full-development training loader without a validation view."""
+    if execution.lifecycle != "reused":
+        raise NeuralTrainingError("Terminal training requires reused loader execution")
+    if execution.pin_memory != runtime.pin_memory_effective:
+        raise NeuralTrainingError("Terminal loader pinning differs from runtime")
+    arguments: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": config.batch_size,
+        "num_workers": execution.num_workers,
+        "pin_memory": execution.pin_memory,
+        "drop_last": False,
+        "persistent_workers": execution.persistent_workers,
+        "generator": dataloader_generator(seed),
+    }
+    if execution.num_workers > 0:
+        arguments["prefetch_factor"] = execution.prefetch_factor
+        arguments["multiprocessing_context"] = "spawn"
+    if getattr(dataset, "epoch_tagged_requests", False):
+        arguments["sampler"] = EpochPermutationSampler(dataset, seed=seed)
+    else:
+        arguments["shuffle"] = True
+    return DataLoader(**arguments)
+
+
+def fit_terminal_two_stage_binary_model(
+    model: TwoStageBinaryModel,
+    train_loader: DataLoader[Any],
+    *,
+    input_keys: tuple[str, ...],
+    config: NeuralConfig,
+    runtime: ResolvedDevice,
+    pos_weight: float,
+    stage1_epochs: int,
+    stage2_epochs: int,
+    fine_tune_scope: FineTuneScope,
+) -> TerminalTrainingResult:
+    """Run a fixed terminal fit without validation, scheduling, or early stopping."""
+    _validate_input_keys(input_keys)
+    if (
+        isinstance(stage1_epochs, bool)
+        or isinstance(stage2_epochs, bool)
+        or not isinstance(stage1_epochs, int)
+        or not isinstance(stage2_epochs, int)
+        or stage1_epochs < 0
+        or stage2_epochs < 0
+        or stage1_epochs + stage2_epochs <= 0
+        or stage1_epochs > config.warmup_epochs
+        or stage2_epochs > config.fine_tune_epochs
+        or fine_tune_scope not in {"all", "terminal"}
+    ):
+        raise NeuralTrainingError("Terminal neural fit schedule is invalid")
+    neural_model = _validated_neural_model(model)
+    loss_function = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=runtime.device)
+    )
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=True) if runtime.mixed_precision_effective else None
+    )
+    neural_model.freeze_encoder()
+    stage1_optimizer = AdamW(
+        neural_model.classifier.parameters(),
+        lr=config.warmup_head_learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    for _ in range(stage1_epochs):
+        train_one_epoch(
+            neural_model,
+            train_loader,
+            optimizer=stage1_optimizer,
+            loss_function=loss_function,
+            runtime=runtime,
+            gradient_clip_norm=config.gradient_clip_norm,
+            warmup=True,
+            input_keys=input_keys,
+            scaler=scaler,
+        )
+    if stage2_epochs:
+        if fine_tune_scope == "all":
+            neural_model.unfreeze_encoder()
+        else:
+            set_cxr_encoder_trainability(neural_model.encoder, fine_tune_scope)
+        encoder_parameters = tuple(
+            parameter for parameter in neural_model.encoder.parameters() if parameter.requires_grad
+        )
+        if not encoder_parameters:
+            raise NeuralTrainingError("Terminal neural fit has no trainable CXR parameters")
+        stage2_optimizer = AdamW(
+            [
+                {
+                    "params": encoder_parameters,
+                    "lr": config.encoder_learning_rate,
+                    "weight_decay": config.weight_decay,
+                },
+                {
+                    "params": neural_model.classifier.parameters(),
+                    "lr": config.head_learning_rate,
+                    "weight_decay": config.weight_decay,
+                },
+            ],
+            weight_decay=config.weight_decay,
+        )
+        for _ in range(stage2_epochs):
+            train_one_epoch(
+                neural_model,
+                train_loader,
+                optimizer=stage2_optimizer,
+                loss_function=loss_function,
+                runtime=runtime,
+                gradient_clip_norm=config.gradient_clip_norm,
+                warmup=False,
+                input_keys=input_keys,
+                scaler=scaler,
+                encoder_trainability=fine_tune_scope,
+            )
+    return TerminalTrainingResult(copy_state_dict_to_cpu(neural_model))
 
 
 def _selected_metric_value(inference: InferenceResult, metric: SelectionMetricName) -> float:

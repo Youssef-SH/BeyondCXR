@@ -32,7 +32,7 @@ def fit_symile_labs_logistic(
     parameters: Mapping[str, object],
     selection_metric: str,
     lab_policy: str,
-    repeat_seed: int,
+    training_seed: int,
 ) -> SymileTabularFit:
     """Fit the frozen LR path on complete outer training."""
     if selection_metric != "none":
@@ -49,7 +49,7 @@ def fit_symile_labs_logistic(
                     C=float(parameters["C"]),
                     max_iter=int(parameters["max_iter"]),
                     class_weight=parameters["class_weight"],
-                    random_state=repeat_seed,
+                    random_state=training_seed,
                 ),
             ),
         ]
@@ -67,7 +67,7 @@ def fit_symile_labs_lightgbm(
     lab_policy: str,
     inner_training_indices: np.ndarray,
     inner_validation_indices: np.ndarray,
-    repeat_seed: int,
+    training_seed: int,
 ) -> SymileTabularFit:
     """Fit the frozen LightGBM path with inner-validation AUROC stopping."""
     if selection_metric != "roc_auc":
@@ -96,12 +96,12 @@ def fit_symile_labs_lightgbm(
         colsample_bytree=float(parameters["colsample_bytree"]),
         reg_lambda=float(parameters["reg_lambda"]),
         class_weight=parameters["class_weight"],
-        random_state=repeat_seed,
-        bagging_seed=repeat_seed,
-        feature_fraction_seed=repeat_seed,
-        data_random_seed=repeat_seed,
-        drop_seed=repeat_seed,
-        extra_seed=repeat_seed,
+        random_state=training_seed,
+        bagging_seed=training_seed,
+        feature_fraction_seed=training_seed,
+        data_random_seed=training_seed,
+        drop_seed=training_seed,
+        extra_seed=training_seed,
         deterministic=True,
         force_col_wise=True,
         n_jobs=1,
@@ -134,6 +134,48 @@ def fit_symile_labs_lightgbm(
         Pipeline([("preprocess", preprocessor), ("classifier", classifier)]),
         best_iteration,
     )
+
+
+def fit_final_symile_labs_lightgbm(
+    features: pd.DataFrame,
+    targets: np.ndarray,
+    *,
+    parameters: Mapping[str, object],
+    n_estimators: int,
+    lab_policy: str,
+    training_seed: int,
+) -> Pipeline:
+    """Fit the frozen final LightGBM estimator without validation or early stopping."""
+    if isinstance(n_estimators, bool) or not isinstance(n_estimators, int) or n_estimators <= 0:
+        raise ValueError("Final Symile LightGBM iteration budget is invalid")
+    truth = validated_binary_targets(targets)
+    preprocessor = _lab_transformer(lab_policy).fit(features)
+    transformed = preprocessor.transform(features)
+    classifier = LGBMClassifier(
+        objective=str(parameters["objective"]),
+        n_estimators=n_estimators,
+        learning_rate=float(parameters["learning_rate"]),
+        num_leaves=int(parameters["num_leaves"]),
+        min_child_samples=int(parameters["min_child_samples"]),
+        subsample=float(parameters["subsample"]),
+        subsample_freq=int(parameters["subsample_freq"]),
+        colsample_bytree=float(parameters["colsample_bytree"]),
+        reg_lambda=float(parameters["reg_lambda"]),
+        class_weight=parameters["class_weight"],
+        random_state=training_seed,
+        bagging_seed=training_seed,
+        feature_fraction_seed=training_seed,
+        data_random_seed=training_seed,
+        drop_seed=training_seed,
+        extra_seed=training_seed,
+        deterministic=True,
+        force_col_wise=True,
+        n_jobs=1,
+        metric="None",
+        verbosity=-1,
+    )
+    classifier.fit(transformed, truth)
+    return Pipeline([("preprocess", preprocessor), ("classifier", classifier)])
 
 
 def _lab_transformer(policy: str) -> SymileLabEcdfTransformer:
