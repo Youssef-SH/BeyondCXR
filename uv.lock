@@ -1688,15 +1688,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pydicom-data"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ef/e3/6a26baebdc614f8c18bc032ceeeb498ca929f7a9ff4dcd3ed9ca5eefd34f/pydicom-data-1.0.0.tar.gz", hash = "sha256:93f2094f219b6fec1e6dbed2e5039fb879272f678646a351b46172f6d0bf110f", size = 34105988, upload-time = "2022-10-03T16:07:05.499Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e8/b1/342693a96b20f38c19bed237e95dc3f8746f423815b61c82f9f8178b71a9/pydicom_data-1.0.0-py3-none-any.whl", hash = "sha256:622ac97265f1d91f76b5120b5bd6eb0f57737c392ef863b72c71779c91e33637", size = 34128415, upload-time = "2022-10-03T16:06:05.62Z" },
-]
-
-[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1829,6 +1820,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "skops" },
+    { name = "sqlalchemy" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "torchxrayvision" },
@@ -1840,7 +1832,6 @@ acquisition = [
 ]
 dev = [
     { name = "pre-commit" },
-    { name = "pydicom-data" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -1858,6 +1849,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-learn", specifier = ">=1.9.0" },
     { name = "skops", specifier = ">=0.14.0" },
+    { name = "sqlalchemy", specifier = ">=2.0.51" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "torchvision", specifier = ">=0.28.0" },
     { name = "torchxrayvision", specifier = ">=1.5.2" },
@@ -1867,7 +1859,6 @@ requires-dist = [
 acquisition = [{ name = "kaggle", specifier = ">=2.2.3" }]
 dev = [
     { name = "pre-commit", specifier = ">=4.6.0" },
-    { name = "pydicom-data", specifier = ">=1.0.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.22" },
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import logging
@@ -17,6 +18,85 @@ from radfusion.utils.operational_logging import (
     log_event,
     timed_phase,
 )
+
+
+@pytest.mark.parametrize(
+    ("module_name", "operation", "arguments"),
+    [
+        ("data.rsna_manifest", "build_rsna_artifacts", []),
+        ("data.symile_manifest", "qualify_symile_source", []),
+        ("data.rsna_audit", "generate_rsna_audit", []),
+        ("data.symile_audit", "generate_symile_audit", []),
+        ("data.symile_cv", "resolve_symile_bundle", []),
+        ("training.rsna_train", "load_experiment_config", ["--config", "unused", "--seed", "42"]),
+        (
+            "training.rsna_evaluate",
+            "load_experiment_config",
+            ["--config", "unused", "--package-id", "unused"],
+        ),
+        ("training.rsna_compare", "regenerate_comparison", ["--evaluation-ids", "unused"]),
+        (
+            "training.rsna_seed_summary",
+            "publish_seed_summary",
+            ["--evaluation-ids", "a", "b", "c"],
+        ),
+        (
+            "training.rsna_localize",
+            "generate_localization_report",
+            ["--evaluation-ids", "a", "b", "c"],
+        ),
+        ("training.rsna_campaign", "execute_rsna_campaign", None),
+        (
+            "training.symile_development",
+            "load_symile_development_config",
+            ["--config", "unused"],
+        ),
+        (
+            "training.symile_analysis",
+            "analyze_symile_development",
+            ["--development-ids", "a", "b", "c", "d", "e", "f"],
+        ),
+        (
+            "training.symile_campaign",
+            "run_symile_campaign",
+            ["--source-root", "unused", "--backup-root", "unused-backup"],
+        ),
+    ],
+)
+def test_cli_failure_does_not_echo_private_exception_text(
+    module_name, operation, arguments, monkeypatch, capsys
+) -> None:
+    module = importlib.import_module(f"radfusion.{module_name}")
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic-patient-secret /private/source/secret.dcm token=synthetic-secret")
+
+    monkeypatch.setattr(module, operation, fail)
+    assert (module.main() if arguments is None else module.main(arguments)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "OSError" in captured.err
+    assert "secret" not in captured.err
+    assert "/private/" not in captured.err
+
+
+@pytest.mark.parametrize("exception_type", [OSError, RuntimeError, Exception])
+def test_symile_campaign_sanitizes_every_exception(exception_type, monkeypatch, capsys) -> None:
+    module = importlib.import_module("radfusion.training.symile_campaign")
+
+    def fail(**kwargs):
+        del kwargs
+        raise exception_type(
+            "synthetic-patient-secret /private/source/secret.dcm token=synthetic-secret"
+        )
+
+    monkeypatch.setattr(module, "run_symile_campaign", fail)
+    assert module.main(["--source-root", "unused", "--backup-root", "unused-backup"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert exception_type.__name__ in captured.err
+    assert "secret" not in captured.err
+    assert "/private/" not in captured.err
 
 
 def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsys) -> None:

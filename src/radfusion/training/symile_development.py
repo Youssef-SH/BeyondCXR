@@ -13,7 +13,7 @@ from typing import Any, cast
 import mlflow
 import numpy as np
 import torch
-from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.metrics import roc_auc_score
 
 from radfusion.data.cxr_transforms import StandardCxrTransform
 from radfusion.data.errors import ManifestBuildError
@@ -29,6 +29,7 @@ from radfusion.models.cxr_baseline import (
     fingerprint_pretrained_weights,
 )
 from radfusion.models.fusion_concat import initialize_fusion_encoder
+from radfusion.models.symile_ecg_fusion import build_symile_trimodal_gated_model
 from radfusion.models.symile_fusion import build_symile_concat_model, build_symile_gated_model
 from radfusion.models.symile_tabular import (
     fit_symile_labs_lightgbm,
@@ -61,7 +62,14 @@ from radfusion.training.symile_data import (
     load_symile_development,
     materialize_outer_fold,
 )
-from radfusion.training.symile_families import SYMILE_FUSION_FAMILIES, SYMILE_NEURAL_FAMILIES
+from radfusion.training.symile_ecg_data import SymileEcgStore, SymileTriModalDataset
+from radfusion.training.symile_families import (
+    SYMILE_ALL_FUSION_FAMILIES,
+    SYMILE_ALL_NEURAL_FAMILIES,
+    SYMILE_CORE_DEVELOPMENT_FAMILIES,
+    SYMILE_ECG_GATED_FAMILY,
+)
+from radfusion.training.symile_statistics import metrics as symile_headline_metrics
 from radfusion.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
@@ -103,6 +111,7 @@ class SymileFoldExecutionContext:
     dependency_lock_sha256: str
     source_cxr_folds: Mapping[tuple[int, int], ValidatedFoldPackage]
     source_cxr_development_id: str | None
+    ecg_store: SymileEcgStore | None = None
 
 
 @dataclass(frozen=True)
@@ -119,20 +128,21 @@ def run_symile_development(
     source_cxr_development_id: str | None = None,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     execution: LoaderExecutionPolicy | None = None,
+    repository_root: str | Path = ".",
 ) -> ValidatedDevelopmentResult:
     """Execute exactly 3 x 5 folds and publish one complete family authority."""
     family_id = config.family.family_id
     _validate_source_argument(family_id, source_cxr_development_id)
-    configure_mlflow(experiment_name=config.runtime.experiment_name, tracking_uri=tracking_uri)
-    commit, dirty = git_revision()
+    commit, dirty = git_revision(repository_root)
     if dirty:
         raise ValueError("Formal Symile development requires a clean Git worktree")
-    lock_hash = uv_lock_sha256()
+    lock_hash = uv_lock_sha256(Path(repository_root) / "uv.lock")
+    configure_mlflow(experiment_name=config.runtime.experiment_name, tracking_uri=tracking_uri)
     data = load_symile_development(config)
     runtime = None
     loader_execution = None
     cxr_store = None
-    if family_id in SYMILE_NEURAL_FAMILIES:
+    if family_id in SYMILE_ALL_NEURAL_FAMILIES:
         if config.neural is None or config.runtime.source_root is None:
             raise ConfigError("Symile neural development configuration is incomplete")
         runtime = resolve_device(
@@ -145,6 +155,11 @@ def run_symile_development(
             pin_memory=runtime.pin_memory_effective,
         )
         cxr_store = SymileCxrStore(data.bundle, config.runtime.source_root)
+    ecg_store = (
+        SymileEcgStore(data.bundle, config.runtime.source_root)
+        if family_id == SYMILE_ECG_GATED_FAMILY and config.runtime.source_root is not None
+        else None
+    )
     source_folds: Mapping[tuple[int, int], ValidatedFoldPackage] = {}
     if source_cxr_development_id is not None:
         source_folds = _resolve_source_cxr_folds(
@@ -152,14 +167,15 @@ def run_symile_development(
             source_cxr_development_id,
         )
     context = SymileFoldExecutionContext(
-        data,
-        cxr_store,
-        runtime,
-        loader_execution,
-        commit,
-        lock_hash,
-        source_folds,
-        source_cxr_development_id,
+        data=data,
+        cxr_store=cxr_store,
+        runtime=runtime,
+        loader_execution=loader_execution,
+        git_commit=commit,
+        dependency_lock_sha256=lock_hash,
+        source_cxr_folds=source_folds,
+        source_cxr_development_id=source_cxr_development_id,
+        ecg_store=ecg_store,
     )
     completed = [
         execute_symile_outer_fold(config, context, repeat_seed=seed, outer_fold=fold)
@@ -201,6 +217,7 @@ def execute_symile_outer_fold(
         "evaluation_scope": "oof",
         "dataset_id": config.dataset.dataset_id,
         "task_id": config.task.task_id,
+        "label_policy_version": config.task.label_policy_version,
         "family_id": config.family.family_id,
         "modalities": serialize_modalities(config.family.modalities),
         "bundle_id": config.dataset.bundle_id,
@@ -213,6 +230,7 @@ def execute_symile_outer_fold(
         "config_source_sha256": config.config_source_sha256,
         "config_semantic_sha256": semantic_hash,
         "git_commit": context.git_commit,
+        "git_dirty": "false",
         "dependency_lock_sha256": context.dependency_lock_sha256,
         "run_complete": "false",
     }
@@ -325,7 +343,7 @@ def _fit_outer_fold(
             parameters=config.training.parameters,
             selection_metric=config.training.selection_metric,
             lab_policy=str(config.preprocessing["lab_policy"]),
-            repeat_seed=outer.repeat_seed,
+            training_seed=outer.repeat_seed,
         )
         return {
             "model": fit.pipeline,
@@ -345,7 +363,7 @@ def _fit_outer_fold(
             lab_policy=str(config.preprocessing["lab_policy"]),
             inner_training_indices=inner.training_indices,
             inner_validation_indices=inner.validation_indices,
-            repeat_seed=outer.repeat_seed,
+            training_seed=outer.repeat_seed,
         )
         return {
             "model": fit.pipeline,
@@ -372,7 +390,7 @@ def _fit_neural_outer_fold(
     lab_preprocessor = None
     transformed_training = None
     transformed_holdout = None
-    if config.family.family_id in SYMILE_FUSION_FAMILIES:
+    if config.family.family_id in SYMILE_ALL_FUSION_FAMILIES:
         if config.preprocessing["lab_policy"] != LAB_ECDF_POLICY_VERSION:
             raise ConfigError("Symile laboratory preprocessing policy is unsupported")
         lab_preprocessor = SymileLabEcdfTransformer().fit(outer.training[list(LAB_FEATURE_COLUMNS)])
@@ -388,20 +406,40 @@ def _fit_neural_outer_fold(
     validation_labs = (
         transformed_training[inner.validation_indices] if transformed_training is not None else None
     )
-    train_dataset = SymileNeuralDataset(
-        inner_training,
-        cxr_store=context.cxr_store,
-        transform=training_transform,
-        repeat_seed=outer.repeat_seed,
-        labs=train_labs,
-    )
-    validation_dataset = SymileNeuralDataset(
-        inner_validation,
-        cxr_store=context.cxr_store,
-        transform=evaluation_transform,
-        repeat_seed=outer.repeat_seed,
-        labs=validation_labs,
-    )
+    if config.family.family_id == SYMILE_ECG_GATED_FAMILY:
+        if context.ecg_store is None or train_labs is None or validation_labs is None:
+            raise ConfigError("Symile ECG development context is incomplete")
+        train_dataset = SymileTriModalDataset(
+            inner_training,
+            cxr_store=context.cxr_store,
+            ecg_store=context.ecg_store,
+            transform=training_transform,
+            training_seed=outer.repeat_seed,
+            labs=train_labs,
+        )
+        validation_dataset = SymileTriModalDataset(
+            inner_validation,
+            cxr_store=context.cxr_store,
+            ecg_store=context.ecg_store,
+            transform=evaluation_transform,
+            training_seed=outer.repeat_seed,
+            labs=validation_labs,
+        )
+    else:
+        train_dataset = SymileNeuralDataset(
+            inner_training,
+            cxr_store=context.cxr_store,
+            transform=training_transform,
+            training_seed=outer.repeat_seed,
+            labs=train_labs,
+        )
+        validation_dataset = SymileNeuralDataset(
+            inner_validation,
+            cxr_store=context.cxr_store,
+            transform=evaluation_transform,
+            training_seed=outer.repeat_seed,
+            labs=validation_labs,
+        )
     loaders = build_image_loaders(
         train_dataset,
         validation_dataset,
@@ -413,7 +451,9 @@ def _fit_neural_outer_fold(
     model, pretrained = _build_neural_model(config, source)
     model.to(context.runtime.device)
     input_keys = (
-        ("image",) if config.family.family_id == "cxr_densenet" else ("image", "structured")
+        ("image", "structured", "ecg")
+        if config.family.family_id == SYMILE_ECG_GATED_FAMILY
+        else (("image",) if config.family.family_id == "cxr_densenet" else ("image", "structured"))
     )
     fit = fit_two_stage_binary_model(
         model,
@@ -440,13 +480,25 @@ def _fit_neural_outer_fold(
     )
     if not np.isclose(restored_roc_auc, fit.selected_validation_metric, rtol=0.0, atol=1e-12):
         raise ValueError("Restored Symile checkpoint does not reproduce selected AUROC")
-    holdout_dataset = SymileNeuralDataset(
-        outer.holdout,
-        cxr_store=context.cxr_store,
-        transform=evaluation_transform,
-        repeat_seed=outer.repeat_seed,
-        labs=transformed_holdout,
-    )
+    if config.family.family_id == SYMILE_ECG_GATED_FAMILY:
+        if context.ecg_store is None or transformed_holdout is None:
+            raise ConfigError("Symile ECG holdout context is incomplete")
+        holdout_dataset = SymileTriModalDataset(
+            outer.holdout,
+            cxr_store=context.cxr_store,
+            ecg_store=context.ecg_store,
+            transform=evaluation_transform,
+            training_seed=outer.repeat_seed,
+            labs=transformed_holdout,
+        )
+    else:
+        holdout_dataset = SymileNeuralDataset(
+            outer.holdout,
+            cxr_store=context.cxr_store,
+            transform=evaluation_transform,
+            training_seed=outer.repeat_seed,
+            labs=transformed_holdout,
+        )
     holdout_loader = build_evaluation_loader(
         holdout_dataset,
         batch_size=config.neural.batch_size,
@@ -518,6 +570,8 @@ def _build_neural_model(
         raise ManifestBuildError("Symile fusion requires its matching CXR fold package")
     if family_id == "cxr_labs_concat":
         model = build_symile_concat_model(parameters, weights=None)
+    elif family_id == SYMILE_ECG_GATED_FAMILY:
+        model = build_symile_trimodal_gated_model(parameters, weights=None)
     else:
         model = build_symile_gated_model(parameters, weights=None)
     checkpoint = load_symile_neural_checkpoint(source.directory / NEURAL_MODEL_FILENAME)
@@ -600,11 +654,13 @@ def _fold_lineage(
         "git_commit": context.git_commit,
         "dependency_lock_sha256": context.dependency_lock_sha256,
         "encoder_identity": (
-            _encoder_identity(config) if config.family.family_id in SYMILE_NEURAL_FAMILIES else None
+            _encoder_identity(config)
+            if config.family.family_id in SYMILE_ALL_NEURAL_FAMILIES
+            else None
         ),
         "transform_contract": (
             _transform(config, training=False).contract()
-            if config.family.family_id in SYMILE_NEURAL_FAMILIES
+            if config.family.family_id in SYMILE_ALL_NEURAL_FAMILIES
             else None
         ),
         "pretrained_weight": dict(pretrained_weight) if pretrained_weight is not None else None,
@@ -664,13 +720,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(args.log_level)
     try:
         config = load_symile_development_config(args.config)
+        if config.family.family_id not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
+            raise ConfigError("The public development command is limited to the six core families")
         result = run_symile_development(
             config,
             source_cxr_development_id=args.source_cxr_development_id,
             tracking_uri=args.tracking_uri,
         )
     except (ConfigError, ManifestBuildError, OSError, RuntimeError, ValueError) as exc:
-        print(f"Symile development failed: {exc}", file=sys.stderr)
+        print(f"Symile development failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(
         json.dumps(
