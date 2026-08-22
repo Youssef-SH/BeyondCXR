@@ -1,13 +1,13 @@
 .PHONY: sync lock-check lint format format-check test check pre-commit clean purge-generated \
 	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-evaluate rsna-compare \
 	rsna-summarize rsna-localize rsna-campaign symile-manifest symile-audit symile-cv \
-	symile-develop symile-analyze symile-campaign
+	symile-develop symile-analyze symile-campaign symile-serve
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
 
 sync:
-	uv sync
+	uv sync --extra serving
 
 lock-check:
 	uv lock --check
@@ -67,6 +67,15 @@ symile-campaign:
 		$(if $(DEVICE),--device "$(DEVICE)") \
 		$(if $(WORKERS),--workers "$(WORKERS)") \
 		--backup-root "$(BACKUP_ROOT)"
+
+symile-serve:
+	@test -n "$(AUTHORITY)" || (echo "AUTHORITY=path/to/serving-authority is required"; exit 2)
+	@test -n "$(PACKAGE_ROOT)" || (echo "PACKAGE_ROOT=path/to/final/packages is required"; exit 2)
+	uv run --locked --extra serving python -m radfusion.serving.cli \
+		--authority "$(AUTHORITY)" --package-root "$(PACKAGE_ROOT)" \
+		$(if $(DEVICE),--device "$(DEVICE)") \
+		$(if $(HOST),--host "$(HOST)") \
+		$(if $(PORT),--port "$(PORT)")
 
 rsna-train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
