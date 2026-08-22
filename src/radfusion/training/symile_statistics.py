@@ -291,6 +291,12 @@ def focused_development_subgroups(
         raise ValueError("Development subgroup repeat predictions are not exactly aligned")
     cxr_ensemble = development_mean_logit_ensemble(cxr)
     gated_ensemble = development_mean_logit_ensemble(gated)
+    expected_sample_ids = set(cxr_ensemble["sample_id"])
+    if (
+        attributes["sample_id"].duplicated().any()
+        or set(attributes["sample_id"]) != expected_sample_ids
+    ):
+        raise ValueError("Development subgroup attributes are not exactly aligned")
     merged = (
         cxr_ensemble.merge(
             gated_ensemble,

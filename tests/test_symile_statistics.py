@@ -250,6 +250,37 @@ def test_focused_subgroups_keep_three_repeat_estimates_separate_from_ensemble() 
     assert supported["n"] == 100
 
 
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
+def test_focused_subgroups_require_exact_attribute_membership(mutation: str) -> None:
+    sample_ids = [f"symile:{index}" for index in range(2)]
+    rows = [
+        {"sample_id": sample_id, "target": index, "logit": float(index), "repeat_seed": seed}
+        for seed in (17, 42, 2026)
+        for index, sample_id in enumerate(sample_ids)
+    ]
+    attributes = pd.DataFrame(
+        {
+            "sample_id": sample_ids,
+            "age_years": [30, 60],
+            "sex": ["F", "M"],
+            "view_position": ["AP", "PA"],
+            "observed_lab_count": [25, 35],
+        }
+    )
+    if mutation == "missing":
+        attributes = attributes.iloc[:1]
+    elif mutation == "extra":
+        attributes = pd.concat(
+            [attributes, attributes.iloc[[0]].assign(sample_id="symile:extra")],
+            ignore_index=True,
+        )
+    else:
+        attributes = pd.concat([attributes, attributes.iloc[[0]]], ignore_index=True)
+
+    with pytest.raises(ValueError, match="not exactly aligned"):
+        focused_development_subgroups(pd.DataFrame(rows), pd.DataFrame(rows), attributes)
+
+
 def test_global_reliability_plot_is_raw_deterministic_and_exact_six() -> None:
     targets = pd.Series([0, 0, 1, 1])
     probabilities = pd.Series([0.1, 0.3, 0.7, 0.9])
