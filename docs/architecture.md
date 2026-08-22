@@ -4,8 +4,9 @@
 
 - **Dataset:** an external source collection with a stable logical identity.
 - **Bundle:** an immutable, validated set of typed artifacts stored under `bundle-<sha256>`.
-- **Manifest:** the bundle's `manifest.json`, which declares identity, contents, hashes, policies,
-  and provenance through the common bundle envelope.
+- **Manifest:** an artifact's `manifest.json`, declaring its identity, contents, integrity,
+  and applicable policies or provenance. Bundle, package, prediction, and result manifests
+  have distinct contracts.
 
 The lifecycle is: authenticated source → immutable bundle publication → validated scientific
 consumer. `CURRENT` supports optional interactive discovery; scientific consumers pin explicit
@@ -23,16 +24,21 @@ immutable bundle IDs.
 | CXR cache | Publish validated deterministic images before live stochastic augmentation |
 | Dataset mapping | Resolve the built-in adapter for a pinned bundle |
 | Model mapping | Resolve a built-in metadata, CXR, or fusion model adapter |
-| Tabular runner | Fit a metadata model and select operating thresholds on validation |
-| Neural runner | Consume a validated CXR cache, train one seed, and select one validation state |
-| Test evaluator | Verify a completed package and explicit compatible evaluation config before applying them to the test partition |
-| Seed summarizer | Validate three package-compatible CXR or fusion evaluations and report complete aggregate claims |
-| Localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
+| RSNA tabular runner | Fit a metadata model and select operating thresholds on validation |
+| RSNA neural runner | Consume a validated CXR cache, train one seed, and select one validation state |
+| RSNA test evaluator | Verify a completed package and explicit compatible evaluation config before applying them to the test partition |
+| RSNA seed summarizer | Validate three package-compatible CXR or fusion evaluations and report complete aggregate claims |
+| RSNA localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
 | RSNA campaign | Execute the ordered CUDA-required campaign and pass exact package and evaluation identities in process |
 | Symile development data | Resolve the pinned bundle and CV reference, then expose only official train and validation rows and authenticated CXR tensors |
 | Symile fold runner | Execute one frozen outer fit, use inner selection where applicable, and publish private OOF evidence |
 | Symile development aggregator | Validate all 15 fold packages and publish repeat metrics and the median final-training budget |
 | Symile analysis | Align six explicit family authorities and publish paired and mean-logit ensemble development evidence |
+| Symile ECG extension result | Combine core analysis and internal ECG development; derive primary thresholds and reference family-owned final budgets |
+| Symile final fitting | Fit terminal full-development state and publish independently reconstructable final packages |
+| Symile campaign control | Validate the pre-test freeze and same-freeze opening; derive the global result and private error review |
+| Symile held-out inference | Reuse the frozen numerical runtime and publish only missing package-bound predictions |
+| Symile preservation | Certify a restored archive before publishing its local ZIP, checksum, and external backup |
 | Private analysis store | Retain aligned private prediction evidence and real-image localization overlays outside public outputs |
 | Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
 
@@ -41,7 +47,7 @@ the dataset mapping. Cache construction authenticates and decodes raw DICOM byte
 consumers verify that cache's exact identity and authorized sample coverage. Model adapters own
 estimator or neural architecture construction.
 
-The manifest owns dataset, task, split, source, and artifact lineage. Parquet tables contain
+The bundle manifest owns dataset, task, split, source, and artifact lineage. Parquet tables contain
 row-level facts, while audits contain derived descriptions. `CURRENT` selects a bundle for
 interactive commands; experiment configs pin an exact bundle ID.
 
@@ -94,8 +100,8 @@ The common bundle envelope and RSNA artifact schemas are defined in
 composition is defined in [`training.md`](training.md). Reconstruction and evaluation protocols
 are defined in [`reproducibility.md`](reproducibility.md).
 
-Symile development follows a separate dataset-specific path after its validated bundle. The data
-layer has no official-test accessor:
+Symile follows a dataset-specific development and terminal campaign path. Development accessors
+expose no official-test data:
 
 ```text
 pinned Symile bundle + pinned 3 x 5 CV assignment
@@ -104,6 +110,12 @@ pinned Symile bundle + pinned 3 x 5 CV assignment
     → immutable fold package + separate private OOF prediction evidence
     → complete family development authority
     → explicit six-family aggregate analysis
+    → ECG extension result, also consuming internal three-modality development
+    → full-development fitting of fourteen immutable final packages
+    → validated pre-test freeze → atomic same-freeze test-open
+    → fourteen package-bound raw prediction evidences → six predictor views
+    → global result and separate private error-review derivative
+    → recursively certified export and external backup
 ```
 
 Fold packages contain only fitted model, preprocessing, configuration, and selection state. The
@@ -123,3 +135,15 @@ final full-development fitting, or official-test evaluation.
 Neural checkpoints are independently reconstructable persisted documents inside their containing
 packages. Each checkpoint therefore owns schema version `1` and is validated independently from
 the outer package manifest.
+
+The terminal campaign consumes these development authorities without changing their exact-six
+public surface or the core two-modality gate. Its separate ECG family uses an exact-three gate.
+Official-test materialization requires both `ValidatedPretestFreeze` and its atomic same-freeze
+test-open record. The freeze binds all final packages, development-derived primary thresholds,
+evaluation policy, numerical inference runtime, and execution provenance. An opened resume cannot
+retrain or change that authority; it completes missing post-open work only.
+
+The global result owns aggregate held-out claims. Private error review is a regenerable derivative,
+not a prerequisite for validating those claims. Preservation includes both, along with their
+recursive authority closure. See [`reproducibility.md`](reproducibility.md) for runtime matching,
+execution, and backup requirements.

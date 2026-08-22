@@ -20,6 +20,11 @@ Each training run records the lock-file SHA-256, Python version, operating syste
 and model, and relevant library versions. Neural runs also record PyTorch, TorchVision, and
 TorchXRayVision versions and requested and effective device policies.
 
+Use a Git checkout on Linux or WSL2 for scientific execution. Make assumes the checkout root;
+from another directory use `make -C /path/to/checkout <target>`. The wheel contains importable
+Python modules; configs, the Git revision, lock, and private data authorities are checkout/operator
+inputs. Installing the wheel or unpacking an sdist without Git provenance does not reproduce a study.
+
 ## Rebuild the RSNA bundle
 
 Place Stage 2 source data under `data/raw/rsna/extracted/`, then run:
@@ -66,7 +71,7 @@ Physical Parquet hashes cover serialized file bytes and detect corruption. They 
 valid encodings of the same logical tables and do not participate in bundle identity. The exact
 identity and acceptance rules are defined in [`data_contract.md`](data_contract.md).
 
-## Generate audits and experiments
+## Generate RSNA audits and experiments
 
 ```bash
 make rsna-campaign
@@ -225,6 +230,78 @@ The development reader requests only official train and validation rows and auth
 corresponding CXR tensors. It has no official-test accessor. Development produces no thresholds,
 calibration, final full-development model, or held-out-test statistic.
 
+## Reproduce the Symile campaign
+
+This is formal scientific execution, not a smoke test. Run it only after the certified science
+commit is sealed and the checkout is clean. Formal Symile execution has not occurred.
+Transfer the authorized frozen bundle and CV artifact with their original manifest bytes into
+`data/manifests/symile/`; all seven Symile configs pin those exact authorities. Rebuilding equivalent
+tables alone does not guarantee the pinned manifest-byte hash. The campaign validates the pinned
+authorities and never substitutes `CURRENT` or regenerates them.
+
+Place the complete authorized Symile-MIMIC 1.0.0 source at the supplied source root. Before neural
+development, materialize the fixed public CXR initialization through the existing acquisition helper:
+
+```bash
+uv run --locked --no-dev python -c 'from radfusion.models.cxr_baseline import ensure_pretrained_weights; ensure_pretrained_weights()'
+```
+
+Preserve that exact weight file throughout development and final fitting. Unlike the RSNA campaign,
+Symile fitting fingerprints an existing cache entry rather than acquiring missing weights. For the
+formal GPU run use the locked runtime environment and `DEVICE=cuda`. `BACKUP_ROOT` must name a
+separate approved persistent destination outside the resolved repository root (including symlink
+targets). The formal command derives the manifest, model, report, private, MLflow, and export roots
+from the checkout and does not accept overrides for them.
+
+The formal campaign is automated: a validated immutable freeze is followed immediately by its
+atomic same-freeze test-open record. The freeze is an ordering and lineage boundary, not a manual
+approval pause. There is no separate public test-opening command.
+
+The primary Symile comparison is gated CXR/labs versus CXR-only, with AUROC primary and Average
+Precision and Brier score secondary. Effects are candidate minus comparator: positive AUROC/AP
+favors the candidate, while negative Brier favors the candidate. These declarations are validated
+in the frozen evaluation policy.
+
+Private FP/FN selections use the primary gated raw probability and frozen development Youden-J
+threshold. Content-addressed JSON derivatives under `private/error-review/symile/` are recursively
+validated and preserved in export/backup. They contain sample identifiers and must remain private.
+Their absence or corruption does not invalidate the global result; a conflicting derivative is
+rejected, not overwritten, and an absent derivative is regenerated on resume.
+
+The only public held-out campaign command is:
+
+```bash
+make symile-campaign SOURCE_ROOT=path/to/private/symile/source DEVICE=cuda \
+  BACKUP_ROOT=path/to/approved/persistent/backup
+```
+
+It validates the exact-six core development authorities, executes the separate ECG development
+stage, creates exactly 14 full-development packages, and requires a validated freeze plus the
+atomic same-freeze test-open record before the canonical accessor can materialize official-test
+state. It then publishes 14 raw prediction evidences, derives six predictor views and one global
+result, and preserves the result through validated export and backup. Both `outbox/` and the
+separately configured backup location contain private scientific state and remain outside version
+control.
+The deterministic archive contains an exact V1 preservation manifest mapping every included
+authority to its canonical restore path and hashing every archived file. Both the local archive and
+external backup are created and validated with owner-only read/write permissions (`0600`).
+When a valid `test-open.json` already exists, `symile-campaign` revalidates and resumes the exact
+opened freeze without development or final retraining, completing only missing post-open work.
+
+### Numerical runtime on resume
+
+Before test opening, all neural packages must agree on inference precision. The campaign resolves
+one effective runtime and freezes exactly `device_type`, `autocast_dtype`, `cuda_runtime_version`,
+`cudnn_version`, `gpu_device_name`, and `gpu_compute_capability`. CPU execution uses `None` for
+CUDA-only fields. On an opened resume, the resolved runtime must match all six fields before any
+official-test materialization. Already-published immutable predictions must not be combined with
+new predictions from a different numerical CUDA environment.
+
+GPU device index, requested device string, hostname, pin-memory setting, MLflow run identity, and
+timestamps are not part of this runtime projection. Dependency/library versions remain bound by
+the frozen dependency-lock authority. The same validated runtime object is used for inference;
+deterministic PyTorch/cuDNN backend settings are explicitly established on fresh and resumed runs.
+
 ## Probability and operating-point metrics
 
 Models expose class labels and probabilities. Evaluation locates the column labeled `1` and
@@ -234,9 +311,11 @@ Average precision is computed with `average_precision_score`. Probability metric
 ROC-AUC and Brier score. Threshold-dependent precision, recall, specificity, F1, and confusion
 counts are grouped by operating point:
 
-- the Youden-J threshold maximizes validation sensitivity minus false-positive rate;
-- the target-sensitivity threshold is the highest validation threshold meeting the configured
-  sensitivity, which is 0.90 in the experiment configs.
+- the Youden-J threshold maximizes sensitivity minus false-positive rate;
+- the target-sensitivity threshold is the highest threshold meeting sensitivity 0.90.
+
+RSNA derives both thresholds from validation under its evaluation config. Symile derives them only
+for the primary gated ensemble from the three-repeat mean-logit development OOF prediction.
 
 Both policies enumerate every finite ROC threshold and choose the highest threshold among ties or
 qualifying candidates. The thresholds are applied unchanged to test probabilities. They are
@@ -244,18 +323,20 @@ benchmark operating points, not clinical optima.
 
 ## Calibration
 
-Expected calibration error uses the configured number of equal-width bins over `[0, 1]`. Bins are
+RSNA expected calibration error uses the configured number of equal-width bins over `[0, 1]`. Bins are
 lower-inclusive; the final bin includes 1. Empty bins contribute zero. Each non-empty bin
 contributes its sample fraction times the absolute difference between mean predicted probability
 and observed positive fraction. Experiment configs use 15 bins, and the plot uses the same count
-and strategy.
+and strategy. Symile reports no ECE scalar and uses a descriptive ten-bin uniform reliability curve.
 
 Calibration slope and intercept come from an L2 logistic regression of the target on predicted
 log-odds. Probabilities are clipped to `[1e-6, 1 - 1e-6]` before the logit transform. The fit uses
 `C=1e6`, the `lbfgs` solver, 2,000 maximum iterations, and an intercept.
 
-Calibration statistics describe raw class-weighted model outputs. They are point estimates;
-bootstrap resampling is not used.
+Calibration statistics describe raw probabilities, not fitted recalibration. RSNA outputs use its
+class-weighting policies; Symile uses no class weighting. Calibration slope/intercept are point
+estimates. Symile's paired held-out AUROC, Average Precision, and Brier differences separately use
+2,000 subject-cluster bootstrap resamples; development OOF has no bootstrap confidence intervals.
 
 ## Latency and model size
 
@@ -303,12 +384,17 @@ make pre-commit
 git diff --check
 ```
 
-The default suite uses synthetic data. Local RSNA integration tests run when the source dataset is
+The default suite uses synthetic fixtures and the public pydicom test fixture bundled with the
+locked pydicom package. Local integration tests are excluded by default; the CUDA autocast case skips
+when CUDA is unavailable. Local RSNA integration tests run when the source dataset is
 available:
 
 ```bash
 uv run pytest -m integration
 ```
 
-Generated bundles, reports, models, and MLflow state can be deliberately deleted with
-`make purge-generated` and rebuilt. Raw datasets remain user-managed external inputs.
+`make purge-generated` is a destructive reset for generated bundles, reports, models, and MLflow
+state, not a preservation operation. It refuses an existing canonical Symile test-open record.
+Preserve complete scientific evidence and backups before cleanup; raw datasets remain external
+inputs. The required operator-supplied `BACKUP_ROOT` must be a separately approved persistent
+destination outside the resolved repository root, including after resolving symlinks.
