@@ -13,6 +13,7 @@ from radfusion.utils.private_predictions import (
     PREDICTION_MANIFEST_FILENAME,
     PREDICTION_SCHEMA,
     PREDICTIONS_FILENAME,
+    SYMILE_TEST_INFERENCE_POLICY,
     build_prediction_table,
     publish_prediction_evidence,
     validate_prediction_evidence,
@@ -57,6 +58,24 @@ def _publish_symile(tmp_path: Path):
     )
 
 
+def _publish_symile_test(tmp_path: Path, *, freeze: str = "pretest-freeze-" + "1" * 64):
+    return publish_prediction_evidence(
+        private_root=tmp_path / "private",
+        dataset_id="symile",
+        model_package_id="final-package-" + "e" * 64,
+        task_id="pneumonia_strict",
+        bundle_id=_BUNDLE_ID,
+        split_assignment_id=_SPLIT_ID,
+        scope="test",
+        sample_ids=("symile:2", "symile:1"),
+        targets=[1, 0],
+        logits=[2.0, -1.0],
+        label_policy_version="symile-pneumonia-strict-v1",
+        inference_policy=SYMILE_TEST_INFERENCE_POLICY,
+        authorized_by_pretest_freeze_id=freeze,
+    )
+
+
 def test_prediction_evidence_publishes_exact_canonical_contract(tmp_path: Path) -> None:
     evidence = _publish(tmp_path)
     validated = validate_prediction_evidence(evidence.directory)
@@ -71,6 +90,45 @@ def test_prediction_evidence_publishes_exact_canonical_contract(tmp_path: Path) 
     assert table.column("sample_id").to_pylist() == ["rsna:a", "rsna:b"]
     assert table.column("target").to_pylist() == [0, 1]
     assert table.schema == build_prediction_table(("rsna:a", "rsna:b"), [0, 1], [-1.0, 2.0]).schema
+
+
+def test_symile_test_authorization_is_control_provenance_not_prediction_identity(
+    tmp_path: Path,
+) -> None:
+    evidence = _publish_symile_test(tmp_path)
+    other_control = _publish_symile_test(tmp_path / "other", freeze="pretest-freeze-" + "2" * 64)
+    manifest = evidence.manifest
+
+    assert other_control.prediction_id == evidence.prediction_id
+    assert manifest["authorized_by_pretest_freeze_id"] == "pretest-freeze-" + "1" * 64
+    assert manifest["label_policy_version"] == "symile-pneumonia-strict-v1"
+    assert manifest["inference_policy"] == SYMILE_TEST_INFERENCE_POLICY
+    with pytest.raises(ValueError, match="different control provenance"):
+        _publish_symile_test(tmp_path, freeze="pretest-freeze-" + "2" * 64)
+
+
+@pytest.mark.parametrize("value", [True, 1.0])
+def test_symile_test_inference_policy_requires_exact_integer_schema_version(
+    tmp_path: Path, value: object
+) -> None:
+    evidence = _publish_symile_test(tmp_path)
+    manifest_path = evidence.directory / PREDICTION_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["inference_policy"]["inference_policy_schema_version"] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="scientific policy"):
+        validate_prediction_evidence(evidence.directory)
+
+
+def test_rsna_test_prediction_contract_does_not_gain_symile_freeze_provenance(
+    tmp_path: Path,
+) -> None:
+    evidence = _publish(tmp_path)
+
+    assert "authorized_by_pretest_freeze_id" not in evidence.manifest
+    assert "label_policy_version" not in evidence.manifest
+    assert "inference_policy" not in evidence.manifest
 
 
 @pytest.mark.parametrize(

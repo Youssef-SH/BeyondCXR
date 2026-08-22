@@ -46,7 +46,8 @@ pin-memory policies are runtime coordinates and do not appear in YAML.
 Family parameters describe estimator/model topology. Preprocessing identifiers own implemented
 scientific transforms. Fitting, optimization, loss weighting, iteration, early-stopping, loader,
 and augmentation policy belong to `training`. `selection_metric` is `none` when fitting performs
-no model selection. Evaluation owns sensitivity and calibration policy. Latency benchmarking uses
+no model selection. RSNA evaluation config owns sensitivity and calibration policy; Symile's
+campaign owns its fixed held-out policy and development-derived primary thresholds. Latency benchmarking uses
 the operational defaults of 100 warm-up calls and 1,000 measured calls; those counts are outside
 scientific configuration identity.
 LightGBM runs quietly with operational `verbosity=-1`; logging verbosity is not scientific
@@ -55,11 +56,12 @@ configuration.
 All configuration and generated scientific-object schemas use version 1. RSNA uses one YAML for
 each of metadata Logistic Regression, metadata LightGBM, CXR DenseNet, and CXR-metadata concat.
 Symile uses one YAML for each of labs Logistic Regression, labs LightGBM, CXR DenseNet, CXR-labs
-concat, CXR-labs gated, and the gated no-observedness ablation. The canonical filenames are listed
+concat, CXR-labs gated, and the gated no-observedness ablation, plus the campaign-internal
+`symile_cxr_labs_ecg_gated.yaml` extension. The canonical filenames are listed
 in the repository `configs/` directory. Manual RSNA training receives `SEED` explicitly; the
 authoritative campaign owns its fixed family-by-seed matrix.
 
-## Feature boundary
+## RSNA feature boundary
 
 The RSNA adapter exposes these model features:
 
@@ -77,7 +79,7 @@ The model package records this ordered input contract, its type categories and m
 semantics, and the policy version. The fitted preprocessing pipeline is embedded in
 `model.skops`.
 
-## Execution
+## RSNA execution
 
 Contributor setup uses `uv sync --locked --group dev`; a paid GPU campaign host uses
 `uv sync --locked --no-dev`.
@@ -118,7 +120,7 @@ metadata training, one shared neural core owns two-stage optimization, and narro
 orchestrators own their data and publication boundaries. The explicit evaluator owns test
 evaluation. Dispatch is determined by the canonical family ID and ordered modalities.
 
-## CXR training
+## RSNA CXR training
 
 The CXR configuration defines the fixed TorchXRayVision DenseNet121 encoder, augmentation, and
 optimization stages; runtime owns the source root, device, and explicit execution seed. Each
@@ -256,18 +258,41 @@ reports/symile/development/analyses/analysis-<sha256>/
 ```
 
 The OOF Parquet is restricted patient-level evidence and remains ignored. Public summaries are
-aggregate and privacy validated. The development layer exposes only official train and validation;
-it implements no official-test, threshold, calibration, ECG, final-fit, or serving path. The
-final-training and held-out lifecycle owns ECG, the representation-transfer probe,
-final-development fitting, calibration, operating thresholds, the pre-test freeze, and the single
-held-out evaluation. The serving lifecycle owns deployment.
+aggregate and privacy validated. The public development layer remains exact-six and exposes only
+official train and validation.
+
+### Symile terminal full-development fitting
+
+The campaign-internal ECG family uses the same repeated-CV selection procedure with its separate
+three-modality gate. Its development result and the core analysis feed the ECG extension result,
+which derives primary gated operating thresholds and references the family-owned final budgets.
+It does not turn ECG into a seventh public core-development family.
+
+Each neural family's final epoch budget is the median selected one-based epoch across its fifteen
+folds. For budget `B`, terminal fitting runs `min(B, 2)` head-only epochs and `max(B - 2, 0)`
+terminal-encoder fine-tuning epochs. It uses all development admissions, fixed within-stage learning
+rates, and no validation split, scheduler, early stopping, or checkpoint selection. The terminal
+state is published, not a newly selected state.
+
+Labs Logistic Regression fits once with seed 42 and no iterative budget. Labs LightGBM fits once
+with seed 42 and the family median `best_iteration` as exact `n_estimators`, without early stopping.
+CXR, concat, gated, and ECG-gated each fit seeds 17, 42, and 2026, giving fourteen final packages.
+The observedness ablation remains development-only. Every fusion member initializes from the exact
+validated same-seed final CXR package, matching dataset/bundle, task, encoder, and CXR transform;
+fusion terminal optimizer, loader, and augmentation settings are not CXR ancestry requirements.
+
+Final packages live under `models/symile/final/packages/final-package-<sha256>/`. Their packaged
+`final_fit_config.json` describes only fit-used full-development semantics, not CV or downstream
+evaluation policy. Neural checkpoints contain terminal state and stage budgets. The campaign
+validates all packages before freezing held-out execution; execution and resume requirements are
+documented in [`reproducibility.md`](reproducibility.md).
 
 ## Tracking and outputs
 
 ### Operational progress
 
 Instrumented entrypoints emit lifecycle records and rate-limited aggregate progress to stderr;
-their final machine-readable result remains on stdout. The full campaign also writes the same
+their final machine-readable result remains on stdout. The RSNA campaign also writes the same
 records to `reports/rsna/campaigns/<campaign-id>/execution.log`. `epoch_throughput` operational
 records include separate training and validation elapsed time, batches per second, and samples per
 second. The bookkeeping uses host clocks and aggregate counters without per-batch logging or extra
@@ -366,10 +391,13 @@ probability content to one model package, task, split, and scope. These patient-
 neither public reports nor MLflow artifacts.
 `RuntimeConfig.private_output_directory` is the single root authority for this private publication.
 
-The training and evaluation CLIs default to `sqlite:///mlflow.db` and accept `--tracking-uri` when
-an isolated local SQLite database is required. Comparison accepts explicit evaluation IDs,
+The RSNA training and evaluation CLIs default to `sqlite:///mlflow.db` and accept `--tracking-uri`
+when an isolated local SQLite database is required. RSNA comparison accepts explicit evaluation IDs,
 validates those scientific evaluation authorities, and deterministically regenerates its CSV and
 Markdown views without MLflow discovery. MLflow remains operational provenance.
+
+Symile development also accepts a tracking URI. The formal Symile campaign instead owns the
+checkout's canonical `mlflow.db` and artifact roots; it exposes no tracking or output-root override.
 
 Metric definitions and experimental protocols are documented in
 [`reproducibility.md`](reproducibility.md).

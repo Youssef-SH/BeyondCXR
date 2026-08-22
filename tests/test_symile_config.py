@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from radfusion.data.symile_schemas import ECG_TENSOR_POLICY_VERSION
 from radfusion.training.config import load_symile_development_config
 
 SYMILE_CONFIG_FILENAMES = (
@@ -46,3 +47,10 @@ def test_symile_gated_ablation_differs_only_by_family_and_observedness() -> None
     assert gated_family["parameters"].pop("use_observedness") is True
     assert ablation_family["parameters"].pop("use_observedness") is False
     assert gated == ablation
+
+
+def test_ecg_gated_config_is_a_separate_exact_three_extension() -> None:
+    config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
+    assert config.family.modalities == ("cxr", "labs", "ecg")
+    assert config.family.parameters["modality_count"] == 3
+    assert config.preprocessing["ecg_policy"] == ECG_TENSOR_POLICY_VERSION

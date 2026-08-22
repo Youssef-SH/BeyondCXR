@@ -18,9 +18,8 @@ from radfusion.data.bundle_contract import valid_bundle_id
 from radfusion.data.cxr_transforms import CXR_TRANSFORM_POLICY_VERSION, STANDARD_CXR_IMAGE_SIZE
 from radfusion.data.rsna_metadata_preprocess import METADATA_INPUT_POLICY_VERSION
 from radfusion.data.symile_preprocess import LAB_ECDF_POLICY_VERSION
-from radfusion.training.symile_families import (
-    SYMILE_NEURAL_FAMILIES,
-)
+from radfusion.data.symile_schemas import ECG_TENSOR_POLICY_VERSION, LABEL_POLICY_VERSION, TASK_ID
+from radfusion.training.symile_families import SYMILE_ALL_NEURAL_FAMILIES, SYMILE_ECG_GATED_FAMILY
 
 
 class ConfigError(ValueError):
@@ -87,6 +86,7 @@ FAMILY_MODALITIES = MappingProxyType(
         ("symile", "cxr_labs_concat"): ("cxr", "labs"),
         ("symile", "cxr_labs_gated"): ("cxr", "labs"),
         ("symile", "cxr_labs_gated_no_observedness"): ("cxr", "labs"),
+        ("symile", SYMILE_ECG_GATED_FAMILY): ("cxr", "labs", "ecg"),
     }
 )
 
@@ -171,6 +171,23 @@ _FAMILY_PARAMETER_FIELDS = MappingProxyType(
                 "use_observedness",
             }
         ),
+        SYMILE_ECG_GATED_FAMILY: frozenset(
+            {
+                "encoder_name",
+                "weights",
+                "image_size",
+                "embedding_dimension",
+                "lab_input_dimension",
+                "lab_hidden_dimension",
+                "lab_core_dimension",
+                "latent_dimension",
+                "observedness_dimension",
+                "gate_hidden_dimension",
+                "classifier_hidden_dimension",
+                "modality_count",
+                "dropout",
+            }
+        ),
     }
 )
 
@@ -205,7 +222,7 @@ _TABULAR_TRAINING_FIELDS = MappingProxyType(
     }
 )
 
-_NEURAL_FAMILIES = frozenset({"cxr_densenet", "cxr_metadata_concat", *SYMILE_NEURAL_FAMILIES})
+_NEURAL_FAMILIES = frozenset({"cxr_densenet", "cxr_metadata_concat", *SYMILE_ALL_NEURAL_FAMILIES})
 
 
 @dataclass(frozen=True)
@@ -479,7 +496,7 @@ def _task_config(value: object, dataset_id: str) -> TaskConfig:
     )
     supported = {
         "rsna": ("pneumonia", "rsna-stage-2-target-v1"),
-        "symile": ("pneumonia_strict", "symile-pneumonia-strict-v1"),
+        "symile": (TASK_ID, LABEL_POLICY_VERSION),
     }
     if (task.task_id, task.label_policy_version) != supported[dataset_id]:
         raise ConfigError("Task and label policy are incompatible with dataset")
@@ -522,11 +539,14 @@ def _preprocessing_config(
         required.add("cxr_transform_policy")
     if "labs" in family.modalities:
         required.add("lab_policy")
+    if "ecg" in family.modalities:
+        required.add("ecg_policy")
     _keys(data, required=required, context="preprocessing")
     expected = {
         "metadata_policy": METADATA_INPUT_POLICY_VERSION,
         "cxr_transform_policy": CXR_TRANSFORM_POLICY_VERSION,
         "lab_policy": LAB_ECDF_POLICY_VERSION,
+        "ecg_policy": ECG_TENSOR_POLICY_VERSION,
     }
     if any(_text(data[key], f"preprocessing.{key}") != expected[key] for key in required):
         raise ConfigError("Preprocessing policy is unsupported by the configured implementation")
@@ -608,6 +628,7 @@ def _validate_section_applicability(
         "cxr_labs_concat": "roc_auc",
         "cxr_labs_gated": "roc_auc",
         "cxr_labs_gated_no_observedness": "roc_auc",
+        SYMILE_ECG_GATED_FAMILY: "roc_auc",
     }.get(family.family_id)
     if family.family_id == "cxr_densenet":
         expected = "average_precision" if dataset.dataset_id == "rsna" else "roc_auc"
@@ -646,7 +667,12 @@ def _validate_family_parameters(family_id: str, values: dict[str, Any]) -> None:
             raise ConfigError("LightGBM families require the binary objective")
         if not 2 <= values["num_leaves"] <= 131072:
             raise ConfigError("LightGBM num_leaves must be in [2, 131072]")
-    if family_id in {"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"}:
+    if family_id in {
+        "cxr_labs_concat",
+        "cxr_labs_gated",
+        "cxr_labs_gated_no_observedness",
+        SYMILE_ECG_GATED_FAMILY,
+    }:
         if values.get("lab_input_dimension") != 100:
             raise ConfigError("Symile laboratory models require the 100-column lab contract")
     if family_id in {"cxr_labs_gated", "cxr_labs_gated_no_observedness"}:
@@ -657,6 +683,11 @@ def _validate_family_parameters(family_id: str, values: dict[str, Any]) -> None:
             raise ConfigError("Gated fusion families require modality_count=2")
         if values.get("observedness_dimension") != 50:
             raise ConfigError("Gated fusion families require 50 observedness indicators")
+    if family_id == SYMILE_ECG_GATED_FAMILY:
+        from radfusion.models.symile_ecg_fusion import TRIMODAL_ARCHITECTURE
+
+        if any(values.get(key) != expected for key, expected in TRIMODAL_ARCHITECTURE.items()):
+            raise ConfigError("Tri-modal gated architecture parameters are inconsistent")
 
 
 def _validate_tabular_training(dataset_id: str, family_id: str, values: dict[str, Any]) -> None:

@@ -35,6 +35,10 @@ track.
 The project requires Python 3.13 and [uv](https://docs.astral.sh/uv/). Data-acquisition tooling is
 available through the optional `acquisition` dependency group.
 
+Scientific execution requires this Git checkout, its configs, the recorded lock, and authorized
+local data artifacts. The wheel provides importable code, not a standalone study reproduction.
+Run Make commands from the checkout root, or use `make -C /path/to/checkout <target>`.
+
 ```bash
 uv sync --locked --group dev
 uv run pre-commit install
@@ -69,6 +73,7 @@ make symile-audit    # publish the bundle-qualified aggregate Symile audit
 make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
 make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
 make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
+make symile-campaign SOURCE_ROOT=path/to/private/symile/source BACKUP_ROOT=path/to/approved/persistent/backup
 
 # Lower-level explicit scientific commands
 make rsna-inspect FILE=path/to/image.dcm
@@ -81,7 +86,7 @@ make rsna-compare EVALUATION_IDS="<evaluation-id> ..."
 make rsna-summarize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
 make rsna-localize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
 make clean           # remove tool caches and interrupted-publication staging state
-make purge-generated # deliberately remove all reproducible generated outputs
+make purge-generated # destructive reset; refuses an opened Symile campaign
 make check           # lock consistency, Ruff checks, and unit/contract tests
 make pre-commit      # run repository hooks against all tracked files
 ```
@@ -95,6 +100,16 @@ not user controls. Concat and gated families additionally require
 `SOURCE_CXR_DEVELOPMENT_ID=development-...`. `symile-analyze` accepts exactly one explicit complete
 development ID for each of the six families and validates family membership independently of CLI
 ordering. Neither command exposes or evaluates the official Symile test.
+
+`symile-campaign` is the sole public held-out campaign command. It preserves the exact-six core
+development analysis, runs the separate exact-three ECG family internally, fits 14 final packages,
+and constructs the compact freeze/test-open firewall. Fourteen raw package-bound predictions
+produce six predictor views and one global result. Formal Symile execution has not occurred, and
+the official test remains untouched.
+If a valid `test-open.json` already exists, the command revalidates and resumes that exact freeze,
+performs no development or final retraining, and completes only missing post-open work.
+Resume requires the same frozen numerical inference runtime; see the
+[runtime requirements](docs/reproducibility.md#numerical-runtime-on-resume).
 
 After the raw dataset is in place, `make rsna-campaign` owns pretrained-weight readiness, bundle and
 audit generation, deterministic image caching, all eight
@@ -147,8 +162,13 @@ real-image Grad-CAM overlays and their traceability manifest remain under `priva
 
 Run `make clean` for development caches and temporary publication state. It preserves completed
 bundles, derived CXR caches, reports, model packages, and experiment history. Run
-`make purge-generated` to remove reproducible outputs, including the derived image cache. Both
-commands preserve raw source datasets under `data/raw/`.
+`make purge-generated` to remove generated outputs, including the derived image cache. It refuses
+when the canonical Symile `test-open.json` exists, preserving the opened freeze and its evidence.
+Both commands preserve raw source datasets under `data/raw/`.
+Formal Symile execution requires `BACKUP_ROOT` to point to a separately approved persistent
+destination outside the resolved repository root and generic repository cleanup ownership.
+The formal command owns the canonical manifest, model, report, private, MLflow, and `outbox/`
+locations in the checkout. Preserve expensive scientific evidence separately before any reset.
 
 ## Repository layout
 
@@ -172,9 +192,10 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 
 ## Limitations
 
-- Implemented scope covers the RSNA Stage 2 metadata, CXR, fusion, and localization campaign
-  plus the authenticated Symile-MIMIC data layer and development-only repeated-CV
-  lifecycle. No formal Symile development results or held-out-test results are reported here.
+- Implemented scope covers the RSNA Stage 2 metadata, CXR, fusion, and localization campaign plus
+  the Symile-MIMIC data foundation, core repeated-CV workflow, ECG extension, final fitting,
+  pre-test controls, and held-out evaluation infrastructure. No formal Symile development or
+  held-out results are reported here.
 - Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
   endpoint definition.
 

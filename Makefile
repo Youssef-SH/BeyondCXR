@@ -1,7 +1,7 @@
 .PHONY: sync lock-check lint format format-check test check pre-commit clean purge-generated \
 	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-evaluate rsna-compare \
 	rsna-summarize rsna-localize rsna-campaign symile-manifest symile-audit symile-cv \
-	symile-develop symile-analyze
+	symile-develop symile-analyze symile-campaign
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -59,6 +59,14 @@ symile-analyze:
 	@test -n "$(DEVELOPMENT_IDS)" || \
 		(echo 'DEVELOPMENT_IDS="<six development IDs>" is required'; exit 2)
 	uv run python -m radfusion.training.symile_analysis --development-ids $(DEVELOPMENT_IDS)
+
+symile-campaign:
+	@test -n "$(SOURCE_ROOT)" || (echo "SOURCE_ROOT=path/to/private/symile/source is required"; exit 2)
+	@test -n "$(BACKUP_ROOT)" || (echo "BACKUP_ROOT must name an approved persistent destination outside the repository"; exit 2)
+	uv run --locked --no-dev python -m radfusion.training.symile_campaign --source-root "$(SOURCE_ROOT)" \
+		$(if $(DEVICE),--device "$(DEVICE)") \
+		$(if $(WORKERS),--workers "$(WORKERS)") \
+		--backup-root "$(BACKUP_ROOT)"
 
 rsna-train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
@@ -119,10 +127,13 @@ clean:
 	printf 'Removed %s cache directories, %s __pycache__ directories, %s .pyc files, %s staging directories, and %s temporary files.\n' \
 		"$$cache_count" "$$pycache_count" "$$pyc_count" "$$staging_count" "$$temporary_count"
 
-purge-generated: clean
+purge-generated:
+	@test ! -e private/control/symile/test-open.json && test ! -L private/control/symile/test-open.json || \
+		(echo 'Refusing to purge an opened Symile campaign; preserve its complete frozen state.'; exit 2)
+	$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" clean
 	@set -eu; \
 	output_count=0; \
-	for path in reports models private/predictions private/localization data/cache mlruns mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm outbox; do \
+	for path in reports models private/predictions private/localization private/control/symile data/cache mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm outbox; do \
 		if [ -e "$$path" ]; then rm -rf -- "$$path"; output_count=$$((output_count + 1)); fi; \
 	done; \
 	artifact_count=0; current_count=0; \

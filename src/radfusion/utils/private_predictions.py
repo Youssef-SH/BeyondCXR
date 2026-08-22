@@ -17,7 +17,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from radfusion.data.hashing import logical_arrow_sha256, sha256_file
-from radfusion.data.symile_schemas import OUTER_FOLDS, REPEAT_SEEDS
+from radfusion.data.symile_schemas import (
+    LABEL_POLICY_VERSION,
+    OUTER_FOLDS,
+    REPEAT_SEEDS,
+    TASK_ID,
+)
 from radfusion.utils.package_identity import canonical_scientific_id
 from radfusion.utils.publication import (
     install_immutable_directory,
@@ -52,6 +57,17 @@ _MANIFEST_FIELDS = {
     "logical_arrow_sha256",
     "row_count",
     "prediction_file_sha256",
+}
+_TEST_CONTROL_FIELD = "authorized_by_pretest_freeze_id"
+_SYMILE_TEST_SEMANTIC_FIELDS = {"label_policy_version", "inference_policy"}
+SYMILE_TEST_INFERENCE_POLICY = {
+    "inference_policy_schema_version": 1,
+    "package_scope": "single_package",
+    "preprocessing": "package_bound_deterministic_official_test",
+    "output": "raw_logit_and_sigmoid_probability",
+    "execution": "one_shot",
+    "calibration": "none",
+    "thresholding": "none",
 }
 
 
@@ -121,6 +137,9 @@ def publish_prediction_evidence(
     cv_assignment_id: str | None = None,
     repeat_seed: int | None = None,
     outer_fold: int | None = None,
+    label_policy_version: str | None = None,
+    inference_policy: Mapping[str, object] | None = None,
+    authorized_by_pretest_freeze_id: str | None = None,
 ) -> ValidatedPredictionEvidence:
     """Publish one immutable prediction object under logical scientific identity."""
     _validate_prediction_coordinate(
@@ -133,6 +152,9 @@ def publish_prediction_evidence(
         cv_assignment_id=cv_assignment_id,
         repeat_seed=repeat_seed,
         outer_fold=outer_fold,
+        label_policy_version=label_policy_version,
+        inference_policy=inference_policy,
+        authorized_by_pretest_freeze_id=authorized_by_pretest_freeze_id,
     )
     table = build_prediction_table(sample_ids, targets, logits)
     _validate_dataset_sample_ids(dataset_id, table["sample_id"].to_pylist())
@@ -149,10 +171,21 @@ def publish_prediction_evidence(
         "outer_fold": outer_fold,
         "logical_arrow_sha256": logical_hash,
     }
+    if dataset_id == "symile" and scope == "test":
+        if label_policy_version is None or inference_policy is None:
+            raise ValueError("Symile test prediction policy is incomplete")
+        semantic.update(
+            {
+                "label_policy_version": label_policy_version,
+                "inference_policy": dict(inference_policy),
+            }
+        )
     prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
     scope_root = Path(private_root) / "predictions" / dataset_id
     if scope == "outer_fold_oof":
         scope_root /= "oof"
+    elif dataset_id == "symile" and scope == "test":
+        scope_root /= "test"
     destination = scope_root / prediction_id
     stage = staging_directory(destination)
     try:
@@ -165,6 +198,10 @@ def publish_prediction_evidence(
             "row_count": table.num_rows,
             "prediction_file_sha256": sha256_file(prediction_path),
         }
+        if dataset_id == "symile" and scope == "test":
+            if authorized_by_pretest_freeze_id is None:
+                raise ValueError("Symile test prediction authorization is missing")
+            manifest[_TEST_CONTROL_FIELD] = authorized_by_pretest_freeze_id
         (stage / PREDICTION_MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
@@ -174,10 +211,10 @@ def publish_prediction_evidence(
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    return replace(
-        validate_prediction_evidence(destination, expected_prediction_id=prediction_id),
-        created=created,
-    )
+    validated = validate_prediction_evidence(destination, expected_prediction_id=prediction_id)
+    if validated.manifest.get(_TEST_CONTROL_FIELD) != authorized_by_pretest_freeze_id:
+        raise ValueError("Existing prediction evidence has different control provenance")
+    return replace(validated, created=created)
 
 
 def validate_prediction_evidence(
@@ -203,7 +240,7 @@ def validate_prediction_evidence(
         manifest = json.loads(manifest_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Prediction manifest is unreadable") from exc
-    if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_FIELDS:
+    if not isinstance(manifest, dict) or set(manifest) != _manifest_fields(manifest):
         raise ValueError("Prediction manifest has an unexpected field set")
     schema_version = manifest["prediction_schema_version"]
     if (
@@ -222,6 +259,9 @@ def validate_prediction_evidence(
         cv_assignment_id=manifest["cv_assignment_id"],
         repeat_seed=manifest["repeat_seed"],
         outer_fold=manifest["outer_fold"],
+        label_policy_version=manifest.get("label_policy_version"),
+        inference_policy=manifest.get("inference_policy"),
+        authorized_by_pretest_freeze_id=manifest.get(_TEST_CONTROL_FIELD),
     )
     prediction_path = root / PREDICTIONS_FILENAME
     if sha256_file(prediction_path) != manifest["prediction_file_sha256"]:
@@ -248,6 +288,8 @@ def validate_prediction_evidence(
             "prediction_file_sha256",
         }
     }
+    if manifest["dataset_id"] == "symile" and manifest["scope"] == "test":
+        semantic.update({key: manifest[key] for key in _SYMILE_TEST_SEMANTIC_FIELDS})
     prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
     if manifest["prediction_id"] != prediction_id:
         raise ValueError("Prediction identity differs from logical content")
@@ -321,6 +363,9 @@ def _validate_prediction_coordinate(
     cv_assignment_id: object,
     repeat_seed: object,
     outer_fold: object,
+    label_policy_version: object,
+    inference_policy: object,
+    authorized_by_pretest_freeze_id: object,
 ) -> None:
     validate_path_component(task_id, "prediction task_id")
     _require_identity(bundle_id, ("bundle-",), "bundle")
@@ -330,27 +375,71 @@ def _validate_prediction_coordinate(
             raise ValueError("RSNA prediction task is invalid")
         _require_identity(model_package_id, ("model-package-",), "model package")
         if scope != "test" or any(
-            value is not None for value in (cv_assignment_id, repeat_seed, outer_fold)
+            value is not None
+            for value in (
+                cv_assignment_id,
+                repeat_seed,
+                outer_fold,
+                label_policy_version,
+                inference_policy,
+                authorized_by_pretest_freeze_id,
+            )
         ):
             raise ValueError("Held-out prediction coordinate is invalid")
         return
     if dataset_id != "symile":
         raise ValueError("Prediction dataset_id is unsupported")
-    if task_id != "pneumonia_strict":
+    if task_id != TASK_ID:
         raise ValueError("Symile prediction task is invalid")
-    _require_identity(model_package_id, ("fold-package-",), "model package")
-    if scope != "outer_fold_oof":
-        raise ValueError("OOF prediction scope is invalid")
-    _require_identity(cv_assignment_id, ("cv-assignment-",), "CV assignment")
-    if (
-        isinstance(repeat_seed, bool)
-        or not isinstance(repeat_seed, int)
-        or repeat_seed not in REPEAT_SEEDS
-        or isinstance(outer_fold, bool)
-        or not isinstance(outer_fold, int)
-        or outer_fold not in OUTER_FOLDS
-    ):
-        raise ValueError("OOF prediction coordinate is invalid")
+    if scope == "outer_fold_oof":
+        _require_identity(model_package_id, ("fold-package-",), "model package")
+        if any(
+            value is not None
+            for value in (
+                label_policy_version,
+                inference_policy,
+                authorized_by_pretest_freeze_id,
+            )
+        ):
+            raise ValueError("OOF predictions cannot declare test authorization")
+        _require_identity(cv_assignment_id, ("cv-assignment-",), "CV assignment")
+        if (
+            isinstance(repeat_seed, bool)
+            or not isinstance(repeat_seed, int)
+            or repeat_seed not in REPEAT_SEEDS
+            or isinstance(outer_fold, bool)
+            or not isinstance(outer_fold, int)
+            or outer_fold not in OUTER_FOLDS
+        ):
+            raise ValueError("OOF prediction coordinate is invalid")
+        return
+    if scope == "test":
+        _require_identity(model_package_id, ("final-package-",), "model package")
+        _require_identity(authorized_by_pretest_freeze_id, ("pretest-freeze-",), "pretest freeze")
+        inference_schema_version = (
+            inference_policy.get("inference_policy_schema_version")
+            if isinstance(inference_policy, Mapping)
+            else None
+        )
+        if (
+            label_policy_version != LABEL_POLICY_VERSION
+            or isinstance(inference_schema_version, bool)
+            or not isinstance(inference_schema_version, int)
+            or inference_schema_version != 1
+            or inference_policy != SYMILE_TEST_INFERENCE_POLICY
+        ):
+            raise ValueError("Symile test prediction scientific policy is invalid")
+        if any(value is not None for value in (cv_assignment_id, repeat_seed, outer_fold)):
+            raise ValueError("Symile test prediction coordinate is invalid")
+        return
+    raise ValueError("Symile prediction scope is invalid")
+
+
+def _manifest_fields(manifest: Mapping[str, object]) -> set[str]:
+    fields = set(_MANIFEST_FIELDS)
+    if manifest.get("dataset_id") == "symile" and manifest.get("scope") == "test":
+        fields.update(_SYMILE_TEST_SEMANTIC_FIELDS | {_TEST_CONTROL_FIELD})
+    return fields
 
 
 def _validate_dataset_sample_ids(dataset_id: str, sample_ids: Sequence[str]) -> None:
@@ -372,7 +461,8 @@ def _validate_dataset_sample_ids(dataset_id: str, sample_ids: Sequence[str]) -> 
 
 def _require_identity(value: object, prefixes: tuple[str, ...], name: str) -> str:
     validate_path_component(value, f"prediction {name}")
-    assert isinstance(value, str)
+    if not isinstance(value, str):
+        raise ValueError(f"Prediction {name} identity is invalid")
     if not any(
         value.startswith(prefix)
         and len(value) == len(prefix) + 64
