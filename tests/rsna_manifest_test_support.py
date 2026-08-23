@@ -9,7 +9,7 @@ import pyarrow as pa
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
-from radfusion.data.rsna_artifacts import BuildResult, build_rsna_artifacts
+from beyondcxr.data.rsna_artifacts import BuildResult, build_rsna_artifacts
 
 
 def write_header(

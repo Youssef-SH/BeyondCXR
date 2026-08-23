@@ -5,7 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from radfusion.data.dicom_loader import read_dicom, record_as_dict
+from beyondcxr.data.dicom_loader import read_dicom, record_as_dict
 
 
 def main() -> None:

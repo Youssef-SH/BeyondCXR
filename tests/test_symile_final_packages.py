@@ -18,29 +18,29 @@ from symile_campaign_test_support import (
 )
 from torch import nn
 
-import radfusion.training.neural as neural
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_final_packages as final_packages
-import radfusion.training.symile_final_training as final_training
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
-from radfusion.models.cxr_baseline import PretrainedWeightIdentity
-from radfusion.models.symile_tabular import fit_symile_labs_logistic
-from radfusion.training.config import load_symile_development_config
-from radfusion.training.execution import reused_loader_policy
-from radfusion.training.neural import (
+import beyondcxr.training.neural as neural
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_final_packages as final_packages
+import beyondcxr.training.symile_final_training as final_training
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS
+from beyondcxr.models.cxr_baseline import PretrainedWeightIdentity
+from beyondcxr.models.symile_tabular import fit_symile_labs_logistic
+from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.execution import reused_loader_policy
+from beyondcxr.training.neural import (
     build_terminal_training_loader,
     fit_terminal_two_stage_binary_model,
 )
-from radfusion.training.symile_families import FINAL_PACKAGE_COUNT
-from radfusion.training.symile_final_packages import (
+from beyondcxr.training.symile_families import FINAL_PACKAGE_COUNT
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
     final_training_plan,
     publish_final_neural_package,
     publish_final_tabular_package,
     validate_final_package,
 )
-from radfusion.training.symile_statistics import (
+from beyondcxr.training.symile_statistics import (
     final_member_mean_logit_ensemble,
 )
 

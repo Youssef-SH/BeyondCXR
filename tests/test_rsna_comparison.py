@@ -12,17 +12,17 @@ import pytest
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-from radfusion.data.rsna_metadata_preprocess import metadata_input_contract
-from radfusion.training import rsna_evaluation_result
-from radfusion.training.config import load_experiment_config
-from radfusion.training.rsna_compare import COMPARISON_COLUMNS, regenerate_comparison
-from radfusion.training.rsna_evaluation_result import (
+from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
+from beyondcxr.training import rsna_evaluation_result
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.rsna_compare import COMPARISON_COLUMNS, regenerate_comparison
+from beyondcxr.training.rsna_evaluation_result import (
     publish_rsna_evaluation,
     validate_rsna_evaluation,
 )
-from radfusion.utils.private_predictions import publish_prediction_evidence
-from radfusion.utils.rsna_model_publication import publish_model_package, threshold_contract
-from radfusion.utils.skops_io import save_skops
+from beyondcxr.utils.private_predictions import publish_prediction_evidence
+from beyondcxr.utils.rsna_model_publication import publish_model_package, threshold_contract
+from beyondcxr.utils.skops_io import save_skops
 
 
 def _package(tmp_path: Path, *, variant: int = 0):
@@ -348,7 +348,7 @@ def test_comparison_cli_consumes_evaluation_ids(tmp_path: Path) -> None:
         [
             sys.executable,
             "-m",
-            "radfusion.training.rsna_compare",
+            "beyondcxr.training.rsna_compare",
             "--evaluation-ids",
             result.manifest["evaluation_id"],
             "--output-directory",

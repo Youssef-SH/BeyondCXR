@@ -13,17 +13,17 @@ from symile_campaign_test_support import (
     _synthetic_test_predictions,
 )
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_statistics as symile_statistics
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_export import SymileExportMember, export_and_verify
-from radfusion.training.symile_final_packages import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_statistics as symile_statistics
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_export import SymileExportMember, export_and_verify
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
-from radfusion.training.symile_test_data import (
+from beyondcxr.training.symile_test_data import (
     FrozenSymileTestData,
 )
-from radfusion.utils.private_predictions import (
+from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
 )
 

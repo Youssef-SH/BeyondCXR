@@ -13,12 +13,12 @@ import torch
 from PIL import Image
 from symile_campaign_test_support import _freeze
 
-import radfusion.serving.cli as serving_cli
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.serving.api import MAX_REQUEST_BODY_BYTES, create_app
-from radfusion.serving.authority import LAB_KEYS, RESEARCH_WARNING, SERVING_SPATIAL_POLICY
-from radfusion.serving.predictor import mean_logit_probability
-from radfusion.serving.preprocessing import (
+import beyondcxr.serving.cli as serving_cli
+from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.serving.api import MAX_REQUEST_BODY_BYTES, create_app
+from beyondcxr.serving.authority import LAB_KEYS, RESEARCH_WARNING, SERVING_SPATIAL_POLICY
+from beyondcxr.serving.predictor import mean_logit_probability
+from beyondcxr.serving.preprocessing import (
     SERVING_CANONICAL_SIZE,
     ServingInputError,
     decode_jpeg_once,
@@ -28,8 +28,8 @@ from radfusion.serving.preprocessing import (
     validate_view_position,
     validated_serving_input,
 )
-from radfusion.training.symile_campaign_control import create_or_validate_test_open_record
-from radfusion.training.symile_test_data import FrozenSymileNeuralTestDataset
+from beyondcxr.training.symile_campaign_control import create_or_validate_test_open_record
+from beyondcxr.training.symile_test_data import FrozenSymileNeuralTestDataset
 
 
 def _jpeg(*, rows: int = 360, columns: int = 480) -> bytes:
@@ -329,7 +329,7 @@ def anyio_backend() -> str:
 @pytest.fixture
 async def client(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
-        "radfusion.serving.api.SymileServingPredictor.load",
+        "beyondcxr.serving.api.SymileServingPredictor.load",
         lambda *args, **kwargs: _FakePredictor(),
     )
     application = create_app(

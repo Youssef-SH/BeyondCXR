@@ -10,8 +10,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from radfusion.training.rsna_train import main as train_main
-from radfusion.utils.operational_logging import (
+from beyondcxr.training.rsna_train import main as train_main
+from beyondcxr.utils.operational_logging import (
     CountProgress,
     configure_logging,
     get_operational_logger,
@@ -66,7 +66,7 @@ from radfusion.utils.operational_logging import (
 def test_cli_failure_does_not_echo_private_exception_text(
     module_name, operation, arguments, monkeypatch, capsys
 ) -> None:
-    module = importlib.import_module(f"radfusion.{module_name}")
+    module = importlib.import_module(f"beyondcxr.{module_name}")
 
     def fail(*args, **kwargs):
         raise OSError("synthetic-patient-secret /private/source/secret.dcm token=synthetic-secret")
@@ -82,7 +82,7 @@ def test_cli_failure_does_not_echo_private_exception_text(
 
 @pytest.mark.parametrize("exception_type", [OSError, RuntimeError, Exception])
 def test_symile_campaign_sanitizes_every_exception(exception_type, monkeypatch, capsys) -> None:
-    module = importlib.import_module("radfusion.training.symile_campaign")
+    module = importlib.import_module("beyondcxr.training.symile_campaign")
 
     def fail(**kwargs):
         del kwargs
@@ -120,7 +120,7 @@ def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsy
         log_event(get_operational_logger("test"), "test_progress")
         return result
 
-    monkeypatch.setattr("radfusion.training.rsna_train.train_metadata_experiment", fake_train)
+    monkeypatch.setattr("beyondcxr.training.rsna_train.train_metadata_experiment", fake_train)
 
     for _ in range(2):
         assert train_main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
@@ -136,13 +136,13 @@ def test_configuration_owns_one_dedicated_handler_and_leaves_library_loggers_alo
     configure_logging("INFO", stream=operational_stream)
     operational_handler = next(
         handler
-        for handler in logging.getLogger("radfusion.operational").handlers
-        if getattr(handler, "_radfusion_console_handler", False)
+        for handler in logging.getLogger("beyondcxr.operational").handlers
+        if getattr(handler, "_beyondcxr_console_handler", False)
     )
     operational_handler.setFormatter(logging.Formatter("%(message)s"))
     configure_logging("INFO", stream=operational_stream)
     log_event(get_operational_logger("test"), "handler_reconfigured")
-    ordinary = logging.getLogger("radfusion.some_library")
+    ordinary = logging.getLogger("beyondcxr.some_library")
     ordinary_handler = logging.StreamHandler(ordinary_stream)
     ordinary_level = ordinary.level
     ordinary_propagate = ordinary.propagate
@@ -159,13 +159,13 @@ def test_configuration_owns_one_dedicated_handler_and_leaves_library_loggers_alo
 
     operational_handlers = [
         handler
-        for handler in logging.getLogger("radfusion.operational").handlers
-        if getattr(handler, "_radfusion_console_handler", False)
+        for handler in logging.getLogger("beyondcxr.operational").handlers
+        if getattr(handler, "_beyondcxr_console_handler", False)
     ]
     assert len(operational_handlers) == 1
     assert not any(
-        getattr(handler, "_radfusion_console_handler", False)
-        for handler in logging.getLogger("radfusion").handlers
+        getattr(handler, "_beyondcxr_console_handler", False)
+        for handler in logging.getLogger("beyondcxr").handlers
     )
     assert ordinary_stream.getvalue() == "library message\n"
     assert ordinary.handlers == ordinary_handlers
@@ -175,13 +175,34 @@ def test_configuration_owns_one_dedicated_handler_and_leaves_library_loggers_alo
     assert operational_stream.getvalue().startswith("timestamp=")
 
 
+def test_log_event_rebinds_a_closed_configured_stream_to_current_stderr(
+    monkeypatch,
+) -> None:
+    expired_stream = io.StringIO()
+    configure_logging("INFO", stream=expired_stream)
+    expired_stream.close()
+    current_stderr = io.StringIO()
+    monkeypatch.setattr("beyondcxr.utils.operational_logging.sys.stderr", current_stderr)
+
+    log_event(get_operational_logger("test"), "stream_lifetime_changed")
+
+    handlers = [
+        handler
+        for handler in logging.getLogger("beyondcxr.operational").handlers
+        if getattr(handler, "_beyondcxr_console_handler", False)
+    ]
+    assert len(handlers) == 1
+    assert handlers[0].stream is current_stderr
+    assert current_stderr.getvalue().count("event=stream_lifetime_changed") == 1
+
+
 def test_operational_events_do_not_propagate_to_root_before_configuration() -> None:
-    namespace = logging.getLogger("radfusion.operational")
+    namespace = logging.getLogger("beyondcxr.operational")
     assert namespace.propagate is False
     configured_handlers = [
         handler
         for handler in namespace.handlers
-        if getattr(handler, "_radfusion_console_handler", False)
+        if getattr(handler, "_beyondcxr_console_handler", False)
     ]
     root = logging.getLogger()
     root_stream = io.StringIO()
@@ -231,7 +252,7 @@ def test_formatter_ignores_nonmapping_record_fields() -> None:
     configure_logging("INFO", stream=stream)
     logger = get_operational_logger("test")
 
-    logger.info("malformed", extra={"radfusion_fields": object()})
+    logger.info("malformed", extra={"beyondcxr_fields": object()})
 
     lines = stream.getvalue().splitlines()
     assert len(lines) == 1
@@ -246,7 +267,7 @@ def test_formatter_drops_unallowed_fields_and_redacts_unsafe_values() -> None:
     logger.info(
         "unsafe",
         extra={
-            "radfusion_fields": {
+            "beyondcxr_fields": {
                 "event": "unsafe event\n",
                 "artifact": "/private/patient.dcm",
                 "unknown": object(),
@@ -292,7 +313,7 @@ def test_count_progress_is_rate_limited_and_reports_completion(monkeypatch) -> N
     configure_logging("INFO", stream=stream)
     timestamps = iter((0.0, 1.0, 31.0, 32.0))
     monkeypatch.setattr(
-        "radfusion.utils.operational_logging.time.perf_counter", lambda: next(timestamps)
+        "beyondcxr.utils.operational_logging.time.perf_counter", lambda: next(timestamps)
     )
     progress = CountProgress(
         get_operational_logger("test"),
@@ -373,7 +394,7 @@ def test_timed_phase_logs_failure_and_preserves_exception(monkeypatch) -> None:
     configure_logging("INFO", stream=stream)
     timestamps = iter((10.0, 12.5))
     monkeypatch.setattr(
-        "radfusion.utils.operational_logging.time.perf_counter", lambda: next(timestamps)
+        "beyondcxr.utils.operational_logging.time.perf_counter", lambda: next(timestamps)
     )
     failure = RuntimeError("original failure")
 

@@ -13,12 +13,12 @@ from neural_test_support import cpu_runtime as _runtime
 from torch import nn
 from torch.utils.data import Dataset
 
-from radfusion.training.config import (
+from beyondcxr.training.config import (
     load_experiment_config,
 )
-from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy
-from radfusion.training.neural import (
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.execution import LoaderExecutionPolicy
+from beyondcxr.training.neural import (
     NeuralTrainingError,
     build_evaluation_loader,
     candidate_is_improvement,
@@ -201,7 +201,7 @@ def test_neural_determinism_configures_algorithms_and_cudnn(monkeypatch) -> None
 def test_seed_neural_runtime_uses_shared_determinism_configurator(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
-        "radfusion.training.neural.configure_neural_determinism",
+        "beyondcxr.training.neural.configure_neural_determinism",
         lambda: calls.append("configured"),
     )
 
@@ -362,7 +362,7 @@ def test_different_loader_seeds_change_training_order() -> None:
 def test_fine_tune_history_records_learning_rate_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     dataset = _TensorDataset([0, 1, 0, 1])
     config = replace(
@@ -397,7 +397,7 @@ def test_fine_tune_history_records_learning_rate_used(
 def test_shared_two_stage_lifecycle_supports_auroc_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     dataset = _TensorDataset([0, 1, 0, 1])
     config = replace(
@@ -472,16 +472,16 @@ def test_cpu_and_cuda_runtime_provenance(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     assert all(cpu[field] is None for field in gpu_fields)
 
-    monkeypatch.setattr("radfusion.training.device.torch.cuda.is_available", lambda: True)
-    monkeypatch.setattr("radfusion.training.device.torch.cuda.current_device", lambda: 2)
+    monkeypatch.setattr("beyondcxr.training.device.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("beyondcxr.training.device.torch.cuda.current_device", lambda: 2)
     monkeypatch.setattr(
-        "radfusion.training.device.torch.cuda.get_device_name", lambda index: f"GPU-{index}"
+        "beyondcxr.training.device.torch.cuda.get_device_name", lambda index: f"GPU-{index}"
     )
     monkeypatch.setattr(
-        "radfusion.training.device.torch.cuda.get_device_capability", lambda index: (8, 6)
+        "beyondcxr.training.device.torch.cuda.get_device_capability", lambda index: (8, 6)
     )
-    monkeypatch.setattr("radfusion.training.device.torch.backends.cudnn.version", lambda: 9100)
-    monkeypatch.setattr("radfusion.training.device.torch.version.cuda", "12.4")
+    monkeypatch.setattr("beyondcxr.training.device.torch.backends.cudnn.version", lambda: 9100)
+    monkeypatch.setattr("beyondcxr.training.device.torch.version.cuda", "12.4")
     cuda = resolve_device("cuda", mixed_precision=True, pin_memory_policy="auto").provenance()
     assert cuda["cuda_runtime_version"] == "12.4"
     assert cuda["cudnn_version"] == 9100
@@ -536,7 +536,7 @@ def test_warmup_preserves_encoder_state_and_fine_tuning_uses_configured_groups(
         for key, value in warmup_model.classifier.state_dict().items()
     )
 
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     optimizers = []
     schedulers = []
@@ -597,7 +597,7 @@ def test_warmup_preserves_encoder_state_and_fine_tuning_uses_configured_groups(
 
 
 def test_cpu_training_avoids_amp_and_rejects_nonfinite_loss(monkeypatch) -> None:
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     monkeypatch.setattr(
         neural_module.torch,
@@ -660,7 +660,7 @@ def test_epoch_loss_is_sample_weighted_for_partial_final_batch() -> None:
 
 
 def test_injected_amp_path_unscales_before_clipping(monkeypatch) -> None:
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     runtime = replace(_runtime(), mixed_precision_effective=True)
     events = []
@@ -719,7 +719,7 @@ def test_injected_amp_path_unscales_before_clipping(monkeypatch) -> None:
 
 
 def test_fine_tuning_patience_is_exact_and_best_stage_can_vary(monkeypatch) -> None:
-    import radfusion.training.neural as neural_module
+    import beyondcxr.training.neural as neural_module
 
     dataset = _TensorDataset([0, 1, 0, 1])
     config = replace(
@@ -761,7 +761,7 @@ def test_fine_tuning_patience_is_exact_and_best_stage_can_vary(monkeypatch) -> N
 
 def test_inference_rejects_nonfinite_average_precision(monkeypatch) -> None:
     monkeypatch.setattr(
-        "radfusion.training.neural.average_precision_score",
+        "beyondcxr.training.neural.average_precision_score",
         lambda targets, probabilities: float("nan"),
     )
     loader = build_image_loaders(

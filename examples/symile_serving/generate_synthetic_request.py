@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from radfusion.serving.authority import LAB_KEYS
+from beyondcxr.serving.authority import LAB_KEYS
 
 
 def main() -> int:

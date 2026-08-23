@@ -8,8 +8,8 @@ import torch
 import torchxrayvision as xrv
 from torchvision.transforms import ColorJitter, InterpolationMode, RandomAffine
 
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.training.neural import seed_neural_runtime
+from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.training.neural import seed_neural_runtime
 
 
 def test_validation_transform_is_deterministic_finite_and_serializable() -> None:

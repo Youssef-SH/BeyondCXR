@@ -1,6 +1,6 @@
-# RadFusion-Clinical
+# BeyondCXR
 
-RadFusion-Clinical is a reproducible machine-learning benchmark and experimentation framework for
+BeyondCXR is a reproducible machine-learning benchmark and experimentation framework for
 prediction of report-derived Pneumonia findings from chest radiographs and admission physiology.
 It contains an RSNA imaging benchmark and an authenticated Symile-MIMIC multimodal development
 track.
@@ -180,11 +180,11 @@ locations in the checkout. Preserve expensive scientific evidence separately bef
 ## Repository layout
 
 ```text
-src/radfusion/data/        ingestion, splits, audits, schemas, validation, and hashing
-src/radfusion/models/      fixed estimator definitions
-src/radfusion/training/    reusable training entry points
-src/radfusion/evaluation/  metrics and aggregate evaluation plots
-src/radfusion/serving/     validated research-only ensemble serving
+src/beyondcxr/data/        ingestion, splits, audits, schemas, validation, and hashing
+src/beyondcxr/models/      fixed estimator definitions
+src/beyondcxr/training/    reusable training entry points
+src/beyondcxr/evaluation/  metrics and aggregate evaluation plots
+src/beyondcxr/serving/     validated research-only ensemble serving
 configs/                   experiment definitions
 tests/                     unit, contract, and local integration tests
 docs/                      architecture, data contracts, privacy, and reproducibility

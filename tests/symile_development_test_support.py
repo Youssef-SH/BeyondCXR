@@ -10,25 +10,25 @@ import pandas as pd
 import pyarrow as pa
 import torch
 
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS, SymileLabEcdfTransformer
-from radfusion.data.symile_schemas import CV_SCHEMA
-from radfusion.models.symile_tabular import (
+from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS, SymileLabEcdfTransformer
+from beyondcxr.data.symile_schemas import CV_SCHEMA
+from beyondcxr.models.symile_tabular import (
     fit_symile_labs_lightgbm,
     fit_symile_labs_logistic,
 )
-from radfusion.training.config import (
+from beyondcxr.training.config import (
     load_symile_development_config,
 )
-from radfusion.training.symile_data import (
+from beyondcxr.training.symile_data import (
     derive_inner_seed,
 )
-from radfusion.training.symile_development import CompletedSymileFold
-from radfusion.utils.private_predictions import (
+from beyondcxr.training.symile_development import CompletedSymileFold
+from beyondcxr.utils.private_predictions import (
     build_prediction_table,
     publish_prediction_evidence,
 )
-from radfusion.utils.symile_publication import (
+from beyondcxr.utils.symile_publication import (
     neural_checkpoint_document,
     publish_fold_package,
 )

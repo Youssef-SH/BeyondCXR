@@ -4,8 +4,8 @@ from pathlib import Path
 
 import yaml
 
-from radfusion.data.symile_schemas import ECG_TENSOR_POLICY_VERSION
-from radfusion.training.config import load_symile_development_config
+from beyondcxr.data.symile_schemas import ECG_TENSOR_POLICY_VERSION
+from beyondcxr.training.config import load_symile_development_config
 
 SYMILE_CONFIG_FILENAMES = (
     "symile_labs_logistic.yaml",

@@ -13,8 +13,8 @@ import mlflow
 import pytest
 from mlflow.tracking import MlflowClient
 
-from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.rsna_campaign import (
+from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.rsna_campaign import (
     CampaignConfigs,
     _validate_neural_campaign_configs,
     _validate_outputs,
@@ -23,8 +23,8 @@ from radfusion.training.rsna_campaign import (
     execute_rsna_campaign,
     main,
 )
-from radfusion.training.rsna_datasets import RsnaDataset
-from radfusion.utils.mlflow_utils import configure_mlflow
+from beyondcxr.training.rsna_datasets import RsnaDataset
+from beyondcxr.utils.mlflow_utils import configure_mlflow
 
 _PACKAGE_IDS = {
     name: "model-package-" + character * 64
@@ -76,15 +76,15 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
     evaluation_configs = []
     expected_package_ids = tuple(_PACKAGE_IDS.values())
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._validate_prerequisites",
+        "beyondcxr.training.rsna_campaign._validate_prerequisites",
         lambda: events.append(("prerequisites", None)) or configs,
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.ensure_pretrained_weights",
+        "beyondcxr.training.rsna_campaign.ensure_pretrained_weights",
         lambda name: events.append(("weights", name)),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.build_and_write",
+        "beyondcxr.training.rsna_campaign.build_and_write",
         lambda *args: (
             events.append(("manifest_build", None))
             or SimpleNamespace(
@@ -97,21 +97,21 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
         ),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._validate_configured_bundle",
+        "beyondcxr.training.rsna_campaign._validate_configured_bundle",
         lambda *args: events.append(("manifest_validation", None)),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.generate_rsna_audit",
+        "beyondcxr.training.rsna_campaign.generate_rsna_audit",
         lambda *args: events.append(("audit", None)),
     )
-    monkeypatch.setattr("radfusion.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
     cache = SimpleNamespace(identity=SimpleNamespace(cache_id="cache-" + "0" * 64))
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.prepare_rsna_cxr_cache",
+        "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
         lambda *args, **kwargs: events.append(("cache", None)) or cache,
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._required_cuda_runtime",
+        "beyondcxr.training.rsna_campaign._required_cuda_runtime",
         lambda config: SimpleNamespace(pin_memory_effective=True),
     )
 
@@ -125,7 +125,7 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
 
     metadata_ids = iter(("metadata-logistic", "metadata-lightgbm"))
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.train_metadata_experiment",
+        "beyondcxr.training.rsna_campaign.train_metadata_experiment",
         lambda *args, **kwargs: (
             events.append(("train", run_id := next(metadata_ids))) or result(run_id)
         ),
@@ -138,7 +138,7 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
         events.append(("train", run_id))
         return result(run_id)
 
-    monkeypatch.setattr("radfusion.training.rsna_campaign.train_cxr_experiment", train_cxr)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_cxr_experiment", train_cxr)
 
     def train_fusion(config, *, source_cxr_package_id, **kwargs):
         training_policies.append(kwargs["execution"])
@@ -147,7 +147,7 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
         events.append(("train", run_id))
         return result(run_id)
 
-    monkeypatch.setattr("radfusion.training.rsna_campaign.train_fusion_experiment", train_fusion)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_fusion_experiment", train_fusion)
 
     def evaluate(package_id, **kwargs):
         frozen = [value for kind, value in events if kind == "candidate_set_frozen"]
@@ -161,21 +161,21 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
             artifact_directory=tmp_path / package_id,
         )
 
-    monkeypatch.setattr("radfusion.training.rsna_campaign.evaluate_model_package", evaluate)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.evaluate_model_package", evaluate)
 
     def summarize(run_ids, **kwargs):
         events.append(("summary", tuple(run_ids)))
         return SimpleNamespace(report_directory=tmp_path / f"summary-{run_ids[0]}")
 
-    monkeypatch.setattr("radfusion.training.rsna_campaign.publish_seed_summary", summarize)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.publish_seed_summary", summarize)
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.generate_localization_report",
+        "beyondcxr.training.rsna_campaign.generate_localization_report",
         lambda run_ids, **kwargs: (
             events.append(("localize", tuple(run_ids))) or tmp_path / "localization"
         ),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.regenerate_comparison",
+        "beyondcxr.training.rsna_campaign.regenerate_comparison",
         lambda *args, **kwargs: (
             events.append(("compare", None))
             or (tmp_path / "comparison.csv", tmp_path / "comparison.md", 16)
@@ -188,11 +188,11 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
         events.append(("candidate_set_frozen", package_ids))
 
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._validate_frozen_training_packages",
+        "beyondcxr.training.rsna_campaign._validate_frozen_training_packages",
         validate_candidates,
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._validate_outputs",
+        "beyondcxr.training.rsna_campaign._validate_outputs",
         lambda *args: events.append(("validate", None)),
     )
 
@@ -209,7 +209,7 @@ def test_campaign_freezes_complete_candidate_set_before_test_access(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"archive")
 
-    monkeypatch.setattr("radfusion.training.rsna_campaign._write_archive", archive)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign._write_archive", archive)
 
     campaign = execute_rsna_campaign()
 
@@ -265,12 +265,12 @@ def test_training_failure_never_crosses_test_boundary(
 ) -> None:
     configs = _configs()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("radfusion.training.rsna_campaign._validate_prerequisites", lambda: configs)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign._validate_prerequisites", lambda: configs)
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.ensure_pretrained_weights", lambda name: None
+        "beyondcxr.training.rsna_campaign.ensure_pretrained_weights", lambda name: None
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.build_and_write",
+        "beyondcxr.training.rsna_campaign.build_and_write",
         lambda *args: SimpleNamespace(
             paths=SimpleNamespace(
                 bundle_id="bundle",
@@ -280,25 +280,25 @@ def test_training_failure_never_crosses_test_boundary(
         ),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._validate_configured_bundle", lambda *args: None
+        "beyondcxr.training.rsna_campaign._validate_configured_bundle", lambda *args: None
     )
-    monkeypatch.setattr("radfusion.training.rsna_campaign.generate_rsna_audit", lambda *args: None)
-    monkeypatch.setattr("radfusion.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args: None)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.prepare_rsna_cxr_cache",
+        "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
         lambda *args, **kwargs: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign._required_cuda_runtime",
+        "beyondcxr.training.rsna_campaign._required_cuda_runtime",
         lambda config: SimpleNamespace(pin_memory_effective=False),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.train_metadata_experiment",
+        "beyondcxr.training.rsna_campaign.train_metadata_experiment",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("training failed")),
     )
     evaluations: list[str] = []
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.evaluate_model_package",
+        "beyondcxr.training.rsna_campaign.evaluate_model_package",
         lambda package_id, **kwargs: evaluations.append(package_id),
     )
     with pytest.raises(RuntimeError):
@@ -324,7 +324,7 @@ def test_campaign_rejects_existing_outputs_without_deleting_them(
 
 def test_campaign_cli_preserves_process_interrupts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "radfusion.training.rsna_campaign.execute_rsna_campaign",
+        "beyondcxr.training.rsna_campaign.execute_rsna_campaign",
         lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
@@ -351,7 +351,7 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
     unrelated_bundle = Path("data/manifests/rsna/bundles/bundle-unrelated/manifest.json")
     unrelated_bundle.parent.mkdir(parents=True)
     unrelated_bundle.write_text("unrelated\n", encoding="utf-8")
-    configure_mlflow(tracking_uri="sqlite:///mlflow.db", experiment_name="radfusion-rsna")
+    configure_mlflow(tracking_uri="sqlite:///mlflow.db", experiment_name="beyondcxr-rsna")
     source_artifact = Path("resolved_config.yaml")
     source_artifact.write_text("experiment: test\n", encoding="utf-8")
     with mlflow.start_run() as run:
@@ -395,7 +395,7 @@ def test_portable_archive_contains_results_and_excludes_sources_and_cache(
     assert "event=campaign_succeeded" not in log_text
     with closing(sqlite3.connect(exported_database)) as database:
         location = database.execute(
-            "SELECT artifact_location FROM experiments WHERE name = 'radfusion-rsna'"
+            "SELECT artifact_location FROM experiments WHERE name = 'beyondcxr-rsna'"
         ).fetchone()
         run_uri = database.execute(
             "SELECT artifact_uri FROM runs WHERE run_uuid = ?", (run_id,)

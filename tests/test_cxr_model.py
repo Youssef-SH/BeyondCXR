@@ -8,7 +8,7 @@ import torch
 import torchxrayvision as xrv
 from torch import nn
 
-from radfusion.models.cxr_baseline import (
+from beyondcxr.models.cxr_baseline import (
     CxrBinaryClassifier,
     CxrDenseNetModel,
     StandardCxrEncoder,
@@ -17,8 +17,8 @@ from radfusion.models.cxr_baseline import (
     set_cxr_encoder_trainability,
     set_cxr_encoder_training_mode,
 )
-from radfusion.training.config import load_experiment_config
-from radfusion.training.rsna_registry import MODELS, get_model
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.rsna_registry import MODELS, get_model
 
 
 class _TinyEncoder(nn.Module):
@@ -278,7 +278,7 @@ def test_evaluation_architecture_is_built_without_pretrained_cache_access() -> N
 
 
 # This warning comes from TorchXRayVision's serialized pretrained weight file.
-# RadFusion model.pt packages will store explicit state dictionaries rather than pickled modules.
+# BeyondCXR model.pt packages will store explicit state dictionaries rather than pickled modules.
 @pytest.mark.filterwarnings(
     "ignore:source code of class .* has changed.*:torch.serialization.SourceChangeWarning"
 )

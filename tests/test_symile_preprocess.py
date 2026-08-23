@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from radfusion.data.symile_preprocess import (
+from beyondcxr.data.symile_preprocess import (
     LAB_FEATURE_COLUMNS,
     LAB_OBSERVED_COLUMNS,
     LAB_VALUE_COLUMNS,

@@ -1,6 +1,6 @@
 # Controlled research serving
 
-RadFusion serving is a research-only execution surface for the predeclared three-member
+BeyondCXR serving is a research-only execution surface for the predeclared three-member
 CXR-plus-laboratories missingness-aware gated ensemble. It is not intended for clinical
 decision-making, is not a medical device or physician replacement, and predicts a report-derived
 Pneumonia finding rather than confirmed infectious pneumonia.
@@ -80,12 +80,12 @@ or trained package. Unless separate distribution authorization exists, mount the
 packages read-only:
 
 ```bash
-docker build -t radfusion-serving .
+docker build -t beyondcxr-serving .
 docker run --rm -p 8000:8000 \
   --mount type=bind,src=/approved/private/serving-authority-<sha256>,\
 dst=/artifacts/serving-authority-<sha256>,readonly \
   --mount type=bind,src=/approved/private/packages,dst=/artifacts/packages,readonly \
-  radfusion-serving \
+  beyondcxr-serving \
   --authority /artifacts/serving-authority-<sha256> \
   --package-root /artifacts/packages --host 0.0.0.0 --port 8000
 ```
@@ -95,7 +95,7 @@ The container downloads no scientific model. An absent or invalid mount terminat
 ## Privacy and failures
 
 The service has no patient database, upload archive, request archive, response archive, or
-prediction cache. RadFusion retains no submitted image, laboratory input, patient identifier,
+prediction cache. BeyondCXR retains no submitted image, laboratory input, patient identifier,
 missingness state, or prediction after request processing. Operational handling does not log
 patient-level inputs or outputs. Stable client errors name only categories such as invalid media,
 image, view, JSON, keys, or numeric values; private paths, package contents, stack traces, and

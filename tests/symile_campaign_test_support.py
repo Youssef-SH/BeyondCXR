@@ -7,28 +7,28 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_final_packages as final_packages
-import radfusion.training.symile_statistics as symile_statistics
-from radfusion.training.config import load_symile_development_config
-from radfusion.training.symile_campaign_control import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_final_packages as final_packages
+import beyondcxr.training.symile_statistics as symile_statistics
+from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.symile_campaign_control import (
     PRETEST_FREEZE_PREFIX,
     ValidatedPretestFreeze,
 )
-from radfusion.training.symile_families import (
+from beyondcxr.training.symile_families import (
     FINAL_NEURAL_MEMBER_SEEDS,
     FINAL_PACKAGE_COUNT,
     FINAL_PACKAGE_POLICY,
     FINAL_TABULAR_SEED,
 )
-from radfusion.training.symile_final_packages import (
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
-from radfusion.training.symile_test_data import (
+from beyondcxr.training.symile_test_data import (
     HeldOutEvaluationProjection,
 )
-from radfusion.utils.package_identity import canonical_scientific_id
-from radfusion.utils.private_predictions import (
+from beyondcxr.utils.package_identity import canonical_scientific_id
+from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
     build_prediction_table,

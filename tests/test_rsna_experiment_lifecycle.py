@@ -12,27 +12,27 @@ import yaml
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
-from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_artifacts import build_and_write
-from radfusion.data.rsna_metadata_preprocess import SOURCE_FEATURES
-from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.rsna_datasets import RsnaDataset
-from radfusion.training.rsna_evaluate import (
+from beyondcxr.data.hashing import sha256_file
+from beyondcxr.data.rsna_artifacts import build_and_write
+from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
+from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.rsna_datasets import RsnaDataset
+from beyondcxr.training.rsna_evaluate import (
     evaluate_model_package,
 )
-from radfusion.training.rsna_evaluate import (
+from beyondcxr.training.rsna_evaluate import (
     main as evaluate_main,
 )
-from radfusion.training.rsna_evaluation_result import (
+from beyondcxr.training.rsna_evaluation_result import (
     CompletedRsnaEvaluation,
     validate_rsna_evaluation,
 )
-from radfusion.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
-from radfusion.training.rsna_train_metadata import train_metadata_experiment, validate_report_set
-from radfusion.utils.mlflow_utils import configure_mlflow
-from radfusion.utils.operational_logging import configure_logging
-from radfusion.utils.private_predictions import validate_prediction_evidence
-from radfusion.utils.rsna_model_publication import (
+from beyondcxr.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
+from beyondcxr.training.rsna_train_metadata import train_metadata_experiment, validate_report_set
+from beyondcxr.utils.mlflow_utils import configure_mlflow
+from beyondcxr.utils.operational_logging import configure_logging
+from beyondcxr.utils.private_predictions import validate_prediction_evidence
+from beyondcxr.utils.rsna_model_publication import (
     model_package_id,
     validate_published_model,
 )
@@ -105,10 +105,10 @@ def _config(
 
 @pytest.fixture(autouse=True)
 def _small_operational_latency_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("radfusion.training.rsna_train_metadata.LATENCY_WARMUP_CALLS", 1)
-    monkeypatch.setattr("radfusion.training.rsna_train_metadata.LATENCY_MEASURED_CALLS", 3)
-    monkeypatch.setattr("radfusion.training.rsna_evaluate.LATENCY_WARMUP_CALLS", 1)
-    monkeypatch.setattr("radfusion.training.rsna_evaluate.LATENCY_MEASURED_CALLS", 3)
+    monkeypatch.setattr("beyondcxr.training.rsna_train_metadata.LATENCY_WARMUP_CALLS", 1)
+    monkeypatch.setattr("beyondcxr.training.rsna_train_metadata.LATENCY_MEASURED_CALLS", 3)
+    monkeypatch.setattr("beyondcxr.training.rsna_evaluate.LATENCY_WARMUP_CALLS", 1)
+    monkeypatch.setattr("beyondcxr.training.rsna_evaluate.LATENCY_MEASURED_CALLS", 3)
 
 
 def _tracking_uri(tmp_path: Path) -> str:
@@ -156,10 +156,10 @@ def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, D
 
 def _fixed_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "radfusion.training.rsna_train_metadata.git_revision",
+        "beyondcxr.training.rsna_train_metadata.git_revision",
         lambda: ("commit-synthetic", False),
     )
-    monkeypatch.setattr("radfusion.training.rsna_train_metadata.uv_lock_sha256", lambda: _SHA256)
+    monkeypatch.setattr("beyondcxr.training.rsna_train_metadata.uv_lock_sha256", lambda: _SHA256)
 
 
 @pytest.mark.parametrize("filename", ["rsna_metadata_logistic.yaml", "rsna_metadata_lightgbm.yaml"])
@@ -450,7 +450,7 @@ def test_fit_failure_leaves_failed_mlflow_run(
             raise RuntimeError("fit failed")
 
     monkeypatch.setattr(
-        "radfusion.training.rsna_train_metadata.get_model", lambda _: FailingModel()
+        "beyondcxr.training.rsna_train_metadata.get_model", lambda _: FailingModel()
     )
     with pytest.raises(RuntimeError):
         _train(config, tmp_path)
@@ -487,7 +487,7 @@ def test_run_start_precedes_post_creation_mlflow_metadata_failure(
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
-        "radfusion.utils.mlflow_utils.mlflow.set_tag",
+        "beyondcxr.utils.mlflow_utils.mlflow.set_tag",
         lambda key, value: (_ for _ in ()).throw(RuntimeError(f"metadata failed: {key}={value}")),
     )
 
@@ -521,7 +521,7 @@ def test_required_model_publication_failure_leaves_failed_mlflow_run(
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.rsna_train_metadata.publish_model_package",
+        "beyondcxr.training.rsna_train_metadata.publish_model_package",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("publication failed")),
     )
 
@@ -541,7 +541,7 @@ def test_incomplete_report_set_fails_training_run(
     _install_dataset(monkeypatch)
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
-    from radfusion.training import rsna_train_metadata
+    from beyondcxr.training import rsna_train_metadata
 
     write_reports = rsna_train_metadata.write_run_reports
 
@@ -567,7 +567,7 @@ def test_training_report_publication_failure_does_not_complete_run(
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.rsna_train_metadata.publish_directory",
+        "beyondcxr.training.rsna_train_metadata.publish_directory",
         lambda *args: (_ for _ in ()).throw(RuntimeError("report publication failed")),
     )
 
@@ -673,7 +673,7 @@ def test_evaluation_report_publication_failure_does_not_complete_run(
     config = _config(tmp_path)
     training = _train(config, tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.rsna_evaluate.publish_rsna_evaluation",
+        "beyondcxr.training.rsna_evaluate.publish_rsna_evaluation",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("report publication failed")),
     )
 
@@ -702,7 +702,7 @@ def test_operational_completion_failure_preserves_published_scientific_objects(
     config = _config(tmp_path)
     training = _train(config, tmp_path)
     monkeypatch.setattr(
-        "radfusion.training.rsna_evaluate.mlflow.log_metrics",
+        "beyondcxr.training.rsna_evaluate.mlflow.log_metrics",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ledger write failed")),
     )
 
@@ -799,7 +799,7 @@ def test_evaluator_cli_serializes_completed_result(
         assert report_directory is None
         return result
 
-    monkeypatch.setattr("radfusion.training.rsna_evaluate.evaluate_model_package", evaluate)
+    monkeypatch.setattr("beyondcxr.training.rsna_evaluate.evaluate_model_package", evaluate)
 
     with pytest.raises(SystemExit):
         evaluate_main(["--package-id", _RESULT_PACKAGE_ID])

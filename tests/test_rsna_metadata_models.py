@@ -10,11 +10,11 @@ import pytest
 import skops.io as sio
 import yaml
 
-from radfusion.models.rsna_metadata import MetadataLightgbmModel, MetadataLogisticModel
-from radfusion.training.config import load_experiment_config
-from radfusion.training.rsna_registry import get_model
-from radfusion.utils.mlflow_utils import cpu_model, environment_provenance
-from radfusion.utils.skops_io import load_skops, save_skops
+from beyondcxr.models.rsna_metadata import MetadataLightgbmModel, MetadataLogisticModel
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.rsna_registry import get_model
+from beyondcxr.utils.mlflow_utils import cpu_model, environment_provenance
+from beyondcxr.utils.skops_io import load_skops, save_skops
 
 
 def _features() -> tuple[pd.DataFrame, np.ndarray]:
@@ -144,9 +144,9 @@ def test_environment_provenance_contains_required_runtime_versions() -> None:
 
 
 def test_cpu_model_uses_linux_cpuinfo(monkeypatch) -> None:
-    monkeypatch.setattr("radfusion.utils.mlflow_utils.platform.system", lambda: "Linux")
+    monkeypatch.setattr("beyondcxr.utils.mlflow_utils.platform.system", lambda: "Linux")
     monkeypatch.setattr(
-        "radfusion.utils.mlflow_utils.Path.read_text",
+        "beyondcxr.utils.mlflow_utils.Path.read_text",
         lambda *args, **kwargs: "processor: 0\nmodel name: Test CPU 9000\n",
     )
 
@@ -154,15 +154,15 @@ def test_cpu_model_uses_linux_cpuinfo(monkeypatch) -> None:
 
 
 def test_cpu_model_has_safe_unknown_fallback(monkeypatch) -> None:
-    monkeypatch.setattr("radfusion.utils.mlflow_utils.platform.system", lambda: "Other")
-    monkeypatch.setattr("radfusion.utils.mlflow_utils.platform.processor", lambda: "")
+    monkeypatch.setattr("beyondcxr.utils.mlflow_utils.platform.system", lambda: "Other")
+    monkeypatch.setattr("beyondcxr.utils.mlflow_utils.platform.processor", lambda: "")
 
     assert cpu_model() == "unknown"
 
 
 def test_environment_provenance_distinguishes_cpu_architecture_and_model(monkeypatch) -> None:
-    monkeypatch.setattr("radfusion.utils.mlflow_utils.platform.machine", lambda: "test-arch")
-    monkeypatch.setattr("radfusion.utils.mlflow_utils.cpu_model", lambda: "test-model")
+    monkeypatch.setattr("beyondcxr.utils.mlflow_utils.platform.machine", lambda: "test-arch")
+    monkeypatch.setattr("beyondcxr.utils.mlflow_utils.cpu_model", lambda: "test-model")
 
     provenance = environment_provenance()
 

@@ -7,11 +7,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_ecg_extension_result as extension_result
-import radfusion.training.symile_statistics as symile_statistics
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_statistics import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_ecg_extension_result as extension_result
+import beyondcxr.training.symile_statistics as symile_statistics
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_statistics import (
     cluster_bootstrap_effect,
     deterministic_error_cases,
     focused_development_subgroups,

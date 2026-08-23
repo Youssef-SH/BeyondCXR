@@ -16,10 +16,10 @@ from symile_data_test_support import (
     _synthetic_release,
 )
 
-import radfusion.data.symile_artifacts as symile_artifacts
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import logical_arrow_sha256
-from radfusion.data.symile_artifacts import (
+import beyondcxr.data.symile_artifacts as symile_artifacts
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.hashing import logical_arrow_sha256
+from beyondcxr.data.symile_artifacts import (
     LABS_FILENAME,
     METADATA_FILENAME,
     SAMPLES_FILENAME,
@@ -35,8 +35,8 @@ from radfusion.data.symile_artifacts import (
     validate_symile_bundle_reference,
     write_symile_bundle,
 )
-from radfusion.data.symile_audit import REPORT_FILENAMES, generate_symile_audit
-from radfusion.data.symile_cv import (
+from beyondcxr.data.symile_audit import REPORT_FILENAMES, generate_symile_audit
+from beyondcxr.data.symile_cv import (
     CV_ASSIGNMENTS_FILENAME,
     _cv_identity_payload,
     cv_assignment_id,
@@ -45,15 +45,15 @@ from radfusion.data.symile_cv import (
     validate_symile_cv,
     validate_symile_cv_reference,
 )
-from radfusion.data.symile_manifest import main as symile_manifest_main
-from radfusion.data.symile_schemas import (
+from beyondcxr.data.symile_manifest import main as symile_manifest_main
+from beyondcxr.data.symile_schemas import (
     CV_SCHEMA,
     LAB_ITEM_IDS,
     LAB_NAMES,
     LAB_SCHEMA,
     SAMPLE_SCHEMA,
 )
-from radfusion.data.symile_source import (
+from beyondcxr.data.symile_source import (
     EXPECTED_RELEASE_ASSETS,
     parse_sha256sums,
     qualify_symile_source,
@@ -364,7 +364,7 @@ def test_manifest_cli_reports_complete_immutable_lineage(
 ) -> None:
     source_root = _synthetic_release(tmp_path)
     source = qualify_symile_source(source_root, enforce_production_counts=False)
-    monkeypatch.setattr("radfusion.data.symile_manifest.qualify_symile_source", lambda _: source)
+    monkeypatch.setattr("beyondcxr.data.symile_manifest.qualify_symile_source", lambda _: source)
     assert (
         symile_manifest_main(
             [
@@ -393,7 +393,7 @@ def test_symile_audit_rejects_patient_or_admission_identifiers(
     samples = read_symile_samples(bundle)
     leaked_value = str(samples.iloc[0][identifier_column])
     monkeypatch.setattr(
-        "radfusion.data.symile_audit._audit_markdown",
+        "beyondcxr.data.symile_audit._audit_markdown",
         lambda *args: f"# Aggregate audit\n\n{leaked_value}\n",
     )
 
@@ -596,7 +596,7 @@ def test_cv_reference_validation_does_not_load_bundle_samples(
     def reject_bundle_sample_access(*args: object, **kwargs: object) -> None:
         raise AssertionError("reference validation accessed bundle samples")
 
-    monkeypatch.setattr("radfusion.data.symile_cv.read_symile_samples", reject_bundle_sample_access)
+    monkeypatch.setattr("beyondcxr.data.symile_cv.read_symile_samples", reject_bundle_sample_access)
     reference = validate_symile_cv_reference(
         directory,
         bundle_id=bundle.bundle_id,

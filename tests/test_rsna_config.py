@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from radfusion.training.config import ConfigError, load_experiment_config, with_runtime
-from radfusion.training.rsna_train import main as train_main
+from beyondcxr.training.config import ConfigError, load_experiment_config, with_runtime
+from beyondcxr.training.rsna_train import main as train_main
 
 
 def _cxr_document() -> dict[str, object]:
@@ -112,7 +112,7 @@ def test_cxr_config_dispatches_to_cxr_runner(monkeypatch, capsys) -> None:
             },
         )()
 
-    monkeypatch.setattr("radfusion.training.rsna_train.train_cxr_experiment", fake_training)
+    monkeypatch.setattr("beyondcxr.training.rsna_train.train_cxr_experiment", fake_training)
 
     assert train_main(["--config", "configs/rsna_cxr_densenet.yaml", "--seed", "42"]) == 0
     assert captured["config"].family.modalities == ("cxr",)

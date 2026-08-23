@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-import radfusion.training.symile_export as symile_export
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_export import (
+import beyondcxr.training.symile_export as symile_export
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_export import (
     SymileExportMember,
     export_and_verify,
     restore_and_validate_symile_export,

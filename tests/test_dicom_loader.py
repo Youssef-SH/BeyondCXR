@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from pydicom.data import get_testdata_file
 
-from radfusion.data.dicom_loader import read_dicom
+from beyondcxr.data.dicom_loader import read_dicom
 
 
 def test_read_dicom_returns_normalized_2d_pixels() -> None:

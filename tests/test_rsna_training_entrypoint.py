@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from radfusion.training.rsna_train import main
+from beyondcxr.training.rsna_train import main
 
 
 def test_training_entrypoint_invokes_runner_from_config(monkeypatch, capsys) -> None:
@@ -21,7 +21,7 @@ def test_training_entrypoint_invokes_runner_from_config(monkeypatch, capsys) -> 
             artifact_directory=Path("reports/rsna/runs/run-test"),
         )
 
-    monkeypatch.setattr("radfusion.training.rsna_train.train_metadata_experiment", fake_train)
+    monkeypatch.setattr("beyondcxr.training.rsna_train.train_metadata_experiment", fake_train)
 
     assert main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
     assert captured["config"].family.family_id == "metadata_logistic"

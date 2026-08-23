@@ -55,7 +55,7 @@ stderr. The interactive `rsna-inspect` utility deliberately displays source meta
 use it only in an authorized private session and do not publish its output or screenshots.
 
 The research serving process is stateless with respect to patients. It keeps no upload archive,
-request or response archive, patient database, or prediction cache. RadFusion retains no submitted
+request or response archive, patient database, or prediction cache. BeyondCXR retains no submitted
 image, laboratory input, patient identifier, missingness state, or prediction after request
 processing, and operational handling does not log patient-level inputs or outputs. The project
 command disables Uvicorn access logging; deployments must apply the same restriction to external

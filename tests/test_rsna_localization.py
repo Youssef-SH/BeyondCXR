@@ -13,18 +13,18 @@ import torch
 import torchxrayvision as xrv
 from torch import nn
 
-from radfusion.data.cxr_transforms import center_crop_geometry
-from radfusion.evaluation.gradcam import gradcam_heatmaps, standard_cxr_gradcam_target
-from radfusion.evaluation.localization import (
+from beyondcxr.data.cxr_transforms import center_crop_geometry
+from beyondcxr.evaluation.gradcam import gradcam_heatmaps, standard_cxr_gradcam_target
+from beyondcxr.evaluation.localization import (
     deterministic_qualitative_selection,
     localization_metrics,
     transform_rsna_box,
     union_box_mask,
 )
-from radfusion.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
-from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.rsna_datasets import RsnaDataset
-from radfusion.training.rsna_localize import (
+from beyondcxr.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
+from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.rsna_datasets import RsnaDataset
+from beyondcxr.training.rsna_localize import (
     QUALITATIVE_POLICY_VERSION,
     _evaluate_member,
     _gradcam_indices,
@@ -36,7 +36,7 @@ from radfusion.training.rsna_localize import (
     _validate_localization_output_boundaries,
     generate_localization_report,
 )
-from radfusion.utils.operational_logging import configure_logging
+from beyondcxr.utils.operational_logging import configure_logging
 
 _PACKAGE_IDS = {
     17: "model-package-" + "1" * 64,
@@ -62,7 +62,7 @@ def test_localization_rejects_non_rsna_before_dataset_access(
     config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
     non_rsna = replace(config, dataset=replace(config.dataset, dataset_id="symile"))
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.get_dataset",
+        "beyondcxr.training.rsna_localize.get_dataset",
         lambda key: pytest.fail(f"dataset registry accessed for {key}"),
     )
 
@@ -94,7 +94,7 @@ def test_standalone_localization_resolves_one_shared_cache(
             configs[seed],
         )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.validate_rsna_evaluation",
+        "beyondcxr.training.rsna_localize.validate_rsna_evaluation",
         lambda path, **kwargs: SimpleNamespace(
             manifest={
                 "model_package_id": _PACKAGE_IDS[evaluation_seeds[path.name]],
@@ -103,14 +103,14 @@ def test_standalone_localization_resolves_one_shared_cache(
         ),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.validate_neural_package_metadata",
+        "beyondcxr.training.rsna_localize.validate_neural_package_metadata",
         lambda package: packages[package.name][0],
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.load_experiment_config",
+        "beyondcxr.training.rsna_localize.load_experiment_config",
         lambda path: packages[path.parent.name][1],
     )
-    monkeypatch.setattr("radfusion.training.rsna_localize.get_dataset", lambda key: RsnaDataset())
+    monkeypatch.setattr("beyondcxr.training.rsna_localize.get_dataset", lambda key: RsnaDataset())
     prepared: list[object] = []
     shared_cache = object()
 
@@ -118,7 +118,7 @@ def test_standalone_localization_resolves_one_shared_cache(
         prepared.append((args, kwargs))
         return shared_cache
 
-    monkeypatch.setattr("radfusion.training.rsna_localize.prepare_rsna_cxr_cache", prepare)
+    monkeypatch.setattr("beyondcxr.training.rsna_localize.prepare_rsna_cxr_cache", prepare)
     observed_caches: list[object] = []
 
     def evaluate(package_id, package, manifest, config, *, examples, cache):
@@ -143,7 +143,7 @@ def test_standalone_localization_resolves_one_shared_cache(
             "forbidden_source_values": set(),
         }
 
-    monkeypatch.setattr("radfusion.training.rsna_localize._evaluate_member", evaluate)
+    monkeypatch.setattr("beyondcxr.training.rsna_localize._evaluate_member", evaluate)
     log_stream = io.StringIO()
     configure_logging("INFO", stream=log_stream)
 
@@ -253,33 +253,33 @@ def test_localization_member_emits_generic_operation_completion(
         ),
     )
     adapter.load_localization_test = lambda *args, **kwargs: localization  # type: ignore[method-assign]
-    monkeypatch.setattr("radfusion.training.rsna_localize.get_dataset", lambda key: adapter)
+    monkeypatch.setattr("beyondcxr.training.rsna_localize.get_dataset", lambda key: adapter)
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.load_validated_neural_checkpoint", lambda *args: {}
+        "beyondcxr.training.rsna_localize.load_validated_neural_checkpoint", lambda *args: {}
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.get_model",
+        "beyondcxr.training.rsna_localize.get_model",
         lambda key: SimpleNamespace(build_architecture=lambda model_config: model),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.strict_load_checkpoint", lambda *args: None
+        "beyondcxr.training.rsna_localize.strict_load_checkpoint", lambda *args: None
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.standard_cxr_gradcam_target", lambda value: value.encoder
+        "beyondcxr.training.rsna_localize.standard_cxr_gradcam_target", lambda value: value.encoder
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.expected_rsna_cxr_cache_identity",
+        "beyondcxr.training.rsna_localize.expected_rsna_cxr_cache_identity",
         lambda **kwargs: object(),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.RsnaCachedImageDataset",
+        "beyondcxr.training.rsna_localize.RsnaCachedImageDataset",
         lambda *args, **kwargs: ControlledDataset(),
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_localize.gradcam_heatmaps",
+        "beyondcxr.training.rsna_localize.gradcam_heatmaps",
         lambda *args, **kwargs: torch.ones((1, 224, 224)),
     )
-    monkeypatch.setattr("radfusion.training.rsna_localize._write_overlay", lambda *args: None)
+    monkeypatch.setattr("beyondcxr.training.rsna_localize._write_overlay", lambda *args: None)
     authentication = {"policy_version": "test"}
     cache = SimpleNamespace(
         source_authentication=SimpleNamespace(as_dict=lambda: authentication),

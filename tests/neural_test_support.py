@@ -6,9 +6,9 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from radfusion.training.device import resolve_device
-from radfusion.training.execution import reused_loader_policy
-from radfusion.training.neural import build_image_loaders as _build_image_loaders
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.execution import reused_loader_policy
+from beyondcxr.training.neural import build_image_loaders as _build_image_loaders
 
 
 class TensorDataset(Dataset[dict[str, object]]):

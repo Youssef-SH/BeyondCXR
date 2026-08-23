@@ -8,10 +8,10 @@ from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 from torch import nn
 
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
-from radfusion.models.fusion_concat import initialize_fusion_encoder
-from radfusion.models.symile_ecg_fusion import (
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS
+from beyondcxr.models.fusion_concat import initialize_fusion_encoder
+from beyondcxr.models.symile_ecg_fusion import (
     ECG_ENCODER_PARAMETER_COUNT,
     TRIMODAL_EXCLUDING_CXR_ENCODER_PARAMETER_COUNT,
     SymileEcgEncoder,
@@ -19,21 +19,21 @@ from radfusion.models.symile_ecg_fusion import (
     SymileTriModalGatedModel,
     parameter_count,
 )
-from radfusion.models.symile_fusion import (
+from beyondcxr.models.symile_fusion import (
     SymileConcatFusionModel,
     SymileGatedFusionHead,
     SymileGatedFusionModel,
     gated_fusion_core,
 )
-from radfusion.models.symile_tabular import (
+from beyondcxr.models.symile_tabular import (
     fit_symile_labs_lightgbm,
     fit_symile_labs_logistic,
     symile_tabular_logits,
 )
-from radfusion.training.config import load_symile_development_config
-from radfusion.training.neural import seed_neural_runtime
-from radfusion.training.symile_data import validated_symile_lab_matrix
-from radfusion.training.symile_ecg_data import SymileEcgStore
+from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.neural import seed_neural_runtime
+from beyondcxr.training.symile_data import validated_symile_lab_matrix
+from beyondcxr.training.symile_ecg_data import SymileEcgStore
 
 
 class _TinyEncoder(nn.Module):

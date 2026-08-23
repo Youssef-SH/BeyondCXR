@@ -17,42 +17,42 @@ from symile_campaign_test_support import (
     _synthetic_final_packages,
 )
 
-import radfusion.training.symile_campaign as symile_campaign
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_data as symile_data
-import radfusion.training.symile_ecg_extension_result as extension_result
-import radfusion.training.symile_final_packages as final_packages
-import radfusion.training.symile_test_data as symile_test_data
-import radfusion.training.symile_test_inference as test_inference
-import radfusion.utils.symile_publication as symile_publication
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.symile_artifacts import validate_symile_bundle_reference
-from radfusion.data.symile_cv import publish_symile_cv
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS, LAB_OBSERVED_COLUMNS
-from radfusion.models.symile_tabular import (
+import beyondcxr.training.symile_campaign as symile_campaign
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_data as symile_data
+import beyondcxr.training.symile_ecg_extension_result as extension_result
+import beyondcxr.training.symile_final_packages as final_packages
+import beyondcxr.training.symile_test_data as symile_test_data
+import beyondcxr.training.symile_test_inference as test_inference
+import beyondcxr.utils.symile_publication as symile_publication
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_artifacts import validate_symile_bundle_reference
+from beyondcxr.data.symile_cv import publish_symile_cv
+from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS, LAB_OBSERVED_COLUMNS
+from beyondcxr.models.symile_tabular import (
     fit_final_symile_labs_lightgbm,
     fit_symile_labs_logistic,
 )
-from radfusion.training.config import load_symile_development_config, with_runtime
-from radfusion.training.symile_campaign_control import (
+from beyondcxr.training.config import load_symile_development_config, with_runtime
+from beyondcxr.training.symile_campaign_control import (
     ValidatedGlobalResult,
     create_or_validate_test_open_record,
 )
-from radfusion.training.symile_data import load_symile_development_cohort
-from radfusion.training.symile_export import export_and_verify, restore_and_validate_symile_export
-from radfusion.training.symile_final_packages import (
+from beyondcxr.training.symile_data import load_symile_development_cohort
+from beyondcxr.training.symile_export import export_and_verify, restore_and_validate_symile_export
+from beyondcxr.training.symile_final_packages import (
     final_training_plan,
     publish_final_neural_package,
     publish_final_tabular_package,
 )
-from radfusion.training.symile_statistics import focused_development_subgroups
-from radfusion.training.symile_test_data import FrozenSymileTestData
-from radfusion.utils.private_predictions import (
+from beyondcxr.training.symile_statistics import focused_development_subgroups
+from beyondcxr.training.symile_test_data import FrozenSymileTestData
+from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
     publish_prediction_evidence,
 )
-from radfusion.utils.symile_publication import (
+from beyondcxr.utils.symile_publication import (
     ValidatedDevelopmentResult,
     publish_analysis_result,
     publish_development_result,

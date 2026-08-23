@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from radfusion.training.rsna_registry import DATASETS, MODELS, RegistryError, get_dataset, get_model
+from beyondcxr.training.rsna_registry import DATASETS, MODELS, RegistryError, get_dataset, get_model
 
 
 def test_builtin_component_mappings_are_immutable_and_complete() -> None:

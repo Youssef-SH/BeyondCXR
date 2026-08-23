@@ -9,16 +9,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from radfusion.data.symile_artifacts import (
+from beyondcxr.data.symile_artifacts import (
     SymileBundlePaths,
     build_symile_artifacts,
     write_symile_bundle,
 )
-from radfusion.data.symile_schemas import (
+from beyondcxr.data.symile_schemas import (
     LAB_ITEM_IDS,
     LAB_NAMES,
 )
-from radfusion.data.symile_source import (
+from beyondcxr.data.symile_source import (
     EXPECTED_RELEASE_ASSETS,
     qualify_symile_source,
 )

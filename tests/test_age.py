@@ -1,6 +1,6 @@
 import pytest
 
-from radfusion.data.age import parse_dicom_age
+from beyondcxr.data.age import parse_dicom_age
 
 
 @pytest.mark.parametrize(

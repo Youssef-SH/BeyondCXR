@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from radfusion.evaluation.metrics import CALIBRATION_BINNING_STRATEGY
-from radfusion.evaluation.plots import write_evaluation_plots
+from beyondcxr.evaluation.metrics import CALIBRATION_BINNING_STRATEGY
+from beyondcxr.evaluation.plots import write_evaluation_plots
 
 
 def test_calibration_plot_uses_configured_bins_and_shared_strategy(tmp_path, monkeypatch) -> None:
@@ -13,7 +13,7 @@ def test_calibration_plot_uses_configured_bins_and_shared_strategy(tmp_path, mon
         observed_call.update(n_bins=n_bins, strategy=strategy)
         return np.asarray([0.25, 0.75]), np.asarray([0.2, 0.8])
 
-    monkeypatch.setattr("radfusion.evaluation.plots.calibration_curve", fake_calibration_curve)
+    monkeypatch.setattr("beyondcxr.evaluation.plots.calibration_curve", fake_calibration_curve)
     paths = write_evaluation_plots(
         [0, 0, 1, 1],
         [0.1, 0.3, 0.7, 0.9],

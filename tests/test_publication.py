@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from radfusion.utils.publication import (
+from beyondcxr.utils.publication import (
     install_immutable_directory,
     publish_directory,
     staging_directory,
@@ -57,7 +57,7 @@ def test_immutable_directory_concurrent_winner_is_reused(
         (winner / "value.txt").write_text("same", encoding="utf-8")
         raise OSError(errno.EEXIST, "concurrent winner")
 
-    monkeypatch.setattr("radfusion.utils.publication.os.rename", concurrent_winner)
+    monkeypatch.setattr("beyondcxr.utils.publication.os.rename", concurrent_winner)
     assert install_immutable_directory(stage, destination, _validate_text_object) is False
     assert (destination / "value.txt").read_text(encoding="utf-8") == "same"
 
@@ -104,7 +104,7 @@ def test_failed_directory_publication_restores_previous_output(
             raise OSError("publication failed")
         real_replace(source, target)
 
-    monkeypatch.setattr("radfusion.utils.publication.os.replace", fail_stage_publish)
+    monkeypatch.setattr("beyondcxr.utils.publication.os.replace", fail_stage_publish)
 
     with pytest.raises(OSError):
         publish_directory(stage, destination)

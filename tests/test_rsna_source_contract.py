@@ -10,11 +10,11 @@ from rsna_manifest_test_support import tables as _tables
 from rsna_manifest_test_support import write_header as _write_header
 from rsna_manifest_test_support import write_sources as _write_sources
 
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.rsna_artifacts import (
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.rsna_artifacts import (
     build_rsna_artifacts,
 )
-from radfusion.data.rsna_schemas import (
+from beyondcxr.data.rsna_schemas import (
     PNEUMONIA_TASK_ID,
     RSNA_ANNOTATION_SCHEMA,
     RSNA_CLASS_TASK_ID,
@@ -23,8 +23,8 @@ from radfusion.data.rsna_schemas import (
     RSNA_SOURCE_INVENTORY_SCHEMA,
     RSNA_SPLIT_SCHEMA,
 )
-from radfusion.data.rsna_source import aggregate_labels
-from radfusion.data.rsna_validation import (
+from beyondcxr.data.rsna_source import aggregate_labels
+from beyondcxr.data.rsna_validation import (
     validate_annotation_table,
     validate_label_table,
     validate_sample_table,

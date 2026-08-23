@@ -36,7 +36,7 @@ make rsna-manifest
 Custom paths and split recipes are available through the CLI:
 
 ```bash
-uv run python -m radfusion.data.rsna_manifest \
+uv run python -m beyondcxr.data.rsna_manifest \
   --source-root /approved/local/rsna/extracted \
   --output-directory /approved/local/manifests \
   --split-seed 42 \
@@ -243,7 +243,7 @@ Place the complete authorized Symile-MIMIC 1.0.0 source at the supplied source r
 development, materialize the fixed public CXR initialization through the existing acquisition helper:
 
 ```bash
-uv run --locked --no-dev python -c 'from radfusion.models.cxr_baseline import ensure_pretrained_weights; ensure_pretrained_weights()'
+uv run --locked --no-dev python -c 'from beyondcxr.models.cxr_baseline import ensure_pretrained_weights; ensure_pretrained_weights()'
 ```
 
 Preserve that exact weight file throughout development and final fitting. Unlike the RSNA campaign,

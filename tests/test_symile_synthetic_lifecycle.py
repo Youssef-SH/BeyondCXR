@@ -10,13 +10,13 @@ from symile_campaign_test_support import (
     _synthetic_final_packages,
 )
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_ecg_extension_result as extension_result
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_final_packages import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_ecg_extension_result as extension_result
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
-from radfusion.utils.symile_publication import ValidatedDevelopmentResult
+from beyondcxr.utils.symile_publication import ValidatedDevelopmentResult
 
 
 def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(

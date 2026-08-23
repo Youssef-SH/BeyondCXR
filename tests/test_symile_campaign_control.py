@@ -10,11 +10,11 @@ from symile_campaign_test_support import (
     _freeze,
 )
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_test_inference as test_inference
-import radfusion.utils.publication as publication
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_campaign_control import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_test_inference as test_inference
+import beyondcxr.utils.publication as publication
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_campaign_control import (
     ValidatedPretestFreeze,
     ValidatedTestOpenRecord,
     create_or_validate_test_open_record,

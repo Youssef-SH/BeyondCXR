@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from radfusion.evaluation.metrics import (
+from beyondcxr.evaluation.metrics import (
     evaluate_operating_point,
     evaluate_probabilities,
     target_sensitivity_threshold,
 )
-from radfusion.training.config import load_experiment_config
-from radfusion.training.rsna_train_metadata import (
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.rsna_train_metadata import (
     _write_evaluation_report,
     metrics_document,
 )

@@ -6,7 +6,7 @@ from pathlib import Path
 import mlflow
 import pytest
 
-from radfusion.utils.mlflow_utils import configure_mlflow, discover_repository_root, uv_lock_sha256
+from beyondcxr.utils.mlflow_utils import configure_mlflow, discover_repository_root, uv_lock_sha256
 
 
 def test_uv_lock_hash_uses_exact_file_bytes(tmp_path: Path) -> None:

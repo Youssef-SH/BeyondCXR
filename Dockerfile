@@ -9,9 +9,9 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN uv sync --locked --no-dev --extra serving
 
-RUN useradd --create-home --uid 10001 radfusion
-USER radfusion
+RUN useradd --create-home --uid 10001 beyondcxr
+USER beyondcxr
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/.venv/bin/python", "-m", "radfusion.serving.cli"]
+ENTRYPOINT ["/app/.venv/bin/python", "-m", "beyondcxr.serving.cli"]

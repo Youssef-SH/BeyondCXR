@@ -29,31 +29,31 @@ from symile_development_test_support import (
     _publish_family_folds,
 )
 
-import radfusion.data.symile_source as symile_source
-import radfusion.training.symile_analysis as symile_analysis
-import radfusion.training.symile_data as symile_data
-import radfusion.training.symile_development as symile_development
-import radfusion.training.symile_ecg_data as symile_ecg_data
-import radfusion.utils.symile_publication as symile_publication
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.symile_artifacts import (
+import beyondcxr.data.symile_source as symile_source
+import beyondcxr.training.symile_analysis as symile_analysis
+import beyondcxr.training.symile_data as symile_data
+import beyondcxr.training.symile_development as symile_development
+import beyondcxr.training.symile_ecg_data as symile_ecg_data
+import beyondcxr.utils.symile_publication as symile_publication
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_artifacts import (
     SymileBundlePaths,
     ValidatedSymileBundleReference,
 )
-from radfusion.data.symile_cv import ValidatedSymileCvReference
-from radfusion.data.symile_preprocess import LAB_FEATURE_COLUMNS
-from radfusion.data.symile_schemas import DEVELOPMENT_SPLITS
-from radfusion.data.symile_source import EXPECTED_RELEASE_ASSETS, modality_asset_path
-from radfusion.models.symile_tabular import (
+from beyondcxr.data.symile_cv import ValidatedSymileCvReference
+from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS
+from beyondcxr.data.symile_schemas import DEVELOPMENT_SPLITS
+from beyondcxr.data.symile_source import EXPECTED_RELEASE_ASSETS, modality_asset_path
+from beyondcxr.models.symile_tabular import (
     fit_symile_labs_logistic,
 )
-from radfusion.training.config import (
+from beyondcxr.training.config import (
     load_symile_development_config,
     with_runtime,
 )
-from radfusion.training.execution import reused_loader_policy
-from radfusion.training.symile_analysis import analyze_symile_development
-from radfusion.training.symile_data import (
+from beyondcxr.training.execution import reused_loader_policy
+from beyondcxr.training.symile_analysis import analyze_symile_development
+from beyondcxr.training.symile_data import (
     SymileCxrStore,
     SymileDevelopmentCohort,
     SymileDevelopmentData,
@@ -62,18 +62,18 @@ from radfusion.training.symile_data import (
     load_symile_development,
     materialize_outer_fold,
 )
-from radfusion.training.symile_development import CompletedSymileFold
-from radfusion.training.symile_ecg_data import SymileEcgStore
-from radfusion.utils.package_identity import (
+from beyondcxr.training.symile_development import CompletedSymileFold
+from beyondcxr.training.symile_ecg_data import SymileEcgStore
+from beyondcxr.utils.package_identity import (
     canonical_scientific_id,
     package_scientific_config_payload,
 )
-from radfusion.utils.private_predictions import (
+from beyondcxr.utils.private_predictions import (
     PREDICTION_SCHEMA,
     publish_prediction_evidence,
     validate_prediction_evidence,
 )
-from radfusion.utils.symile_publication import (
+from beyondcxr.utils.symile_publication import (
     ValidatedDevelopmentResult,
     neural_checkpoint_document,
     publish_development_result,
@@ -153,7 +153,7 @@ def test_neutral_training_seed_accepts_a_nonprotocol_integer() -> None:
     training_seed = 314_159
     epoch = 7
     sample_id = "symile:admission"
-    payload = f"radfusion-symile-augmentation\0{training_seed}\0{epoch}\0{sample_id}".encode()
+    payload = f"beyondcxr-symile-augmentation\0{training_seed}\0{epoch}\0{sample_id}".encode()
     expected = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63)
 
     assert derive_augmentation_seed(training_seed, epoch, sample_id) == expected

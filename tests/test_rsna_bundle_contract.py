@@ -9,9 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 from rsna_manifest_test_support import tables as _tables
 
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import logical_arrow_sha256, sha256_file
-from radfusion.data.rsna_artifacts import (
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
+from beyondcxr.data.rsna_artifacts import (
     ANNOTATIONS_FILENAME,
     LABELS_FILENAME,
     SAMPLES_FILENAME,
@@ -24,13 +24,13 @@ from radfusion.data.rsna_artifacts import (
     validate_bundle_reference,
     write_bundle,
 )
-from radfusion.data.rsna_schemas import (
+from beyondcxr.data.rsna_schemas import (
     RSNA_ANNOTATION_SCHEMA,
     RSNA_LABEL_SCHEMA,
     RSNA_SAMPLE_SCHEMA,
 )
-from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.rsna_datasets import RsnaDataset
+from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.rsna_datasets import RsnaDataset
 
 
 def test_parquet_round_trip_is_exact_and_nested_free(tmp_path: Path) -> None:
@@ -231,7 +231,7 @@ def test_staging_failure_preserves_current_bundle(
     def fail_validation(*args: object, **kwargs: object) -> None:
         raise ManifestBuildError("staged validation failed")
 
-    monkeypatch.setattr("radfusion.data.rsna_artifacts.validate_bundle_directory", fail_validation)
+    monkeypatch.setattr("beyondcxr.data.rsna_artifacts.validate_bundle_directory", fail_validation)
     with pytest.raises(ManifestBuildError):
         write_bundle(result, output)
     assert first.paths.current_path.read_text(encoding="utf-8") == current_before
@@ -261,7 +261,7 @@ def test_new_bundle_is_validated_once_before_publication(
         )
 
     monkeypatch.setattr(
-        "radfusion.data.rsna_artifacts.validate_bundle_directory",
+        "beyondcxr.data.rsna_artifacts.validate_bundle_directory",
         record_validation,
     )
     written = write_bundle(result, tmp_path / "manifests")
@@ -288,7 +288,7 @@ def test_bundle_reference_validation_does_not_materialize_parquet_rows(
     written = write_bundle(result, tmp_path / "manifests")
 
     monkeypatch.setattr(
-        "radfusion.data.rsna_artifacts.pq.read_table",
+        "beyondcxr.data.rsna_artifacts.pq.read_table",
         lambda *args, **kwargs: pytest.fail((args, kwargs, "row materialization")),
     )
 
@@ -396,7 +396,7 @@ def test_cxr_test_manifest_mismatch_fails_before_partition_access(
         source_root=tmp_path / "raw",
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_datasets._task_frame",
+        "beyondcxr.training.rsna_datasets._task_frame",
         lambda *args, **kwargs: pytest.fail((args, kwargs, "test partition access")),
     )
 
@@ -564,7 +564,7 @@ def test_portable_bundle_validation_does_not_access_external_dicoms(
         raise AssertionError("portable validation accessed the external dataset")
 
     monkeypatch.setattr(
-        "radfusion.data.rsna_artifacts.resolve_image_path",
+        "beyondcxr.data.rsna_artifacts.resolve_image_path",
         reject_external_access,
     )
     validate_bundle_directory(

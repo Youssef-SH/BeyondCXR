@@ -3,7 +3,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from radfusion.data.hashing import logical_arrow_sha256
+from beyondcxr.data.hashing import logical_arrow_sha256
 
 
 def test_logical_arrow_hash_is_stable_across_chunk_layout() -> None:

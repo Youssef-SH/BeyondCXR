@@ -30,40 +30,40 @@ rsna-inspect:
 	uv run python scripts/inspect_dicom.py "$(FILE)"
 
 rsna-manifest:
-	uv run python -m radfusion.data.rsna_manifest \
+	uv run python -m beyondcxr.data.rsna_manifest \
 		$(if $(SOURCE_ROOT),--source-root "$(SOURCE_ROOT)")
 
 rsna-audit:
-	uv run python -m radfusion.data.rsna_audit \
+	uv run python -m beyondcxr.data.rsna_audit \
 		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
 
 symile-manifest:
-	uv run python -m radfusion.data.symile_manifest \
+	uv run python -m beyondcxr.data.symile_manifest \
 		$(if $(SOURCE_ROOT),--source-root "$(SOURCE_ROOT)")
 
 symile-audit:
-	uv run python -m radfusion.data.symile_audit \
+	uv run python -m beyondcxr.data.symile_audit \
 		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
 
 symile-cv:
-	uv run python -m radfusion.data.symile_cv \
+	uv run python -m beyondcxr.data.symile_cv \
 		$(if $(BUNDLE_ID),--bundle-id "$(BUNDLE_ID)")
 
 symile-develop:
 	@test -n "$(CONFIG)" || (echo "CONFIG=configs/symile_<family>.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Symile development config not found: $(CONFIG)"; exit 2)
-	uv run python -m radfusion.training.symile_development --config "$(CONFIG)" \
+	uv run python -m beyondcxr.training.symile_development --config "$(CONFIG)" \
 		$(if $(SOURCE_CXR_DEVELOPMENT_ID),--source-cxr-development-id "$(SOURCE_CXR_DEVELOPMENT_ID)")
 
 symile-analyze:
 	@test -n "$(DEVELOPMENT_IDS)" || \
 		(echo 'DEVELOPMENT_IDS="<six development IDs>" is required'; exit 2)
-	uv run python -m radfusion.training.symile_analysis --development-ids $(DEVELOPMENT_IDS)
+	uv run python -m beyondcxr.training.symile_analysis --development-ids $(DEVELOPMENT_IDS)
 
 symile-campaign:
 	@test -n "$(SOURCE_ROOT)" || (echo "SOURCE_ROOT=path/to/private/symile/source is required"; exit 2)
 	@test -n "$(BACKUP_ROOT)" || (echo "BACKUP_ROOT must name an approved persistent destination outside the repository"; exit 2)
-	uv run --locked --no-dev python -m radfusion.training.symile_campaign --source-root "$(SOURCE_ROOT)" \
+	uv run --locked --no-dev python -m beyondcxr.training.symile_campaign --source-root "$(SOURCE_ROOT)" \
 		$(if $(DEVICE),--device "$(DEVICE)") \
 		$(if $(WORKERS),--workers "$(WORKERS)") \
 		--backup-root "$(BACKUP_ROOT)"
@@ -71,7 +71,7 @@ symile-campaign:
 symile-serve:
 	@test -n "$(AUTHORITY)" || (echo "AUTHORITY=path/to/serving-authority is required"; exit 2)
 	@test -n "$(PACKAGE_ROOT)" || (echo "PACKAGE_ROOT=path/to/final/packages is required"; exit 2)
-	uv run --locked --extra serving python -m radfusion.serving.cli \
+	uv run --locked --extra serving python -m beyondcxr.serving.cli \
 		--authority "$(AUTHORITY)" --package-root "$(PACKAGE_ROOT)" \
 		$(if $(DEVICE),--device "$(DEVICE)") \
 		$(if $(HOST),--host "$(HOST)") \
@@ -81,32 +81,32 @@ rsna-train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
 	@test -n "$(SEED)" || (echo "SEED=<integer 0..2147483647> is required"; exit 2)
-	uv run python -m radfusion.training.rsna_train --config "$(CONFIG)" --seed "$(SEED)" \
+	uv run python -m beyondcxr.training.rsna_train --config "$(CONFIG)" --seed "$(SEED)" \
 		$(if $(SOURCE_CXR_PACKAGE_ID),--source-cxr-package-id "$(SOURCE_CXR_PACKAGE_ID)")
 
 rsna-evaluate:
 	@test -n "$(PACKAGE_ID)" || (echo "PACKAGE_ID=<model-package-id> is required"; exit 2)
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
 	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
-	uv run python -m radfusion.training.rsna_evaluate \
+	uv run python -m beyondcxr.training.rsna_evaluate \
 		--package-id "$(PACKAGE_ID)" --config "$(CONFIG)"
 
 rsna-compare:
 	@test -n "$(EVALUATION_IDS)" || (echo 'EVALUATION_IDS="<evaluation-id> ..." is required'; exit 2)
-	uv run python -m radfusion.training.rsna_compare --evaluation-ids $(EVALUATION_IDS)
+	uv run python -m beyondcxr.training.rsna_compare --evaluation-ids $(EVALUATION_IDS)
 
 rsna-summarize:
 	@test -n "$(EVALUATION_IDS)" || \
 		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
-	uv run python -m radfusion.training.rsna_seed_summary --evaluation-ids $(EVALUATION_IDS)
+	uv run python -m beyondcxr.training.rsna_seed_summary --evaluation-ids $(EVALUATION_IDS)
 
 rsna-localize:
 	@test -n "$(EVALUATION_IDS)" || \
 		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
-	uv run python -m radfusion.training.rsna_localize --evaluation-ids $(EVALUATION_IDS)
+	uv run python -m beyondcxr.training.rsna_localize --evaluation-ids $(EVALUATION_IDS)
 
 rsna-campaign:
-	uv run --locked --no-dev python -m radfusion.training.rsna_campaign_cli
+	uv run --locked --no-dev python -m beyondcxr.training.rsna_campaign_cli
 
 pre-commit:
 	uv run pre-commit run --all-files

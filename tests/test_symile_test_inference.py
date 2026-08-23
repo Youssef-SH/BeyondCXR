@@ -17,20 +17,20 @@ from symile_campaign_test_support import (
     _synthetic_test_predictions,
 )
 
-import radfusion.training.symile_campaign_control as campaign_control
-import radfusion.training.symile_final_packages as final_packages
-import radfusion.training.symile_test_inference as test_inference
-import radfusion.utils.publication as publication
-from radfusion.data.errors import ManifestBuildError
-from radfusion.training.symile_export import SymileExportMember, export_and_verify
-from radfusion.training.symile_final_packages import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+import beyondcxr.training.symile_final_packages as final_packages
+import beyondcxr.training.symile_test_inference as test_inference
+import beyondcxr.utils.publication as publication
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.symile_export import SymileExportMember, export_and_verify
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
-from radfusion.training.symile_test_data import (
+from beyondcxr.training.symile_test_data import (
     HeldOutEvaluationProjection,
     validate_prediction_against_test_projection,
 )
-from radfusion.utils.private_predictions import (
+from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
     build_prediction_table,
@@ -357,8 +357,8 @@ def test_runtime_resolution_validates_all_packages_and_precision_agreement(
 def test_neural_partial_resume_uses_validated_runtime_and_preserves_existing_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from radfusion.training.config import load_symile_development_config
-    from radfusion.training.symile_final_packages import (
+    from beyondcxr.training.config import load_symile_development_config
+    from beyondcxr.training.symile_final_packages import (
         _final_input_projection,
         _final_package_config_from_input,
     )

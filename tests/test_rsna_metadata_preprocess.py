@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 import skops.io as sio
 
-from radfusion.data.rsna_metadata_preprocess import (
+from beyondcxr.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     RsnaMetadataFeatures,
     build_rsna_preprocessor,
@@ -16,8 +16,8 @@ from radfusion.data.rsna_metadata_preprocess import (
     transformed_rsna_feature_names,
     validate_fitted_rsna_preprocessor,
 )
-from radfusion.models.rsna_metadata import MetadataLogisticModel
-from radfusion.training.config import load_experiment_config
+from beyondcxr.models.rsna_metadata import MetadataLogisticModel
+from beyondcxr.training.config import load_experiment_config
 
 
 def _frames() -> tuple[pd.DataFrame, pd.DataFrame]:

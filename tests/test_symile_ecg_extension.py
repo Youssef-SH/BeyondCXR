@@ -11,11 +11,11 @@ from symile_campaign_test_support import (
     _synthetic_final_family_authorities,
 )
 
-import radfusion.training.symile_ecg_extension_result as extension_result
-import radfusion.training.symile_statistics as symile_statistics
-from radfusion.data.errors import ManifestBuildError
-from radfusion.utils.package_identity import canonical_scientific_id
-from radfusion.utils.symile_publication import ValidatedDevelopmentResult
+import beyondcxr.training.symile_ecg_extension_result as extension_result
+import beyondcxr.training.symile_statistics as symile_statistics
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.utils.package_identity import canonical_scientific_id
+from beyondcxr.utils.symile_publication import ValidatedDevelopmentResult
 
 
 def test_focused_subgroup_derivative_requires_exact_v1_contract(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from radfusion.evaluation.metrics import (
+from beyondcxr.evaluation.metrics import (
     calibration_coefficients,
     evaluate_binary,
     expected_calibration_error,
@@ -52,7 +52,7 @@ def test_threshold_selection_enumerates_all_roc_candidates(monkeypatch) -> None:
             np.asarray([float("inf"), 0.7, 0.4]),
         )
 
-    monkeypatch.setattr("radfusion.evaluation.metrics.roc_curve", fake_roc_curve)
+    monkeypatch.setattr("beyondcxr.evaluation.metrics.roc_curve", fake_roc_curve)
     assert youden_j_threshold([0, 1], [0.1, 0.9]) == pytest.approx(0.7)
     assert target_sensitivity_threshold([0, 1], [0.1, 0.9], sensitivity=0.8) == pytest.approx(0.7)
     assert calls == [False, False]
@@ -60,7 +60,7 @@ def test_threshold_selection_enumerates_all_roc_candidates(monkeypatch) -> None:
 
 def test_youden_ties_select_the_highest_finite_threshold(monkeypatch) -> None:
     monkeypatch.setattr(
-        "radfusion.evaluation.metrics.roc_curve",
+        "beyondcxr.evaluation.metrics.roc_curve",
         lambda *args, **kwargs: (
             np.asarray([0.0, 0.25, 0.5]),
             np.asarray([0.0, 0.75, 1.0]),
@@ -135,7 +135,7 @@ def test_calibration_coefficients_clip_exact_probability_boundaries(monkeypatch)
             captured["targets"] = np.asarray(targets)
             return self
 
-    monkeypatch.setattr("radfusion.evaluation.metrics.LogisticRegression", _CalibrationFit)
+    monkeypatch.setattr("beyondcxr.evaluation.metrics.LogisticRegression", _CalibrationFit)
 
     assert calibration_coefficients([0, 1], [0.0, 1.0]) == (2.0, -1.0)
     clipped = np.asarray([1e-6, 1.0 - 1e-6])

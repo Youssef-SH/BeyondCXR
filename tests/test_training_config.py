@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from radfusion.training.config import (
+from beyondcxr.training.config import (
     FAMILY_MODALITIES,
     ConfigError,
     load_experiment_config,

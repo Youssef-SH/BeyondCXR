@@ -8,7 +8,7 @@ import pyarrow as pa
 import pytest
 from rsna_manifest_test_support import write_sources as _write_sources
 
-from radfusion.data.rsna_artifacts import (
+from beyondcxr.data.rsna_artifacts import (
     CURRENT_FILENAME,
     SOURCE_INVENTORY_FILENAME,
     BuildResult,
@@ -16,12 +16,12 @@ from radfusion.data.rsna_artifacts import (
     resolve_bundle,
     write_bundle,
 )
-from radfusion.data.rsna_audit import REPORT_FILENAMES, generate_rsna_audit
-from radfusion.data.rsna_manifest import main
-from radfusion.data.rsna_schemas import (
+from beyondcxr.data.rsna_audit import REPORT_FILENAMES, generate_rsna_audit
+from beyondcxr.data.rsna_manifest import main
+from beyondcxr.data.rsna_schemas import (
     PNEUMONIA_TASK_ID,
 )
-from radfusion.utils.privacy import validate_public_reports
+from beyondcxr.utils.privacy import validate_public_reports
 
 
 def test_cli_success_and_failure_exit_codes(tmp_path: Path) -> None:

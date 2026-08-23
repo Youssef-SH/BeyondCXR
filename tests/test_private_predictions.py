@@ -8,8 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from radfusion.data.hashing import logical_arrow_sha256, sha256_file
-from radfusion.utils.private_predictions import (
+from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
+from beyondcxr.utils.private_predictions import (
     PREDICTION_MANIFEST_FILENAME,
     PREDICTION_SCHEMA,
     PREDICTIONS_FILENAME,

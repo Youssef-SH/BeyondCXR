@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from radfusion.training import rsna_seed_summary
-from radfusion.training.rsna_seed_summary import (
+from beyondcxr.training import rsna_seed_summary
+from beyondcxr.training.rsna_seed_summary import (
     EXPECTED_SEEDS,
     MANIFEST_FILENAME,
     SEED_SUMMARY_FILENAMES,
@@ -140,10 +140,10 @@ def authority(monkeypatch: pytest.MonkeyPatch):
         return packages[package_id]
 
     monkeypatch.setattr(
-        "radfusion.training.rsna_seed_summary.validate_rsna_evaluation", validate_evaluation
+        "beyondcxr.training.rsna_seed_summary.validate_rsna_evaluation", validate_evaluation
     )
     monkeypatch.setattr(
-        "radfusion.training.rsna_seed_summary.validate_rsna_model_package", validate_package
+        "beyondcxr.training.rsna_seed_summary.validate_rsna_model_package", validate_package
     )
     return evaluations, packages
 

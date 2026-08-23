@@ -13,21 +13,21 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.dicom_loader import DicomRecord
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_cxr_cache import (
+from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.data.dicom_loader import DicomRecord
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.hashing import sha256_file
+from beyondcxr.data.rsna_cxr_cache import (
     CxrCacheIdentity,
     build_cxr_cache,
     preprocessing_identity,
     validate_cxr_cache,
 )
-from radfusion.training.config import load_experiment_config
-from radfusion.training.device import resolve_device
-from radfusion.training.execution import LoaderExecutionPolicy
-from radfusion.training.neural import EpochPermutationSampler, build_image_loaders
-from radfusion.training.rsna_datasets import (
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.execution import LoaderExecutionPolicy
+from beyondcxr.training.neural import EpochPermutationSampler, build_image_loaders
+from beyondcxr.training.rsna_datasets import (
     RsnaCachedFusionDataset,
     RsnaCachedImageDataset,
 )
@@ -116,7 +116,7 @@ def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             photometric_interpretation="MONOCHROME2",
         )
 
-    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.read_dicom", decode)
+    monkeypatch.setattr("beyondcxr.data.rsna_cxr_cache.read_dicom", decode)
     transform = StandardCxrTransform(training=False)
     built = build_cxr_cache(
         _cache_frame(),
@@ -146,7 +146,7 @@ def test_deterministic_transform_policy_participates_in_cache_identity(monkeypat
     transform = StandardCxrTransform(training=False)
     original = preprocessing_identity(transform)
     monkeypatch.setattr(
-        "radfusion.data.cxr_transforms.CXR_TRANSFORM_POLICY_VERSION",
+        "beyondcxr.data.cxr_transforms.CXR_TRANSFORM_POLICY_VERSION",
         "changed-deterministic-policy",
     )
 
@@ -172,7 +172,7 @@ def test_cache_source_frame_requires_all_three_partitions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "radfusion.data.rsna_cxr_cache.read_dicom",
+        "beyondcxr.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded partial cache")),
     )
     with pytest.raises(ManifestBuildError):
@@ -189,7 +189,7 @@ def test_cache_source_frame_rejects_task_columns_before_decoding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "radfusion.data.rsna_cxr_cache.read_dicom",
+        "beyondcxr.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded labeled rows")),
     )
 
@@ -279,7 +279,7 @@ def test_interrupted_cache_publication_cannot_leave_a_valid_destination(
         del stage, destination
         raise OSError("interrupted publication")
 
-    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.publish_directory", interrupt)
+    monkeypatch.setattr("beyondcxr.data.rsna_cxr_cache.publish_directory", interrupt)
     with pytest.raises(OSError):
         build_cxr_cache(
             _cache_frame(),
@@ -306,7 +306,7 @@ def test_cache_mmaps_close_on_build_and_validation_failure(
 
     monkeypatch.setattr(np.lib.format, "open_memmap", tracked_open_memmap)
     monkeypatch.setattr(
-        "radfusion.data.rsna_cxr_cache.read_dicom",
+        "beyondcxr.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError((args, kwargs))),
     )
     identity = replace(built.identity, bundle_manifest_sha256="4" * 64)
@@ -376,7 +376,7 @@ def test_cache_build_rejects_unsafe_paths_and_decoded_patient_mismatch(
             photometric_interpretation="MONOCHROME2",
         )
 
-    monkeypatch.setattr("radfusion.data.rsna_cxr_cache.read_dicom", wrong_patient)
+    monkeypatch.setattr("beyondcxr.data.rsna_cxr_cache.read_dicom", wrong_patient)
     with pytest.raises(ManifestBuildError):
         build_cxr_cache(
             _cache_frame(),
@@ -470,8 +470,21 @@ def test_order_and_augmentation_are_worker_and_persistence_independent(cache) ->
     single = _loader_epochs(built, 0, False)
     one_worker = _loader_epochs(built, 1, True)
     persistent = _loader_epochs(built, 2, True)
-    assert single[0][0] != single[1][0]
-    assert not np.array_equal(single[0][1], single[1][1])
+    dataset, _ = _dataset_and_loader(built, 0, False)
+    epoch_zero = tuple(EpochPermutationSampler(dataset, seed=42, epoch=0))
+    repeated_epoch_zero = tuple(EpochPermutationSampler(dataset, seed=42, epoch=0))
+    epoch_one = tuple(EpochPermutationSampler(dataset, seed=42, epoch=1))
+    assert epoch_zero == repeated_epoch_zero
+    assert {epoch for epoch, _ in epoch_zero} == {0}
+    assert {epoch for epoch, _ in epoch_one} == {1}
+    epoch_zero_images = dict(zip(single[0][0], single[0][1], strict=True))
+    epoch_one_images = dict(zip(single[1][0], single[1][1], strict=True))
+
+    assert epoch_zero_images.keys() == epoch_one_images.keys()
+    assert any(
+        not np.array_equal(epoch_zero_images[sample_id], epoch_one_images[sample_id])
+        for sample_id in epoch_zero_images
+    )
     for expected, one, reused in zip(single, one_worker, persistent, strict=True):
         assert expected[0] == one[0] == reused[0]
         np.testing.assert_array_equal(expected[1], one[1])

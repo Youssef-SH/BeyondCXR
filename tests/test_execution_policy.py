@@ -4,14 +4,14 @@ import pytest
 import torch
 from torch.utils.data import TensorDataset
 
-from radfusion.training.config import load_experiment_config, with_runtime
-from radfusion.training.device import resolve_device
-from radfusion.training.execution import (
+from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.execution import (
     LoaderExecutionPolicy,
     one_shot_loader_policy,
     reused_loader_policy,
 )
-from radfusion.training.neural import build_evaluation_loader, build_image_loaders
+from beyondcxr.training.neural import build_evaluation_loader, build_image_loaders
 
 
 @pytest.mark.parametrize("workers", [0, 2])

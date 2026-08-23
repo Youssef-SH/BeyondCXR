@@ -1842,7 +1842,7 @@ wheels = [
 ]
 
 [[package]]
-name = "radfusion-clinical"
+name = "beyondcxr"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

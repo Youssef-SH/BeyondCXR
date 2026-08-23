@@ -5,9 +5,9 @@ from collections import Counter, defaultdict
 import pyarrow as pa
 import pytest
 
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from radfusion.data.rsna_splitting import (
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
+from beyondcxr.data.rsna_splitting import (
     SPLIT_ALGORITHM_VERSION,
     SPLIT_NAMES,
     SplitConfig,

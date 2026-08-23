@@ -22,28 +22,28 @@ from symile_campaign_test_support import (
     _synthetic_final_packages as _all_synthetic_final_packages,
 )
 
-import radfusion.training.symile_campaign_control as campaign_control
-from radfusion.data.errors import ManifestBuildError
-from radfusion.data.symile_preprocess import (
+import beyondcxr.training.symile_campaign_control as campaign_control
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_preprocess import (
     LAB_FEATURE_COLUMNS,
     SymileLabEcdfTransformer,
 )
-from radfusion.models.symile_fusion import build_symile_gated_model
-from radfusion.serving.api import create_app
-from radfusion.serving.authority import LAB_KEYS, publish_serving_authority
-from radfusion.serving.predictor import SymileServingPredictor
-from radfusion.training.config import load_symile_development_config
-from radfusion.training.symile_campaign_control import (
+from beyondcxr.models.symile_fusion import build_symile_gated_model
+from beyondcxr.serving.api import create_app
+from beyondcxr.serving.authority import LAB_KEYS, publish_serving_authority
+from beyondcxr.serving.predictor import SymileServingPredictor
+from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.symile_campaign_control import (
     PRETEST_FREEZE_PREFIX,
     ValidatedPretestFreeze,
 )
-from radfusion.training.symile_final_packages import (
+from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
     final_training_plan,
     publish_final_neural_package,
 )
-from radfusion.training.symile_test_data import FrozenSymileTestData
-from radfusion.utils.package_identity import canonical_scientific_id
+from beyondcxr.training.symile_test_data import FrozenSymileTestData
+from beyondcxr.utils.package_identity import canonical_scientific_id
 
 
 @pytest.fixture

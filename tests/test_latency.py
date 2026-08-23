@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from radfusion.evaluation.latency import (
+from beyondcxr.evaluation.latency import (
     LATENCY_MEASURED_CALLS,
     LATENCY_WARMUP_CALLS,
     benchmark_single_sample_latency_ms,
@@ -31,7 +31,7 @@ def test_latency_benchmark_uses_warmup_and_median_single_sample_calls(monkeypatc
     features = pd.DataFrame({"feature": [1.0, 2.0]}, index=["first", "second"])
     timestamps = iter([0, 1_000_000, 10_000_000, 13_000_000, 20_000_000, 25_000_000])
     monkeypatch.setattr(
-        "radfusion.evaluation.latency.time.perf_counter_ns", lambda: next(timestamps)
+        "beyondcxr.evaluation.latency.time.perf_counter_ns", lambda: next(timestamps)
     )
 
     latency_ms = benchmark_single_sample_latency_ms(

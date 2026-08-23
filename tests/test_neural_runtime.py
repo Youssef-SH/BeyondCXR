@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from radfusion.training.device import resolve_device
-from radfusion.training.neural import (
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.neural import (
     dataloader_generator,
     seed_neural_runtime,
 )

@@ -6,18 +6,18 @@ from pathlib import Path
 import pytest
 from symile_campaign_test_support import _freeze
 
-import radfusion.serving.authority as serving_authority
-from radfusion.data.errors import ManifestBuildError
-from radfusion.serving.authority import (
+import beyondcxr.serving.authority as serving_authority
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.serving.authority import (
     ENSEMBLE_POLICY,
     PRIMARY_FAMILY,
     validate_serving_authority,
 )
-from radfusion.serving.authority import (
+from beyondcxr.serving.authority import (
     publish_serving_authority as _publish_serving_authority,
 )
-from radfusion.training.symile_campaign_control import ValidatedGlobalResult
-from radfusion.training.symile_final_packages import ValidatedFinalPackage
+from beyondcxr.training.symile_campaign_control import ValidatedGlobalResult
+from beyondcxr.training.symile_final_packages import ValidatedFinalPackage
 
 _SERVING_RELEASE = {
     "git_commit": "1" * 40,

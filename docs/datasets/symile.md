@@ -1,6 +1,6 @@
 # Symile-MIMIC dataset track
 
-RadFusion uses the credentialed Symile-MIMIC 1.0.0 release as the synchronized multimodal source
+BeyondCXR uses the credentialed Symile-MIMIC 1.0.0 release as the synchronized multimodal source
 for strict-pneumonia development. Access is governed by the PhysioNet credentialed-data license,
 data-use agreement, and required training. Source data and patient-level derivatives remain
 outside version control.

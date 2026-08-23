@@ -12,52 +12,52 @@ import yaml
 from torch import nn
 from torch.utils.data import Dataset
 
-from radfusion.data.cxr_transforms import StandardCxrTransform
-from radfusion.data.hashing import sha256_file
-from radfusion.data.rsna_cxr_cache import (
+from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.data.hashing import sha256_file
+from beyondcxr.data.rsna_cxr_cache import (
     SOURCE_AUTHENTICATION_POLICY_VERSION,
     CxrCacheIdentity,
     CxrCacheSourceAuthentication,
     preprocessing_identity,
 )
-from radfusion.data.rsna_metadata_preprocess import (
+from beyondcxr.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     build_rsna_preprocessor,
     fitted_rsna_preprocessor_contract,
     save_preprocessor,
 )
-from radfusion.models.fusion_concat import (
+from beyondcxr.models.fusion_concat import (
     RsnaConcatFusionModel,
     RsnaCxrMetadataConcatModel,
     fusion_architecture_contract,
     initialize_fusion_encoder,
 )
-from radfusion.training.config import (
+from beyondcxr.training.config import (
     ConfigError,
     load_experiment_config,
     with_runtime,
 )
-from radfusion.training.device import resolve_device
-from radfusion.training.rsna_compare import regenerate_comparison
-from radfusion.training.rsna_datasets import (
+from beyondcxr.training.device import resolve_device
+from beyondcxr.training.rsna_compare import regenerate_comparison
+from beyondcxr.training.rsna_datasets import (
     CxrRunData,
     FusionRunData,
     FusionTestData,
     SourceInventoryIdentity,
 )
-from radfusion.training.rsna_evaluate import evaluate_model_package
-from radfusion.training.rsna_fusion_source import VerifiedSourceCxr, _validate_source_contract
-from radfusion.training.rsna_interfaces import DatasetLineage
-from radfusion.training.rsna_train import main as train_main
-from radfusion.training.rsna_train_cxr import _manifest as _cxr_manifest
-from radfusion.training.rsna_train_fusion import (
+from beyondcxr.training.rsna_evaluate import evaluate_model_package
+from beyondcxr.training.rsna_fusion_source import VerifiedSourceCxr, _validate_source_contract
+from beyondcxr.training.rsna_interfaces import DatasetLineage
+from beyondcxr.training.rsna_train import main as train_main
+from beyondcxr.training.rsna_train_cxr import _manifest as _cxr_manifest
+from beyondcxr.training.rsna_train_fusion import (
     _manifest,
     load_validated_rsna_fusion_preprocessor,
     train_fusion_experiment,
 )
-from radfusion.utils.mlflow_utils import configure_mlflow
-from radfusion.utils.private_predictions import validate_prediction_evidence
-from radfusion.utils.rsna_neural_publication import (
+from beyondcxr.utils.mlflow_utils import configure_mlflow
+from beyondcxr.utils.private_predictions import validate_prediction_evidence
+from beyondcxr.utils.rsna_neural_publication import (
     FUSION_MANIFEST_FIELDS,
     _validate_fusion_source_package,
     checkpoint_document,
@@ -770,8 +770,8 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         return _FusionTensorDataset(frame_value, structured)
 
     for module in (
-        "radfusion.training.rsna_train_fusion",
-        "radfusion.training.rsna_evaluate_fusion",
+        "beyondcxr.training.rsna_train_fusion",
+        "beyondcxr.training.rsna_evaluate_fusion",
     ):
         monkeypatch.setattr(f"{module}.get_dataset", lambda key: adapter)
         monkeypatch.setattr(f"{module}.get_model", lambda key: builder)
@@ -801,9 +801,9 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         monkeypatch.setattr(f"{module}.prepare_rsna_cxr_cache", prepared_cache)
         monkeypatch.setattr(f"{module}.resolve_source_cxr_package", lambda *args, **kwargs: source)
     monkeypatch.setattr(
-        "radfusion.training.rsna_train_fusion.git_revision", lambda: ("fusion-commit", False)
+        "beyondcxr.training.rsna_train_fusion.git_revision", lambda: ("fusion-commit", False)
     )
-    monkeypatch.setattr("radfusion.training.rsna_train_fusion.uv_lock_sha256", lambda: "8" * 64)
+    monkeypatch.setattr("beyondcxr.training.rsna_train_fusion.uv_lock_sha256", lambda: "8" * 64)
 
     tracking_uri = f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}"
     training = train_fusion_experiment(
@@ -874,7 +874,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         raise OSError((args, kwargs))
 
     monkeypatch.setattr(
-        "radfusion.training.rsna_evaluate_fusion.publish_rsna_evaluation", fail_publication
+        "beyondcxr.training.rsna_evaluate_fusion.publish_rsna_evaluation", fail_publication
     )
     with pytest.raises(OSError):
         evaluate_model_package(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from radfusion.utils.privacy import validate_public_reports
+from beyondcxr.utils.privacy import validate_public_reports
 
 
 @pytest.mark.parametrize(

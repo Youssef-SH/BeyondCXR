@@ -16,16 +16,16 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from radfusion.data.rsna_metadata_preprocess import metadata_input_contract
-from radfusion.training.config import load_experiment_config
-from radfusion.utils.package_identity import (
+from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
+from beyondcxr.training.config import load_experiment_config
+from beyondcxr.utils.package_identity import (
     _array,
     _tagged,
     fitted_object_state_sha256,
     package_scientific_config_payload,
     tensor_state_sha256,
 )
-from radfusion.utils.rsna_model_publication import (
+from beyondcxr.utils.rsna_model_publication import (
     MODEL_PACKAGE_ID_PREFIX,
     REQUIRED_MANIFEST_FIELDS,
     model_package_id,
@@ -33,7 +33,7 @@ from radfusion.utils.rsna_model_publication import (
     threshold_contract,
     validate_published_model,
 )
-from radfusion.utils.skops_io import load_skops, save_skops
+from beyondcxr.utils.skops_io import load_skops, save_skops
 
 _SHA256 = "a" * 64
 

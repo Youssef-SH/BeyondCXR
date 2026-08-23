@@ -7,7 +7,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from radfusion.evaluation.probabilities import (
+from beyondcxr.evaluation.probabilities import (
     canonical_binary_raw_scores,
     positive_class_probabilities,
 )
