@@ -12,7 +12,7 @@ uv sync --locked --no-dev
 Contributors install the development group before running quality gates:
 
 ```bash
-uv sync --locked --group dev
+uv sync --locked --group dev --extra serving
 uv run pre-commit install
 ```
 
@@ -378,7 +378,7 @@ captured at the ready-for-export boundary.
 
 ```bash
 uv lock --check
-uv sync --locked --group dev
+uv sync --locked --group dev --extra serving
 make check
 make pre-commit
 git diff --check
@@ -398,3 +398,17 @@ state, not a preservation operation. It refuses an existing canonical Symile tes
 Preserve complete scientific evidence and backups before cleanup; raw datasets remain external
 inputs. The required operator-supplied `BACKUP_ROOT` must be a separately approved persistent
 destination outside the resolved repository root, including after resolving symlinks.
+
+## Serving reproduction boundary
+
+A serving process starts only from an explicit validated `serving-authority-<sha256>` and the
+exact three bound final primary gated package directories in seed order 17, 42, and 2026; there is
+no mutable latest pointer, best-model selection, or MLflow model discovery. Install with
+`uv sync --locked --extra serving`, then use `make symile-serve AUTHORITY=... PACKAGE_ROOT=...`.
+The serving authority records the formal science Git and dependency-lock witnesses from the
+validated pre-test freeze without changing them. It separately binds the Git commit and lock hash
+of the serving release supplied at publication, so downstream product code cannot be mistaken for
+the frozen science execution state. Publication canonically revalidates the complete Symile global
+result from its freeze, all 14 packages and raw prediction evidences, and official-test projection
+before selecting the exact three primary gated packages. Exact transport, preprocessing, Docker,
+and privacy contracts are documented in [`serving.md`](serving.md).

@@ -81,7 +81,7 @@ semantics, and the policy version. The fitted preprocessing pipeline is embedded
 
 ## RSNA execution
 
-Contributor setup uses `uv sync --locked --group dev`; a paid GPU campaign host uses
+Contributor setup uses `uv sync --locked --group dev --extra serving`; a paid GPU campaign host uses
 `uv sync --locked --no-dev`.
 
 ```bash

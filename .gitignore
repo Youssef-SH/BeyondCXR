@@ -57,3 +57,6 @@ credentials.json
 
 # Portable generated campaign exports
 /outbox/
+
+# Generated synthetic serving example
+/synthetic-serving-request/
