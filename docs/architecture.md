@@ -147,3 +147,17 @@ The global result owns aggregate held-out claims. Private error review is a rege
 not a prerequisite for validating those claims. Preservation includes both, along with their
 recursive authority closure. See [`reproducibility.md`](reproducibility.md) for runtime matching,
 execution, and backup requirements.
+
+## Controlled research serving
+
+Serving is downstream of the scientific evidence chain. One immutable, non-scientific serving
+authority binds the ordered seed-17, seed-42, and seed-2026 final CXR-plus-labs gated packages,
+their integrity witnesses, the global result, the frozen input and preprocessing contracts, and
+the development-derived thresholds. Authority publication first uses the canonical Symile
+global-result validator to close the global result over its freeze, all 14 final packages and
+prediction evidences, and the official-test projection. It binds separate frozen-science and
+serving-release Git/lock provenance.
+Startup recursively validates and reconstructs all three selected packages. Runtime inference
+averages their raw logits in frozen order and applies sigmoid once. The service never selects
+models through MLflow or observed performance and does not modify a scientific package, prediction
+evidence, or result.

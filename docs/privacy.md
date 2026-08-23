@@ -53,3 +53,12 @@ Local MLflow databases and `mlartifacts/` are private operational state, not pub
 Handled scientific-command failures report exception types without copying exception text into
 stderr. The interactive `rsna-inspect` utility deliberately displays source metadata and pixels:
 use it only in an authorized private session and do not publish its output or screenshots.
+
+The research serving process is stateless with respect to patients. It keeps no upload archive,
+request or response archive, patient database, or prediction cache. RadFusion retains no submitted
+image, laboratory input, patient identifier, missingness state, or prediction after request
+processing, and operational handling does not log patient-level inputs or outputs. The project
+command disables Uvicorn access logging; deployments must apply the same restriction to external
+proxies and platforms. Public Docker images contain only distributable code and the locked runtime.
+Restricted serving authorities and trained packages are mounted read-only at runtime unless their
+distribution is separately authorized. Public request examples are explicitly synthetic.

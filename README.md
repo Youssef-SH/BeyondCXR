@@ -40,7 +40,7 @@ local data artifacts. The wheel provides importable code, not a standalone study
 Run Make commands from the checkout root, or use `make -C /path/to/checkout <target>`.
 
 ```bash
-uv sync --locked --group dev
+uv sync --locked --group dev --extra serving
 uv run pre-commit install
 ```
 
@@ -74,6 +74,7 @@ make symile-cv       # publish the bundle-bound immutable repeated-CV assignment
 make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
 make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
 make symile-campaign SOURCE_ROOT=path/to/private/symile/source BACKUP_ROOT=path/to/approved/persistent/backup
+make symile-serve AUTHORITY=path/to/serving-authority PACKAGE_ROOT=path/to/final/packages
 
 # Lower-level explicit scientific commands
 make rsna-inspect FILE=path/to/image.dcm
@@ -104,12 +105,18 @@ ordering. Neither command exposes or evaluates the official Symile test.
 `symile-campaign` is the sole public held-out campaign command. It preserves the exact-six core
 development analysis, runs the separate exact-three ECG family internally, fits 14 final packages,
 and constructs the compact freeze/test-open firewall. Fourteen raw package-bound predictions
-produce six predictor views and one global result. Formal Symile execution has not occurred, and
-the official test remains untouched.
+produce six predictor views and one global result.
 If a valid `test-open.json` already exists, the command revalidates and resumes that exact freeze,
 performs no development or final retraining, and completes only missing post-open work.
 Resume requires the same frozen numerical inference runtime; see the
 [runtime requirements](docs/reproducibility.md#numerical-runtime-on-resume).
+
+`symile-serve` starts the research-only FastAPI service from one explicit validated serving
+authority and its three frozen primary gated packages. It accepts only the strict JPEG
+(`image/jpeg`), AP-or-PA, and 50-laboratory contract and returns the raw mean-logit ensemble
+probability. Serving authorities are publishable only from the validated formal Symile
+scientific-evidence chain; see
+[controlled research serving](docs/serving.md).
 
 After the raw dataset is in place, `make rsna-campaign` owns pretrained-weight readiness, bundle and
 audit generation, deterministic image caching, all eight
@@ -177,6 +184,7 @@ src/radfusion/data/        ingestion, splits, audits, schemas, validation, and h
 src/radfusion/models/      fixed estimator definitions
 src/radfusion/training/    reusable training entry points
 src/radfusion/evaluation/  metrics and aggregate evaluation plots
+src/radfusion/serving/     validated research-only ensemble serving
 configs/                   experiment definitions
 tests/                     unit, contract, and local integration tests
 docs/                      architecture, data contracts, privacy, and reproducibility
@@ -194,8 +202,8 @@ version control. See [`docs/privacy.md`](docs/privacy.md).
 
 - Implemented scope covers the RSNA Stage 2 metadata, CXR, fusion, and localization campaign plus
   the Symile-MIMIC data foundation, core repeated-CV workflow, ECG extension, final fitting,
-  pre-test controls, and held-out evaluation infrastructure. No formal Symile development or
-  held-out results are reported here.
+  pre-test controls, held-out evaluation infrastructure, and controlled research serving of the
+  fixed three-member CXR-plus-labs gated ensemble through an explicit validated authority.
 - Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
   endpoint definition.
 
