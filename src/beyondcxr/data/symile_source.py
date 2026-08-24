@@ -238,7 +238,7 @@ def establish_authenticated_release_asset(
 
 
 def reopen_authenticated_release_memmap(authority: AuthenticatedReleaseAsset) -> np.memmap:
-    """Reopen a previously byte-authenticated asset without hashing it again."""
+    """Reopen a byte-authenticated asset without re-hashing its bytes."""
     descriptor = _open_authenticated_asset(authority)
     try:
         array = np.load(f"/proc/self/fd/{descriptor}", mmap_mode="r", allow_pickle=False)

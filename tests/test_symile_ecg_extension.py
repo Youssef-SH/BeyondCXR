@@ -43,7 +43,7 @@ def test_focused_subgroup_derivative_requires_exact_v1_contract(tmp_path: Path) 
         elif mutation == "float":
             altered["focused_subgroup_derivative_schema_version"] = 1.0
         else:
-            altered["legacy"] = True
+            altered["unexpected"] = True
         encoded = (json.dumps(altered, sort_keys=True, separators=(",", ":")) + "\n").encode()
         altered_id = "focused-subgroup-" + hashlib.sha256(encoded).hexdigest()
         altered_path = path.parent / f"{altered_id}.json"

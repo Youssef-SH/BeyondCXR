@@ -1,4 +1,4 @@
-"""Expose only the frozen Symile development cohort and required CXR tensors."""
+"""Expose the prespecified Symile development cohort and required CXR tensors."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class SymileDevelopmentCohort:
 
 @dataclass(frozen=True)
 class SymileDevelopmentData:
-    """Layer the frozen repeated-CV assignment over one development cohort."""
+    """Layer the recorded repeated-CV assignment over one development cohort."""
 
     cohort: SymileDevelopmentCohort
     cv_reference: ValidatedSymileCvReference
@@ -167,7 +167,7 @@ def load_symile_development(
 def materialize_outer_fold(
     data: SymileDevelopmentData, *, repeat_seed: int, outer_fold: int
 ) -> SymileOuterFold:
-    """Materialize one exact frozen outer fold from the experimental-design assignment."""
+    """Materialize one outer fold from the recorded experimental-design assignment."""
     if repeat_seed not in REPEAT_SEEDS or outer_fold not in OUTER_FOLDS:
         raise ManifestBuildError("Symile outer-fold coordinates are invalid")
     assignments = data.cv_reference.assignments.to_pandas()
@@ -191,7 +191,7 @@ def materialize_outer_fold(
 
 
 def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
-    """Derive the frozen deterministic patient-grouped inner split."""
+    """Derive the deterministic patient-grouped inner split."""
     frame = outer.training.sort_values("sample_id", kind="stable").reset_index(drop=True)
     inner_seed = derive_inner_seed(outer.repeat_seed, outer.outer_fold)
     splitter = StratifiedGroupKFold(
@@ -246,7 +246,7 @@ def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
 
 
 def derive_inner_seed(repeat_seed: int, outer_fold: int) -> int:
-    """Derive the canonical inner-split seed for one frozen outer coordinate."""
+    """Derive the inner-split seed for one recorded outer coordinate."""
     if repeat_seed not in REPEAT_SEEDS or outer_fold not in OUTER_FOLDS:
         raise ManifestBuildError("Symile inner-split coordinates are invalid")
     payload = f"symile-inner-split\0{repeat_seed}\0{outer_fold}".encode()

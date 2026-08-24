@@ -1,4 +1,4 @@
-"""Fit the two frozen unweighted Symile laboratory baselines."""
+"""Fit the two prespecified unweighted Symile laboratory baselines."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def fit_symile_labs_logistic(
     lab_policy: str,
     training_seed: int,
 ) -> SymileTabularFit:
-    """Fit the frozen LR path on complete outer training."""
+    """Fit the Logistic Regression path on complete outer training."""
     if selection_metric != "none":
         raise ValueError("Symile Labs Logistic Regression does not perform model selection")
     targets = validated_binary_targets(outer_training_targets)
@@ -69,7 +69,7 @@ def fit_symile_labs_lightgbm(
     inner_validation_indices: np.ndarray,
     training_seed: int,
 ) -> SymileTabularFit:
-    """Fit the frozen LightGBM path with inner-validation AUROC stopping."""
+    """Fit the LightGBM path with inner-validation AUROC stopping."""
     if selection_metric != "roc_auc":
         raise ValueError("Symile Labs LightGBM selection requires roc_auc")
     targets = validated_binary_targets(outer_training_targets)
@@ -145,7 +145,7 @@ def fit_final_symile_labs_lightgbm(
     lab_policy: str,
     training_seed: int,
 ) -> Pipeline:
-    """Fit the frozen final LightGBM estimator without validation or early stopping."""
+    """Fit the terminal LightGBM estimator without validation or early stopping."""
     if isinstance(n_estimators, bool) or not isinstance(n_estimators, int) or n_estimators <= 0:
         raise ValueError("Final Symile LightGBM iteration budget is invalid")
     truth = validated_binary_targets(targets)

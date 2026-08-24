@@ -1,4 +1,4 @@
-"""Compose the frozen Symile concat and missingness-aware gated models."""
+"""Compose the prespecified Symile concat and missingness-aware gated models."""
 
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ class SymileGatedFusionModel(nn.Module):
 def build_symile_concat_model(
     parameters: Mapping[str, object], *, weights: str | None
 ) -> SymileConcatFusionModel:
-    """Build one frozen-topology Symile concat model."""
+    """Build one fixed-topology Symile concat model."""
     return SymileConcatFusionModel(
         StandardCxrEncoder(
             weights=weights,
@@ -184,7 +184,7 @@ def build_symile_concat_model(
 def build_symile_gated_model(
     parameters: Mapping[str, object], *, weights: str | None
 ) -> SymileGatedFusionModel:
-    """Build one frozen-topology Symile gated model."""
+    """Build one fixed-topology Symile gated model."""
     return SymileGatedFusionModel(
         StandardCxrEncoder(
             weights=weights,

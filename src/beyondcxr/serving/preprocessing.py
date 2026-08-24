@@ -1,4 +1,4 @@
-"""Strict, stateless serving inputs aligned with frozen Symile evaluation."""
+"""Strict, stateless serving inputs aligned with package-bound Symile evaluation."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def decode_jpeg_once(content: bytes) -> np.ndarray:
 
 
 def serving_canonical_image(grayscale: np.ndarray) -> np.ndarray:
-    """Map decoded grayscale into the frozen M7 canonical spatial representation."""
+    """Map decoded grayscale into the authority-bound canonical spatial representation."""
     if (
         not isinstance(grayscale, np.ndarray)
         or grayscale.dtype != np.uint8
@@ -106,7 +106,7 @@ def serving_canonical_image(grayscale: np.ndarray) -> np.ndarray:
 def serving_tensor_from_canonical_image(
     canonical: np.ndarray, transform: StandardCxrTransform
 ) -> torch.Tensor:
-    """Map one canonical 320-square image through the frozen evaluation transform."""
+    """Map one canonical 320-square image through the package-bound evaluation transform."""
     if (
         not isinstance(canonical, np.ndarray)
         or canonical.dtype != np.float32
@@ -124,7 +124,7 @@ def serving_tensor_from_canonical_image(
 
 
 def serving_image_tensor(grayscale: np.ndarray, transform: StandardCxrTransform) -> torch.Tensor:
-    """Compose M7 spatial adaptation with the frozen evaluation transform."""
+    """Apply serving spatial adaptation followed by the package-bound evaluation transform."""
     return serving_tensor_from_canonical_image(serving_canonical_image(grayscale), transform)
 
 

@@ -467,7 +467,7 @@ def fit_rsna_two_stage_binary_model(
     progress_callback: NeuralProgressCallback | None = None,
     throughput_callback: TrainingEpochThroughputCallback | None = None,
 ) -> SelectedTrainingResult:
-    """Run the frozen RSNA AP-selected two-stage binary lifecycle."""
+    """Run the prespecified RSNA AP-selected two-stage binary lifecycle."""
     return fit_two_stage_binary_model(
         model,
         train_loader,
