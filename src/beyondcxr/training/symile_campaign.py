@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlflow
@@ -86,6 +87,7 @@ from beyondcxr.utils.private_predictions import (
 )
 from beyondcxr.utils.publication import validate_path_component
 from beyondcxr.utils.symile_publication import (
+    ValidatedDevelopmentResult,
     validate_analysis_result,
     validate_development_result,
     validated_development_repeat_oof,
@@ -97,6 +99,21 @@ _CONFIGS = {
 }
 
 
+@dataclass(frozen=True)
+class RestoredCampaignClosure:
+    """Recursively validated campaign state exposed to downstream release consumers."""
+
+    freeze: ValidatedPretestFreeze
+    extension: ValidatedEcgExtensionResult
+    analysis: dict[str, object]
+    subgroup: dict[str, object]
+    developments: tuple[ValidatedDevelopmentResult, ...]
+    packages: tuple[ValidatedFinalPackage, ...]
+    predictions: tuple[ValidatedPredictionEvidence, ...]
+    global_result: ValidatedGlobalResult
+    test_data: FrozenSymileTestData
+
+
 def run_symile_campaign(
     *,
     source_root: str | Path,
@@ -104,7 +121,7 @@ def run_symile_campaign(
     workers: int = 2,
     backup_root: str | Path,
 ) -> dict[str, str]:
-    """Execute the frozen ordered lifecycle; no internal stage is a public command."""
+    """Execute the prespecified end-to-end Symile campaign."""
     repository_root = discover_repository_root()
     manifest_root = repository_root / "data" / "manifests"
     model_root = repository_root / "models" / "symile"
@@ -479,7 +496,7 @@ def _complete_opened_campaign(
         export_root=export_root,
         backup_root=backup_root,
         export_name=global_result.result_id,
-        restoration_validator=_validate_restored_campaign,
+        restoration_validator=validate_restored_campaign,
     )
     return {
         "core_analysis_id": analysis_id,
@@ -490,8 +507,8 @@ def _complete_opened_campaign(
     }
 
 
-def _validate_restored_campaign(restored_root: Path) -> None:
-    """Recursively certify one campaign using only its restored canonical tree."""
+def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
+    """Recursively validate one campaign from its restored artifact tree."""
     manifest_root = restored_root / "data" / "manifests"
     model_root = restored_root / "models" / "symile"
     report_root = restored_root / "reports" / "symile"
@@ -532,10 +549,11 @@ def _validate_restored_campaign(restored_root: Path) -> None:
         manifest_root=manifest_root,
         expected_analysis_id=analysis_id,
     )
-    for development_id in (
+    development_ids = (
         *analysis["family_development_ids"].values(),
         extension.manifest["ecg_development_id"],
-    ):
+    )
+    developments = tuple(
         validate_development_result(
             report_root / "development" / "families" / development_id,
             model_root=model_root / "development",
@@ -543,8 +561,10 @@ def _validate_restored_campaign(restored_root: Path) -> None:
             manifest_root=manifest_root,
             expected_development_id=development_id,
         )
+        for development_id in development_ids
+    )
     subgroup_id = str(extension.manifest["focused_subgroup_derivative"])
-    validate_focused_subgroup_derivative(
+    subgroup = validate_focused_subgroup_derivative(
         report_root / "development-subgroups" / f"{subgroup_id}.json",
         expected_id=subgroup_id,
     )
@@ -595,7 +615,7 @@ def _validate_restored_campaign(restored_root: Path) -> None:
     error_reviews = tuple((private_root / "error-review" / "symile").iterdir())
     if len(global_directories) != 1 or len(error_reviews) != 1:
         raise ManifestBuildError("Restored campaign result membership is invalid")
-    validate_global_result(
+    global_result = validate_global_result(
         global_directories[0],
         capability=freeze,
         predictions=predictions,
@@ -607,6 +627,17 @@ def _validate_restored_campaign(restored_root: Path) -> None:
         capability=freeze,
         predictions=predictions,
         final_packages=packages,
+        test_data=test_data,
+    )
+    return RestoredCampaignClosure(
+        freeze=freeze,
+        extension=extension,
+        analysis=analysis,
+        subgroup=subgroup,
+        developments=developments,
+        packages=packages,
+        predictions=predictions,
+        global_result=global_result,
         test_data=test_data,
     )
 

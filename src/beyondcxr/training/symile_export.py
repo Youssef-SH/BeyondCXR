@@ -12,7 +12,7 @@ import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, overload
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.utils.publication import is_publication_staging_directory, validate_path_component
@@ -112,11 +112,27 @@ def export_and_verify(
     return archive
 
 
+@overload
 def restore_and_validate_symile_export(
     archive: str | Path,
     *,
-    restoration_validator: Callable[[Path], None] | None = None,
-) -> None:
+    restoration_validator: None = None,
+) -> None: ...
+
+
+@overload
+def restore_and_validate_symile_export[RestorationResult](
+    archive: str | Path,
+    *,
+    restoration_validator: Callable[[Path], RestorationResult],
+) -> RestorationResult: ...
+
+
+def restore_and_validate_symile_export[RestorationResult](
+    archive: str | Path,
+    *,
+    restoration_validator: Callable[[Path], RestorationResult] | None = None,
+) -> RestorationResult | None:
     """Restore a campaign using only its archive-owned V1 manifest and validate it."""
     source = Path(archive)
     _validate_private_file(source)
@@ -145,7 +161,8 @@ def restore_and_validate_symile_export(
                         expected_hash,
                     )
             if restoration_validator is not None:
-                restoration_validator(restored_root)
+                return restoration_validator(restored_root)
+    return None
 
 
 def _build_export_manifest(

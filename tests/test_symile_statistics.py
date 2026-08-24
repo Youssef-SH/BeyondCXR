@@ -344,7 +344,7 @@ def test_global_effect_computation_and_metadata_share_comparison_authority(monke
         "GLOBAL_EFFECT_COMPARISONS",
         (("only_effect", "candidate", "comparator"),),
     )
-    monkeypatch.setattr(campaign_control, "_predictor_views", lambda packages, predictions: views)
+    monkeypatch.setattr(campaign_control, "predictor_views", lambda packages, predictions: views)
     monkeypatch.setattr(
         campaign_control,
         "_validated_projection_subjects",

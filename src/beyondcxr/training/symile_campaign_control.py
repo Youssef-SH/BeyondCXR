@@ -480,7 +480,7 @@ def _error_review_document(capability, predictions, final_packages, test_data):
     packages = _validated_frozen_packages(capability, final_packages)
     projection = _frozen_evaluation_projection(capability, test_data)
     evidence = _validated_predictions(capability, packages, predictions, projection)
-    primary = _predictor_views(packages, evidence)["cxr_labs_gated"]
+    primary = predictor_views(packages, evidence)["cxr_labs_gated"]
     threshold = capability.manifest["primary_thresholds"]["youden_j"]
     semantic = {
         "pretest_freeze_id": capability.freeze_id,
@@ -568,7 +568,7 @@ def _derive_global_claims(
     predictions: Sequence[ValidatedPredictionEvidence],
     projection: HeldOutEvaluationProjection,
 ) -> dict[str, object]:
-    views = _predictor_views(packages, predictions)
+    views = predictor_views(packages, predictions)
     subjects = _validated_projection_subjects(capability, projection, views["labs_logistic"])
     effects: dict[str, object] = {}
     for name, candidate, comparator in GLOBAL_EFFECT_COMPARISONS:
@@ -676,7 +676,7 @@ def _reliability_svg(curves: object) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _predictor_views(
+def predictor_views(
     packages: Sequence[ValidatedFinalPackage],
     predictions: Sequence[ValidatedPredictionEvidence],
 ) -> dict[str, pd.DataFrame]:

@@ -207,7 +207,7 @@ def test_export_manifest_rejects_hostile_contracts(mutation: str) -> None:
     elif mutation == "missing_field":
         member.pop("files")
     elif mutation == "extra_field":
-        member["legacy"] = True
+        member["unexpected"] = True
     elif mutation == "duplicate_restore":
         document["members"].append({**deepcopy(member), "archive_identity": "member-0001"})
     elif mutation == "absolute_restore":
@@ -303,13 +303,14 @@ def test_standalone_restore_uses_only_backup_manifest_after_sources_are_deleted(
     backup = tmp_path / "backup/campaign.zip"
     for member in arguments["members"]:
         shutil.rmtree(member.path) if member.path.is_dir() else member.path.unlink()
-    observed: dict[str, bytes] = {}
 
-    def validate(root: Path) -> None:
-        observed["artifact"] = (root / "reports/symile/result/artifact.bin").read_bytes()
-        observed["open"] = (root / "private/control/symile/test-open.json").read_bytes()
+    def validate(root: Path) -> dict[str, bytes]:
+        return {
+            "artifact": (root / "reports/symile/result/artifact.bin").read_bytes(),
+            "open": (root / "private/control/symile/test-open.json").read_bytes(),
+        }
 
-    restore_and_validate_symile_export(backup, restoration_validator=validate)
+    observed = restore_and_validate_symile_export(backup, restoration_validator=validate)
     assert observed == {
         "artifact": b"bounded-streaming-input" * 100,
         "open": b'{"test_open_schema_version":1}\n',

@@ -957,13 +957,13 @@ def test_real_campaign_closure_restores_after_original_authorities_are_removed(
         export_root=tmp_path / "outbox",
         backup_root=backup_root,
         export_name=global_result.result_id,
-        restoration_validator=symile_campaign._validate_restored_campaign,
+        restoration_validator=symile_campaign.validate_restored_campaign,
     )
     backup = backup_root / f"{global_result.result_id}.zip"
     for member in members:
         shutil.rmtree(member.path) if member.path.is_dir() else member.path.unlink()
     assert not any(member.path.exists() for member in members)
     restore_and_validate_symile_export(
-        backup, restoration_validator=symile_campaign._validate_restored_campaign
+        backup, restoration_validator=symile_campaign.validate_restored_campaign
     )
     assert analysis_id == extension.manifest["core_analysis_id"]
