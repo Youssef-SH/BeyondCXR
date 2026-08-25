@@ -83,27 +83,33 @@ class SymileServingPredictor:
         return probability
 
     def model_info(self) -> dict[str, object]:
-        manifest = self.authority.manifest
-        return {
-            "task": manifest["task"]["task_id"],
-            "positive_class": dict(manifest["positive_class"]),
-            "serving_authority_id": self.authority.authority_id,
-            "model_package_ids": [item["package_id"] for item in manifest["members"]],
-            "seeds": list(manifest["ordered_seeds"]),
-            "family": manifest["family"],
-            "ensemble_policy": ENSEMBLE_POLICY,
-            "input_contract": dict(manifest["input_contract"]),
-            "preprocessing": dict(manifest["preprocessing"]),
-            "operating_thresholds": dict(manifest["primary_thresholds"]),
-            "global_result_id": manifest["global_result"]["global_result_id"],
-            "science_git_commit": manifest["science_execution"]["git_commit"],
-            "serving_release_git_commit": manifest["serving_release"]["git_commit"],
-            "warning": manifest["warning"],
-        }
+        return serving_model_info(self.authority)
+
+
+def serving_model_info(authority: ValidatedServingAuthority) -> dict[str, object]:
+    """Project one validated serving authority onto the public model-info contract."""
+    validated = require_serving_authority(authority)
+    manifest = validated.manifest
+    return {
+        "task": manifest["task"]["task_id"],
+        "positive_class": dict(manifest["positive_class"]),
+        "serving_authority_id": validated.authority_id,
+        "model_package_ids": [item["package_id"] for item in manifest["members"]],
+        "seeds": list(manifest["ordered_seeds"]),
+        "family": manifest["family"],
+        "ensemble_policy": ENSEMBLE_POLICY,
+        "input_contract": dict(manifest["input_contract"]),
+        "preprocessing": dict(manifest["preprocessing"]),
+        "operating_thresholds": dict(manifest["primary_thresholds"]),
+        "global_result_id": manifest["global_result"]["global_result_id"],
+        "science_git_commit": manifest["science_execution"]["git_commit"],
+        "serving_release_git_commit": manifest["serving_release"]["git_commit"],
+        "warning": manifest["warning"],
+    }
 
 
 def mean_logit_probability(logits: list[float] | tuple[float, ...]) -> float:
-    """Apply the frozen serving ensemble arithmetic to exactly three finite logits."""
+    """Average exactly three finite member logits and apply sigmoid once."""
     values = np.asarray(logits, dtype=np.float64)
     if values.shape != (3,) or not np.isfinite(values).all():
         raise ValueError("Serving ensemble requires exactly three finite raw logits")
