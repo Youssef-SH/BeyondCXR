@@ -12,6 +12,7 @@ from beyondcxr.models.cxr_baseline import (
     set_cxr_encoder_trainability,
 )
 from beyondcxr.models.fusion_concat import ConcatFusionHead
+from beyondcxr.models.symile_validation import _validate_fusion_input_devices
 
 
 def symile_concat_architecture(parameters: Mapping[str, object]) -> dict[str, int | float]:
@@ -128,6 +129,7 @@ class SymileGatedFusionHead(nn.Module):
             "CXR embedding",
         )
         _validate_matrix(labs, len(image_embedding), self.lab_input_dimension, "laboratory input")
+        _validate_fusion_input_devices(image_embedding, labs)
         values = labs[:, : self.lab_input_dimension - self.observedness_dimension]
         observedness = labs[:, -self.observedness_dimension :]
         if not self.use_observedness:

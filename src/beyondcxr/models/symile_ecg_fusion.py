@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from beyondcxr.models.cxr_baseline import StandardCxrEncoder, set_cxr_encoder_trainability
+from beyondcxr.models.symile_validation import _validate_fusion_input_devices
 
 ECG_ENCODER_PARAMETER_COUNT = 2_189_632
 TRIMODAL_EXCLUDING_CXR_ENCODER_PARAMETER_COUNT = 2_726_785
@@ -179,14 +180,10 @@ class SymileTriModalGatedHead(nn.Module):
             not isinstance(labs, torch.Tensor)
             or labs.shape != (len(image_embedding), self.lab_input_dimension)
             or labs.dtype != torch.float32
-            or labs.device != image_embedding.device
         ):
             raise ValueError("laboratory input is invalid")
-        _validate_ecg_structure(
-            ecg,
-            batch_size=len(image_embedding),
-            device=image_embedding.device,
-        )
+        _validate_ecg_structure(ecg, batch_size=len(image_embedding))
+        _validate_fusion_input_devices(image_embedding, labs, ecg)
         observedness = labs[:, -self.observedness_dimension :]
         representations = (
             self.image_projection(image_embedding),
@@ -257,7 +254,6 @@ def _validate_ecg_structure(
     ecg: object,
     *,
     batch_size: int | None = None,
-    device: torch.device | None = None,
 ) -> None:
     if (
         not isinstance(ecg, torch.Tensor)
@@ -266,6 +262,5 @@ def _validate_ecg_structure(
         or len(ecg) == 0
         or (batch_size is not None and len(ecg) != batch_size)
         or ecg.dtype != torch.float32
-        or (device is not None and ecg.device != device)
     ):
         raise ValueError("ECG input must be a B x 12 x 5000 float32 tensor")

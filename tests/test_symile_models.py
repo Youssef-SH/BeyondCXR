@@ -407,13 +407,13 @@ def test_tri_modal_autocast_forward_backward(device_type: str) -> None:
         with torch.no_grad(), torch.autocast(device_type, dtype=dtype):
             assert torch.isfinite(model(images, labs, ecg)).all()
     if device_type == "cuda":
-        with pytest.raises(ValueError, match="laboratory input"):
+        with pytest.raises(ValueError, match="share the fusion input device"):
             model.classifier(embedding, labs.cpu(), ecg)
         with pytest.raises(ValueError, match="share the fusion input device"):
             model.classifier(embedding, labs, ecg.cpu())
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "shape", "labs"])
+@pytest.mark.parametrize("invalid", ["dtype", "shape", "batch", "labs"])
 def test_tri_modal_autocast_preserves_structural_input_rejections(invalid: str) -> None:
     config = load_symile_development_config("configs/symile_cxr_labs_ecg_gated.yaml")
     head = SymileTriModalGatedHead(config.family.parameters)
@@ -424,12 +424,43 @@ def test_tri_modal_autocast_preserves_structural_input_rejections(invalid: str) 
         ecg = ecg.bfloat16()
     elif invalid == "shape":
         ecg = ecg.transpose(1, 2)
+    elif invalid == "batch":
+        ecg = ecg.repeat(2, 1, 1)
     else:
         labs = labs[:, :99]
     with (
         torch.autocast("cpu", dtype=torch.bfloat16),
         pytest.raises(ValueError, match="ECG input|laboratory input"),
     ):
+        head(embedding, labs, ecg)
+
+
+@pytest.mark.parametrize(
+    ("family", "misplaced_input"),
+    [
+        ("cxr_labs_gated", "labs"),
+        ("cxr_labs_ecg_gated", "labs"),
+        ("cxr_labs_ecg_gated", "ecg"),
+    ],
+)
+def test_gated_fusion_inputs_report_device_mismatch_without_cuda(
+    family: str, misplaced_input: str
+) -> None:
+    config = load_symile_development_config(f"configs/symile_{family}.yaml")
+    embedding = torch.ones(1, 1024)
+    labs = torch.ones(1, 100)
+    if family == "cxr_labs_gated":
+        head = SymileGatedFusionHead(config.family.parameters)
+        with pytest.raises(ValueError, match="share the fusion input device"):
+            head(embedding, labs.to("meta"))
+        return
+    head = SymileTriModalGatedHead(config.family.parameters)
+    ecg = torch.ones(1, 12, 5000)
+    if misplaced_input == "labs":
+        labs = labs.to("meta")
+    else:
+        ecg = ecg.to("meta")
+    with pytest.raises(ValueError, match="share the fusion input device"):
         head(embedding, labs, ecg)
 
 
