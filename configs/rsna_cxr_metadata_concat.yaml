@@ -2,8 +2,8 @@ config_schema_version: 1
 
 dataset:
   dataset_id: rsna
-  bundle_id: bundle-c5fcf688c2f282c004abda92e5070724b50885ea20b1d252d02285f0607c352a
-  bundle_manifest_sha256: 14068a686778c00c90cb8e039e5d7db4dbff9bf27cf8464db4504ae8688f5794
+  bundle_id: bundle-a0adf886a59d56cd117c6dc4f3a1d032dac3d279de923ace86b9154930ca3077
+  bundle_manifest_sha256: 66c3d2fa739732f952be5b244870fea91d7881c06d500200b95e1fd58858bb27
   split_assignment_id: split-assignment-b36a1ab52e0a2310f3cf1631b40c9b96b027ce67cc65616cdc13c89787396bfd
 
 task:

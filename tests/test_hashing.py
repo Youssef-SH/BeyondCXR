@@ -33,6 +33,27 @@ def test_logical_arrow_hash_is_stable_across_chunk_layout() -> None:
     assert logical_arrow_sha256(contiguous) == logical_arrow_sha256(chunked)
 
 
+def test_logical_arrow_hash_identity_contract_is_stable() -> None:
+    schema = pa.schema(
+        [
+            pa.field("sample", pa.string(), nullable=False),
+            pa.field("value", pa.float64(), nullable=True),
+            pa.field("observed", pa.bool_(), nullable=False),
+        ]
+    )
+    table = pa.Table.from_pylist(
+        [
+            {"sample": "a", "value": 1.5, "observed": True},
+            {"sample": "b", "value": None, "observed": False},
+        ],
+        schema=schema,
+    )
+
+    assert logical_arrow_sha256(table) == (
+        "a1cb281ee3e11a3e7877b1130933b1c90d474837258f495e49876f0cf430be3d"
+    )
+
+
 def test_logical_arrow_hash_binds_schema_order_nulls_and_values() -> None:
     baseline = pa.table({"value": pa.array([0.0, None], type=pa.float64())})
     negative_zero = pa.table({"value": pa.array([-0.0, None], type=pa.float64())})

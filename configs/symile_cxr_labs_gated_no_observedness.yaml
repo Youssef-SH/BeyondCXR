@@ -2,10 +2,10 @@ config_schema_version: 1
 
 dataset:
   dataset_id: symile
-  bundle_id: bundle-ccacf0c6db78879572467008035b8846a789dbae87fd90288bd47d38c29ce1dd
-  bundle_manifest_sha256: e990804116a596a6fcbb97d3a187670348e33bd524bc889cfa806b2bd9763a06
+  bundle_id: bundle-178f23e7f9f2d07f8c6a8c0a6b6bcf366c107a13d74a2bf45a1c1275013e1648
+  bundle_manifest_sha256: d2b71ca23b446f9ac19954232f34411c8656818ac202e65163842c9141eae259
   split_assignment_id: split-assignment-917a594754a779f0774b690d9f988e29d8773d6a5f619fef379a263a7b700f27
-  cv_assignment_id: cv-assignment-db26920142b7d0e6dd3c2520e44507f86a14556d0af619bd7f3d2f0deefbb095
+  cv_assignment_id: cv-assignment-11328f8bd2b996657b758922ef6a4ac4028949c5b21b154445168b8731fc20eb
 
 task:
   task_id: pneumonia_strict
