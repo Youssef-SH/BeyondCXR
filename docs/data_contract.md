@@ -3,7 +3,7 @@
 The common bundle manifest uses schema version `1`. Bundle IDs and declared hashes identify exact
 content.
 
-Both dataset tracks publish immutable `bundle-<sha256>` directories with `manifest.json` and typed
+Both datasets publish immutable `bundle-<sha256>` directories with `manifest.json` and typed
 Parquet artifacts. Their manifests use the common envelope `dataset`, `tasks`, `membership`,
 `source`, `modalities`, `privacy`, `bundle`, `artifacts`, `provenance`, `generation`, and
 `qualification`. Arrow artifacts declare `logical_arrow_sha256`, `physical_file_sha256`, and
@@ -160,3 +160,36 @@ bundle ID; `CURRENT` is the interactive selection pointer.
 Symile source-asset paths are canonical names within the authenticated official release, not local
 filesystem locations. Relocating the complete source root leaves semantic bundle identity
 unchanged.
+
+## Symile bundle and CV assignment
+
+A Symile bundle contains `manifest.json`, `samples.parquet`, and `labs.parquet`. The samples table
+has one row per official classification admission, ordered by `sample_id`:
+
+| Field | Arrow type | Nullable | Role |
+| --- | --- | --- | --- |
+| `sample_id` | `string` | no | Internal model key |
+| `subject_id` | `int64` | no | Patient grouping key |
+| `hadm_id` | `int64` | no | Admission alignment key |
+| `official_split` | `string` | no | Train, validation, or test |
+| `source_row` | `int64` | no | Split-aligned tensor row |
+| `pneumonia_state` | `int8` | yes | Source label state |
+| `age_years` | `int16` | no | Prespecified subgroup attribute |
+| `sex` | `string` | no | Prespecified subgroup attribute |
+| `view_position` | `string` | no | AP/PA audit attribute |
+
+The laboratory table starts with `sample_id`, followed by 50 nullable `float64`
+`lab_<item_id>_value` columns and 50 non-null `bool` `lab_<item_id>_observed` columns in the
+manifest-declared item order. Observedness must equal value presence; observed values must be
+finite.
+
+The manifest binds official membership, strict-label policy, source checksum inventory, modality
+alignment, temporal and view contracts, laboratory order, logical and physical artifact hashes,
+the 11,622-to-11,214 reconciliation, and the semantic bundle identity. Validation checks exact
+admission and patient isolation, tensor-row domains, AP/PA membership, and strict-task counts.
+
+The separate CV directory contains `manifest.json` and `assignments.parquet`. Assignment rows have
+`sample_id:string`, `repeat_seed:int32`, and `outer_fold:int8`, ordered by repeat then sample. The
+identity binds the Symile bundle, strict task, patient grouping, five-fold stratified-group policy,
+repeat seeds 17/42/2026, and logical assignment content. Every eligible development admission
+appears exactly once per repeat, and a patient occupies one outer fold within a repeat.

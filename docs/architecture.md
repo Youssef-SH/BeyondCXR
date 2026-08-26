@@ -1,163 +1,125 @@
 # Architecture
 
-## Terminology
+BeyondCXR separates source qualification, scientific execution, public reporting, and serving.
+Scientific consumers receive explicit validated object identities; MLflow records operational
+provenance.
 
-- **Dataset:** an external source collection with a stable logical identity.
-- **Bundle:** an immutable, validated set of typed artifacts stored under `bundle-<sha256>`.
-- **Manifest:** an artifact's `manifest.json`, declaring its identity, contents, integrity,
-  and applicable policies or provenance. Bundle, package, prediction, and result manifests
-  have distinct contracts.
+## Study structure
 
-The lifecycle is: authenticated source → immutable bundle publication → validated scientific
-consumer. `CURRENT` supports optional interactive discovery; scientific consumers pin explicit
-immutable bundle IDs.
+Symile-MIMIC carries the primary multimodal study. Its prespecified families test the incremental
+value of laboratory information beyond CXR, missingness-aware fusion, and the further contribution
+of ECG. RSNA Stage 2 supplies the supporting DICOM, image-modeling, metadata-fusion, and
+localization foundation. The datasets have
+different endpoints and separate evidence chains.
 
-## Component boundaries
+```text
+authenticated sources
+        ↓
+immutable dataset bundle + split authority
+        ↓
+model package → prediction evidence → scientific result
+        ↓
+validated preservation export
+        ├── aggregate public results
+        └── controlled serving
+```
 
-| Component | Responsibility |
+## Data boundary
+
+Source adapters authenticate dataset-specific files and construct typed artifacts. Bundle
+validators enforce schemas, ordering, relationships, source witnesses, split isolation, logical
+content hashes, physical byte hashes, and semantic identity. Scientific consumers pin immutable
+bundle and split identities. `CURRENT` is limited to interactive dataset operations.
+
+RSNA packages labeled DICOM metadata, labels, boxes, patient-disjoint splits, and a source
+inventory. A deterministic authenticated CXR cache separates raw DICOM decoding from model
+training. Symile packages the lean admission spine and raw laboratory values while retaining
+authenticated references to the large CXR and ECG tensors. Its separate CV assignment artifact fixes all
+repeat/fold assignments.
+
+Exact schemas and identity rules live in the [data contract](data_contract.md). Dataset roles,
+access, and limitations live in the [data statement](data_statement.md).
+
+## Model and evaluation evidence
+
+At the model/evaluation layer, scientific claims follow a three-role evidence chain:
+
+| Object | Responsibility |
 | --- | --- |
-| Source adapter | Parse source tables, discover DICOM files, and extract selected headers |
-| Artifact builder | Normalize typed records and construct patient-level assignments |
-| Validator | Enforce schemas, relationships, paths, identities, and ordering |
-| Bundle publisher | Publish immutable bundles and update `CURRENT` atomically |
-| Audit generator | Produce aggregate dataset reports from a validated bundle |
-| CXR cache | Publish validated deterministic images before live stochastic augmentation |
-| Dataset mapping | Resolve the built-in adapter for a pinned bundle |
-| Model mapping | Resolve a built-in metadata, CXR, or fusion model adapter |
-| RSNA tabular runner | Fit a metadata model and select operating thresholds on validation |
-| RSNA neural runner | Consume a validated CXR cache, train one seed, and select one validation state |
-| RSNA test evaluator | Verify a completed package and explicit compatible evaluation config before applying them to the test partition |
-| RSNA seed summarizer | Validate three package-compatible CXR or fusion evaluations and report complete aggregate claims |
-| RSNA localization evaluator | Generate three-seed CXR Grad-CAM and aggregate box-localization reports |
-| RSNA campaign | Execute the ordered CUDA-required campaign and pass exact package and evaluation identities in process |
-| Symile development data | Resolve the pinned bundle and CV reference, then expose only official train and validation rows and authenticated CXR tensors |
-| Symile fold runner | Execute one frozen outer fit, use inner selection where applicable, and publish private OOF evidence |
-| Symile development aggregator | Validate all 15 fold packages and publish repeat metrics and the median final-training budget |
-| Symile analysis | Align six explicit family authorities and publish paired and mean-logit ensemble development evidence |
-| Symile ECG extension result | Combine core analysis and internal ECG development; derive primary thresholds and reference family-owned final budgets |
-| Symile final fitting | Fit terminal full-development state and publish independently reconstructable final packages |
-| Symile campaign control | Validate the pre-test freeze and same-freeze opening; derive the global result and private error review |
-| Symile held-out inference | Reuse the frozen numerical runtime and publish only missing package-bound predictions |
-| Symile preservation | Certify a restored archive before publishing its local ZIP, checksum, and external backup |
-| Private analysis store | Retain aligned private prediction evidence and real-image localization overlays outside public outputs |
-| Evaluation utilities | Compute probabilities, metrics, thresholds, latency, and plots |
+| Model package | Reconstructable fitted model and preprocessing state |
+| Prediction evidence | Immutable package-bound sample-level outputs |
+| Scientific result | Aggregate claims rederived from validated prediction evidence |
 
-Dataset adapters isolate source-specific behavior. Training reads validated bundle records through
-the dataset mapping. Cache construction authenticates and decodes raw DICOM bytes; CXR and fusion
-consumers verify that cache's exact identity and authorized sample coverage. Model adapters own
-estimator or neural architecture construction.
+Semantic identity records scientific meaning. The sealed science-execution Git commit is a public
+code-state and scientific coordinate in the result binding. Integrity witnesses authenticate
+serialized bytes; the dependency lock, MLflow, paths, device, runtime, and ordinary execution
+facts are reproducibility or operational provenance. Validators keep those roles distinct.
 
-The bundle manifest owns dataset, task, split, source, and artifact lineage. Parquet tables contain
-row-level facts, while audits contain derived descriptions. `CURRENT` selects a bundle for
-interactive commands; experiment configs pin an exact bundle ID.
+Dataset bundles, split and CV assignments, pre-test controls, and preservation exports are
+distinct data and control objects that support this evidence chain.
 
-Image and fusion experiment configs pin the semantic bundle ID. Validation computes the observed
-bundle-manifest SHA-256 and verifies its physical, logical, semantic, split, and source contracts
-before partition reads. Training freezes that exact identity in the package; linked evaluation
-requires the same bundle-manifest SHA-256 before test access.
+Patient-level prediction evidence remains under the ignored `private/` workspace. Public reports
+contain aggregate derivatives only.
 
-Model packages under `models/` and complete reports under `reports/` are the authoritative
-physical outputs. MLflow stores the run ledger and references to those outputs; see
-[`training.md`](training.md) for the experiment artifact contract.
+## Primary Symile workflow
 
-Sample-level private prediction evidence and real-image localization examples are written under the
-ignored `private/` workspace. Public reports contain aggregate results only; see
-[`privacy.md`](privacy.md).
-
-Selected execution facts such as loader policy are persisted as runtime provenance; transient
-operational measurements remain outside scientific identity.
-
-The canonical `make rsna-campaign` workflow writes one durable execution log, validates required output
-completeness and lineage, and exports the portable scientific/provenance surface with a checksum.
-The raw dataset and disposable deterministic image cache remain outside that archive. Detailed
-execution and ownership contracts are in [`training.md`](training.md).
-
-Campaign preparation authenticates and deterministically preprocesses image bytes from every bundle
-partition into an immutable cache. Its identity binds bundle, source-inventory, and preprocessing
-identity; validation separately proves the exact sample-to-partition index and cached image-content
-digest. Cache derivation identity and source authentication are package-bound; the mapping and
-content hashes validate the disposable cache locally. Cache-backed consumers reopen no raw DICOMs.
-This label-free step fits no statistics or models; within the canonical campaign, task-bearing
-training completes before held-out evaluation.
-
-## Data flow
+Development consumes official train and validation rows only:
 
 ```text
-RSNA source files
-    → dataset adapter
-    → validated tables and manifest
-    → immutable bundle
-    → audit and deterministic CXR cache
-    → metadata, CXR, or fusion training
-    → explicit test evaluation and post-test analysis
-    → bundle-qualified audits or operational experiment outputs
-    → validated portable campaign archive
+pinned bundle + pinned 3 × 5 grouped CV assignment
+        ↓
+fold package + separate private OOF evidence
+        ↓
+family development result
+        ↓
+prespecified CXR/labs analysis + secondary ECG analysis
+        ↓
+14 terminal full-development packages
 ```
 
-The common bundle envelope and RSNA artifact schemas are defined in
-[`data_contract.md`](data_contract.md). Dataset-specific source contracts are described in
-[`datasets/rsna.md`](datasets/rsna.md) and [`datasets/symile.md`](datasets/symile.md). Experiment
-composition is defined in [`training.md`](training.md). Reconstruction and evaluation protocols
-are defined in [`reproducibility.md`](reproducibility.md).
+The prespecified CXR/labs families share one repeated grouped cross-validation assignment. The
+secondary ECG family uses the same development design. Family results rederive repeat metrics and
+terminal budgets from all 15 fold coordinates; model definitions and fitting rules are documented
+in [training](training.md).
 
-Symile follows a dataset-specific development and terminal campaign path. Development accessors
-expose no official-test data:
+Held-out test materialization requires a fully validated pre-test freeze and its atomic
+same-freeze opening record. The freeze binds all 14 packages, the two primary development-derived
+thresholds, held-out policy, numerical inference runtime, and formal execution provenance.
 
 ```text
-pinned Symile bundle + pinned 3 x 5 CV assignment
-    → official train + validation strict-pneumonia rows
-    → deterministic inner split per repeat and outer fold for selection families
-    → immutable fold package + separate private OOF prediction evidence
-    → complete family development authority
-    → explicit six-family aggregate analysis
-    → ECG extension result, also consuming internal three-modality development
-    → full-development fitting of fourteen immutable final packages
-    → validated pre-test freeze → atomic same-freeze test-open
-    → fourteen package-bound raw prediction evidences → six predictor views
-    → global result and separate private error-review derivative
-    → recursively certified export and external backup
+validated freeze + same-freeze opening
+        ↓
+14 package-bound raw predictions
+        ↓
+six fixed predictor views
+        ↓
+one global result + private error review
+        ↓
+validated export, backup, and restoration
 ```
 
-Fold packages contain only fitted model, preprocessing, configuration, and selection state. The
-minimal patient-level OOF fields (`sample_id`, target, logit, and probability) live in separate
-ignored prediction objects under `private/`. Family and cross-family reports contain aggregate
-values only. Fold validation reconstructs the configured fitted estimator or neural architecture,
-strict-loads safe state, and checks preprocessing and selection witnesses. Family validation
-records the deterministic inner split for every fold. Because labs Logistic Regression fits the
-complete outer-training fold without inner selection, that record is audit-only for its package
-identity. Selection-family package identities bind `inner_split_id` because their selected fitted
-state depends on that partition. Family validation re-derives repeat metrics and final-budget
-witnesses from all 15 folds; cross-family validation
-re-derives paired and ensemble claims from the six family authorities. Each Markdown summary is a
-deterministic rendering of its manifest. Development performs no threshold selection, calibration,
-final full-development fitting, or official-test evaluation.
+An opened campaign can complete missing deterministic post-open work; it cannot retrain or alter
+the freeze. The global result owns held-out claims. Private error review is regenerable and remains
+outside the public result surface.
 
-Neural checkpoints are independently reconstructable persisted documents inside their containing
-packages. Each checkpoint therefore owns schema version `1` and is validated independently from
-the outer package manifest.
+## Supporting RSNA workflow
 
-The terminal campaign consumes these development authorities without changing their exact-six
-public surface or the core two-modality gate. Its separate ECG family uses an exact-three gate.
-Official-test materialization requires both `ValidatedPretestFreeze` and its atomic same-freeze
-test-open record. The freeze binds all final packages, development-derived primary thresholds,
-evaluation policy, numerical inference runtime, and execution provenance. An opened resume cannot
-retrain or change that authority; it completes missing post-open work only.
+The RSNA campaign authenticates source DICOM bytes, builds the deterministic CXR cache, fits
+metadata and three-seed neural families, freezes validation-derived thresholds, evaluates explicit
+packages on the held-out partition, and publishes aggregate evaluation, seed-summary, comparison,
+and localization results. Private aligned predictions and real-image overlays remain outside Git.
 
-The global result owns aggregate held-out claims. Private error review is a regenerable derivative,
-not a prerequisite for validating those claims. Preservation includes both, along with their
-recursive authority closure. See [`reproducibility.md`](reproducibility.md) for runtime matching,
-execution, and backup requirements.
+## Release and serving
 
-## Controlled research serving
+The release layer restores the preserved Symile campaign, validates its scientific evidence,
+derives the path-neutral result binding, and constructs an aggregate-only public projection.
+Reproduction derives the same projection from the same preserved evidence. The tracked outputs are
+deterministic derivatives, not scientific authorities.
 
-Serving is downstream of the scientific evidence chain. One immutable, non-scientific serving
-authority binds the ordered seed-17, seed-42, and seed-2026 final CXR-plus-labs gated packages,
-their integrity witnesses, the global result, the frozen input and preprocessing contracts, and
-the development-derived thresholds. Authority publication first uses the canonical Symile
-global-result validator to close the global result over its freeze, all 14 final packages and
-prediction evidences, and the official-test projection. It binds separate frozen-science and
-serving-release Git/lock provenance.
-Startup recursively validates and reconstructs all three selected packages. Runtime inference
-averages their raw logits in frozen order and applies sigmoid once. The service never selects
-models through MLflow or observed performance and does not modify a scientific package, prediction
-evidence, or result.
+Serving uses a separate immutable deployment control. It binds the ordered seed-17, seed-42, and
+seed-2026 primary CXR-plus-labs gated packages, the mean-logit policy, preprocessing, global-result
+lineage, thresholds as metadata, and science/release provenance. Startup validates and reconstructs
+all members. Runtime inference averages raw logits and applies sigmoid once.
+
+See [training](training.md), [reproducibility](reproducibility.md), [privacy](privacy.md), and
+[controlled serving](serving.md) for the operational contracts.

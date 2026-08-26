@@ -1,214 +1,107 @@
 # BeyondCXR
 
-BeyondCXR is a reproducible machine-learning benchmark and experimentation framework for
-prediction of report-derived Pneumonia findings from chest radiographs and admission physiology.
-It contains an RSNA imaging benchmark and an authenticated Symile-MIMIC multimodal development
-track.
+**Measuring the incremental value of admission physiology beyond chest radiography.**
 
-> Research and educational prototype. Clinical decision-making lies outside its intended use.
+> Research use only. BeyondCXR is not intended for clinical decision-making, is not a medical
+> device, does not replace physician judgment, and predicts a radiology-derived Pneumonia finding
+> rather than confirmed infectious pneumonia.
 
-## Implemented capabilities
+BeyondCXR asks whether admission physiology provides predictive information beyond CXR for a
+strict report-derived Pneumonia endpoint.
 
-- Validated joins across RSNA labels, classes, and DICOM images
-- DICOM header extraction and aggregate data-quality reporting
-- Typed samples, labels, bounding-box annotations, and patient-disjoint splits
-- SHA-256 source inventory for every labeled DICOM
-- Content-addressed immutable bundles with exact schemas and integrity validation
-- Authenticated Symile-MIMIC 1.0.0 source qualification, two-table bundle, aggregate audit, and
-  immutable repeated-CV assignments
-- Development-only Symile repeated-CV execution for fixed labs, CXR, concat, gated, and
-  observedness-ablation families, with immutable OOF evidence and aggregate analysis
-- Metadata preprocessing fitted on the training split and fixed Logistic Regression and LightGBM
-  baselines
-- A TorchXRayVision DenseNet121 CXR baseline with deterministic per-seed training
-- Same-byte raw-DICOM authentication and decoding during deterministic cache construction
-- Observed bundle-manifest SHA-256 lineage for CXR training and linked evaluation
-- Separate immutable model packages, private prediction evidence, and aggregate evaluations
-- Explicit RSNA CXR and fusion three-seed summaries with individual, mean, and sample-SD results
-- Fixed CXR-metadata concat fusion with same-seed CXR package initialization
-- Post-training three-seed Grad-CAM localization against RSNA bounding boxes
-- Immutable content-addressed metadata and neural model packages
-- Ruff, pytest, pre-commit, and continuous-integration checks
+## Study design
 
-## Setup
+| Dataset | Scientific role | What it contributes |
+| --- | --- | --- |
+| Symile-MIMIC | Primary multimodal incremental-value study | CXR, 50 laboratory measurements, ECG, repeated grouped cross-validation, and a patient-disjoint held-out test |
+| RSNA Stage 2 | Supporting CXR qualification | DICOM ingestion, image modeling, metadata fusion, localization, and supporting imaging evaluation |
 
-The project requires Python 3.13 and [uv](https://docs.astral.sh/uv/). Data-acquisition tooling is
-available through the optional `acquisition` dependency group.
+The datasets have different endpoints and separate evidence chains. RSNA is not external
+validation of the Symile predictor.
 
-Scientific execution requires this Git checkout, its configs, the recorded lock, and authorized
-local data artifacts. The wheel provides importable code, not a standalone study reproduction.
-Run Make commands from the checkout root, or use `make -C /path/to/checkout <target>`.
+## Prespecified comparisons
+
+- Primary: CXR + labs missingness-aware gated fusion versus CXR-only.
+- Architecture control: CXR + labs gated fusion versus simple concatenation.
+- Secondary modality: CXR + labs + ECG gated fusion versus CXR + labs gated fusion.
+
+## Evaluation
+
+Development uses three five-fold patient-grouped repeats. Neural ensembles use seeds 17, 42, and
+2026, average aligned raw logits, and apply sigmoid once. AUROC is primary; Average Precision and
+Brier score are key secondary measures. Held-out effects use paired subject-level bootstrap
+intervals, and the primary operating points are derived from development evidence.
+
+Held-out test access occurs only after all required model packages validate, the pre-test
+freeze validates, and its atomic same-freeze opening record exists. The held-out test is internal
+testing within the patient-disjoint Symile source population.
+
+## Results
+
+<!-- BEYONDCXR_RESULTS_START -->
+Awaiting formal Symile execution. The release command replaces this bounded region only after the
+preserved campaign, result binding, and complete scientific evidence chain validate.
+<!-- BEYONDCXR_RESULTS_END -->
+
+## Evidence and reproducibility
+
+At the model/evaluation layer, claims follow:
+
+```text
+model package → prediction evidence → scientific result
+```
+
+Public results are aggregate derivatives of that evidence rather than scientific authorities.
+MLflow records operational provenance only. See
+[reproducibility](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/reproducibility.md),
+[architecture](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/architecture.md), and the
+[data contract](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/data_contract.md).
+
+## Controlled research serving
+
+The API loads one serving authority for the ordered seed-17/42/2026 primary gated ensemble. It
+accepts a frontal JPEG, AP/PA validation metadata, and exactly 50 laboratory keys. `/predict`
+returns one raw probability and no diagnosis or thresholded decision. See
+[controlled serving](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/serving.md) and the
+[synthetic request](https://github.com/Youssef-SH/BeyondCXR/tree/main/examples/symile_serving/).
+
+## Getting started
+
+BeyondCXR requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --locked --group dev --extra serving
-uv run pre-commit install
+make check
 ```
 
-On a paid GPU host, install only the locked runtime dependencies required by the campaign:
+Scientific execution requires authorized local data. Procedures and commands are documented in
+[training](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/training.md) and
+[reproducibility](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/reproducibility.md).
 
-```bash
-uv sync --locked --no-dev
-```
+## Repository guide
 
-## Data prerequisite
+| Path | Purpose |
+| --- | --- |
+| `src/beyondcxr/data/` | Source qualification, bundles, splits, and preprocessing |
+| `src/beyondcxr/models/` | Estimator and fusion architectures |
+| `src/beyondcxr/training/` | Training, evaluation, scientific objects, and campaigns |
+| `src/beyondcxr/serving/` | Controlled research inference |
+| `src/beyondcxr/release/` | Aggregate result rendering and release validation |
+| `configs/` | Experiment configurations |
+| `results/` | Public aggregate result derivatives |
 
-Obtain the RSNA Pneumonia Detection Challenge data under its original access terms and extract it
-to `data/raw/rsna/extracted/`. The required filenames and directory layout are documented in
-[`data/README.md`](data/README.md).
+Documentation: [data statement](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/data_statement.md),
+[model card](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/model_card.md),
+[privacy](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/privacy.md), and
+[serving](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/serving.md).
 
-Symile data commands require the credentialed Symile-MIMIC 1.0.0 release under
-`data/raw/symile/extracted/`. Restricted source and generated patient-level bundles remain local.
+## Data, citation, and license
 
-Symile supervised development is restricted to the frozen official train and validation cohorts.
-The implementation can execute six fixed families over the immutable 3-by-5 patient-grouped CV
-assignment and publish complete OOF evidence. The official Symile test remains closed to this
-development lifecycle.
+Patient-level data, generated bundles, predictions, trained packages, and operational state remain
+outside Git. Dataset access and citations are documented in the
+[data statement](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/data_statement.md); project citation metadata is in
+[`CITATION.cff`](CITATION.cff), and third-party attribution is in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-## Commands
-
-```bash
-make rsna-campaign   # run and export the complete authoritative RSNA campaign
-make symile-manifest # authenticate Symile-MIMIC and publish its immutable bundle
-make symile-audit    # publish the bundle-qualified aggregate Symile audit
-make symile-cv       # publish the bundle-bound immutable repeated-CV assignments
-make symile-develop CONFIG=configs/symile_cxr_densenet.yaml
-make symile-analyze DEVELOPMENT_IDS="<six explicit development IDs>"
-make symile-campaign SOURCE_ROOT=path/to/private/symile/source BACKUP_ROOT=path/to/approved/persistent/backup
-make symile-serve AUTHORITY=path/to/serving-authority PACKAGE_ROOT=path/to/final/packages
-
-# Lower-level explicit scientific commands
-make rsna-inspect FILE=path/to/image.dcm
-make rsna-manifest SOURCE_ROOT=data/raw/rsna/extracted
-make rsna-audit BUNDLE_ID=bundle-...
-make rsna-train CONFIG=configs/rsna_metadata_logistic.yaml SEED=42
-make rsna-train CONFIG=configs/rsna_cxr_densenet.yaml SEED=42
-make rsna-evaluate PACKAGE_ID=model-package-... CONFIG=configs/rsna_metadata_logistic.yaml
-make rsna-compare EVALUATION_IDS="<evaluation-id> ..."
-make rsna-summarize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
-make rsna-localize EVALUATION_IDS="<evaluation-id> <evaluation-id> <evaluation-id>"
-make clean           # remove tool caches and interrupted-publication staging state
-make purge-generated # destructive reset; refuses an opened Symile campaign
-make check           # lock consistency, Ruff checks, and unit/contract tests
-make pre-commit      # run repository hooks against all tracked files
-```
-
-`symile-audit` and `symile-cv` resolve `data/manifests/symile/CURRENT` once for interactive use.
-Pass `BUNDLE_ID=bundle-...` to select an immutable bundle explicitly. Published CV artifacts bind
-the resolved immutable bundle ID. Later scientific configurations pin both immutable identities.
-
-`symile-develop` runs one configured family across all 15 frozen outer folds; repeat and fold are
-not user controls. Concat and gated families additionally require
-`SOURCE_CXR_DEVELOPMENT_ID=development-...`. `symile-analyze` accepts exactly one explicit complete
-development ID for each of the six families and validates family membership independently of CLI
-ordering. Neither command exposes or evaluates the official Symile test.
-
-`symile-campaign` is the sole public held-out campaign command. It preserves the exact-six core
-development analysis, runs the separate exact-three ECG family internally, fits 14 final packages,
-and constructs the compact freeze/test-open firewall. Fourteen raw package-bound predictions
-produce six predictor views and one global result.
-If a valid `test-open.json` already exists, the command revalidates and resumes that exact freeze,
-performs no development or final retraining, and completes only missing post-open work.
-Resume requires the same frozen numerical inference runtime; see the
-[runtime requirements](docs/reproducibility.md#numerical-runtime-on-resume).
-
-`symile-serve` starts the research-only FastAPI service from one explicit validated serving
-authority and its three frozen primary gated packages. It accepts only the strict JPEG
-(`image/jpeg`), AP-or-PA, and 50-laboratory contract and returns the raw mean-logit ensemble
-probability. Serving authorities are publishable only from the validated formal Symile
-scientific-evidence chain; see
-[controlled research serving](docs/serving.md).
-
-After the raw dataset is in place, `make rsna-campaign` owns pretrained-weight readiness, bundle and
-audit generation, deterministic image caching, all eight
-training runs, all eight package-bound evaluations, both seed summaries, localization, comparison,
-final validation, and export. It requires no operator-supplied IDs. The campaign log is written to
-`reports/rsna/campaigns/<campaign-id>/execution.log`; the portable archive and checksum are written
-to `outbox/rsna-results-<campaign-id>.tar.gz` and `.tar.gz.sha256`.
-
-Deterministic cache preparation authenticates and preprocesses image bytes for the complete pinned
-bundle without reading task labels or fitting population statistics. Training consumes only train
-and validation task rows. Within the canonical campaign, held-out evaluation begins only after all
-eight packages are frozen.
-
-Model packages are stored under `models/`, generated reports under `reports/`, MLflow metadata in
-`mlflow.db`, and small MLflow training-configuration artifacts under `mlartifacts/`.
-
-Instrumented manifest, audit, training, evaluation, and comparison commands emit operational
-records to stderr while preserving machine-readable stdout; see the training guide for capture
-examples.
-
-Every experiment is declared by a validated YAML file under `configs/`. See
-[`docs/training.md`](docs/training.md) for the training workflow.
-
-CXR and fusion training execute one configured seed per invocation. Cache preparation
-materializes each source DICOM's bytes once, authenticates them, and decodes the same in-memory
-bytes. Neural consumers use a validated cache whose validation proves its identity, exact
-sample-to-partition mapping, and content integrity without reopening raw DICOMs. CXR training
-fingerprints the pretrained weight file immediately before and after model construction and
-requires exact equality.
-`make rsna-evaluate` verifies the selected immutable package and the explicitly supplied compatible
-evaluation config before accessing test data. The package owns fitted state and frozen thresholds;
-the explicit config owns downstream evaluation policy. Neural evaluation reconstructs the model
-without the pretrained-weight cache.
-
-Fusion training requires an explicit same-seed CXR package at execution time. The committed
-fusion YAML remains a stable scientific definition; the resulting package records the exact source
-CXR package and embeds its train-fitted structured preprocessor.
-
-The RSNA campaign owns the CXR and fusion seeds 17, 42, and 2026; seed is an execution
-coordinate rather than YAML content. Evaluations for one modality can be
-summarized only by supplying all three evaluation IDs explicitly. The summary retains individual results
-and reports their mean and sample standard deviation without selecting a canonical seed or
-averaging models.
-
-Neural test evaluation writes aligned sample-level predictions only to the ignored `private/`
-workspace. Localization reports under `reports/` contain aggregate metrics and methodology;
-real-image Grad-CAM overlays and their traceability manifest remain under `private/`.
-
-## Cleaning generated artifacts
-
-Run `make clean` for development caches and temporary publication state. It preserves completed
-bundles, derived CXR caches, reports, model packages, and experiment history. Run
-`make purge-generated` to remove generated outputs, including the derived image cache. It refuses
-when the canonical Symile `test-open.json` exists, preserving the opened freeze and its evidence.
-Both commands preserve raw source datasets under `data/raw/`.
-Formal Symile execution requires `BACKUP_ROOT` to point to a separately approved persistent
-destination outside the resolved repository root and generic repository cleanup ownership.
-The formal command owns the canonical manifest, model, report, private, MLflow, and `outbox/`
-locations in the checkout. Preserve expensive scientific evidence separately before any reset.
-
-## Repository layout
-
-```text
-src/beyondcxr/data/        ingestion, splits, audits, schemas, validation, and hashing
-src/beyondcxr/models/      fixed estimator definitions
-src/beyondcxr/training/    reusable training entry points
-src/beyondcxr/evaluation/  metrics and aggregate evaluation plots
-src/beyondcxr/serving/     validated research-only ensemble serving
-configs/                   experiment definitions
-tests/                     unit, contract, and local integration tests
-docs/                      architecture, data contracts, privacy, and reproducibility
-data/                      ignored local inputs and generated artifacts
-outbox/                    portable campaign archives and checksums
-scripts/                   small inspection utilities
-```
-
-## Privacy boundary
-
-Keep DICOMs, patient-level bundle artifacts, credentials, and real patient examples outside
-version control. See [`docs/privacy.md`](docs/privacy.md).
-
-## Limitations
-
-- Implemented scope covers the RSNA Stage 2 metadata, CXR, fusion, and localization campaign plus
-  the Symile-MIMIC data foundation, core repeated-CV workflow, ECG extension, final fitting,
-  pre-test controls, held-out evaluation infrastructure, and controlled research serving of the
-  fixed three-member CXR-plus-labs gated ensemble through an explicit validated authority.
-- Benchmark targets are radiology-derived findings. Confirmed clinical diagnosis lies outside the
-  endpoint definition.
-
-See [`docs/architecture.md`](docs/architecture.md) for system structure,
-[`docs/data_contract.md`](docs/data_contract.md) for the shared bundle and RSNA artifact contract, and
-[`docs/reproducibility.md`](docs/reproducibility.md) for reconstruction details. RSNA-specific
-facts are documented in [`docs/datasets/rsna.md`](docs/datasets/rsna.md); Symile-specific facts are
-documented in [`docs/datasets/symile.md`](docs/datasets/symile.md).
+Repository code is licensed under [Apache-2.0](LICENSE). The code license does not grant rights to
+restricted datasets, pretrained weights, or trained artifacts.

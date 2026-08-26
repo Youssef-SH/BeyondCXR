@@ -1,4 +1,8 @@
-# Symile-MIMIC dataset track
+# Symile-MIMIC source guide
+
+Symile-MIMIC is BeyondCXR's primary multimodal scientific dataset. The complete dataset role,
+cohort, access, timing, missingness, transfer, and limitation statement is in
+[`data_statement.md`](../data_statement.md); this page records source-facing operational details.
 
 BeyondCXR uses the credentialed Symile-MIMIC 1.0.0 release as the synchronized multimodal source
 for strict-pneumonia development. Access is governed by the PhysioNet credentialed-data license,
@@ -17,7 +21,7 @@ tensors remain external and are authenticated against the pinned source-release 
 strict endpoint includes explicit `Pneumonia = 1` and `Pneumonia = 0` rows and excludes uncertain
 or missing values.
 
-Core development combines only official train and validation strict-pneumonia rows. It consumes
+Development combines only official train and validation strict-pneumonia rows. It consumes
 the pinned patient-grouped three-repeat by five-fold CV assignment and has no official-test data
 accessor. Every outer-fold model package publishes separate private OOF prediction evidence; the
 family development result and six-family analysis contain aggregate claims only.

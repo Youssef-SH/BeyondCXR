@@ -34,5 +34,8 @@ results):
 }
 ```
 
-The same request is the Docker smoke path after the validated synthetic or real authority and
-package roots have been mounted as described in `docs/serving.md`.
+Host-side final-release validation sends the same request through the in-process ASGI application
+against the staged candidate authority. Container acceptance mounts that staged authority and the
+restored final-package tree read-only, reconstructs inside the built image, and exercises
+`/health`, `/model-info`, and this synthetic `/predict` request. The final authority is atomically
+published only after all acceptance checks succeed. See [controlled serving](../../docs/serving.md).
