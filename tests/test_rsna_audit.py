@@ -144,8 +144,16 @@ def test_age_distribution_matches_the_strictly_greater_than_120_policy() -> None
 def test_bbox_statistics_handles_scope_without_positive_samples() -> None:
     frame = pd.DataFrame(
         [
-            {"sample_id": "train-positive", "split_name": "train", "target_pneumonia": 1},
-            {"sample_id": "train-negative", "split_name": "train", "target_pneumonia": 0},
+            {
+                "sample_id": "train-positive",
+                "split_name": "train",
+                "target_pneumonia": 1,
+            },
+            {
+                "sample_id": "train-negative",
+                "split_name": "train",
+                "target_pneumonia": 0,
+            },
             {
                 "sample_id": "validation-negative",
                 "split_name": "validation",

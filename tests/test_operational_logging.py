@@ -61,6 +61,7 @@ from beyondcxr.utils.operational_logging import (
             "run_symile_campaign",
             ["--source-root", "unused", "--backup-root", "unused-backup"],
         ),
+        ("release.cli", "check_repository", ["check", "--root", "unused"]),
     ],
 )
 def test_cli_failure_does_not_echo_private_exception_text(
@@ -69,7 +70,7 @@ def test_cli_failure_does_not_echo_private_exception_text(
     module = importlib.import_module(f"beyondcxr.{module_name}")
 
     def fail(*args, **kwargs):
-        raise OSError("synthetic-patient-secret /private/source/secret.dcm token=synthetic-secret")
+        raise OSError("synthetic-patient-secret /private/source/secret.dcm token=demo")
 
     monkeypatch.setattr(module, operation, fail)
     assert (module.main() if arguments is None else module.main(arguments)) == 1
@@ -86,12 +87,27 @@ def test_symile_campaign_sanitizes_every_exception(exception_type, monkeypatch, 
 
     def fail(**kwargs):
         del kwargs
-        raise exception_type(
-            "synthetic-patient-secret /private/source/secret.dcm token=synthetic-secret"
-        )
+        raise exception_type("synthetic-patient-secret /private/source/secret.dcm token=demo")
 
     monkeypatch.setattr(module, "run_symile_campaign", fail)
     assert module.main(["--source-root", "unused", "--backup-root", "unused-backup"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert exception_type.__name__ in captured.err
+    assert "secret" not in captured.err
+    assert "/private/" not in captured.err
+
+
+@pytest.mark.parametrize("exception_type", [OSError, RuntimeError, Exception])
+def test_release_cli_sanitizes_every_exception(exception_type, monkeypatch, capsys) -> None:
+    module = importlib.import_module("beyondcxr.release.cli")
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise exception_type("synthetic-patient-secret /private/source/secret.dcm token=demo")
+
+    monkeypatch.setattr(module, "check_repository", fail)
+    assert module.main(["check", "--root", "unused"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert exception_type.__name__ in captured.err

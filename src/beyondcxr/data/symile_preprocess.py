@@ -1,4 +1,4 @@
-"""Fit and apply the frozen outer-fold Symile laboratory ECDF transform."""
+"""Fit and apply the outer-fold Symile laboratory ECDF transform."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ class SymileLabEcdfTransformer(TransformerMixin, BaseEstimator):
         return result
 
     def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
-        """Return the frozen transformed feature order."""
+        """Return the transformed feature order."""
         del input_features
         return np.asarray(
             tuple(f"lab_{item}_ecdf" for item in LAB_ITEM_IDS) + LAB_OBSERVED_COLUMNS,

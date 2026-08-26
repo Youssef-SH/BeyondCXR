@@ -110,7 +110,7 @@ class SymileEcgEncoder(nn.Module):
 
 
 class SymileTriModalGatedHead(nn.Module):
-    """The separately frozen CXR/labs/ECG per-feature softmax gate."""
+    """The prespecified CXR/labs/ECG per-feature softmax gate."""
 
     def __init__(self, parameters: Mapping[str, object]) -> None:
         super().__init__()

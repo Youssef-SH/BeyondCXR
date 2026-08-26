@@ -33,6 +33,9 @@ from beyondcxr.models.symile_tabular import (
     fit_final_symile_labs_lightgbm,
     fit_symile_labs_logistic,
 )
+from beyondcxr.release import serving as release_serving
+from beyondcxr.release.render import RESULT_END, RESULT_START
+from beyondcxr.release.reproduction import publish_results, reproduce_results
 from beyondcxr.training.config import load_symile_development_config, with_runtime
 from beyondcxr.training.symile_campaign_control import (
     ValidatedGlobalResult,
@@ -553,7 +556,13 @@ def test_campaign_exact_export_and_interrupted_opened_resume_rehearsal(
     monkeypatch.setattr(
         campaign_control,
         "cluster_bootstrap_effect",
-        lambda frame, **kwargs: {"subject_count": int(frame["subject_id"].nunique())},
+        lambda frame, **kwargs: {
+            "point": 0.0,
+            "lower": -0.1,
+            "upper": 0.1,
+            "accepted": 2000,
+            "attempts": 2000,
+        },
     )
     monkeypatch.setattr(
         symile_campaign,
@@ -620,7 +629,7 @@ def test_campaign_exact_export_and_interrupted_opened_resume_rehearsal(
     )
 
 
-def test_real_campaign_closure_restores_after_original_authorities_are_removed(
+def test_preserved_campaign_drives_downstream_release_and_serving_consumers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Certify the archive with real recursive validators and bounded synthetic fitted state."""
@@ -693,6 +702,10 @@ def test_real_campaign_closure_restores_after_original_authorities_are_removed(
         def __init__(self) -> None:
             super().__init__()
             self.encoder = torch.nn.Linear(1, 1, bias=False)
+
+        def forward(self, image: torch.Tensor, structured: torch.Tensor) -> torch.Tensor:
+            del image
+            return self.encoder(structured[:, :1]).squeeze(1)
 
     monkeypatch.setattr(symile_publication, "_validate_neural_reconstruction", lambda *args: None)
     monkeypatch.setattr(final_packages, "_reconstruct_neural", lambda config: TinyNeural())
@@ -921,7 +934,13 @@ def test_real_campaign_closure_restores_after_original_authorities_are_removed(
     monkeypatch.setattr(
         campaign_control,
         "cluster_bootstrap_effect",
-        lambda frame, **kwargs: {"subject_count": int(frame["subject_id"].nunique())},
+        lambda frame, **kwargs: {
+            "point": 0.0,
+            "lower": -0.1,
+            "upper": 0.1,
+            "accepted": 2000,
+            "attempts": 2000,
+        },
     )
     global_result = campaign_control.publish_global_result(
         report_root=report_root,
@@ -952,18 +971,78 @@ def test_real_campaign_closure_restores_after_original_authorities_are_removed(
         private_root=private_root,
     )
     backup_root = tmp_path / "backup"
-    export_and_verify(
+    archive = export_and_verify(
         members=members,
         export_root=tmp_path / "outbox",
         backup_root=backup_root,
         export_name=global_result.result_id,
-        restoration_validator=symile_campaign._validate_restored_campaign,
+        restoration_validator=symile_campaign.validate_restored_campaign,
     )
+    readme = tmp_path / "README.md"
+    model_card = tmp_path / "model-card.md"
+    bounded = f"Before\n{RESULT_START}\nAwaiting formal Symile execution\n{RESULT_END}\nAfter\n"
+    readme.write_text(bounded, encoding="utf-8")
+    model_card.write_text(bounded, encoding="utf-8")
+    public_results = tmp_path / "public-results"
+    public_results.mkdir()
+    (public_results / "README.md").write_text("# Aggregate results\n", encoding="utf-8")
+    publish_results(
+        artifact_root=archive,
+        output_root=public_results,
+        readme_path=readme,
+        model_card_path=model_card,
+    )
+    assert (public_results / "symile/tables/observedness_subgroups.md").is_file()
+    assert (public_results / "symile/figures/reliability.svg").is_file()
+    generated_readme = readme.read_text(encoding="utf-8")
+    generated_model_card = model_card.read_text(encoding="utf-8")
+    for generated_document in (generated_readme, generated_model_card):
+        assert "Development OOF evidence" in generated_document
+        assert "Held-out test evidence" in generated_document
+    assert (public_results / "symile/binding.json").is_file()
+    reproduce_results(
+        binding_path=public_results / "symile/binding.json",
+        artifact_root=archive,
+        output_root=public_results,
+        readme_path=readme,
+        model_card_path=model_card,
+    )
+    monkeypatch.setattr(
+        release_serving,
+        "clean_release_provenance",
+        lambda root: {
+            "git_commit": "e" * 40,
+            "dependency_lock_sha256": "2" * 64,
+        },
+    )
+    authority = release_serving.publish_and_smoke_test_serving_authority(
+        artifact_root=archive,
+        authority_root=tmp_path / "authorities",
+        repository_root=tmp_path / "checkout",
+    )
+    assert authority.name.startswith("serving-authority-")
+    authority_bytes = {
+        path.relative_to(authority).as_posix(): path.read_bytes()
+        for path in authority.rglob("*")
+        if path.is_file()
+    }
+    repeated_authority = release_serving.publish_and_smoke_test_serving_authority(
+        artifact_root=archive,
+        authority_root=tmp_path / "authorities",
+        repository_root=tmp_path / "checkout",
+    )
+    assert repeated_authority == authority
+    assert {
+        path.relative_to(authority).as_posix(): path.read_bytes()
+        for path in authority.rglob("*")
+        if path.is_file()
+    } == authority_bytes
+    assert [path for path in (tmp_path / "authorities").iterdir() if path.is_dir()] == [authority]
     backup = backup_root / f"{global_result.result_id}.zip"
     for member in members:
         shutil.rmtree(member.path) if member.path.is_dir() else member.path.unlink()
     assert not any(member.path.exists() for member in members)
     restore_and_validate_symile_export(
-        backup, restoration_validator=symile_campaign._validate_restored_campaign
+        backup, restoration_validator=symile_campaign.validate_restored_campaign
     )
     assert analysis_id == extension.manifest["core_analysis_id"]

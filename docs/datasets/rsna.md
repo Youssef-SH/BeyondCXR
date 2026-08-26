@@ -1,5 +1,10 @@
 # RSNA Pneumonia Detection Challenge
 
+RSNA Stage 2 provides BeyondCXR's supporting CXR qualification. It establishes DICOM ingestion,
+image modeling, metadata fusion, and localization; it is not external validation of the primary
+Symile predictor. Dataset roles and transfer constraints are summarized in the
+[data statement](../data_statement.md).
+
 ## Source and access
 
 The adapter uses the Stage 2 files from the RSNA Pneumonia Detection Challenge. Access is through

@@ -3,6 +3,9 @@
 This directory holds local source data and generated patient-level artifacts. Git tracks this file
 and directory placeholders; local data content is ignored.
 
+Dataset access, cohort roles, and distribution constraints are documented in the
+[data statement](../docs/data_statement.md). This page owns only the local filesystem layout.
+
 ## RSNA source and artifact layout
 
 The RSNA source and generated artifacts use this layout:
@@ -76,11 +79,6 @@ Run `make symile-manifest`, `make symile-audit`, and `make symile-cv` in that or
 an interactive bundle selector. Durable consumers pin immutable bundle and CV assignment
 identities. Official CXR, ECG, lab-percentile, missingness, and identifier NPY arrays remain
 external restricted source assets authenticated through the bundle-bound release checksum manifest.
-
-Supervised development reads only strict-pneumonia rows from official train and validation and
-consumes the immutable CV assignment without regenerating it. Each fold model package has a
-separate patient-level OOF prediction object under the ignored `private/` tree. The official test
-rows are not available through the development data layer.
 
 Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
 control. These files contain patient-level information even when public identifiers are

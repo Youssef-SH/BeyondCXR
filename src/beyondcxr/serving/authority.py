@@ -38,9 +38,9 @@ ENSEMBLE_POLICY = "ordered-seed-17-42-2026-mean-logit-then-sigmoid-v1"
 TRANSPORT_POLICY = "symile-jpeg-ap-pa-exact-50-labs-v1"
 SERVING_SPATIAL_POLICY = "symile-jpeg-spatial-short-side-320-center-crop-bilinear-v1"
 RESEARCH_WARNING = (
-    "Research prototype only. Not for clinical decision-making. Not a medical device or "
-    "physician replacement. Predicts a radiology-derived Pneumonia finding, not confirmed "
-    "infectious pneumonia."
+    "Research use only. BeyondCXR is not intended for clinical decision-making, is not a medical "
+    "device, does not replace physician judgment, and predicts a radiology-derived Pneumonia "
+    "finding rather than confirmed infectious pneumonia."
 )
 LAB_KEYS = tuple(f"lab_{item_id}" for item_id in LAB_ITEM_IDS)
 _GUARD = object()
@@ -70,7 +70,7 @@ def publish_serving_authority(
     final_packages: Sequence[ValidatedFinalPackage],
     serving_release: Mapping[str, str],
 ) -> ValidatedServingAuthority:
-    """Publish the exact primary three-member serving control after formal M6."""
+    """Publish the primary three-member serving authority from validated scientific evidence."""
     frozen = validated_pretest_freeze_manifest(capability)
     release = _validated_provenance(serving_release, "Serving release")
     global_reference = _validated_global_reference(

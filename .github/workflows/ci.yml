@@ -35,5 +35,8 @@ jobs:
       - name: Test
         run: uv run pytest
 
+      - name: Check public release surfaces
+        run: make release-check
+
       - name: Build package
         run: uv build

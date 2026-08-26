@@ -1,8 +1,10 @@
 [project]
 name = "beyondcxr"
 version = "0.1.0"
-description = "Reproducible radiographic and multimodal clinical-AI research framework."
+description = "Multimodal prediction of a radiology-derived Pneumonia finding from chest radiography, laboratory data, and ECG."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
     { name = "Youssef Shili", email = "youssef.shili.contact@gmail.com" }
 ]
@@ -39,6 +41,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/beyondcxr"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/THIRD_PARTY_NOTICES.md",
+    "/CITATION.cff",
+]
 
 [tool.ruff]
 line-length = 100

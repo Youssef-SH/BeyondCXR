@@ -157,7 +157,7 @@ def test_fourteen_package_predictions_derive_exactly_six_views(tmp_path: Path) -
                 )
             )
             index += 1
-    views = campaign_control._predictor_views(packages, predictions)
+    views = campaign_control.predictor_views(packages, predictions)
     assert set(views) == {
         "labs_logistic",
         "labs_lightgbm",
@@ -176,7 +176,7 @@ def test_fourteen_package_predictions_derive_exactly_six_views(tmp_path: Path) -
             build_prediction_table(["a", "b"], [1, 0], [-1.0, 1.0]),
         )
     with pytest.raises(ManifestBuildError, match="not exactly aligned"):
-        campaign_control._predictor_views(packages, predictions)
+        campaign_control.predictor_views(packages, predictions)
 
 
 def test_partial_prediction_resume_infers_only_missing_packages(

@@ -1,4 +1,4 @@
-"""Execute one frozen six-family Symile repeated-CV development lifecycle."""
+"""Execute one prespecified Symile family over the repeated-CV design."""
 
 from __future__ import annotations
 

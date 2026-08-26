@@ -1,7 +1,8 @@
 .PHONY: sync lock-check lint format format-check test check pre-commit clean purge-generated \
 	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-evaluate rsna-compare \
 	rsna-summarize rsna-localize rsna-campaign symile-manifest symile-audit symile-cv \
-	symile-develop symile-analyze symile-campaign symile-serve
+	symile-develop symile-analyze symile-campaign symile-serve results reproduce \
+	serving-authority release-check
 
 # Cleanup searches preserve repository metadata, environments, and source data.
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
@@ -76,6 +77,26 @@ symile-serve:
 		$(if $(DEVICE),--device "$(DEVICE)") \
 		$(if $(HOST),--host "$(HOST)") \
 		$(if $(PORT),--port "$(PORT)")
+
+results:
+	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT=path/to/preserved-campaign.zip is required"; exit 2)
+	uv run --locked python -m beyondcxr.release.cli results --artifact-root "$(ARTIFACT_ROOT)"
+
+reproduce:
+	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT=path/to/preserved-campaign.zip is required"; exit 2)
+	uv run --locked python -m beyondcxr.release.cli reproduce --artifact-root "$(ARTIFACT_ROOT)"
+
+serving-authority:
+	@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT=path/to/preserved-campaign.zip is required"; exit 2)
+	@test -n "$(AUTHORITY_ROOT)" || (echo "AUTHORITY_ROOT=path/to/private/authorities is required"; exit 2)
+	uv run --locked --extra serving python -m beyondcxr.release.cli serving-authority \
+		--artifact-root "$(ARTIFACT_ROOT)" --authority-root "$(AUTHORITY_ROOT)"
+
+release-check:
+	$(if $(filter 1,$(FINAL)),@test -n "$(ARTIFACT_ROOT)" || (echo "ARTIFACT_ROOT=path/to/preserved-campaign.zip is required for final acceptance"; exit 2))
+	$(if $(filter 1,$(FINAL)),@test -n "$(AUTHORITY_ROOT)" || (echo "AUTHORITY_ROOT=path/to/private/authorities is required for final acceptance"; exit 2))
+	uv run --locked python -m beyondcxr.release.cli check --root . \
+		$(if $(filter 1,$(FINAL)),--final --artifact-root "$(ARTIFACT_ROOT)" --authority-root "$(AUTHORITY_ROOT)")
 
 rsna-train:
 	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)

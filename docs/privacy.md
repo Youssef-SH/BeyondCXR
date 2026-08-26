@@ -59,6 +59,14 @@ request or response archive, patient database, or prediction cache. BeyondCXR re
 image, laboratory input, patient identifier, missingness state, or prediction after request
 processing, and operational handling does not log patient-level inputs or outputs. The project
 command disables Uvicorn access logging; deployments must apply the same restriction to external
-proxies and platforms. Public Docker images contain only distributable code and the locked runtime.
+proxies and platforms. BeyondCXR project content in public Docker images is limited to
+distributable project files; dependencies are installed from the recorded environment.
 Restricted serving authorities and trained packages are mounted read-only at runtime unless their
 distribution is separately authorized. Public request examples are explicitly synthetic.
+
+Public result generation starts from an allowlisted aggregate projection of validated claims.
+Release validation scans tracked textual surfaces for canonical source identifiers, private paths,
+and common credential patterns. Distribution inspection separately rejects restricted or
+unexpected members. Projection validation rejects row-level identifier keys. Automated safeguards
+do not replace human review. Synthetic renders stay in test workspaces; aggregate derivatives are
+committed only after validated post-execution result binding.
