@@ -8,7 +8,7 @@
 CLEAN_FIND_PRUNE = \( -path './.git' -o -path './.venv' -o -path './data/raw' \) -prune -o
 
 sync:
-	uv sync --extra serving
+	uv sync --locked --group dev --extra serving
 
 lock-check:
 	uv lock --check

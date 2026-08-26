@@ -827,7 +827,6 @@ def test_evaluator_cli_serializes_completed_result(
     }
 
 
-@pytest.mark.integration
 def test_synthetic_raw_source_to_bundle_training_and_explicit_test_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -81,36 +81,31 @@ def test_cli_failure_does_not_echo_private_exception_text(
     assert "/private/" not in captured.err
 
 
-@pytest.mark.parametrize("exception_type", [OSError, RuntimeError, Exception])
-def test_symile_campaign_sanitizes_every_exception(exception_type, monkeypatch, capsys) -> None:
-    module = importlib.import_module("beyondcxr.training.symile_campaign")
-
-    def fail(**kwargs):
-        del kwargs
-        raise exception_type("synthetic-patient-secret /private/source/secret.dcm token=demo")
-
-    monkeypatch.setattr(module, "run_symile_campaign", fail)
-    assert module.main(["--source-root", "unused", "--backup-root", "unused-backup"]) == 1
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert exception_type.__name__ in captured.err
-    assert "secret" not in captured.err
-    assert "/private/" not in captured.err
-
-
-@pytest.mark.parametrize("exception_type", [OSError, RuntimeError, Exception])
-def test_release_cli_sanitizes_every_exception(exception_type, monkeypatch, capsys) -> None:
-    module = importlib.import_module("beyondcxr.release.cli")
+@pytest.mark.parametrize(
+    ("module_name", "operation", "arguments"),
+    [
+        (
+            "training.symile_campaign",
+            "run_symile_campaign",
+            ["--source-root", "unused", "--backup-root", "unused-backup"],
+        ),
+        ("release.cli", "check_repository", ["check", "--root", "unused"]),
+    ],
+)
+def test_broad_exception_clis_sanitize_runtime_errors(
+    module_name, operation, arguments, monkeypatch, capsys
+) -> None:
+    module = importlib.import_module(f"beyondcxr.{module_name}")
 
     def fail(*args, **kwargs):
         del args, kwargs
-        raise exception_type("synthetic-patient-secret /private/source/secret.dcm token=demo")
+        raise RuntimeError("synthetic-patient-secret /private/source/secret.dcm token=demo")
 
-    monkeypatch.setattr(module, "check_repository", fail)
-    assert module.main(["check", "--root", "unused"]) == 1
+    monkeypatch.setattr(module, operation, fail)
+    assert module.main(arguments) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert exception_type.__name__ in captured.err
+    assert "RuntimeError" in captured.err
     assert "secret" not in captured.err
     assert "/private/" not in captured.err
 

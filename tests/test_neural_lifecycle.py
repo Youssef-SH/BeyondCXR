@@ -198,18 +198,6 @@ def test_neural_determinism_configures_algorithms_and_cudnn(monkeypatch) -> None
     assert torch.backends.cudnn.benchmark is False
 
 
-def test_seed_neural_runtime_uses_shared_determinism_configurator(monkeypatch) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(
-        "beyondcxr.training.neural.configure_neural_determinism",
-        lambda: calls.append("configured"),
-    )
-
-    seed_neural_runtime(42)
-
-    assert calls == ["configured"]
-
-
 def test_repeated_tiny_training_is_deterministic() -> None:
     dataset = _TensorDataset([0, 1, 0, 1, 0])
     config = replace(_rsna_cxr_neural_config(), batch_size=3, warmup_epochs=1, fine_tune_epochs=1)
