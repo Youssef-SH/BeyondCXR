@@ -7,28 +7,67 @@ import sys
 from pathlib import Path
 
 
-def test_purge_generated_removes_abandoned_preopen_symile_control(tmp_path: Path) -> None:
+def test_clear_caches_preserves_symile_control_and_authorities(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     freeze = workspace / "private/control/symile/freezes/pretest-freeze-synthetic/manifest.json"
     freeze.parent.mkdir(parents=True)
     freeze.write_text('{"pretest_freeze_schema_version":1}\n', encoding="utf-8")
 
-    purge = subprocess.run(
+    authority = workspace / "data/manifests/symile/bundles/bundle-test/manifest.json"
+    authority.parent.mkdir(parents=True)
+    authority.write_text("{}\n", encoding="utf-8")
+    cache = workspace / "data/cache/symile/cache-test/images.npy"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"cache")
+    cleanup = subprocess.run(
         [
             "make",
             "-f",
             str(Path("Makefile").resolve()),
             "-C",
             str(workspace),
-            "purge-generated",
+            "clear-caches",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert purge.returncode == 0, purge.stderr
-    assert not (workspace / "private/control/symile").exists()
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert freeze.is_file()
+    assert authority.is_file()
+    assert not cache.exists()
+
+
+def test_clear_caches_removes_dangling_cache_symlink_without_following_target(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cache = workspace / "data/cache"
+    cache.parent.mkdir(parents=True)
+    missing_target = tmp_path / "missing-cache-target"
+    cache.symlink_to(missing_target, target_is_directory=True)
+
+    cleanup = subprocess.run(
+        [
+            "make",
+            "-f",
+            str(Path("Makefile").resolve()),
+            "-C",
+            str(workspace),
+            "clear-caches",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert not cache.exists()
+    assert not cache.is_symlink()
+    assert not missing_target.exists()
 
 
 def test_symile_make_requires_and_forwards_backup_root(tmp_path: Path) -> None:
@@ -74,11 +113,13 @@ def test_symile_make_requires_and_forwards_backup_root(tmp_path: Path) -> None:
     assert forwarded[forwarded.index("--source-root") + 1] == "source"
 
 
-def test_clean_and_purge_generated_own_distinct_reproducible_scopes(tmp_path: Path) -> None:
+def test_cleanup_targets_own_distinct_lifecycle_scopes(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     generated = (
-        "reports/keep.txt",
-        "models/keep.txt",
+        "reports/rsna/keep.txt",
+        "reports/symile/keep.txt",
+        "models/rsna/keep.txt",
+        "models/symile/keep.txt",
         "private/predictions/rsna/prediction-test/predictions.parquet",
         "private/localization/localization-test/summary.json",
         "mlartifacts/keep.txt",
@@ -91,7 +132,8 @@ def test_clean_and_purge_generated_own_distinct_reproducible_scopes(tmp_path: Pa
         "data/manifests/symile/bundles/bundle-test/bundle.txt",
         "data/manifests/symile/cv/cv-assignment-test/assignments.parquet",
         "data/manifests/symile/CURRENT",
-        "outbox/results.tar.gz",
+        "outbox/rsna-execution.zip",
+        "outbox/global-result-test.zip",
     )
     transient = (
         ".pytest_cache/cache.txt",
@@ -134,40 +176,25 @@ def test_clean_and_purge_generated_own_distinct_reproducible_scopes(tmp_path: Pa
     test_open = workspace / "private/control/symile/test-open.json"
     test_open.parent.mkdir(parents=True)
     test_open.write_text("synthetic opened-record sentinel\n", encoding="utf-8")
-    blocked = subprocess.run(
-        ["make", "-f", str(makefile), "-C", str(workspace), "purge-generated"],
+    cache_cleanup = subprocess.run(
+        ["make", "-f", str(makefile), "-C", str(workspace), "clear-caches"],
         check=False,
         capture_output=True,
         text=True,
     )
-    assert blocked.returncode != 0
-    assert "Refusing to purge" in blocked.stdout
-    assert all((workspace / path).is_file() for path in (*generated, *preserved))
+    assert cache_cleanup.returncode == 0, cache_cleanup.stderr
+    assert all(
+        (workspace / path).is_file()
+        for path in (*generated, *preserved)
+        if not path.startswith("data/cache/")
+    )
+    assert not (workspace / "data/cache").exists()
     assert test_open.is_file()
-    test_open.unlink()
-
-    purge = subprocess.run(
-        ["make", "-f", str(makefile), "-C", str(workspace), "purge-generated"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert purge.returncode == 0, purge.stderr
-    assert all(not (workspace / path).exists() for path in generated)
     assert all((workspace / path).is_file() for path in preserved)
-    for path in (
-        "reports",
-        "models",
-        "private/predictions",
-        "private/localization",
-        "mlartifacts",
-        "data/cache",
-        "outbox",
-        "data/manifests/rsna/bundles/bundle-test",
-        "data/manifests/symile/bundles/bundle-test",
-        "data/manifests/symile/cv/cv-assignment-test",
-    ):
-        assert not (workspace / path).exists()
+    assert (workspace / "mlartifacts/keep.txt").is_file()
+    assert (workspace / "data/manifests/rsna/bundles/bundle-test").is_dir()
+    assert (workspace / "data/manifests/symile/bundles/bundle-test").is_dir()
+    assert (workspace / "data/manifests/symile/cv/cv-assignment-test").is_dir()
     assert (workspace / "data/raw").is_dir()
     assert (workspace / ".git").is_dir()
     assert (workspace / ".venv").is_dir()

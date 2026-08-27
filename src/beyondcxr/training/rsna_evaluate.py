@@ -1,16 +1,10 @@
-"""Evaluate one explicit immutable RSNA model package on held-out test data."""
+"""Evaluate one package authorized by the complete formal RSNA package freeze."""
 
 from __future__ import annotations
 
-import argparse
-import json
-import sys
-from collections.abc import Sequence
 from pathlib import Path
 
 import mlflow
-from mlflow.exceptions import MlflowException
-from sqlalchemy.exc import SQLAlchemyError
 
 from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
 from beyondcxr.data.rsna_metadata_preprocess import validate_metadata_pipeline
@@ -21,20 +15,24 @@ from beyondcxr.evaluation.latency import (
 )
 from beyondcxr.evaluation.probabilities import canonical_binary_raw_scores
 from beyondcxr.training.config import (
-    ConfigError,
     ExperimentConfig,
-    load_experiment_config,
+    require_runtime_seed,
     with_runtime,
 )
+from beyondcxr.training.device import ResolvedDevice, neural_inference_runtime_policy
 from beyondcxr.training.execution import LoaderExecutionPolicy
+from beyondcxr.training.neural import configure_neural_determinism
+from beyondcxr.training.rsna_campaign_control import (
+    ValidatedRsnaPackageFreeze,
+)
 from beyondcxr.training.rsna_evaluation_result import (
     CompletedRsnaEvaluation,
     publish_rsna_evaluation,
     validate_rsna_model_package,
     validated_rsna_evaluation_policy,
 )
-from beyondcxr.training.rsna_registry import RegistryError, get_dataset
-from beyondcxr.training.rsna_train_metadata import mlflow_metrics
+from beyondcxr.training.rsna_registry import get_dataset
+from beyondcxr.training.rsna_training_report import mlflow_metrics
 from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
@@ -43,8 +41,6 @@ from beyondcxr.utils.mlflow_utils import (
     tracked_run,
 )
 from beyondcxr.utils.operational_logging import (
-    add_logging_argument,
-    configure_logging,
     get_operational_logger,
     log_event,
     timed_phase,
@@ -62,7 +58,9 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_model_package(
     model_package_id: str,
     *,
+    authorization: ValidatedRsnaPackageFreeze,
     evaluation_config: ExperimentConfig,
+    runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     model_directory: str | Path = "models/rsna",
     cache: ValidatedCxrCache | None = None,
@@ -70,12 +68,32 @@ def evaluate_model_package(
     private_output_directory: str | Path | None = None,
     report_directory: str | Path | None = None,
 ) -> CompletedRsnaEvaluation:
-    """Dispatch held-out evaluation from explicit package and config authority."""
+    """Dispatch held-out evaluation only after validating the complete package freeze."""
+    frozen = authorization.require(model_package_id)
+    position = authorization.packages.index(frozen)
+    configured = authorization.execution.manifest["configs"][position]
+    if (
+        configured["family_id"] != evaluation_config.family.family_id
+        or configured["seed"] != require_runtime_seed(evaluation_config)
+        or configured["config_source_sha256"] != evaluation_config.config_source_sha256
+        or configured["config_semantic_sha256"] != evaluation_config.config_semantic_sha256
+    ):
+        raise ValueError("Held-out evaluation config differs from the frozen formal plan")
     manifest = validate_rsna_model_package(model_directory, model_package_id)
+    if manifest["family_id"] != configured["family_id"]:
+        raise ValueError("Held-out package family differs from the frozen formal plan")
+    if evaluation_config.neural is not None:
+        if (
+            neural_inference_runtime_policy(runtime)
+            != authorization.execution.manifest["training_evaluation_runtime"]
+        ):
+            raise ValueError("Held-out numerical runtime differs from the frozen execution")
+        configure_neural_determinism()
     package = Path(model_directory) / "packages" / model_package_id
     if (package / MODEL_FILENAME).is_file():
         return _evaluate_tabular_package(
             package,
+            authorization=authorization,
             evaluation_config=evaluation_config,
             tracking_uri=tracking_uri,
             private_output_directory=private_output_directory,
@@ -87,21 +105,25 @@ def evaluate_model_package(
     if manifest["family_id"] == "cxr_densenet":
         return evaluate_cxr_model_package(
             model_package_id,
+            authorization=authorization,
             evaluation_config=evaluation_config,
             tracking_uri=tracking_uri,
             model_directory=model_directory,
             cache=cache,
             execution=execution,
+            runtime=runtime,
             private_output_directory=private_output_directory,
             report_directory=report_directory,
         )
     return evaluate_fusion_model_package(
         model_package_id,
+        authorization=authorization,
         evaluation_config=evaluation_config,
         tracking_uri=tracking_uri,
         model_directory=model_directory,
         cache=cache,
         execution=execution,
+        runtime=runtime,
         private_output_directory=private_output_directory,
         report_directory=report_directory,
     )
@@ -110,6 +132,7 @@ def evaluate_model_package(
 def _evaluate_tabular_package(
     package: Path,
     *,
+    authorization: ValidatedRsnaPackageFreeze,
     evaluation_config: ExperimentConfig,
     tracking_uri: str,
     private_output_directory: str | Path | None,
@@ -160,7 +183,11 @@ def _evaluate_tabular_package(
     ) as run_id:
         context = {"run_id": run_id, "family_id": config.family.family_id}
         with timed_phase(_LOGGER, "test_dataset_loading", **context):
-            test, lineage = dataset.load_test(config)
+            test, lineage = dataset.load_test(
+                config,
+                authorization=authorization,
+                package_id=str(manifest["model_package_id"]),
+            )
         if (
             lineage.bundle_id != manifest["bundle_id"]
             or lineage.split_assignment_id != manifest["split_assignment_id"]
@@ -228,59 +255,3 @@ def _evaluate_tabular_package(
             result.manifest["claims"]["probability_metrics"]["average_precision"]
         ),
     )
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package-id", required=True, help="Immutable model package ID")
-    parser.add_argument("--config", required=True, type=Path, help="Explicit evaluation config")
-    parser.add_argument("--tracking-uri", default=DEFAULT_TRACKING_URI)
-    parser.add_argument("--model-directory", type=Path, default=Path("models/rsna"))
-    parser.add_argument("--private-output-directory", type=Path, default=None)
-    parser.add_argument("--report-directory", type=Path, default=None)
-    add_logging_argument(parser)
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Evaluate one package and print scientific result lineage."""
-    args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
-    try:
-        result = evaluate_model_package(
-            args.package_id,
-            evaluation_config=load_experiment_config(args.config),
-            tracking_uri=args.tracking_uri,
-            model_directory=args.model_directory,
-            private_output_directory=args.private_output_directory,
-            report_directory=args.report_directory,
-        )
-    except (
-        ConfigError,
-        RegistryError,
-        MlflowException,
-        SQLAlchemyError,
-        OSError,
-        ValueError,
-        KeyError,
-    ) as exc:
-        print(f"Test evaluation failed: {type(exc).__name__}", file=sys.stderr)
-        return 1
-    print(
-        json.dumps(
-            {
-                "model_package_id": result.model_package_id,
-                "prediction_id": result.prediction_id,
-                "evaluation_id": result.evaluation_id,
-                "mlflow_run_id": result.mlflow_run_id,
-                "test_average_precision": result.average_precision,
-                "artifact_directory": result.artifact_directory.as_posix(),
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

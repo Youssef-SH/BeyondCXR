@@ -21,9 +21,10 @@ from beyondcxr.training.config import (
     require_runtime_seed,
     with_runtime,
 )
-from beyondcxr.training.device import resolve_device
+from beyondcxr.training.device import ResolvedDevice
 from beyondcxr.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
 from beyondcxr.training.neural import build_evaluation_loader, deterministic_inference
+from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
 from beyondcxr.training.rsna_datasets import (
     RsnaCachedFusionDataset,
     RsnaDataset,
@@ -39,7 +40,7 @@ from beyondcxr.training.rsna_evaluation_result import (
 from beyondcxr.training.rsna_fusion_source import resolve_source_cxr_package
 from beyondcxr.training.rsna_registry import get_dataset, get_model
 from beyondcxr.training.rsna_train_fusion import load_validated_rsna_fusion_preprocessor
-from beyondcxr.training.rsna_train_metadata import mlflow_metrics
+from beyondcxr.training.rsna_training_report import mlflow_metrics
 from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
@@ -60,7 +61,9 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_fusion_model_package(
     model_package_id: str,
     *,
+    authorization: ValidatedRsnaPackageFreeze,
     evaluation_config: ExperimentConfig,
+    runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
@@ -141,6 +144,8 @@ def evaluate_fusion_model_package(
             data = dataset.load_fusion_test(
                 config,
                 expected_manifest_sha256=str(manifest["bundle_manifest_sha256"]),
+                authorization=authorization,
+                package_id=model_package_id,
             )
         _verify_test_lineage(data, manifest)
         transformed = transform_rsna_metadata(
@@ -188,11 +193,6 @@ def evaluate_fusion_model_package(
             partition="test",
             transform=transform,
             training_seed=require_runtime_seed(config),
-        )
-        runtime = resolve_device(
-            config.runtime.device,
-            mixed_precision=neural.mixed_precision,
-            pin_memory_policy=config.runtime.pin_memory_policy,
         )
         loader_execution = execution or one_shot_loader_policy(
             pin_memory=runtime.pin_memory_effective

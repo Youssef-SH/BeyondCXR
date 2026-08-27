@@ -15,12 +15,13 @@ from beyondcxr.training.config import (
     require_runtime_seed,
     with_runtime,
 )
-from beyondcxr.training.device import resolve_device
+from beyondcxr.training.device import ResolvedDevice
 from beyondcxr.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
 from beyondcxr.training.neural import (
     build_evaluation_loader,
     deterministic_inference,
 )
+from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
 from beyondcxr.training.rsna_datasets import (
     RsnaCachedImageDataset,
     RsnaDataset,
@@ -35,7 +36,7 @@ from beyondcxr.training.rsna_evaluation_result import (
 )
 from beyondcxr.training.rsna_interfaces import RsnaCxrModelImplementation
 from beyondcxr.training.rsna_registry import get_dataset, get_model
-from beyondcxr.training.rsna_train_metadata import (
+from beyondcxr.training.rsna_training_report import (
     mlflow_metrics,
 )
 from beyondcxr.utils.mlflow_utils import (
@@ -63,7 +64,9 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_cxr_model_package(
     model_package_id: str,
     *,
+    authorization: ValidatedRsnaPackageFreeze,
     evaluation_config: ExperimentConfig,
+    runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
@@ -127,6 +130,8 @@ def evaluate_cxr_model_package(
             cxr_data = dataset_adapter.load_cxr_test(
                 config,
                 expected_manifest_sha256=manifest["bundle_manifest_sha256"],
+                authorization=authorization,
+                package_id=model_package_id,
             )
         if (
             cxr_data.lineage.bundle_id != manifest["bundle_id"]
@@ -170,11 +175,6 @@ def evaluate_cxr_model_package(
             partition="test",
             transform=evaluation_transform,
             training_seed=require_runtime_seed(config),
-        )
-        runtime = resolve_device(
-            config.runtime.device,
-            mixed_precision=neural.mixed_precision,
-            pin_memory_policy=config.runtime.pin_memory_policy,
         )
         loader_execution = execution or one_shot_loader_policy(
             pin_memory=runtime.pin_memory_effective

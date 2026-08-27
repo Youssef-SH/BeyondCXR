@@ -17,6 +17,8 @@ from neural_test_support import TensorDataset as _TensorDataset
 from neural_test_support import TinyImageModel as _TinyImageModel
 from neural_test_support import build_synchronous_image_loaders as build_image_loaders
 from neural_test_support import cpu_runtime as _runtime
+from rsna_authorization_test_support import authorize_rsna_package, rsna_test_runtime
+from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
 
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
 from beyondcxr.data.errors import ManifestBuildError
@@ -67,6 +69,58 @@ from beyondcxr.utils.rsna_neural_publication import (
 _SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64
 
 
+def test_neural_evaluation_reestablishes_deterministic_backend_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml"),
+        seed=42,
+        device="cpu",
+    )
+    package_id = "model-package-" + "a" * 64
+    authorization = authorize_rsna_package(config, package_id, monkeypatch=monkeypatch)
+    runtime = rsna_test_runtime(config)
+    sentinel = object()
+
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_evaluate.validate_rsna_model_package",
+        lambda *args, **kwargs: {"family_id": "cxr_densenet"},
+    )
+
+    def dispatched(*args, **kwargs):
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.backends.cudnn.deterministic is True
+        assert torch.backends.cudnn.benchmark is False
+        return sentinel
+
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_evaluate_cxr.evaluate_cxr_model_package",
+        dispatched,
+    )
+    prior = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    try:
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        assert (
+            evaluate_model_package(
+                package_id,
+                authorization=authorization,
+                evaluation_config=config,
+                runtime=runtime,
+            )
+            is sentinel
+        )
+    finally:
+        torch.use_deterministic_algorithms(prior[0], warn_only=True)
+        torch.backends.cudnn.deterministic = prior[1]
+        torch.backends.cudnn.benchmark = prior[2]
+
+
 def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, object]:
     config_path = Path("configs/rsna_cxr_densenet.yaml")
     config = with_runtime(load_experiment_config(config_path), seed=42)
@@ -88,7 +142,7 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
         "task_id": "pneumonia",
         "positive_class": 1,
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": "e" * 64,
+        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
         "split_assignment_id": config.dataset.split_assignment_id,
         "label_policy_version": config.task.label_policy_version,
         "config_source_sha256": digest,
@@ -194,6 +248,14 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
         model_root=tmp_path / "models" / "rsna",
         checkpoint_path=checkpoint_path,
         source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json",
+            config_bytes,
+            seed=42,
+            selected_epoch=3,
+            selected_stage="fine_tune",
+            selected_validation_average_precision=0.75,
+        ),
         manifest=_manifest(config_bytes, checkpoint),
     )
 
@@ -204,6 +266,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
         NEURAL_MODEL_FILENAME,
         "resolved_config.yaml",
         "manifest.json",
+        "validation-evidence.json",
     }
     assert set(restored) == CHECKPOINT_FIELDS
     assert loaded["selected_epoch"] == checkpoint["selected_epoch"]
@@ -217,6 +280,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
         model_root=tmp_path / "models" / "rsna",
         checkpoint_path=alternate_checkpoint,
         source_config_bytes=config_bytes,
+        validation_evidence_path=published.package_directory / "validation-evidence.json",
         manifest=_manifest(config_bytes, checkpoint),
     )
     assert repeated.model_package_id == published.model_package_id
@@ -251,6 +315,14 @@ def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutat
         model_root=tmp_path / "models" / "rsna",
         checkpoint_path=checkpoint_path,
         source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json",
+            config_bytes,
+            seed=42,
+            selected_epoch=1,
+            selected_stage="warmup",
+            selected_validation_average_precision=0.5,
+        ),
         manifest=_manifest(config_bytes, checkpoint),
     )
     document = json.loads(published.manifest_path.read_text(encoding="utf-8"))
@@ -279,6 +351,14 @@ def test_neural_manifest_requires_integer_schema_version_one(tmp_path: Path, val
         model_root=tmp_path / "models" / "rsna",
         checkpoint_path=checkpoint_path,
         source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json",
+            config_bytes,
+            seed=42,
+            selected_epoch=1,
+            selected_stage="warmup",
+            selected_validation_average_precision=0.5,
+        ),
         manifest=_manifest(config_bytes, checkpoint),
     )
     document = json.loads(published.manifest_path.read_text(encoding="utf-8"))
@@ -373,6 +453,14 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         model_root=tmp_path / "models" / "rsna",
         checkpoint_path=checkpoint_path,
         source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json",
+            config_bytes,
+            seed=42,
+            selected_epoch=1,
+            selected_stage="warmup",
+            selected_validation_average_precision=0.6,
+        ),
         manifest=_manifest(config_bytes, checkpoint),
     )
     identity = json.loads(published.manifest_path.read_text(encoding="utf-8"))
@@ -557,7 +645,10 @@ def _synthetic_cxr_lifecycle(
                 source_inventory=source_inventory,
             )
 
-        def load_cxr_test(self, dataset_config, *, expected_manifest_sha256):
+        def load_cxr_test(
+            self, dataset_config, *, expected_manifest_sha256, authorization, package_id
+        ):
+            authorization.require(package_id)
             assert expected_manifest_sha256 == config.dataset.bundle_manifest_sha256
             self.test_calls += 1
             return CxrTestData(
@@ -743,7 +834,11 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
 
     evaluation = evaluate_model_package(
         training.model_package_id,
+        authorization=authorize_rsna_package(
+            setup.config, training.model_package_id, monkeypatch=monkeypatch
+        ),
         evaluation_config=setup.config,
+        runtime=rsna_test_runtime(setup.config),
         tracking_uri=setup.tracking_uri,
         model_directory=setup.config.runtime.model_directory,
         private_output_directory=setup.config.runtime.private_output_directory,
@@ -773,14 +868,14 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
     assert evaluation_run.data.params["evaluation_loader_num_workers"] == "0"
     assert evaluation_run.data.params["evaluation_cxr_cache_id"].startswith("cache-")
 
-    csv_path, _, rows = regenerate_comparison(
+    comparison_result = regenerate_comparison(
         [evaluation.evaluation_id],
         output_directory=setup.config.runtime.report_directory,
         private_directory=setup.config.runtime.private_output_directory,
         model_directory=setup.config.runtime.model_directory,
     )
-    comparison = pd.read_csv(csv_path)
-    assert rows == 1
+    comparison = pd.read_csv(comparison_result.csv_path)
+    assert comparison_result.row_count == 1
     assert comparison["evaluation_id"].tolist() == [evaluation.evaluation_id]
     assert comparison["model_package_id"].tolist() == [training.model_package_id]
 
@@ -860,7 +955,11 @@ def test_cxr_evaluation_rejects_package_cache_identity_before_inference(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                setup.config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=setup.config,
+            runtime=rsna_test_runtime(setup.config),
             tracking_uri=setup.tracking_uri,
             model_directory=setup.config.runtime.model_directory,
         )
@@ -879,7 +978,11 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                setup.config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=setup.config,
+            runtime=rsna_test_runtime(setup.config),
             tracking_uri=setup.tracking_uri,
             model_directory=setup.config.runtime.model_directory,
         )
@@ -892,7 +995,11 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                setup.config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=setup.config,
+            runtime=rsna_test_runtime(setup.config),
             tracking_uri=setup.tracking_uri,
             model_directory=setup.config.runtime.model_directory,
         )
@@ -904,7 +1011,11 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                setup.config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=setup.config,
+            runtime=rsna_test_runtime(setup.config),
             tracking_uri=setup.tracking_uri,
             model_directory=setup.config.runtime.model_directory,
         )
@@ -919,7 +1030,11 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     client.log_metric(training.run_id, "model_size_mib", original_size + 0.01)
     evaluation = evaluate_model_package(
         training.model_package_id,
+        authorization=authorize_rsna_package(
+            setup.config, training.model_package_id, monkeypatch=monkeypatch
+        ),
         evaluation_config=setup.config,
+        runtime=rsna_test_runtime(setup.config),
         tracking_uri=setup.tracking_uri,
         model_directory=setup.config.runtime.model_directory,
         private_output_directory=setup.config.runtime.private_output_directory,
@@ -944,7 +1059,11 @@ def test_cxr_publication_failures_remain_incomplete(
     with pytest.raises(OSError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                setup.config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=setup.config,
+            runtime=rsna_test_runtime(setup.config),
             tracking_uri=setup.tracking_uri,
             model_directory=setup.config.runtime.model_directory,
             private_output_directory=setup.config.runtime.private_output_directory,

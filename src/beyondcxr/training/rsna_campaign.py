@@ -1,34 +1,28 @@
-"""Execute the complete authoritative RSNA campaign."""
+"""Execute the formal RSNA campaign from one exact prepublished authority."""
 
 from __future__ import annotations
 
-import hashlib
+import argparse
 import json
-import os
 import shutil
-import sqlite3
 import sys
-import tarfile
-import tempfile
 import time
 from collections.abc import Sequence
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO, cast
 
-import torch
-
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.rsna_artifacts import (
     BUNDLES_DIRECTORY,
-    build_and_write,
     validate_bundle_directory,
+    validate_bundle_reference,
 )
 from beyondcxr.data.rsna_audit import generate_rsna_audit
-from beyondcxr.data.rsna_cxr_cache import preprocessing_identity
-from beyondcxr.models.cxr_baseline import ensure_pretrained_weights
+from beyondcxr.data.rsna_cxr_cache import preprocessing_identity, validate_cxr_source_availability
+from beyondcxr.models.cxr_baseline import fingerprint_pretrained_weights
 from beyondcxr.training.config import (
     ExperimentConfig,
     load_experiment_config,
@@ -41,43 +35,56 @@ from beyondcxr.training.execution import (
     one_shot_loader_policy,
     reused_loader_policy,
 )
-from beyondcxr.training.rsna_compare import regenerate_comparison
+from beyondcxr.training.operational_validation import (
+    validate_existing_sqlite_database,
+    validate_writable_directory_destination,
+    validate_writable_file_destination,
+)
+from beyondcxr.training.preservation import (
+    export_and_verify,
+    validate_preservation_paths,
+)
+from beyondcxr.training.rsna_campaign_control import (
+    load_evaluation_record,
+    publish_evaluation_record,
+    publish_or_validate_execution,
+    publish_or_validate_package_freeze,
+    validate_package_freeze,
+)
+from beyondcxr.training.rsna_compare import ComparisonResult, regenerate_comparison
 from beyondcxr.training.rsna_datasets import RsnaDataset, prepare_rsna_cxr_cache
 from beyondcxr.training.rsna_evaluate import evaluate_model_package
+from beyondcxr.training.rsna_formal import (
+    _FORMAL_PLAN_GUARD,
+    RSNA_FORMAL_RUN_PLAN,
+    RsnaAuthorityCoordinates,
+    RsnaFormalRoots,
+    ValidatedRsnaPlan,
+)
 from beyondcxr.training.rsna_localize import generate_localization_report
+from beyondcxr.training.rsna_preservation import (
+    campaign_export_members,
+    validate_restored_rsna_campaign,
+)
 from beyondcxr.training.rsna_registry import get_dataset
 from beyondcxr.training.rsna_seed_summary import publish_seed_summary
 from beyondcxr.training.rsna_train_cxr import train_cxr_experiment
 from beyondcxr.training.rsna_train_fusion import train_fusion_experiment
 from beyondcxr.training.rsna_train_metadata import MetadataModelResult, train_metadata_experiment
-from beyondcxr.utils.mlflow_utils import DEFAULT_TRACKING_URI
+from beyondcxr.utils.mlflow_utils import (
+    discover_repository_root,
+    git_revision,
+    uv_lock_sha256,
+)
 from beyondcxr.utils.operational_logging import (
     configure_logging,
     get_operational_logger,
     log_event,
     timed_phase,
 )
-from beyondcxr.utils.rsna_model_publication import validate_published_model
-from beyondcxr.utils.rsna_neural_publication import validate_neural_package_metadata
 
-EXPECTED_SEEDS = (17, 42, 2026)
-RAW_ROOT = Path("data/raw/rsna/extracted")
-MANIFEST_ROOT = Path("data/manifests")
-CACHE_ROOT = Path("data/cache/rsna")
-REPORT_ROOT = Path("reports")
-OUTBOX_ROOT = Path("outbox")
 _MINIMUM_FREE_BYTES = 16 * 1024**3
 _LOGGER = get_operational_logger(__name__)
-
-
-@dataclass(frozen=True)
-class CampaignConfigs:
-    """The eight reviewed experiment definitions in canonical order."""
-
-    metadata_logistic: ExperimentConfig
-    metadata_lightgbm: ExperimentConfig
-    cxr: tuple[ExperimentConfig, ...]
-    fusions: tuple[ExperimentConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -115,11 +122,11 @@ class _TeeStream:
             stream.flush()
 
 
-def execute_rsna_campaign() -> CampaignResult:
-    """Run one fresh fail-fast RSNA campaign with direct identity handoff."""
-    _require_fresh_output_surface()
-    campaign_id = "campaign-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    campaign_directory = REPORT_ROOT / "rsna" / "campaigns" / campaign_id
+def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
+    """Run or resume one exact RSNA execution after mutation-free preflight."""
+    plan = _preflight_rsna_campaign(backup_root=backup_root)
+    campaign_id = "campaign-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    campaign_directory = plan.roots.report_root / "rsna" / "campaigns" / campaign_id
     campaign_directory.mkdir(parents=True, exist_ok=False)
     log_path = campaign_directory / "execution.log"
     with log_path.open("w", encoding="utf-8", buffering=1) as log_stream:
@@ -132,87 +139,130 @@ def execute_rsna_campaign() -> CampaignResult:
             phase="preparation",
         )
         try:
-            with timed_phase(_LOGGER, "prerequisite_validation"):
-                configs = _validate_prerequisites()
-            with timed_phase(_LOGGER, "pretrained_weight_readiness"):
-                ensure_pretrained_weights("densenet121-res224-chex")
-            with timed_phase(_LOGGER, "manifest_build"):
-                written = build_and_write(RAW_ROOT, MANIFEST_ROOT)
-                _validate_configured_bundle(configs, written.paths.bundle_id)
+            execution = publish_or_validate_execution(plan)
             with timed_phase(_LOGGER, "dataset_audit"):
-                generate_rsna_audit(MANIFEST_ROOT, REPORT_ROOT / "rsna" / "audit")
-                audit_directory = REPORT_ROOT / "rsna" / "audit" / written.paths.bundle_id
-            dataset = get_dataset("rsna")
-            if not isinstance(dataset, RsnaDataset):
-                raise TypeError("RSNA campaign requires the concrete RSNA dataset adapter")
-            cxr_reference = configs.cxr[0]
+                bundle_id = plan.authority.bundle_id
+                generate_rsna_audit(
+                    plan.roots.manifest_root,
+                    plan.roots.report_root / "rsna" / "audit",
+                    bundle_id=bundle_id,
+                )
+                audit_directory = plan.roots.report_root / "rsna" / "audit" / bundle_id
+            cxr_configs = tuple(
+                config
+                for spec, config in zip(plan.runs, plan.configs, strict=True)
+                if spec.family_id == "cxr_densenet"
+            )
+            fusion_configs = tuple(
+                config
+                for spec, config in zip(plan.runs, plan.configs, strict=True)
+                if spec.family_id == "cxr_metadata_concat"
+            )
+            cxr_reference = cxr_configs[0]
             transform = _transform(cxr_reference, training=False)
             with timed_phase(_LOGGER, "cxr_cache_preparation"):
                 cache = prepare_rsna_cxr_cache(
-                    dataset, cxr_reference, transform, cache_root=CACHE_ROOT
+                    plan.dataset, cxr_reference, transform, cache_root=plan.roots.cache_root
                 )
-            runtime = _required_cuda_runtime(cxr_reference)
-            training_execution = _training_execution_policy(cxr_reference, runtime)
-            evaluation_execution = one_shot_loader_policy(pin_memory=runtime.pin_memory_effective)
-            metadata_training = _train_metadata(configs)
-            cxr_training = tuple(
-                train_cxr_experiment(
-                    config,
-                    tracking_uri=DEFAULT_TRACKING_URI,
-                    cache=cache,
-                    execution=training_execution,
+            freeze_path = execution.directory / "package-freeze.json"
+            if freeze_path.exists() or freeze_path.is_symlink():
+                freeze = validate_package_freeze(
+                    execution,
+                    model_root=plan.roots.model_root,
+                    report_root=plan.roots.report_root,
+                    bundle_directory=plan.authority.bundle_directory,
                 )
-                for config in configs.cxr
-            )
-            fusion_training = tuple(
-                train_fusion_experiment(
-                    config,
-                    source_cxr_package_id=source.model_package_id,
-                    tracking_uri=DEFAULT_TRACKING_URI,
-                    cache=cache,
-                    execution=training_execution,
+                log_event(_LOGGER, "training_resumed_from_package_freeze", total=8)
+            else:
+                metadata_training = _train_metadata(plan)
+                cxr_training = tuple(
+                    train_cxr_experiment(
+                        config,
+                        tracking_uri=plan.roots.tracking_uri,
+                        cache=cache,
+                        execution=plan.training_execution,
+                        runtime=plan.runtime,
+                    )
+                    for config in cxr_configs
                 )
-                for config, source in zip(configs.fusions, cxr_training, strict=True)
-            )
-            training_results = (*metadata_training, *cxr_training, *fusion_training)
-            _validate_frozen_training_packages(training_results)
+                fusion_training = tuple(
+                    train_fusion_experiment(
+                        config,
+                        source_cxr_package_id=source.model_package_id,
+                        tracking_uri=plan.roots.tracking_uri,
+                        cache=cache,
+                        execution=plan.training_execution,
+                        runtime=plan.runtime,
+                    )
+                    for config, source in zip(fusion_configs, cxr_training, strict=True)
+                )
+                completed = (*metadata_training, *cxr_training, *fusion_training)
+                freeze = publish_or_validate_package_freeze(
+                    plan=plan,
+                    execution=execution,
+                    results=completed,
+                )
+            training_results = freeze.packages
             log_event(_LOGGER, "training_boundary_completed", total=len(training_results))
-
-            evaluation_results = tuple(
-                evaluate_model_package(
-                    result.model_package_id,
-                    evaluation_config=config,
-                    tracking_uri=DEFAULT_TRACKING_URI,
-                    cache=cache,
-                    execution=evaluation_execution,
+            evaluation_results_list = []
+            for result, config in zip(
+                training_results,
+                plan.configs,
+                strict=True,
+            ):
+                evaluation = load_evaluation_record(
+                    execution,
+                    package_id=result.model_package_id,
+                    report_root=plan.roots.report_root,
+                    private_root=plan.roots.private_root,
+                    model_root=plan.roots.model_root,
                 )
-                for result, config in zip(
-                    training_results,
-                    (
-                        configs.metadata_logistic,
-                        configs.metadata_lightgbm,
-                        *configs.cxr,
-                        *configs.fusions,
-                    ),
-                    strict=True,
-                )
-            )
+                if evaluation is None:
+                    evaluation = evaluate_model_package(
+                        result.model_package_id,
+                        authorization=freeze,
+                        evaluation_config=config,
+                        runtime=plan.runtime,
+                        tracking_uri=plan.roots.tracking_uri,
+                        model_directory=plan.roots.model_root,
+                        cache=cache,
+                        execution=plan.evaluation_execution,
+                        private_output_directory=plan.roots.private_root,
+                        report_directory=plan.roots.report_root,
+                    )
+                    publish_evaluation_record(execution, evaluation)
+                evaluation_results_list.append(evaluation)
+            evaluation_results = tuple(evaluation_results_list)
             cxr_tests = evaluation_results[2:5]
             fusion_tests = evaluation_results[5:]
             cxr_evaluation_ids = tuple(result.evaluation_id for result in cxr_tests)
             fusion_evaluation_ids = tuple(result.evaluation_id for result in fusion_tests)
-            cxr_summary = publish_seed_summary(cxr_evaluation_ids, output_directory=REPORT_ROOT)
+            cxr_summary = publish_seed_summary(
+                cxr_evaluation_ids,
+                output_directory=plan.roots.report_root,
+                model_directory=plan.roots.model_root,
+                private_directory=plan.roots.private_root,
+            )
             fusion_summary = publish_seed_summary(
-                fusion_evaluation_ids, output_directory=REPORT_ROOT
+                fusion_evaluation_ids,
+                output_directory=plan.roots.report_root,
+                model_directory=plan.roots.model_root,
+                private_directory=plan.roots.private_root,
             )
             localization = generate_localization_report(
                 cxr_evaluation_ids,
-                output_directory=REPORT_ROOT,
+                authorization=freeze,
+                output_directory=plan.roots.report_root,
+                model_directory=plan.roots.model_root,
+                private_directory=plan.roots.private_root,
                 cache=cache,
+                runtime=plan.runtime,
             )
             comparison = regenerate_comparison(
                 tuple(result.evaluation_id for result in evaluation_results),
-                output_directory=REPORT_ROOT,
+                output_directory=plan.roots.report_root,
+                private_directory=plan.roots.private_root,
+                model_directory=plan.roots.model_root,
             )
             with timed_phase(_LOGGER, "output_validation"):
                 _validate_outputs(
@@ -222,24 +272,36 @@ def execute_rsna_campaign() -> CampaignResult:
                     cxr_summary.report_directory,
                     fusion_summary.report_directory,
                     localization,
-                    comparison[:2],
+                    comparison,
                     log_path,
+                    roots=plan.roots,
                 )
             log_event(_LOGGER, "campaign_ready_for_export", phase="export")
             log_stream.flush()
-            archive = OUTBOX_ROOT / f"rsna-results-{campaign_id}.tar.gz"
             archive_started_at = time.perf_counter()
-            _write_archive(
-                archive,
-                bundle_directory=written.paths.bundle_directory,
-                current_path=written.paths.current_path,
+            summaries = (cxr_summary, fusion_summary)
+            archive = export_and_verify(
+                members=campaign_export_members(
+                    package_freeze=freeze,
+                    evaluations=evaluation_results,
+                    summaries=summaries,
+                    localization=localization,
+                    comparison=comparison,
+                    audit_directory=audit_directory,
+                    campaign_log=log_path,
+                    private_root=plan.roots.private_root,
+                ),
+                export_root=plan.roots.export_root,
+                backup_root=plan.roots.backup_root,
+                export_name=f"rsna-{execution.execution_id}-{campaign_id}",
+                restoration_validator=validate_restored_rsna_campaign,
             )
             log_event(
                 _LOGGER,
                 "archive_created",
                 elapsed_s=time.perf_counter() - archive_started_at,
             )
-            checksum = _write_checksum(archive)
+            checksum = archive.with_suffix(".zip.sha256")
             log_event(
                 _LOGGER,
                 "campaign_succeeded",
@@ -269,77 +331,245 @@ def execute_rsna_campaign() -> CampaignResult:
     )
 
 
-def _train_metadata(configs: CampaignConfigs) -> tuple[MetadataModelResult, MetadataModelResult]:
+def _train_metadata(plan: ValidatedRsnaPlan) -> tuple[MetadataModelResult, MetadataModelResult]:
+    configs = tuple(
+        config
+        for spec, config in zip(plan.runs, plan.configs, strict=True)
+        if spec.family_id in {"metadata_logistic", "metadata_lightgbm"}
+    )
+    if len(configs) != 2:
+        raise ManifestBuildError("RSNA formal plan must contain exactly two metadata runs")
+    first_config, second_config = configs
     return (
-        train_metadata_experiment(configs.metadata_logistic, tracking_uri=DEFAULT_TRACKING_URI),
-        train_metadata_experiment(configs.metadata_lightgbm, tracking_uri=DEFAULT_TRACKING_URI),
+        train_metadata_experiment(first_config, tracking_uri=plan.roots.tracking_uri),
+        train_metadata_experiment(second_config, tracking_uri=plan.roots.tracking_uri),
     )
 
 
-def _validate_prerequisites() -> CampaignConfigs:
-    if not RAW_ROOT.is_dir():
-        raise FileNotFoundError(f"RSNA raw dataset is missing: {RAW_ROOT}")
+def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
+    """Validate every formal input before creating campaign-owned output."""
+    repository_root = discover_repository_root()
+    if Path.cwd().resolve() != repository_root:
+        raise ManifestBuildError("Formal RSNA campaign must run from the repository root")
+    _validate_canonical_rsna_layout(repository_root)
+    source_root = repository_root / "data/raw/rsna/extracted"
+    manifest_root = repository_root / "data/manifests"
+    cache_root = repository_root / "data/cache/rsna"
+    model_root = repository_root / "models/rsna"
+    report_root = repository_root / "reports"
+    private_root = repository_root / "private"
+    control_root = private_root / "control/rsna"
+    export_root = repository_root / "outbox"
+    backup_input = Path(backup_root)
+    backup = validate_writable_directory_destination(backup_input, "RSNA backup destination")
+    if backup.is_relative_to(repository_root):
+        raise ManifestBuildError("RSNA backup must reside outside the repository root")
+    validate_preservation_paths(
+        sources=(
+            source_root,
+            manifest_root,
+            model_root,
+            report_root / "rsna",
+            private_root,
+        ),
+        export_root=export_root,
+        backup_root=backup,
+    )
+    tracking_database = repository_root / "mlflow.db"
+    for root in (
+        cache_root,
+        report_root,
+        model_root,
+        private_root,
+        export_root,
+    ):
+        validate_writable_directory_destination(root, "RSNA campaign directory destination")
+    validate_writable_file_destination(
+        tracking_database, "RSNA campaign tracking database destination"
+    )
+    validate_existing_sqlite_database(tracking_database, "RSNA campaign tracking database")
+    commit, dirty = git_revision(repository_root)
+    if dirty:
+        raise ManifestBuildError("Formal RSNA campaign requires a clean Git worktree")
+    lock_hash = uv_lock_sha256(repository_root / "uv.lock")
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"RSNA raw dataset is missing: {source_root}")
     required_raw = (
-        RAW_ROOT / "stage_2_train_images",
-        RAW_ROOT / "stage_2_train_labels.csv",
-        RAW_ROOT / "stage_2_detailed_class_info.csv",
+        source_root / "stage_2_train_images",
+        source_root / "stage_2_train_labels.csv",
+        source_root / "stage_2_detailed_class_info.csv",
     )
     if not all(path.is_dir() if path.suffix == "" else path.is_file() for path in required_raw):
         raise FileNotFoundError("RSNA raw dataset is incomplete")
-    paths = {
-        "metadata_logistic": Path("configs/rsna_metadata_logistic.yaml"),
-        "metadata_lightgbm": Path("configs/rsna_metadata_lightgbm.yaml"),
-        "cxr": Path("configs/rsna_cxr_densenet.yaml"),
-        "fusion": Path("configs/rsna_cxr_metadata_concat.yaml"),
-    }
-    if missing := [path for path in paths.values() if not path.is_file()]:
+    config_paths = tuple(repository_root / spec.config_relative for spec in RSNA_FORMAL_RUN_PLAN)
+    if missing := [path for path in config_paths if not path.is_file()]:
         raise FileNotFoundError(f"RSNA campaign configs are missing: {missing}")
-    configs = CampaignConfigs(
-        with_runtime(load_experiment_config(paths["metadata_logistic"]), seed=42),
-        with_runtime(load_experiment_config(paths["metadata_lightgbm"]), seed=42),
-        tuple(
-            with_runtime(load_experiment_config(paths["cxr"]), seed=seed) for seed in EXPECTED_SEEDS
-        ),
-        tuple(
-            with_runtime(load_experiment_config(paths["fusion"]), seed=seed)
-            for seed in EXPECTED_SEEDS
-        ),
+    configs = tuple(
+        with_runtime(
+            load_experiment_config(path),
+            seed=spec.seed,
+            manifest_directory=manifest_root,
+            source_root=source_root,
+            model_directory=model_root,
+            report_directory=report_root,
+            private_output_directory=private_root,
+            device="cuda",
+        )
+        for spec, path in zip(RSNA_FORMAL_RUN_PLAN, config_paths, strict=True)
     )
     _validate_neural_campaign_configs(configs)
-    if DEFAULT_TRACKING_URI != "sqlite:///mlflow.db":
-        raise RuntimeError("RSNA campaign requires canonical local mlflow.db tracking")
-    for root in (
-        MANIFEST_ROOT,
-        CACHE_ROOT,
-        REPORT_ROOT,
-        Path("models"),
-        Path("private"),
-        OUTBOX_ROOT,
+    _validate_config_agreement(configs)
+    reference = configs[0]
+    bundle_directory = (
+        reference.runtime.manifest_directory
+        / "rsna"
+        / BUNDLES_DIRECTORY
+        / reference.dataset.bundle_id
+    )
+    validated = validate_bundle_reference(
+        bundle_directory,
+        expected_bundle_id=reference.dataset.bundle_id,
+        expected_manifest_sha256=reference.dataset.bundle_manifest_sha256,
+    )
+    manifest = validate_bundle_directory(
+        bundle_directory,
+        expected_bundle_id=reference.dataset.bundle_id,
+    )
+    if (
+        validated.manifest_sha256 != reference.dataset.bundle_manifest_sha256
+        or manifest["membership"]["split"]["split_assignment_id"]
+        != reference.dataset.split_assignment_id
     ):
-        root.mkdir(parents=True, exist_ok=True)
-        if not os.access(root, os.W_OK):
-            raise PermissionError(f"RSNA campaign output is not writable: {root}")
+        raise ManifestBuildError("Configured RSNA authority lineage is inconsistent")
+    dataset = get_dataset("rsna")
+    if not isinstance(dataset, RsnaDataset):
+        raise TypeError("RSNA campaign requires the concrete RSNA dataset adapter")
+    cxr_reference = next(
+        config
+        for spec, config in zip(RSNA_FORMAL_RUN_PLAN, configs, strict=True)
+        if spec.family_id == "cxr_densenet"
+    )
+    cache_input = dataset.load_image_cache(cxr_reference)
+    if cxr_reference.runtime.source_root is None:
+        raise ManifestBuildError("RSNA campaign requires an explicit source root")
+    validate_cxr_source_availability(
+        cache_input.frame,
+        dataset_root=cxr_reference.runtime.source_root,
+    )
     if shutil.disk_usage(Path.cwd()).free < _MINIMUM_FREE_BYTES:
         raise OSError("RSNA campaign requires at least 16 GiB of free workspace storage")
-    if not torch.cuda.is_available():
-        raise RuntimeError("RSNA campaign requires CUDA")
-    return configs
+    runtime = _required_cuda_runtime(cxr_reference)
+    weight = fingerprint_pretrained_weights("densenet121-res224-chex")
+    roots = RsnaFormalRoots(
+        repository_root=repository_root,
+        source_root=source_root,
+        manifest_root=manifest_root,
+        cache_root=cache_root,
+        model_root=model_root,
+        report_root=report_root,
+        private_root=private_root,
+        control_root=control_root,
+        export_root=export_root,
+        backup_root=backup,
+        tracking_database=tracking_database,
+    )
+    authority = RsnaAuthorityCoordinates(
+        dataset_id=reference.dataset.dataset_id,
+        bundle_id=reference.dataset.bundle_id,
+        bundle_manifest_sha256=reference.dataset.bundle_manifest_sha256,
+        split_assignment_id=reference.dataset.split_assignment_id,
+        task_id=reference.task.task_id,
+        label_policy_version=reference.task.label_policy_version,
+        bundle_directory=bundle_directory,
+    )
+    return ValidatedRsnaPlan(
+        authority=authority,
+        roots=roots,
+        runs=RSNA_FORMAL_RUN_PLAN,
+        configs=configs,
+        dataset=dataset,
+        git_commit=commit,
+        dependency_lock_sha256=lock_hash,
+        pretrained_weight=weight,
+        runtime=runtime,
+        training_execution=_training_execution_policy(cxr_reference, runtime),
+        evaluation_execution=one_shot_loader_policy(pin_memory=runtime.pin_memory_effective),
+        _guard=_FORMAL_PLAN_GUARD,
+    )
 
 
-def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
+def _validate_canonical_rsna_layout(repository_root: Path) -> None:
+    """Reject redirected, aliased, or mistyped checkout-owned RSNA state."""
+    root = repository_root.resolve()
+    directory_roots = tuple(
+        repository_root / path
+        for path in (
+            "data/manifests/rsna",
+            "data/cache/rsna",
+            "models/rsna/packages",
+            "reports/rsna/runs",
+            "reports/rsna/evaluations",
+            "reports/rsna/seed-summaries",
+            "reports/rsna/localization",
+            "reports/rsna/comparisons",
+            "reports/rsna/audit",
+            "reports/rsna/campaigns",
+            "private/control/rsna",
+            "private/predictions/rsna",
+            "private/localization",
+            "outbox",
+            "mlartifacts",
+        )
+    )
+    file_roots = tuple(
+        repository_root / name for name in ("mlflow.db", "mlflow.db-wal", "mlflow.db-shm")
+    )
+    for target in (*directory_roots, *file_roots):
+        try:
+            relative = target.relative_to(repository_root)
+        except ValueError as exc:
+            raise ManifestBuildError("Canonical RSNA layout is outside the repository") from exc
+        current = repository_root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ManifestBuildError("Canonical RSNA layout contains a symlink redirect")
+            if current.exists() and current != target and not current.is_dir():
+                raise ManifestBuildError("Canonical RSNA layout has a parent type mismatch")
+        if target.exists():
+            expects_directory = target in directory_roots
+            if (expects_directory and not target.is_dir()) or (
+                not expects_directory and not target.is_file()
+            ):
+                raise ManifestBuildError("Canonical RSNA layout has a root type mismatch")
+            if not target.resolve().is_relative_to(root):
+                raise ManifestBuildError("Canonical RSNA layout escapes the repository")
+    existing = [path for path in (*directory_roots, *file_roots) if path.exists()]
+    for index, left in enumerate(existing):
+        for right in existing[index + 1 :]:
+            if left.samefile(right):
+                raise ManifestBuildError("Canonical RSNA layout roots are aliased")
+
+
+def _validate_neural_campaign_configs(configs: Sequence[ExperimentConfig]) -> None:
     """Validate all six neural configs against one campaign execution contract."""
+    cxr = tuple(config for config in configs if config.family.family_id == "cxr_densenet")
+    fusions = tuple(
+        config for config in configs if config.family.family_id == "cxr_metadata_concat"
+    )
+    expected_seeds = tuple(
+        spec.seed for spec in RSNA_FORMAL_RUN_PLAN if spec.family_id == "cxr_densenet"
+    )
     if (
-        len(configs.cxr) != len(EXPECTED_SEEDS)
-        or len(configs.fusions) != len(EXPECTED_SEEDS)
-        or tuple(require_runtime_seed(config) for config in configs.cxr) != EXPECTED_SEEDS
-        or tuple(require_runtime_seed(config) for config in configs.fusions) != EXPECTED_SEEDS
+        tuple(require_runtime_seed(config) for config in cxr) != expected_seeds
+        or tuple(require_runtime_seed(config) for config in fusions) != expected_seeds
     ):
-        raise ValueError("RSNA campaign requires CXR and fusion seeds 17, 42, and 2026")
-    if len({config.config_semantic_sha256 for config in configs.cxr}) != 1:
+        raise ValueError("RSNA campaign neural seeds differ from the formal run plan")
+    if len({config.config_semantic_sha256 for config in cxr}) != 1:
         raise ValueError("RSNA CXR configurations do not form one scientific family")
-    if len({config.config_semantic_sha256 for config in configs.fusions}) != 1:
+    if len({config.config_semantic_sha256 for config in fusions}) != 1:
         raise ValueError("RSNA fusion configurations do not form one scientific family")
-    neural_configs = (*configs.cxr, *configs.fusions)
+    neural_configs = (*cxr, *fusions)
     neural_settings = tuple(config.neural for config in neural_configs)
     if any(neural is None for neural in neural_settings):
         raise ValueError("RSNA campaign requires six complete neural configurations")
@@ -371,19 +601,28 @@ def _validate_neural_campaign_configs(configs: CampaignConfigs) -> None:
         raise ValueError("RSNA neural configurations do not share the campaign execution contract")
 
 
-def _validate_configured_bundle(configs: CampaignConfigs, bundle_id: str) -> None:
-    all_configs = (
-        configs.metadata_logistic,
-        configs.metadata_lightgbm,
-        *configs.cxr,
-        *configs.fusions,
+def _validate_config_agreement(configs: Sequence[ExperimentConfig]) -> None:
+    coordinates = {
+        (
+            config.dataset.dataset_id,
+            config.dataset.bundle_id,
+            config.dataset.bundle_manifest_sha256,
+            config.dataset.split_assignment_id,
+            config.task.task_id,
+            config.task.label_policy_version,
+        )
+        for config in configs
+    }
+    observed_matrix = tuple(
+        (config.family.family_id, require_runtime_seed(config)) for config in configs
     )
-    if any(config.dataset.bundle_id != bundle_id for config in all_configs):
-        raise ValueError("RSNA experiment config bundle IDs do not match the built bundle")
-    validate_bundle_directory(
-        MANIFEST_ROOT / "rsna" / BUNDLES_DIRECTORY / bundle_id,
-        expected_bundle_id=bundle_id,
-    )
+    expected_matrix = tuple((spec.family_id, spec.seed) for spec in RSNA_FORMAL_RUN_PLAN)
+    if (
+        len(configs) != len(RSNA_FORMAL_RUN_PLAN)
+        or len(coordinates) != 1
+        or observed_matrix != expected_matrix
+    ):
+        raise ManifestBuildError("RSNA campaign configurations disagree on authority or task")
 
 
 def _required_cuda_runtime(config: ExperimentConfig) -> ResolvedDevice:
@@ -428,35 +667,6 @@ def _transform(config: ExperimentConfig, *, training: bool) -> StandardCxrTransf
     )
 
 
-def _validate_frozen_training_packages(results: Sequence[Any]) -> None:
-    for result in results:
-        path = Path(result.model_path)
-        package = path.parent
-        if isinstance(result, MetadataModelResult):
-            validate_published_model(package)
-        else:
-            validate_neural_package_metadata(package)
-
-
-def _require_fresh_output_surface() -> None:
-    """Reject mixed campaigns without deleting inspectable prior outputs."""
-    generated = (
-        REPORT_ROOT,
-        Path("models"),
-        Path("private/predictions"),
-        Path("private/localization"),
-        Path("mlartifacts"),
-        Path("mlflow.db"),
-        Path("mlflow.db-wal"),
-        Path("mlflow.db-shm"),
-        OUTBOX_ROOT,
-    )
-    if existing := [path for path in generated if path.exists()]:
-        raise FileExistsError(
-            f"RSNA campaign requires a fresh generated-output surface: {existing}"
-        )
-
-
 def _validate_outputs(
     training_results: Sequence[Any],
     evaluation_results: Sequence[Any],
@@ -464,9 +674,12 @@ def _validate_outputs(
     cxr_summary: Path,
     fusion_summary: Path,
     localization: Path,
-    comparison: tuple[Path, Path],
+    comparison: ComparisonResult,
     log_path: Path,
+    *,
+    roots: RsnaFormalRoots,
 ) -> None:
+    private_root = roots.private_root
     if len(training_results) != 8 or len(evaluation_results) != 8:
         raise ValueError("RSNA campaign requires eight training and eight evaluation results")
     package_ids = tuple(result.model_package_id for result in training_results)
@@ -483,146 +696,26 @@ def _validate_outputs(
         cxr_summary,
         fusion_summary,
         localization,
-        *comparison,
+        comparison.directory,
         log_path,
-        Path("mlflow.db"),
     ]
     for result in evaluation_results:
         private = getattr(result, "private_prediction_directory", None)
         if private is not None:
             required.append(Path(private))
-    private_localization = Path("private/localization") / localization.name
+    private_localization = private_root / "localization" / localization.name
     required.append(private_localization)
     if missing := [path for path in required if not path.exists()]:
         raise FileNotFoundError(f"Mandatory RSNA campaign outputs are missing: {missing}")
-    _validate_sqlite_integrity(Path("mlflow.db"))
 
 
-def _write_archive(
-    destination: Path,
-    *,
-    bundle_directory: Path,
-    current_path: Path,
-) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        raise FileExistsError(f"RSNA results archive already exists: {destination}")
-    expected_bundle_root = (MANIFEST_ROOT / "rsna" / BUNDLES_DIRECTORY).resolve()
-    if (
-        bundle_directory.resolve().parent != expected_bundle_root
-        or not bundle_directory.name.startswith("bundle-")
-        or current_path.resolve().parent != (MANIFEST_ROOT / "rsna").resolve()
-        or current_path.name != "CURRENT"
-        or current_path.read_text(encoding="utf-8").strip() != bundle_directory.name
-    ):
-        raise ValueError("Archive bundle lineage does not match the current RSNA bundle")
-    roots = [
-        Path("models"),
-        REPORT_ROOT,
-        Path("private/predictions"),
-        Path("private/localization"),
-        Path("mlartifacts"),
-    ]
-    database = Path("mlflow.db")
-    if missing := [
-        path for path in (*roots, database, bundle_directory, current_path) if not path.exists()
-    ]:
-        raise FileNotFoundError(f"Archive inputs are missing: {missing}")
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    try:
-        with tempfile.TemporaryDirectory(prefix="beyondcxr-mlflow-export-") as temporary_directory:
-            snapshot = Path(temporary_directory) / database.name
-            _snapshot_sqlite_database(database, snapshot)
-            with tarfile.open(temporary, "w:gz") as archive:
-                archive.add(bundle_directory, arcname=bundle_directory.as_posix(), recursive=True)
-                archive.add(current_path, arcname=current_path.as_posix(), recursive=False)
-                for root in roots:
-                    archive.add(root, arcname=root.as_posix(), recursive=True)
-                archive.add(snapshot, arcname=database.as_posix(), recursive=False)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _write_checksum(archive: Path) -> Path:
-    digest = hashlib.sha256()
-    with archive.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    destination = archive.with_suffix(archive.suffix + ".sha256")
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(f"{digest.hexdigest()}  {archive.name}\n", encoding="utf-8")
-    os.replace(temporary, destination)
-    return destination
-
-
-def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
-    """Create one consistent snapshot with archive-relative artifact URIs."""
-    source_uri = f"file:{source.resolve().as_posix()}?mode=ro"
-    with closing(sqlite3.connect(source_uri, uri=True)) as input_database:
-        with closing(sqlite3.connect(destination)) as output_database, output_database:
-            input_database.backup(output_database)
-            _make_mlflow_snapshot_portable(output_database)
-            result = output_database.execute("PRAGMA integrity_check").fetchone()
-    if result != ("ok",):
-        raise RuntimeError("MLflow SQLite snapshot failed integrity validation")
-
-
-def _validate_sqlite_integrity(database: Path) -> None:
-    uri = f"file:{database.resolve().as_posix()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as connection:
-        result = connection.execute("PRAGMA integrity_check").fetchone()
-    if result != ("ok",):
-        raise RuntimeError("MLflow SQLite database failed integrity validation")
-
-
-def _make_mlflow_snapshot_portable(database: sqlite3.Connection) -> None:
-    """Replace machine-absolute MLflow artifact URIs in the exported snapshot."""
-    live_root = Path("mlartifacts").resolve().as_uri().rstrip("/")
-    portable_root = "file:mlartifacts"
-    experiments = database.execute(
-        """
-        SELECT experiments.experiment_id, experiments.artifact_location,
-               COUNT(runs.run_uuid)
-        FROM experiments
-        LEFT JOIN runs ON runs.experiment_id = experiments.experiment_id
-        GROUP BY experiments.experiment_id, experiments.artifact_location
-        """
-    ).fetchall()
-    for experiment_id, location, run_count in experiments:
-        if run_count:
-            if location != live_root:
-                raise ValueError(
-                    "Active MLflow experiment artifact location is outside mlartifacts: "
-                    f"{location!r}"
-                )
-            portable_location = portable_root
-        else:
-            portable_location = f"{portable_root}/experiments/{experiment_id}"
-        database.execute(
-            "UPDATE experiments SET artifact_location = ? WHERE experiment_id = ?",
-            (portable_location, experiment_id),
-        )
-
-    live_prefix = live_root + "/"
-    for run_uuid, artifact_uri in database.execute(
-        "SELECT run_uuid, artifact_uri FROM runs"
-    ).fetchall():
-        if not isinstance(artifact_uri, str) or not artifact_uri.startswith(live_prefix):
-            raise ValueError(
-                f"MLflow run {run_uuid!r} artifact URI is outside mlartifacts: {artifact_uri!r}"
-            )
-        portable_uri = portable_root + "/" + artifact_uri.removeprefix(live_prefix)
-        database.execute(
-            "UPDATE runs SET artifact_uri = ? WHERE run_uuid = ?",
-            (portable_uri, run_uuid),
-        )
-
-
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run the campaign and print its final transport paths."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backup-root", type=Path, required=True)
+    args = parser.parse_args(argv)
     try:
-        result = execute_rsna_campaign()
+        result = execute_rsna_campaign(backup_root=args.backup_root)
     except Exception as exc:
         print(f"RSNA campaign failed: {type(exc).__name__}", file=sys.stderr)
         return 1

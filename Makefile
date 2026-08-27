@@ -1,6 +1,6 @@
-.PHONY: sync lock-check lint format format-check test check pre-commit clean purge-generated \
-	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-evaluate rsna-compare \
-	rsna-summarize rsna-localize rsna-campaign symile-manifest symile-audit symile-cv \
+.PHONY: sync lock-check lint format format-check test check pre-commit clean clear-caches \
+	rsna-inspect rsna-manifest rsna-audit rsna-train rsna-compare \
+	rsna-summarize rsna-campaign prepare-cxr-weights symile-manifest symile-audit symile-cv \
 	symile-develop symile-analyze symile-campaign symile-serve results reproduce \
 	serving-authority release-check
 
@@ -69,6 +69,9 @@ symile-campaign:
 		$(if $(WORKERS),--workers "$(WORKERS)") \
 		--backup-root "$(BACKUP_ROOT)"
 
+prepare-cxr-weights:
+	uv run --locked --no-dev python -m beyondcxr.training.prepare_cxr_weights
+
 symile-serve:
 	@test -n "$(AUTHORITY)" || (echo "AUTHORITY=path/to/serving-authority is required"; exit 2)
 	@test -n "$(PACKAGE_ROOT)" || (echo "PACKAGE_ROOT=path/to/final/packages is required"; exit 2)
@@ -105,13 +108,6 @@ rsna-train:
 	uv run python -m beyondcxr.training.rsna_train --config "$(CONFIG)" --seed "$(SEED)" \
 		$(if $(SOURCE_CXR_PACKAGE_ID),--source-cxr-package-id "$(SOURCE_CXR_PACKAGE_ID)")
 
-rsna-evaluate:
-	@test -n "$(PACKAGE_ID)" || (echo "PACKAGE_ID=<model-package-id> is required"; exit 2)
-	@test -n "$(CONFIG)" || (echo "CONFIG=path/to/experiment.yaml is required"; exit 2)
-	@test -f "$(CONFIG)" || (echo "Experiment config not found: $(CONFIG)"; exit 2)
-	uv run python -m beyondcxr.training.rsna_evaluate \
-		--package-id "$(PACKAGE_ID)" --config "$(CONFIG)"
-
 rsna-compare:
 	@test -n "$(EVALUATION_IDS)" || (echo 'EVALUATION_IDS="<evaluation-id> ..." is required'; exit 2)
 	uv run python -m beyondcxr.training.rsna_compare --evaluation-ids $(EVALUATION_IDS)
@@ -121,13 +117,10 @@ rsna-summarize:
 		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
 	uv run python -m beyondcxr.training.rsna_seed_summary --evaluation-ids $(EVALUATION_IDS)
 
-rsna-localize:
-	@test -n "$(EVALUATION_IDS)" || \
-		(echo 'EVALUATION_IDS="<evaluation17> <evaluation42> <evaluation2026>" is required'; exit 2)
-	uv run python -m beyondcxr.training.rsna_localize --evaluation-ids $(EVALUATION_IDS)
-
 rsna-campaign:
-	uv run --locked --no-dev python -m beyondcxr.training.rsna_campaign_cli
+	@test -n "$(BACKUP_ROOT)" || (echo "BACKUP_ROOT must name an approved persistent destination outside the repository"; exit 2)
+	uv run --locked --no-dev python -m beyondcxr.training.rsna_campaign_cli \
+		--backup-root "$(BACKUP_ROOT)"
 
 pre-commit:
 	uv run pre-commit run --all-files
@@ -157,24 +150,9 @@ clean:
 	printf 'Removed %s cache directories, %s __pycache__ directories, %s .pyc files, %s staging directories, and %s temporary files.\n' \
 		"$$cache_count" "$$pycache_count" "$$pyc_count" "$$staging_count" "$$temporary_count"
 
-purge-generated:
-	@test ! -e private/control/symile/test-open.json && test ! -L private/control/symile/test-open.json || \
-		(echo 'Refusing to purge an opened Symile campaign; preserve its complete frozen state.'; exit 2)
+clear-caches:
 	$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" clean
 	@set -eu; \
-	output_count=0; \
-	for path in reports models private/predictions private/localization private/control/symile data/cache mlartifacts mlflow.db mlflow.db-wal mlflow.db-shm outbox; do \
-		if [ -e "$$path" ]; then rm -rf -- "$$path"; output_count=$$((output_count + 1)); fi; \
-	done; \
-	artifact_count=0; current_count=0; \
-	if [ -d data/manifests ]; then \
-		artifact_count=$$(find data/manifests -type d \
-			\( -name 'bundle-*' -o -name 'cv-assignment-*' \) -print | wc -l); \
-		find data/manifests -type d \
-			\( -name 'bundle-*' -o -name 'cv-assignment-*' \) -prune -exec rm -rf -- {} +; \
-		current_count=$$(find data/manifests \( -type f -o -type l \) -name CURRENT -print | wc -l); \
-		find data/manifests \( -type f -o -type l \) -name CURRENT -exec rm -f -- {} +; \
-		find data/manifests -depth -type d -empty ! -path data/manifests -exec rmdir -- {} \;; \
-	fi; \
-	printf 'Purged %s generated output paths, %s manifest artifacts, and %s CURRENT pointers.\n' \
-		"$$output_count" "$$artifact_count" "$$current_count"
+	cache_count=0; \
+	if [ -e data/cache ] || [ -L data/cache ]; then rm -rf -- data/cache; cache_count=1; fi; \
+	printf 'Removed %s disposable cache roots.\n' "$$cache_count"

@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from beyondcxr.training.config import ConfigError, load_experiment_config, with_runtime
+from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.training.rsna_train import main as train_main
 
 
@@ -47,11 +48,12 @@ def test_runtime_seeds_share_one_locked_cxr_config() -> None:
     path = Path("configs/rsna_cxr_densenet.yaml")
     documents = [yaml.safe_load(path.read_text(encoding="utf-8")) for _ in range(3)]
     baseline = load_experiment_config(path)
-    configs = [with_runtime(baseline, seed=seed) for seed in (17, 42, 2026)]
+    configs = [with_runtime(baseline, seed=seed) for seed in RSNA_NEURAL_SEEDS]
     seeds = {config.runtime.seed for config in configs}
     semantic_hashes = {config.config_semantic_sha256 for config in configs}
 
-    assert seeds == {17, 42, 2026}
+    assert RSNA_NEURAL_SEEDS == (17, 42, 2026)
+    assert seeds == set(RSNA_NEURAL_SEEDS)
     assert documents[1:] == documents[:-1]
     assert len(semantic_hashes) == 1
 

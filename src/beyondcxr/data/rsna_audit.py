@@ -102,7 +102,15 @@ def _generate_rsna_audit(
             [stage / filename for filename in REPORT_FILENAMES],
             forbidden_source_values=_source_identifiers(sample_frame),
         )
-        publish_directory(stage, output)
+        if output.exists() or output.is_symlink():
+            if (
+                output.is_symlink()
+                or not output.is_dir()
+                or _audit_bytes(output) != _audit_bytes(stage)
+            ):
+                raise ValueError("Existing RSNA audit differs from the frozen bundle derivative")
+        else:
+            publish_directory(stage, output)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -115,6 +123,16 @@ def _generate_rsna_audit(
         "report_directory": output.as_posix(),
         "reports": list(REPORT_FILENAMES),
     }
+
+
+def _audit_bytes(directory: Path) -> dict[str, bytes]:
+    """Return the exact bounded audit file set for idempotent immutable publication."""
+    paths = tuple(directory.iterdir())
+    if {path.name for path in paths} != set(REPORT_FILENAMES) or any(
+        path.is_symlink() or not path.is_file() for path in paths
+    ):
+        raise ValueError("RSNA audit artifact set is invalid")
+    return {path.name: path.read_bytes() for path in paths}
 
 
 def _audit_frame(samples: pd.DataFrame, labels: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame:

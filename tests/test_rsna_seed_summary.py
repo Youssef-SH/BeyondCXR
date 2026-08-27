@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from beyondcxr.training import rsna_seed_summary
+from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.training.rsna_seed_summary import (
-    EXPECTED_SEEDS,
     MANIFEST_FILENAME,
     SEED_SUMMARY_FILENAMES,
     publish_seed_summary,
@@ -17,9 +17,9 @@ from beyondcxr.training.rsna_seed_summary import (
 )
 
 _EVALUATION_IDS = {
-    seed: "evaluation-" + f"{index:064x}" for index, seed in enumerate(EXPECTED_SEEDS, start=1)
+    seed: "evaluation-" + f"{index:064x}" for index, seed in enumerate(RSNA_NEURAL_SEEDS, start=1)
 }
-_PACKAGE_IDS = {seed: "model-package-" + f"{seed:064x}" for seed in EXPECTED_SEEDS}
+_PACKAGE_IDS = {seed: "model-package-" + f"{seed:064x}" for seed in RSNA_NEURAL_SEEDS}
 
 
 def _threshold_contract() -> dict[str, object]:
@@ -40,7 +40,7 @@ def _evaluation_policy() -> dict[str, object]:
 
 
 def _claims(seed: int) -> dict[str, object]:
-    index = EXPECTED_SEEDS.index(seed)
+    index = RSNA_NEURAL_SEEDS.index(seed)
     offset = index / 10
     operating = {
         "precision": 0.50 + offset,
@@ -129,7 +129,7 @@ def _evaluation(seed: int) -> SimpleNamespace:
 @pytest.fixture
 def authority(monkeypatch: pytest.MonkeyPatch):
     evaluations = {identity: _evaluation(seed) for seed, identity in _EVALUATION_IDS.items()}
-    packages = {_PACKAGE_IDS[seed]: _package(seed) for seed in EXPECTED_SEEDS}
+    packages = {_PACKAGE_IDS[seed]: _package(seed) for seed in RSNA_NEURAL_SEEDS}
 
     def validate_evaluation(path: Path, **kwargs):
         assert kwargs["expected_evaluation_id"] == path.name
@@ -168,7 +168,7 @@ def test_summary_is_authoritative_deterministic_complete_and_idempotent(
     assert first.seed_summary_id == second.seed_summary_id
     assert first.directory == second.directory
     assert {path.name for path in first.directory.iterdir()} == SEED_SUMMARY_FILENAMES
-    assert document["evaluation_ids"] == [_EVALUATION_IDS[seed] for seed in EXPECTED_SEEDS]
+    assert document["evaluation_ids"] == [_EVALUATION_IDS[seed] for seed in RSNA_NEURAL_SEEDS]
     assert set(document["aggregate"]["probability_metrics"]) == {
         "average_precision",
         "roc_auc",
@@ -360,7 +360,7 @@ def test_summary_rejects_wrong_seed_set(tmp_path: Path, authority) -> None:
 
 def test_summary_rejects_unsupported_three_seed_family(tmp_path: Path, authority) -> None:
     evaluations, packages = authority
-    for seed in EXPECTED_SEEDS:
+    for seed in RSNA_NEURAL_SEEDS:
         packages[_PACKAGE_IDS[seed]].update(
             {"family_id": "metadata_logistic", "modalities": ["metadata"]}
         )
@@ -375,7 +375,7 @@ def test_summary_ignores_operational_and_fitted_member_differences(
     tmp_path: Path, authority
 ) -> None:
     _, packages = authority
-    for index, seed in enumerate(EXPECTED_SEEDS):
+    for index, seed in enumerate(RSNA_NEURAL_SEEDS):
         packages[_PACKAGE_IDS[seed]]["runtime_provenance"] = {"device": f"cuda:{index}"}
         packages[_PACKAGE_IDS[seed]]["model_state_sha256"] = f"{index + 1:064x}"
         packages[_PACKAGE_IDS[seed]]["model_identity"]["pretrained_weight"].update(
@@ -392,7 +392,7 @@ def test_summary_ignores_operational_and_fitted_member_differences(
 def test_summary_rejects_fusion_source_with_different_seed(tmp_path: Path, authority) -> None:
     evaluations, packages = authority
     source_ids: dict[int, str] = {}
-    for seed in EXPECTED_SEEDS:
+    for seed in RSNA_NEURAL_SEEDS:
         source_id = "model-package-" + f"{seed + 10_000:064x}"
         source_ids[seed] = source_id
         source = deepcopy(_package(seed))

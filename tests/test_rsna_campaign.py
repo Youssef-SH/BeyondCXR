@@ -3,28 +3,33 @@ from __future__ import annotations
 import hashlib
 import shutil
 import sqlite3
-import tarfile
-from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
-import mlflow
 import pytest
-from mlflow.tracking import MlflowClient
+from rsna_preservation_test_support import build_real_rsna_campaign_closure
 
+from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.training.config import load_experiment_config, with_runtime
 from beyondcxr.training.rsna_campaign import (
-    CampaignConfigs,
+    _preflight_rsna_campaign,
+    _validate_config_agreement,
     _validate_neural_campaign_configs,
     _validate_outputs,
-    _write_archive,
-    _write_checksum,
     execute_rsna_campaign,
     main,
 )
+from beyondcxr.training.rsna_campaign_control import validate_execution
+from beyondcxr.training.rsna_compare import ComparisonResult
 from beyondcxr.training.rsna_datasets import RsnaDataset
-from beyondcxr.utils.mlflow_utils import configure_mlflow
+from beyondcxr.training.rsna_formal import (
+    _FORMAL_PLAN_GUARD,
+    RSNA_FORMAL_RUN_PLAN,
+    RsnaAuthorityCoordinates,
+    RsnaFormalRoots,
+    ValidatedRsnaPlan,
+)
 
 _PACKAGE_IDS = {
     name: "model-package-" + character * 64
@@ -49,381 +54,663 @@ def _evaluation_id(package_id: str) -> str:
     return "evaluation-" + hashlib.sha256(package_id.encode("ascii")).hexdigest()
 
 
-def _configs() -> CampaignConfigs:
-    seeds = (17, 42, 2026)
-    return CampaignConfigs(
-        with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42),
-        with_runtime(load_experiment_config("configs/rsna_metadata_lightgbm.yaml"), seed=42),
-        tuple(
-            with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=seed)
-            for seed in seeds
-        ),
-        tuple(
-            with_runtime(load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=seed)
-            for seed in seeds
-        ),
+def _configs():
+    return tuple(
+        with_runtime(load_experiment_config(spec.config_relative), seed=spec.seed)
+        for spec in RSNA_FORMAL_RUN_PLAN
     )
 
 
-def test_campaign_freezes_complete_candidate_set_before_test_access(
+def _plan(tmp_path: Path) -> ValidatedRsnaPlan:
+    configs = _configs()
+    reference = configs[0]
+    roots = RsnaFormalRoots(
+        tmp_path,
+        tmp_path / "data/raw/rsna/extracted",
+        tmp_path / "data/manifests",
+        tmp_path / "data/cache/rsna",
+        tmp_path / "models/rsna",
+        tmp_path / "reports",
+        tmp_path / "private",
+        tmp_path / "private/control/rsna",
+        tmp_path / "outbox",
+        tmp_path / "backup",
+        tmp_path / "mlflow.db",
+    )
+    return ValidatedRsnaPlan(
+        authority=RsnaAuthorityCoordinates(
+            reference.dataset.dataset_id,
+            reference.dataset.bundle_id,
+            reference.dataset.bundle_manifest_sha256,
+            reference.dataset.split_assignment_id,
+            reference.task.task_id,
+            reference.task.label_policy_version,
+            tmp_path / f"data/manifests/rsna/bundles/{reference.dataset.bundle_id}",
+        ),
+        roots=roots,
+        runs=RSNA_FORMAL_RUN_PLAN,
+        configs=configs,
+        dataset=RsnaDataset(),
+        git_commit="f" * 40,
+        dependency_lock_sha256="0" * 64,
+        pretrained_weight=SimpleNamespace(as_dict=lambda: {}),
+        runtime=SimpleNamespace(pin_memory_effective=True),
+        training_execution=SimpleNamespace(),
+        evaluation_execution=SimpleNamespace(),
+        _guard=_FORMAL_PLAN_GUARD,
+    )
+
+
+def test_formal_preflight_accepts_existing_tracking_database_on_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    configs = _configs()
-    monkeypatch.chdir(tmp_path)
-    events: list[tuple[str, object]] = []
-    training_policies = []
-    evaluation_policies = []
-    evaluation_configs = []
-    expected_package_ids = tuple(_PACKAGE_IDS.values())
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    with sqlite3.connect(repository_root / "mlflow.db") as connection:
+        connection.execute("CREATE TABLE tracking_state (value INTEGER NOT NULL)")
+    backup_root = tmp_path / "backup"
+    monkeypatch.chdir(repository_root)
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._validate_prerequisites",
-        lambda: events.append(("prerequisites", None)) or configs,
+        "beyondcxr.training.rsna_campaign.discover_repository_root",
+        lambda: repository_root,
+    )
+
+    class DestinationValidationPassed(Exception):
+        pass
+
+    def stop_after_destination_validation(root: Path) -> tuple[str, bool]:
+        assert root == repository_root
+        raise DestinationValidationPassed
+
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.git_revision",
+        stop_after_destination_validation,
+    )
+
+    with pytest.raises(DestinationValidationPassed):
+        _preflight_rsna_campaign(backup_root=backup_root)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "models/rsna/packages",
+        "reports/rsna/runs",
+        "private/control/rsna",
+        "private/predictions/rsna",
+    ),
+)
+def test_formal_preflight_rejects_nested_canonical_layout_symlinks_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    repository_root = tmp_path / "repository"
+    redirected = tmp_path / "redirected"
+    repository_root.mkdir()
+    redirected.mkdir()
+    branch = repository_root / relative
+    branch.parent.mkdir(parents=True)
+    branch.symlink_to(redirected, target_is_directory=True)
+    monkeypatch.chdir(repository_root)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.discover_repository_root",
+        lambda: repository_root,
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.ensure_pretrained_weights",
-        lambda name: events.append(("weights", name)),
-    )
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.build_and_write",
-        lambda *args: (
-            events.append(("manifest_build", None))
-            or SimpleNamespace(
-                paths=SimpleNamespace(
-                    bundle_id="bundle",
-                    bundle_directory=Path("data/manifests/rsna/bundles/bundle-test"),
-                    current_path=Path("data/manifests/rsna/CURRENT"),
-                )
-            )
+        "beyondcxr.training.rsna_campaign.git_revision",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("canonical layout validation must happen first")
         ),
     )
+
+    with pytest.raises(ManifestBuildError, match="Canonical RSNA layout.*symlink redirect"):
+        _preflight_rsna_campaign(backup_root=tmp_path / "backup")
+
+
+def test_formal_preflight_rejects_canonical_layout_type_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository_root = tmp_path / "repository"
+    runs = repository_root / "reports/rsna/runs"
+    runs.parent.mkdir(parents=True)
+    runs.write_bytes(b"not a directory")
+    monkeypatch.chdir(repository_root)
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._validate_configured_bundle",
-        lambda *args: events.append(("manifest_validation", None)),
+        "beyondcxr.training.rsna_campaign.discover_repository_root",
+        lambda: repository_root,
+    )
+
+    with pytest.raises(ManifestBuildError, match="Canonical RSNA layout.*root type mismatch"):
+        _preflight_rsna_campaign(backup_root=tmp_path / "backup")
+
+
+def test_campaign_consumes_preflight_authority_and_freezes_before_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight = _plan(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    events: list[tuple[str, object]] = []
+    execution_directory = tmp_path / "private/control/rsna/executions/rsna-execution-test"
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda **kwargs: events.append(("preflight", kwargs["backup_root"])) or preflight,
+    )
+    execution = SimpleNamespace(
+        execution_id="rsna-execution-" + "a" * 64,
+        directory=execution_directory,
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_or_validate_execution",
+        lambda plan: events.append(("execution", plan)) or execution,
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.generate_rsna_audit",
-        lambda *args: events.append(("audit", None)),
+        lambda *args, **kwargs: events.append(("audit", kwargs["bundle_id"])),
     )
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
-    cache = SimpleNamespace(identity=SimpleNamespace(cache_id="cache-" + "0" * 64))
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
-        lambda *args, **kwargs: events.append(("cache", None)) or cache,
-    )
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._required_cuda_runtime",
-        lambda config: SimpleNamespace(pin_memory_effective=True),
+        lambda *args, **kwargs: events.append(("cache", None)) or SimpleNamespace(),
     )
 
     def result(run_id: str):
         return SimpleNamespace(
             run_id=run_id,
             model_package_id=_PACKAGE_IDS[run_id],
-            model_path=tmp_path / f"{run_id}.model",
-            artifact_directory=tmp_path / f"{run_id}.report",
+            model_path=tmp_path / f"models/rsna/packages/{_PACKAGE_IDS[run_id]}/model.pt",
+            artifact_directory=tmp_path / f"reports/rsna/runs/{run_id}",
         )
 
     metadata_ids = iter(("metadata-logistic", "metadata-lightgbm"))
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.train_metadata_experiment",
-        lambda *args, **kwargs: (
-            events.append(("train", run_id := next(metadata_ids))) or result(run_id)
-        ),
+        lambda *args, **kwargs: result(next(metadata_ids)),
     )
     cxr_ids = iter(("cxr-17", "cxr-42", "cxr-2026"))
-
-    def train_cxr(*args, **kwargs):
-        training_policies.append(kwargs["execution"])
-        run_id = next(cxr_ids)
-        events.append(("train", run_id))
-        return result(run_id)
-
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_cxr_experiment", train_cxr)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.train_cxr_experiment",
+        lambda *args, **kwargs: result(next(cxr_ids)),
+    )
 
     def train_fusion(config, *, source_cxr_package_id, **kwargs):
-        training_policies.append(kwargs["execution"])
         run_id = f"fusion-{config.runtime.seed}"
         events.append(("fusion_source", (run_id, source_cxr_package_id)))
-        events.append(("train", run_id))
         return result(run_id)
 
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_fusion_experiment", train_fusion)
 
+    def freeze(**kwargs):
+        values = tuple(kwargs["results"])
+        execution_directory.mkdir(parents=True)
+        (execution_directory / "package-freeze.json").write_text("{}\n", encoding="utf-8")
+        events.append(("candidate_set_frozen", tuple(item.model_package_id for item in values)))
+        return SimpleNamespace(packages=values)
+
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_or_validate_package_freeze", freeze
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.load_evaluation_record",
+        lambda *args, **kwargs: None,
+    )
+
     def evaluate(package_id, **kwargs):
-        frozen = [value for kind, value in events if kind == "candidate_set_frozen"]
-        assert frozen == [expected_package_ids]
-        evaluation_policies.append(kwargs["execution"])
-        evaluation_configs.append(kwargs["evaluation_config"])
+        assert any(kind == "candidate_set_frozen" for kind, _ in events)
         events.append(("test_access", package_id))
+        evaluation_id = _evaluation_id(package_id)
         return SimpleNamespace(
             mlflow_run_id=f"run-{package_id}",
-            evaluation_id=_evaluation_id(package_id),
-            artifact_directory=tmp_path / package_id,
+            evaluation_id=evaluation_id,
+            prediction_id="prediction-" + package_id[-64:],
+            model_package_id=package_id,
+            artifact_directory=tmp_path / f"reports/rsna/evaluations/{evaluation_id}",
+            private_prediction_directory=tmp_path / f"private/predictions/rsna/{package_id}",
         )
 
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.evaluate_model_package", evaluate)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_evaluation_record",
+        lambda execution, result: events.append(("evaluation_record", result.evaluation_id)),
+    )
 
-    def summarize(run_ids, **kwargs):
-        events.append(("summary", tuple(run_ids)))
-        return SimpleNamespace(report_directory=tmp_path / f"summary-{run_ids[0]}")
+    def summarize(ids, **kwargs):
+        identity = "seed-summary-" + hashlib.sha256("".join(ids).encode()).hexdigest()
+        return SimpleNamespace(
+            seed_summary_id=identity,
+            directory=tmp_path / f"reports/rsna/seed-summaries/{identity}",
+            report_directory=tmp_path / f"reports/rsna/seed-summaries/{identity}",
+        )
 
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.publish_seed_summary", summarize)
+    localization = tmp_path / "reports/rsna/localization/localization-test"
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.generate_localization_report",
-        lambda run_ids, **kwargs: (
-            events.append(("localize", tuple(run_ids))) or tmp_path / "localization"
-        ),
+        lambda *args, **kwargs: localization,
+    )
+    comparison = ComparisonResult(
+        "comparison-" + "b" * 64,
+        tmp_path / ("reports/rsna/comparisons/comparison-" + "b" * 64),
+        tmp_path / "table.csv",
+        tmp_path / "table.md",
+        8,
+        {},
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.regenerate_comparison",
-        lambda *args, **kwargs: (
-            events.append(("compare", None))
-            or (tmp_path / "comparison.csv", tmp_path / "comparison.md", 16)
-        ),
-    )
-
-    def validate_candidates(results):
-        package_ids = tuple(result.model_package_id for result in results)
-        assert package_ids == expected_package_ids
-        events.append(("candidate_set_frozen", package_ids))
-
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._validate_frozen_training_packages",
-        validate_candidates,
+        lambda *args, **kwargs: comparison,
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign._validate_outputs",
-        lambda *args: events.append(("validate", None)),
+        lambda *args, **kwargs: events.append(("outputs_validated", None)),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.campaign_export_members",
+        lambda **kwargs: (SimpleNamespace(),),
     )
 
-    def archive(path, **_lineage):
-        log = (
-            Path("reports/rsna/campaigns")
-            / next(child.name for child in Path("reports/rsna/campaigns").iterdir())
-            / "execution.log"
-        )
-        archived_log = log.read_text(encoding="utf-8")
-        assert "event=campaign_ready_for_export" in archived_log
-        assert "event=campaign_succeeded" not in archived_log
-        events.append(("archive", None))
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def export(**kwargs):
+        path = tmp_path / "outbox/campaign.zip"
+        path.parent.mkdir(parents=True)
         path.write_bytes(b"archive")
+        path.with_suffix(".zip.sha256").write_text("checksum\n", encoding="utf-8")
+        events.append(("export", kwargs["export_name"]))
+        return path
 
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign._write_archive", archive)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.export_and_verify", export)
 
-    campaign = execute_rsna_campaign()
+    campaign = execute_rsna_campaign(backup_root=tmp_path / "backup")
 
-    assert [(kind, value) for kind, value in events if kind == "fusion_source"] == [
-        ("fusion_source", ("fusion-17", _PACKAGE_IDS["cxr-17"])),
-        ("fusion_source", ("fusion-42", _PACKAGE_IDS["cxr-42"])),
-        ("fusion_source", ("fusion-2026", _PACKAGE_IDS["cxr-2026"])),
-    ]
-    training_positions = [index for index, value in enumerate(events) if value[0] == "train"]
-    evaluation_positions = [
-        index for index, value in enumerate(events) if value[0] == "test_access"
-    ]
-    freeze_position = next(
-        index for index, value in enumerate(events) if value[0] == "candidate_set_frozen"
-    )
-    assert len(training_positions) == 8
-    assert len(evaluation_positions) == 8
-    assert max(training_positions) < min(evaluation_positions)
-    assert max(training_positions) < freeze_position < min(evaluation_positions)
-    assert len(training_policies) == 6
-    assert all(policy.lifecycle == "reused" for policy in training_policies)
-    assert len(evaluation_policies) == 8
-    assert all(policy.lifecycle == "one_shot" for policy in evaluation_policies)
-    assert evaluation_configs == [
-        configs.metadata_logistic,
-        configs.metadata_lightgbm,
-        *configs.cxr,
-        *configs.fusions,
-    ]
-    assert [kind for kind, _ in events[:6]] == [
-        "prerequisites",
-        "weights",
-        "manifest_build",
-        "manifest_validation",
-        "audit",
-        "cache",
-    ]
-    assert [value for kind, value in events if kind == "summary"] == [
-        tuple(_evaluation_id(_PACKAGE_IDS[f"cxr-{seed}"]) for seed in (17, 42, 2026)),
-        tuple(_evaluation_id(_PACKAGE_IDS[f"fusion-{seed}"]) for seed in (17, 42, 2026)),
-    ]
+    freeze_index = next(i for i, event in enumerate(events) if event[0] == "candidate_set_frozen")
+    test_indices = [i for i, event in enumerate(events) if event[0] == "test_access"]
+    assert freeze_index < min(test_indices)
+    assert len(test_indices) == 8
+    assert events[0][0] == "preflight"
     assert campaign.archive_path.is_file()
     assert campaign.checksum_path.is_file()
-    assert campaign.campaign_log_path.is_file()
-    campaign_log = campaign.campaign_log_path.read_text(encoding="utf-8")
-    assert "event=campaign_started" in campaign_log
-    assert "event=campaign_succeeded" in campaign_log
-    assert [kind for kind, _ in events][-3:] == ["compare", "validate", "archive"]
 
 
-def test_training_failure_never_crosses_test_boundary(
+def test_campaign_resume_reuses_frozen_packages_and_evaluations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    configs = _configs()
+    preflight = _plan(tmp_path)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign._validate_prerequisites", lambda: configs)
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.ensure_pretrained_weights", lambda name: None
+    execution_directory = tmp_path / "private/control/rsna/executions/execution"
+    execution_directory.mkdir(parents=True)
+    (execution_directory / "package-freeze.json").write_text("{}\n", encoding="utf-8")
+    packages = tuple(
+        SimpleNamespace(
+            run_id=name,
+            model_package_id=package_id,
+            model_path=tmp_path / f"models/rsna/packages/{package_id}/model.pt",
+            artifact_directory=tmp_path / f"reports/rsna/runs/{name}",
+        )
+        for name, package_id in _PACKAGE_IDS.items()
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.build_and_write",
-        lambda *args: SimpleNamespace(
-            paths=SimpleNamespace(
-                bundle_id="bundle",
-                bundle_directory=Path("data/manifests/rsna/bundles/bundle-test"),
-                current_path=Path("data/manifests/rsna/CURRENT"),
-            )
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: preflight
+    )
+    execution = SimpleNamespace(execution_id="execution", directory=execution_directory)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_or_validate_execution", lambda plan: execution
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.validate_package_freeze",
+        lambda *args, **kwargs: SimpleNamespace(packages=packages),
+    )
+    for name in (
+        "train_metadata_experiment",
+        "train_cxr_experiment",
+        "train_fusion_experiment",
+        "evaluate_model_package",
+    ):
+        monkeypatch.setattr(
+            f"beyondcxr.training.rsna_campaign.{name}",
+            lambda *args, _name=name, **kwargs: pytest.fail(f"unexpected {_name}"),
+        )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+
+    def completed(*args, package_id, **kwargs):
+        return SimpleNamespace(
+            evaluation_id=_evaluation_id(package_id),
+            prediction_id="prediction-" + package_id[-64:],
+            model_package_id=package_id,
+            mlflow_run_id="run",
+            artifact_directory=tmp_path / "evaluation",
+            private_prediction_directory=tmp_path / "prediction",
+        )
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.load_evaluation_record", completed)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_seed_summary",
+        lambda ids, **kwargs: SimpleNamespace(
+            seed_summary_id="summary", directory=tmp_path, report_directory=tmp_path
         ),
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._validate_configured_bundle", lambda *args: None
+        "beyondcxr.training.rsna_campaign.generate_localization_report",
+        lambda *args, **kwargs: tmp_path / "localization",
     )
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args: None)
-    monkeypatch.setattr("beyondcxr.training.rsna_campaign.get_dataset", lambda key: RsnaDataset())
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.regenerate_comparison",
+        lambda *args, **kwargs: ComparisonResult("comparison", tmp_path, tmp_path, tmp_path, 8, {}),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._validate_outputs", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.campaign_export_members",
+        lambda **kwargs: (SimpleNamespace(),),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.export_and_verify",
+        lambda **kwargs: _archive(tmp_path),
+    )
+
+    execute_rsna_campaign(backup_root=tmp_path / "backup")
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("fit failed"), KeyboardInterrupt(), SystemExit(2)]
+)
+def test_training_failure_cannot_cross_package_freeze_or_heldout_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    plan = _plan(tmp_path)
+    execution_directory = plan.roots.control_root / "executions/execution"
+    execution_directory.mkdir(parents=True)
+    execution = SimpleNamespace(execution_id="execution", directory=execution_directory)
+    heldout_calls = []
+    freeze_calls = []
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: plan
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_or_validate_execution", lambda value: execution
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
         lambda *args, **kwargs: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._required_cuda_runtime",
-        lambda config: SimpleNamespace(pin_memory_effective=False),
+        "beyondcxr.training.rsna_campaign._train_metadata",
+        lambda value: (_ for _ in ()).throw(failure),
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.train_metadata_experiment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("training failed")),
+        "beyondcxr.training.rsna_campaign.publish_or_validate_package_freeze",
+        lambda **kwargs: freeze_calls.append(kwargs),
     )
-    evaluations: list[str] = []
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.evaluate_model_package",
-        lambda package_id, **kwargs: evaluations.append(package_id),
+        lambda *args, **kwargs: heldout_calls.append((args, kwargs)),
     )
-    with pytest.raises(RuntimeError):
-        execute_rsna_campaign()
-    assert evaluations == []
-    log_path = next((tmp_path / "reports/rsna/campaigns").glob("*/execution.log"))
-    assert "event=campaign_failed" in log_path.read_text(encoding="utf-8")
+
+    with pytest.raises(type(failure)):
+        execute_rsna_campaign(backup_root=plan.roots.backup_root)
+
+    assert freeze_calls == []
+    assert heldout_calls == []
+    assert not (execution_directory / "package-freeze.json").exists()
+    assert not (plan.roots.private_root / "predictions/rsna").exists()
+    logs = tuple((plan.roots.report_root / "rsna/campaigns").glob("*/execution.log"))
+    assert len(logs) == 1
+    assert "event=campaign_failed" in logs[0].read_text(encoding="utf-8")
 
 
-def test_campaign_rejects_existing_outputs_without_deleting_them(
+def test_partial_training_publication_is_not_completion_before_package_freeze(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    existing = Path("models/rsna/packages/model-package-existing/model.pt")
-    existing.parent.mkdir(parents=True)
-    existing.write_bytes(b"partial output")
+    closure = build_real_rsna_campaign_closure(tmp_path / "campaign")
+    plan = closure.plan
+    execution = closure.execution
+    execution_id = execution.execution_id
+    freeze_path = execution.directory / "package-freeze.json"
+    freeze_path.unlink()
+    shutil.rmtree(execution.directory / "evaluations")
+    for path in (
+        plan.roots.report_root / "rsna/evaluations",
+        plan.roots.report_root / "rsna/seed-summaries",
+        plan.roots.report_root / "rsna/localization",
+        plan.roots.report_root / "rsna/comparisons",
+        plan.roots.private_root / "predictions/rsna",
+        plan.roots.private_root / "localization",
+    ):
+        shutil.rmtree(path)
 
-    with pytest.raises(FileExistsError):
-        execute_rsna_campaign()
+    holding = tmp_path / "holding"
+    holding_packages = holding / "packages"
+    holding_reports = holding / "reports"
+    holding_packages.mkdir(parents=True)
+    holding_reports.mkdir(parents=True)
+    results = {
+        (spec.family_id, spec.seed): result
+        for spec, result in zip(plan.runs, closure.training_results, strict=True)
+    }
+    for result in results.values():
+        result.model_path.parent.rename(holding_packages / result.model_package_id)
+        result.artifact_directory.rename(holding_reports / result.run_id)
 
-    assert existing.read_bytes() == b"partial output"
+    monkeypatch.chdir(plan.roots.repository_root)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda **kwargs: plan,
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+
+    phase = "interrupt"
+    calls: dict[str, list[tuple[str, int]]] = {
+        "interrupt": [],
+        "conflict": [],
+        "complete": [],
+    }
+    restored: dict[str, list[tuple[str, int]]] = {
+        "interrupt": [],
+        "conflict": [],
+        "complete": [],
+    }
+
+    class PlannedInterruption(RuntimeError):
+        pass
+
+    class HeldoutReached(RuntimeError):
+        pass
+
+    def train(config, **kwargs):
+        del kwargs
+        key = (config.family.family_id, config.runtime.seed)
+        calls[phase].append(key)
+        if phase == "interrupt" and len(calls[phase]) == 2:
+            raise PlannedInterruption("interrupted after one durable training publication")
+        result = results[key]
+        package = result.model_path.parent
+        report = result.artifact_directory
+        if not package.exists():
+            (holding_packages / result.model_package_id).rename(package)
+            (holding_reports / result.run_id).rename(report)
+            restored[phase].append(key)
+        return result
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_metadata_experiment", train)
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_cxr_experiment", train)
+
+    def train_fusion(config, *, source_cxr_package_id, **kwargs):
+        expected = results[("cxr_densenet", config.runtime.seed)].model_package_id
+        assert source_cxr_package_id == expected
+        return train(config, **kwargs)
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.train_fusion_experiment", train_fusion)
+    heldout_calls: list[str] = []
+
+    def heldout(package_id, *, authorization, **kwargs):
+        del kwargs
+        assert freeze_path.is_file()
+        assert len(authorization.packages) == 8
+        authorization.require(package_id)
+        assert all(result.model_path.parent.is_dir() for result in results.values())
+        assert all(result.artifact_directory.is_dir() for result in results.values())
+        heldout_calls.append(package_id)
+        raise HeldoutReached("held-out reached only after complete freeze")
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.evaluate_model_package", heldout)
+
+    with pytest.raises(PlannedInterruption, match="one durable training publication"):
+        execute_rsna_campaign(backup_root=plan.roots.backup_root)
+
+    first_key = ("metadata_logistic", 42)
+    first = results[first_key]
+    assert calls["interrupt"] == [first_key, ("metadata_lightgbm", 42)]
+    assert restored["interrupt"] == [first_key]
+    assert first.model_path.parent.is_dir()
+    assert first.artifact_directory.is_dir()
+    assert sum(result.model_path.parent.is_dir() for result in results.values()) == 1
+    assert not freeze_path.exists()
+    assert heldout_calls == []
+    assert validate_execution(execution.directory).execution_id == execution_id
+
+    report_file = first.artifact_directory / "evaluation_report.md"
+    original_report = report_file.read_bytes()
+    report_file.write_bytes(original_report + b"conflicting partial state\n")
+    phase = "conflict"
+    with pytest.raises(ValueError, match="differs from authoritative evidence rendering"):
+        execute_rsna_campaign(backup_root=plan.roots.backup_root)
+
+    assert calls["conflict"] == [(spec.family_id, spec.seed) for spec in plan.runs]
+    assert len(restored["conflict"]) == 7
+    assert all(result.model_path.parent.is_dir() for result in results.values())
+    assert all(result.artifact_directory.is_dir() for result in results.values())
+    assert not freeze_path.exists()
+    assert heldout_calls == []
+    assert validate_execution(execution.directory).execution_id == execution_id
+
+    report_file.write_bytes(original_report)
+    phase = "complete"
+    with pytest.raises(HeldoutReached, match="only after complete freeze"):
+        execute_rsna_campaign(backup_root=plan.roots.backup_root)
+
+    assert calls["complete"] == [(spec.family_id, spec.seed) for spec in plan.runs]
+    assert restored["complete"] == []
+    assert freeze_path.is_file()
+    assert len(heldout_calls) == 1
+    assert validate_execution(execution.directory).execution_id == execution_id
 
 
-def test_campaign_cli_preserves_process_interrupts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_source_authentication_failure_prevents_all_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _plan(tmp_path)
+    execution_directory = plan.roots.control_root / "executions/execution"
+    execution_directory.mkdir(parents=True)
+    execution = SimpleNamespace(execution_id="execution", directory=execution_directory)
+    training_calls = []
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: plan
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.publish_or_validate_execution", lambda value: execution
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.generate_rsna_audit", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.prepare_rsna_cxr_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ManifestBuildError("source inventory SHA-256 mismatch")
+        ),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._train_metadata",
+        lambda value: training_calls.append(value),
+    )
+
+    with pytest.raises(ManifestBuildError, match="source inventory SHA-256 mismatch"):
+        execute_rsna_campaign(backup_root=plan.roots.backup_root)
+
+    assert training_calls == []
+    assert not (execution_directory / "package-freeze.json").exists()
+    assert not (plan.roots.private_root / "predictions/rsna").exists()
+
+
+def _archive(tmp_path: Path) -> Path:
+    path = tmp_path / "campaign.zip"
+    path.write_bytes(b"archive")
+    path.with_suffix(".zip.sha256").write_text("checksum\n", encoding="utf-8")
+    return path
+
+
+def test_campaign_cli_requires_backup_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = []
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.execute_rsna_campaign",
-        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or SimpleNamespace(
+                campaign_id="campaign",
+                model_package_ids=(),
+                evaluation_ids=(),
+                training_run_ids=(),
+                evaluation_run_ids=(),
+                archive_path=tmp_path / "archive.zip",
+                checksum_path=tmp_path / "archive.zip.sha256",
+                campaign_log_path=tmp_path / "execution.log",
+            )
+        ),
     )
+    with pytest.raises(SystemExit):
+        main([])
+    assert "--backup-root" in capsys.readouterr().err
+    assert main(["--backup-root", str(tmp_path / "backup")]) == 0
+    assert calls == [{"backup_root": tmp_path / "backup"}]
 
-    with pytest.raises(KeyboardInterrupt):
-        main()
 
-
-def test_portable_archive_contains_results_and_excludes_sources_and_cache(
+def test_preflight_rejection_occurs_before_campaign_output_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    included = (
-        Path("data/manifests/rsna/bundles/bundle-test/manifest.json"),
-        Path("data/manifests/rsna/CURRENT"),
-        Path("models/rsna/packages/model-package-train/model.skops"),
-        Path("reports/rsna/campaigns/campaign-test/execution.log"),
-        Path("private/predictions/rsna/prediction-test/predictions.parquet"),
-        Path("private/localization/localization-test/summary.json"),
-    )
-    for path in included:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("result\n", encoding="utf-8")
-    included[1].write_text("bundle-test\n", encoding="utf-8")
-    unrelated_bundle = Path("data/manifests/rsna/bundles/bundle-unrelated/manifest.json")
-    unrelated_bundle.parent.mkdir(parents=True)
-    unrelated_bundle.write_text("unrelated\n", encoding="utf-8")
-    configure_mlflow(tracking_uri="sqlite:///mlflow.db", experiment_name="beyondcxr-rsna")
-    source_artifact = Path("resolved_config.yaml")
-    source_artifact.write_text("experiment: test\n", encoding="utf-8")
-    with mlflow.start_run() as run:
-        run_id = run.info.run_id
-        mlflow.log_artifact(source_artifact, artifact_path="config")
-    archived_artifact = Path(f"mlartifacts/{run_id}/artifacts/config/resolved_config.yaml")
-    for excluded in (
-        Path("data/raw/rsna/extracted/stage_2_train_images/a.dcm"),
-        Path("data/cache/rsna/cache-test/images.npy"),
-    ):
-        excluded.parent.mkdir(parents=True, exist_ok=True)
-        excluded.write_text("source\n", encoding="utf-8")
 
-    destination = Path("outbox/results.tar.gz").resolve()
-    included[3].write_text("event=campaign_ready_for_export\n", encoding="utf-8")
-    _write_archive(
-        destination,
-        bundle_directory=included[0].parent,
-        current_path=included[1],
-    )
-    checksum = _write_checksum(destination)
+    def reject(**kwargs):
+        del kwargs
+        raise ManifestBuildError("exact configured authority differs")
 
-    with tarfile.open(destination, "r:gz") as archive:
-        names = set(archive.getnames())
-        database_member = archive.extractfile("mlflow.db")
-        assert database_member is not None
-        exported_database = tmp_path / "exported-mlflow.db"
-        exported_database.write_bytes(database_member.read())
-        relocated = tmp_path / "relocated"
-        archive.extractall(relocated, filter="data")
-    assert all(path.as_posix() in names for path in (*included, archived_artifact))
-    assert "mlflow.db" in names
-    assert not any(name.startswith("data/raw/") for name in names)
-    assert not any(name.startswith("data/cache/") for name in names)
-    assert unrelated_bundle.as_posix() not in names
-    with tarfile.open(destination, "r:gz") as archive:
-        archived_log = archive.extractfile(included[3].as_posix())
-        assert archived_log is not None
-        log_text = archived_log.read().decode()
-    assert "event=campaign_ready_for_export" in log_text
-    assert "event=campaign_succeeded" not in log_text
-    with closing(sqlite3.connect(exported_database)) as database:
-        location = database.execute(
-            "SELECT artifact_location FROM experiments WHERE name = 'beyondcxr-rsna'"
-        ).fetchone()
-        run_uri = database.execute(
-            "SELECT artifact_uri FROM runs WHERE run_uuid = ?", (run_id,)
-        ).fetchone()
-    assert location == ("file:mlartifacts",)
-    assert run_uri == (f"file:mlartifacts/{run_id}/artifacts",)
-    monkeypatch.chdir(relocated)
-    relocated_client = MlflowClient(tracking_uri=f"sqlite:///{relocated / 'mlflow.db'}")
-    downloaded = relocated_client.download_artifacts(
-        run_id,
-        "config/resolved_config.yaml",
-        str(relocated / "download"),
-    )
-    assert Path(downloaded).read_text(encoding="utf-8") == "experiment: test\n"
-    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-    assert checksum.read_text(encoding="utf-8") == f"{digest}  {destination.name}\n"
-    shutil.rmtree("models")
-    with pytest.raises(FileNotFoundError):
-        _write_archive(
-            Path("outbox/incomplete.tar.gz"),
-            bundle_directory=included[0].parent,
-            current_path=included[1],
-        )
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign._preflight_rsna_campaign", reject)
+
+    with pytest.raises(ManifestBuildError, match="exact configured authority differs"):
+        execute_rsna_campaign(backup_root=tmp_path.parent / "backup")
+
+    assert not (tmp_path / "reports").exists()
+    assert not (tmp_path / "models").exists()
+    assert not (tmp_path / "private").exists()
+    assert not (tmp_path / "outbox").exists()
+
+
+def test_formal_campaign_module_has_no_authority_builder() -> None:
+    import beyondcxr.training.rsna_campaign as campaign
+
+    assert not hasattr(campaign, "build_and_write")
+    assert not hasattr(campaign, "ensure_pretrained_weights")
 
 
 @pytest.mark.parametrize("mismatch", ["preprocessing", "device", "batch_size", "workers", "seed"])
 def test_campaign_rejects_neural_config_contract_mismatch(mismatch: str) -> None:
     configs = _configs()
+    fusion_indices = tuple(
+        index
+        for index, spec in enumerate(RSNA_FORMAL_RUN_PLAN)
+        if spec.family_id == "cxr_metadata_concat"
+    )
     if mismatch == "preprocessing":
         fusions = tuple(
             replace(
@@ -433,34 +720,44 @@ def test_campaign_rejects_neural_config_contract_mismatch(mismatch: str) -> None
                     parameters=MappingProxyType({**config.family.parameters, "image_size": 225}),
                 ),
             )
-            for config in configs.fusions
+            for config in (configs[index] for index in fusion_indices)
         )
     elif mismatch == "device":
         fusions = tuple(
             replace(config, runtime=replace(config.runtime, device="cpu"))
-            for config in configs.fusions
+            for config in (configs[index] for index in fusion_indices)
         )
     elif mismatch == "seed":
+        selected = tuple(configs[index] for index in fusion_indices)
         fusions = (
-            replace(
-                configs.fusions[0],
-                runtime=replace(configs.fusions[0].runtime, seed=18),
-            ),
-            *configs.fusions[1:],
+            replace(selected[0], runtime=replace(selected[0].runtime, seed=18)),
+            *selected[1:],
         )
     elif mismatch == "batch_size":
         fusions = tuple(
             replace(config, neural=replace(config.neural, batch_size=16))
-            for config in configs.fusions
+            for config in (configs[index] for index in fusion_indices)
         )
     else:
         fusions = tuple(
             replace(config, runtime=replace(config.runtime, num_workers=4))
-            for config in configs.fusions
+            for config in (configs[index] for index in fusion_indices)
         )
-
     with pytest.raises(ValueError):
-        _validate_neural_campaign_configs(replace(configs, fusions=fusions))
+        changed = list(configs)
+        for index, config in zip(fusion_indices, fusions, strict=True):
+            changed[index] = config
+        _validate_neural_campaign_configs(tuple(changed))
+
+
+def test_campaign_rejects_cross_config_authority_disagreement() -> None:
+    configs = _configs()
+    changed = replace(
+        configs[1],
+        dataset=replace(configs[1].dataset, bundle_manifest_sha256="0" * 64),
+    )
+    with pytest.raises(ManifestBuildError, match="disagree"):
+        _validate_config_agreement((configs[0], changed, *configs[2:]))
 
 
 def test_output_validation_rejects_evaluation_lineage_mismatch(tmp_path: Path) -> None:
@@ -489,6 +786,7 @@ def test_output_validation_rejects_evaluation_lineage_mismatch(tmp_path: Path) -
             tmp_path / "cxr-summary",
             tmp_path / "fusion-summary",
             tmp_path / "localization",
-            (tmp_path / "comparison.csv", tmp_path / "comparison.md"),
+            ComparisonResult("comparison", tmp_path, tmp_path, tmp_path, 8, {}),
             tmp_path / "execution.log",
+            roots=_plan(tmp_path).roots,
         )

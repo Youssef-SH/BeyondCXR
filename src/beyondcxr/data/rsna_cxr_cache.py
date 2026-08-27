@@ -401,6 +401,35 @@ def build_cxr_cache(
     )
 
 
+def validate_cxr_source_availability(
+    frame: pd.DataFrame,
+    *,
+    dataset_root: str | Path,
+) -> None:
+    """Prove that every inventoried DICOM is available before campaign output begins.
+
+    Full byte authentication remains owned by cache construction. This preflight checks the
+    complete path and declared-size surface without decoding or duplicating the cache's SHA-256
+    pass.
+    """
+    _validate_source_frame(frame)
+    root = Path(dataset_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ManifestBuildError("RSNA source root is unavailable")
+    for row in frame.itertuples(index=False):
+        path = resolve_image_path(root, _relative_image_path(row.image_path))
+        if path.is_symlink() or not path.is_file():
+            raise ManifestBuildError(f"RSNA source DICOM is unavailable for {row.sample_id!r}")
+        try:
+            observed_size = path.stat().st_size
+        except OSError as exc:
+            raise ManifestBuildError(
+                f"RSNA source DICOM is unavailable for {row.sample_id!r}"
+            ) from exc
+        if observed_size != int(row.byte_size):
+            raise ManifestBuildError(f"RSNA source DICOM size differs for {row.sample_id!r}")
+
+
 def validate_cxr_cache(
     directory: str | Path,
     *,

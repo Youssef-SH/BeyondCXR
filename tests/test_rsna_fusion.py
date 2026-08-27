@@ -9,6 +9,8 @@ import pandas as pd
 import pytest
 import torch
 import yaml
+from rsna_authorization_test_support import authorize_rsna_package, rsna_test_runtime
+from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -164,6 +166,14 @@ def _publish_source_cxr_package(
         model_root=model_root,
         checkpoint_path=checkpoint_path,
         source_config_bytes=source_config.source_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "source-cxr-validation-evidence.json",
+            source_path,
+            seed=seed,
+            selected_epoch=1,
+            selected_stage="warmup",
+            selected_validation_average_precision=0.7,
+        ),
         manifest=manifest,
     )
 
@@ -298,11 +308,11 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         validation=features,
         lineage=DatasetLineage(
             bundle_id=config.dataset.bundle_id,
-            split_assignment_id="split-test",
-            label_policy_version="label-test",
+            split_assignment_id=config.dataset.split_assignment_id,
+            label_policy_version=config.task.label_policy_version,
             task_id="pneumonia",
         ),
-        bundle_manifest_sha256="4" * 64,
+        bundle_manifest_sha256=config.dataset.bundle_manifest_sha256,
         source_inventory=source_inventory,
     )
     neural = config.neural
@@ -370,6 +380,11 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         model_root=tmp_path / "models",
         checkpoint_path=checkpoint_path,
         source_config_bytes=config_path.read_bytes(),
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "fusion-validation-evidence.json",
+            config_path,
+            seed=42,
+        ),
         manifest=manifest,
         structured_preprocessor_path=preprocessor_path,
     )
@@ -379,6 +394,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         "model.pt",
         "resolved_config.yaml",
         "manifest.json",
+        "validation-evidence.json",
         "structured_preprocessor.skops",
     }
     assert validated["structured_preprocessor_contract"] == contract
@@ -473,7 +489,7 @@ def test_fusion_validation_resolves_source_cxr_package(tmp_path: Path, source_st
         model_root=tmp_path / "models",
         fusion_config=fusion_config,
         lineage=lineage,
-        bundle_manifest_sha256="4" * 64,
+        bundle_manifest_sha256=fusion_config.dataset.bundle_manifest_sha256,
         source_inventory=inventory,
         source_authentication=authentication,
         weight_identity=weight,
@@ -717,7 +733,10 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
                 source_inventory,
             )
 
-        def load_fusion_test(self, dataset_config, *, expected_manifest_sha256):
+        def load_fusion_test(
+            self, dataset_config, *, expected_manifest_sha256, authorization, package_id
+        ):
+            authorization.require(package_id)
             assert expected_manifest_sha256 == "5" * 64
             self.test_calls += 1
             return FusionTestData(frame("test"), lineage, "5" * 64, source_inventory)
@@ -829,7 +848,11 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             tracking_uri=tracking_uri,
             model_directory=config.runtime.model_directory,
         )
@@ -838,7 +861,11 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
 
     evaluation = evaluate_model_package(
         training.model_package_id,
+        authorization=authorize_rsna_package(
+            config, training.model_package_id, monkeypatch=monkeypatch
+        ),
         evaluation_config=config,
+        runtime=rsna_test_runtime(config),
         tracking_uri=tracking_uri,
         model_directory=config.runtime.model_directory,
         private_output_directory=config.runtime.private_output_directory,
@@ -861,14 +888,16 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert recorded.data.tags["run_complete"] == "true"
     assert recorded.data.params["evaluation_loader_num_workers"] == "0"
     assert recorded.data.params["evaluation_cxr_cache_id"].startswith("cache-")
-    comparison_path, _, rows = regenerate_comparison(
+    comparison_result = regenerate_comparison(
         [evaluation.evaluation_id],
         output_directory=config.runtime.report_directory,
         private_directory=config.runtime.private_output_directory,
         model_directory=config.runtime.model_directory,
     )
-    assert rows == 1
-    assert pd.read_csv(comparison_path)["model_package_id"].tolist() == [training.model_package_id]
+    assert comparison_result.row_count == 1
+    assert pd.read_csv(comparison_result.csv_path)["model_package_id"].tolist() == [
+        training.model_package_id
+    ]
 
     def fail_publication(*args, **kwargs):
         raise OSError((args, kwargs))
@@ -879,7 +908,11 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     with pytest.raises(OSError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             tracking_uri=tracking_uri,
             model_directory=config.runtime.model_directory,
             private_output_directory=config.runtime.private_output_directory,

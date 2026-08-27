@@ -11,6 +11,7 @@ import pytest
 import torch
 import yaml
 from lightgbm import Booster, LGBMClassifier
+from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -74,6 +75,9 @@ def _publish(tmp_path: Path):
         model_root=tmp_path / "models" / "rsna",
         serialized_model_path=serialized,
         source_config_bytes=config.read_bytes(),
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json", config, seed=42
+        ),
         manifest=manifest,
     )
     return features, model, published
@@ -89,6 +93,7 @@ def test_model_package_has_exact_reconstructable_artifacts(tmp_path: Path) -> No
         "model.skops",
         "resolved_config.yaml",
         "manifest.json",
+        "validation-evidence.json",
     }
     document = validate_published_model(published.package_directory)
     assert set(document) == REQUIRED_MANIFEST_FIELDS
@@ -115,6 +120,7 @@ def test_model_package_reuses_equivalent_alternate_serialization(tmp_path: Path)
         model_root=tmp_path / "models" / "rsna",
         serialized_model_path=alternate_serialization,
         source_config_bytes=published.config_path.read_bytes(),
+        validation_evidence_path=published.package_directory / "validation-evidence.json",
         manifest={
             **_manifest(),
             "config_source_sha256": hashlib.sha256(published.config_path.read_bytes()).hexdigest(),
@@ -475,6 +481,7 @@ def test_conflicting_model_publication_retry_is_rejected(tmp_path: Path) -> None
             model_root=tmp_path / "models" / "rsna",
             serialized_model_path=published.model_path,
             source_config_bytes=published.config_path.read_bytes(),
+            validation_evidence_path=published.package_directory / "validation-evidence.json",
             manifest={
                 **_manifest(),
                 "bundle_id": "different",

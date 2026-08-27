@@ -19,7 +19,7 @@ from beyondcxr.evaluation.metrics import (
     evaluate_probabilities,
 )
 from beyondcxr.training.config import ExperimentConfig
-from beyondcxr.training.rsna_train_metadata import (
+from beyondcxr.training.rsna_training_report import (
     metrics_document,
     validate_report_set,
     write_run_reports,

@@ -214,6 +214,14 @@ def test_audit_publication_owns_only_the_bundle_specific_output(
     assert not list(output.parent.glob(".rsna-staging-*"))
     assert not list(output.parent.glob(".rsna-backup-*"))
 
+    before = {path.name: path.read_bytes() for path in destination.iterdir()}
+    generate_rsna_audit(tmp_path / "manifests", output)
+    assert {path.name: path.read_bytes() for path in destination.iterdir()} == before
+
+    (destination / "dataset_summary.md").write_text("conflict\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs"):
+        generate_rsna_audit(tmp_path / "manifests", output)
+
 
 def test_audit_failure_preserves_previous_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

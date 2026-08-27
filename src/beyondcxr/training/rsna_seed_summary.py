@@ -20,6 +20,7 @@ from beyondcxr.training.rsna_evaluation_result import (
     validate_rsna_evaluation,
     validate_rsna_model_package,
 )
+from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
 from beyondcxr.utils.package_identity import (
     canonical_scientific_id,
@@ -32,7 +33,6 @@ from beyondcxr.utils.publication import (
     validate_path_component,
 )
 
-EXPECTED_SEEDS = (17, 42, 2026)
 SEED_SUMMARY_SCHEMA_VERSION = 1
 SEED_SUMMARY_PREFIX = "seed-summary-"
 MANIFEST_FILENAME = "manifest.json"
@@ -92,7 +92,7 @@ def publish_seed_summary(
     semantic = {
         **context,
         "evaluation_ids": [item["evaluation_id"] for item in members],
-        "required_seeds": list(EXPECTED_SEEDS),
+        "required_seeds": list(RSNA_NEURAL_SEEDS),
         "policy": _POLICY,
     }
     summary_id = canonical_scientific_id(SEED_SUMMARY_PREFIX, semantic)
@@ -181,7 +181,7 @@ def validate_seed_summary(
         or schema_version != SEED_SUMMARY_SCHEMA_VERSION
     ):
         raise ValueError("Seed summary schema version is invalid")
-    if document["required_seeds"] != list(EXPECTED_SEEDS) or document["policy"] != _POLICY:
+    if document["required_seeds"] != list(RSNA_NEURAL_SEEDS) or document["policy"] != _POLICY:
         raise ValueError("Seed summary policy is invalid")
     members = _validated_members(
         document["evaluation_ids"],
@@ -276,8 +276,8 @@ def _validated_members(
             }
         )
     members.sort(key=lambda item: item["seed"])
-    if tuple(item["seed"] for item in members) != EXPECTED_SEEDS:
-        raise ValueError(f"Seed summary requires seeds {list(EXPECTED_SEEDS)}")
+    if tuple(item["seed"] for item in members) != RSNA_NEURAL_SEEDS:
+        raise ValueError(f"Seed summary requires seeds {list(RSNA_NEURAL_SEEDS)}")
     reference = members[0]
     if any(
         item["scientific_context"] != reference["scientific_context"]
