@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
+import sqlite3
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,14 +32,124 @@ from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.release import serving as release_serving
 from beyondcxr.release.render import RESULT_END, RESULT_START
 from beyondcxr.release.reproduction import publish_results, reproduce_results
-from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.config import load_symile_development_config, with_runtime
+from beyondcxr.training.preservation import (
+    EXPORT_MANIFEST_FILENAME,
+    export_and_verify,
+    restore_and_validate_export,
+)
 from beyondcxr.training.symile_campaign_control import create_or_validate_test_open_record
-from beyondcxr.training.symile_export import export_and_verify, restore_and_validate_symile_export
 from beyondcxr.training.symile_test_data import FrozenSymileTestData
 from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     publish_prediction_evidence,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bypass_full_source_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Campaign orchestration tests isolate the separately tested read-only preflight."""
+    monkeypatch.setattr(symile_campaign, "_preflight_symile_campaign", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        symile_campaign, "_validate_symile_storage_readiness", lambda *args, **kwargs: None
+    )
+
+
+def test_storage_readiness_rejects_low_space_before_campaign_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    events: list[str] = []
+    monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository)
+    monkeypatch.setattr(
+        symile_campaign,
+        "_validate_symile_storage_readiness",
+        lambda *args: (_ for _ in ()).throw(OSError("low storage")),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "git_revision",
+        lambda *args: events.append("git") or ("f" * 40, False),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "run_symile_development",
+        lambda *args, **kwargs: events.append("development"),
+    )
+    with pytest.raises(OSError, match="low storage"):
+        symile_campaign.run_symile_campaign(
+            source_root=source,
+            device="cpu",
+            workers=0,
+            backup_root=tmp_path / "backup",
+        )
+    assert events == []
+    assert not (repository / "models").exists()
+
+
+def test_storage_readiness_accounts_for_distinct_and_shared_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.undo()
+    repository = tmp_path / "repository"
+    backup = tmp_path / "external/backup"
+    gib = 1024**3
+    monkeypatch.setattr(
+        symile_campaign,
+        "_storage_volume",
+        lambda path: (1, 32 * gib) if path == repository else (2, 8 * gib),
+    )
+    symile_campaign._validate_symile_storage_readiness(repository, backup)
+
+    monkeypatch.setattr(symile_campaign, "_storage_volume", lambda path: (1, 39 * gib))
+    with pytest.raises(OSError, match="40 GiB"):
+        symile_campaign._validate_symile_storage_readiness(repository, backup)
+
+
+def test_final_fit_configures_the_explicit_tracking_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = with_runtime(
+        load_symile_development_config("configs/symile_labs_logistic.yaml"),
+        seed=42,
+    )
+    supplied = "sqlite:////tmp/explicit-final-fit.db"
+    configured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        symile_campaign,
+        "configure_mlflow",
+        lambda *, experiment_name, tracking_uri: configured.append((experiment_name, tracking_uri)),
+    )
+
+    class Run:
+        def __enter__(self):
+            return "run-id"
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(symile_campaign, "tracked_run", lambda **kwargs: Run())
+    monkeypatch.setattr(symile_campaign, "log_source_config", lambda config: None)
+    monkeypatch.setattr(symile_campaign.mlflow, "set_tags", lambda values: None)
+    monkeypatch.setattr(symile_campaign.mlflow, "set_tag", lambda key, value: None)
+    package = SimpleNamespace(package_id="final-package-test")
+
+    result = symile_campaign._tracked_final_fit(
+        config,
+        tracking_uri=supplied,
+        member_seed=42,
+        provenance={
+            "git_commit": "f" * 40,
+            "dependency_lock_sha256": "0" * 64,
+        },
+        fit=lambda operational: package,
+    )
+
+    assert result is package
+    assert configured == [(config.runtime.experiment_name, supplied)]
 
 
 def _forbid_campaign_training(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -51,6 +165,165 @@ def _forbid_campaign_training(monkeypatch: pytest.MonkeyPatch) -> None:
         "_tracked_final_fit",
     ):
         monkeypatch.setattr(symile_campaign, name, forbidden)
+
+
+def test_formal_campaign_accepts_existing_tracking_database_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    with sqlite3.connect(repository_root / "mlflow.db") as connection:
+        connection.execute("CREATE TABLE tracking_state (value INTEGER NOT NULL)")
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    backup_root = tmp_path / "backup"
+    monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository_root)
+
+    class DestinationValidationPassed(Exception):
+        pass
+
+    def stop_after_destination_validation(root: Path) -> tuple[str, bool]:
+        assert root == repository_root
+        raise DestinationValidationPassed
+
+    monkeypatch.setattr(symile_campaign, "git_revision", stop_after_destination_validation)
+
+    with pytest.raises(DestinationValidationPassed):
+        symile_campaign.run_symile_campaign(
+            source_root=source_root,
+            device="cpu",
+            workers=0,
+            backup_root=backup_root,
+        )
+
+
+def test_comprehensive_preflight_precedes_all_campaign_output_and_development(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    repository_root = Path(__file__).resolve().parents[1]
+    events: list[str] = []
+    monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository_root)
+    monkeypatch.setattr(symile_campaign, "git_revision", lambda root: ("f" * 40, False))
+    monkeypatch.setattr(symile_campaign, "uv_lock_sha256", lambda path: "0" * 64)
+
+    def reject(configs, *, source_root, require_pretrained_weights):
+        del configs, source_root
+        assert require_pretrained_weights is True
+        events.append("preflight")
+        raise ManifestBuildError("preflight rejected")
+
+    monkeypatch.setattr(symile_campaign, "_preflight_symile_campaign", reject)
+    monkeypatch.setattr(
+        symile_campaign,
+        "run_symile_development",
+        lambda *args, **kwargs: events.append("development"),
+    )
+
+    with pytest.raises(ManifestBuildError, match="preflight rejected"):
+        symile_campaign.run_symile_campaign(
+            source_root=source_root,
+            device="cpu",
+            workers=0,
+            backup_root=tmp_path / "backup",
+        )
+
+    assert events == ["preflight"]
+
+
+def test_comprehensive_preflight_validates_full_authority_assets_and_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.undo()
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    configs = {
+        family: with_runtime(
+            load_symile_development_config(path),
+            manifest_directory=tmp_path / "manifests",
+            source_root=source_root,
+            device="cpu",
+            num_workers=0,
+        )
+        for family, path in symile_campaign._CONFIGS.items()
+    }
+    reference = next(iter(configs.values()))
+    bundle = tmp_path / "manifests/symile/bundles" / reference.dataset.bundle_id
+    events: list[str] = []
+    monkeypatch.setattr(
+        symile_campaign,
+        "validate_symile_bundle",
+        lambda directory, **kwargs: events.append("full_bundle") or {},
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "load_symile_development",
+        lambda config: (
+            events.append("bundle_cv")
+            or SimpleNamespace(bundle=SimpleNamespace(bundle_directory=bundle))
+        ),
+    )
+    manifest = {
+        "source": {
+            "checksum_manifest_sha256": "0" * 64,
+            "source_assets": [
+                {"relative_path": "cxr.npy"},
+                {"relative_path": "ecg.npy"},
+            ],
+        }
+    }
+    monkeypatch.setattr(
+        symile_campaign,
+        "validate_symile_bundle_reference",
+        lambda *args, **kwargs: (
+            events.append("exact_manifest") or SimpleNamespace(manifest=manifest)
+        ),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "establish_authenticated_release_asset",
+        lambda *args, **kwargs: events.append(f"asset:{kwargs['relative_path']}"),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "SymileCxrStore",
+        lambda *args, **kwargs: events.append("cxr_store"),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "SymileEcgStore",
+        lambda *args, **kwargs: events.append("ecg_store"),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "fingerprint_pretrained_weights",
+        lambda weights: events.append(f"weights:{weights}"),
+    )
+    monkeypatch.setattr(
+        symile_campaign,
+        "resolve_device",
+        lambda *args, **kwargs: (
+            events.append("runtime")
+            or SimpleNamespace(
+                device=SimpleNamespace(type="cpu"),
+                autocast_dtype=None,
+                pin_memory_effective=False,
+            )
+        ),
+    )
+
+    symile_campaign._preflight_symile_campaign(configs, source_root=source_root)
+
+    assert events[:3] == ["full_bundle", "bundle_cv", "exact_manifest"]
+    assert events[3:8] == [
+        "asset:cxr.npy",
+        "asset:ecg.npy",
+        "cxr_store",
+        "ecg_store",
+        "weights:densenet121-res224-chex",
+    ]
+    assert events.count("runtime") == 5
 
 
 def test_campaign_cli_requires_and_forwards_backup_root(
@@ -124,8 +397,61 @@ def test_campaign_rejects_backup_parent_that_contains_repository(tmp_path, monke
     repository = tmp_path / "repository"
     repository.mkdir()
     monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository)
-    with pytest.raises(ManifestBuildError, match="contain campaign source state"):
+    with pytest.raises(ManifestBuildError, match="must be disjoint"):
         symile_campaign.run_symile_campaign(source_root=tmp_path / "source", backup_root=tmp_path)
+
+
+def test_preservation_topology_uses_broad_checkout_roots_without_nested_duplicates(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    sources = symile_campaign._preservation_topology_sources(
+        repository_root=repository,
+        configurable_roots=(
+            repository / "data/manifests",
+            repository / "models/symile",
+            repository / "reports/symile",
+            repository / "private",
+            repository / "data/raw/symile",
+        ),
+    )
+
+    assert sources == tuple(repository / name for name in ("data", "models", "reports", "private"))
+
+
+@pytest.mark.parametrize("backup_contains_model", (False, True))
+def test_external_formal_root_overlap_is_rejected_by_early_preservation_topology(
+    tmp_path: Path,
+    backup_contains_model: bool,
+) -> None:
+    repository = tmp_path / "repository"
+    external = tmp_path / "external"
+    if backup_contains_model:
+        backup = external / "backup"
+        model_root = backup / "models"
+    else:
+        model_root = external / "models"
+        backup = model_root / "backup"
+    sources = symile_campaign._preservation_topology_sources(
+        repository_root=repository,
+        configurable_roots=(
+            repository / "data/manifests",
+            model_root,
+            repository / "reports/symile",
+            repository / "private",
+            repository / "data/raw/symile",
+        ),
+    )
+
+    with pytest.raises(ManifestBuildError, match="disjoint"):
+        symile_campaign.validate_preservation_paths(
+            sources=sources,
+            export_root=repository / "outbox",
+            backup_root=backup,
+        )
+
+    assert not repository.exists()
+    assert not external.exists()
 
 
 def test_canonical_formal_layout_accepts_normal_checkout_roots(tmp_path: Path) -> None:
@@ -583,6 +909,9 @@ def test_preserved_campaign_drives_downstream_release_and_serving_consumers(
         neural_inference_runtime={
             "device_type": "cpu",
             "autocast_dtype": None,
+            "deterministic_algorithms": "enabled_warn_only",
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
             "cuda_runtime_version": None,
             "cudnn_version": None,
             "gpu_device_name": None,
@@ -666,6 +995,16 @@ def test_preserved_campaign_drives_downstream_release_and_serving_consumers(
         export_name=global_result.result_id,
         restoration_validator=symile_campaign.validate_restored_campaign,
     )
+    corrupted = _add_external_preservation_member(
+        archive,
+        tmp_path / "symile-external-member.zip",
+    )
+    restore_and_validate_export(corrupted)
+    with pytest.raises(ManifestBuildError, match="outside its exact closure"):
+        restore_and_validate_export(
+            corrupted,
+            restoration_validator=symile_campaign.validate_restored_campaign,
+        )
     readme = tmp_path / "README.md"
     model_card = tmp_path / "model-card.md"
     bounded = f"Before\n{RESULT_START}\nAwaiting formal Symile execution\n{RESULT_END}\nAfter\n"
@@ -730,7 +1069,33 @@ def test_preserved_campaign_drives_downstream_release_and_serving_consumers(
     for member in members:
         shutil.rmtree(member.path) if member.path.is_dir() else member.path.unlink()
     assert not any(member.path.exists() for member in members)
-    restore_and_validate_symile_export(
+    restore_and_validate_export(
         backup, restoration_validator=symile_campaign.validate_restored_campaign
     )
     assert analysis_id == extension.manifest["core_analysis_id"]
+
+
+def _add_external_preservation_member(archive: Path, destination: Path) -> Path:
+    content = b"{}\n"
+    with zipfile.ZipFile(archive) as source:
+        infos = source.infolist()
+        contents = {info.filename: source.read(info.filename) for info in infos}
+    manifest = json.loads(contents[EXPORT_MANIFEST_FILENAME])
+    identity = f"member-{len(manifest['members']):04d}"
+    manifest["members"].append(
+        {
+            "archive_identity": identity,
+            "restore_relative": "private/unrelated",
+            "kind": "directory",
+            "files": [{"path": "state.json", "sha256": hashlib.sha256(content).hexdigest()}],
+        }
+    )
+    contents[EXPORT_MANIFEST_FILENAME] = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+    with zipfile.ZipFile(destination, "w") as output:
+        for info in infos:
+            output.writestr(info, contents[info.filename])
+        output.writestr(f"{identity}/state.json", content)
+    os.chmod(destination, 0o600)
+    return destination

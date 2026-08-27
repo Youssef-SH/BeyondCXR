@@ -1,4 +1,4 @@
-"""Deterministic preservation export for a completed Symile campaign."""
+"""Deterministic preservation export for a completed scientific campaign."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ from typing import Any, overload
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.utils.publication import is_publication_staging_directory, validate_path_component
 
-SYMILE_EXPORT_MANIFEST_SCHEMA_VERSION = 1
+PRESERVATION_MANIFEST_SCHEMA_VERSION = 1
 EXPORT_MANIFEST_FILENAME = "export-manifest.json"
 
 
 @dataclass(frozen=True)
-class SymileExportMember:
+class PreservationMember:
     """One validated campaign authority and its canonical restoration target."""
 
     path: Path
@@ -37,34 +37,63 @@ class _ValidatedManifestMember:
     files: tuple[tuple[PurePosixPath, str], ...]
 
 
-def validate_export_paths(
+def validate_exact_restored_closure(
+    restored_root: str | Path,
+    members: Sequence[PreservationMember],
+) -> None:
+    """Require the restored tree to contain exactly the recomputed campaign closure."""
+    root = Path(restored_root).resolve()
+    expected: list[tuple[Path, bool]] = []
+    for member in members:
+        target = (root / member.restore_relative).resolve()
+        if not target.is_relative_to(root):
+            raise ManifestBuildError("Restored preservation member escapes its authority root")
+        if target.is_symlink() or not target.exists():
+            raise ManifestBuildError("Restored preservation authority is unavailable")
+        expected.append((target, target.is_dir()))
+    if len({path for path, _ in expected}) != len(expected):
+        raise ManifestBuildError("Restored preservation authority paths contain duplicates")
+    for path in root.rglob("*"):
+        resolved = path.resolve()
+        if path.is_symlink() or not any(
+            resolved == authority
+            or (is_directory and resolved.is_relative_to(authority))
+            or authority.is_relative_to(resolved)
+            for authority, is_directory in expected
+        ):
+            raise ManifestBuildError("Restored campaign contains state outside its exact closure")
+
+
+def validate_preservation_paths(
     *, sources: Sequence[str | Path], export_root: str | Path, backup_root: str | Path
 ) -> None:
-    """Reject self-including snapshots and overlapping preservation destinations."""
-    export = Path(export_root).resolve()
-    backup = Path(backup_root).resolve()
-    if export.is_relative_to(backup) or backup.is_relative_to(export):
-        raise ManifestBuildError("Symile export and backup destinations must be disjoint")
-    for source in sources:
-        root = Path(source).resolve()
-        if export.is_relative_to(root) or backup.is_relative_to(root):
-            raise ManifestBuildError("Symile preservation destinations must be outside sources")
+    """Reject symlinks and every source/destination ancestor overlap."""
+    export = _resolved_preservation_path(export_root)
+    backup = _resolved_preservation_path(backup_root)
+    if _paths_overlap(export, backup):
+        raise ManifestBuildError("Export and backup destinations must be disjoint")
+    resolved_sources = tuple(_resolved_preservation_path(source) for source in sources)
+    for index, root in enumerate(resolved_sources):
+        if _paths_overlap(export, root) or _paths_overlap(backup, root):
+            raise ManifestBuildError("Preservation sources and destinations must be disjoint")
+        if any(_paths_overlap(root, other) for other in resolved_sources[index + 1 :]):
+            raise ManifestBuildError("Preservation sources must be mutually disjoint")
 
 
 def export_and_verify(
     *,
-    members: Sequence[SymileExportMember],
+    members: Sequence[PreservationMember],
     export_root: str | Path,
     backup_root: str | Path,
     export_name: str,
     restoration_validator: Callable[[Path], None] | None = None,
 ) -> Path:
     """Archive exact authorities, preserve privately, and certify standalone restoration."""
-    validate_path_component(export_name, "Symile export name")
+    validate_path_component(export_name, "preservation export name")
     values = tuple(members)
-    if not values or any(not isinstance(member, SymileExportMember) for member in values):
-        raise ManifestBuildError("Symile export members are invalid")
-    validate_export_paths(
+    if not values or any(not isinstance(member, PreservationMember) for member in values):
+        raise ManifestBuildError("Preservation export members are invalid")
+    validate_preservation_paths(
         sources=[member.path for member in values],
         export_root=export_root,
         backup_root=backup_root,
@@ -88,7 +117,7 @@ def export_and_verify(
                     shutil.copyfileobj(source, destination)
         digest = _file_sha256(temporary)
         _validate_private_file(temporary, expected_sha256=digest)
-        restore_and_validate_symile_export(temporary, restoration_validator=restoration_validator)
+        restore_and_validate_export(temporary, restoration_validator=restoration_validator)
         _install_or_validate(temporary, archive)
     finally:
         temporary.unlink(missing_ok=True)
@@ -109,11 +138,25 @@ def export_and_verify(
     finally:
         backup_temporary.unlink(missing_ok=True)
     _validate_private_file(backup, expected_sha256=digest)
+    restore_and_validate_export(backup, restoration_validator=restoration_validator)
     return archive
 
 
+def _resolved_preservation_path(value: str | Path) -> Path:
+    path = Path(value).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.exists() or candidate.is_symlink():
+            if candidate.is_symlink():
+                raise ManifestBuildError("Preservation paths must not contain symlinks")
+    return path.resolve()
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+
 @overload
-def restore_and_validate_symile_export(
+def restore_and_validate_export(
     archive: str | Path,
     *,
     restoration_validator: None = None,
@@ -121,14 +164,14 @@ def restore_and_validate_symile_export(
 
 
 @overload
-def restore_and_validate_symile_export[RestorationResult](
+def restore_and_validate_export[RestorationResult](
     archive: str | Path,
     *,
     restoration_validator: Callable[[Path], RestorationResult],
 ) -> RestorationResult: ...
 
 
-def restore_and_validate_symile_export[RestorationResult](
+def restore_and_validate_export[RestorationResult](
     archive: str | Path,
     *,
     restoration_validator: Callable[[Path], RestorationResult] | None = None,
@@ -166,29 +209,29 @@ def restore_and_validate_symile_export[RestorationResult](
 
 
 def _build_export_manifest(
-    members: tuple[SymileExportMember, ...],
+    members: tuple[PreservationMember, ...],
 ) -> tuple[dict[str, object], tuple[tuple[str, Path], ...]]:
     documents: list[dict[str, object]] = []
     entries: list[tuple[str, Path]] = []
     for index, member in enumerate(members):
         root = member.path
         if root.is_symlink() or not root.exists():
-            raise ManifestBuildError("Symile export source state is invalid")
+            raise ManifestBuildError("Preservation export source state is invalid")
         restore = _validated_relative_path(member.restore_relative.as_posix(), "restore target")
         identity = f"member-{index:04d}"
         kind = "file" if root.is_file() else "directory" if root.is_dir() else None
         if kind is None:
-            raise ManifestBuildError("Symile export source kind is invalid")
+            raise ManifestBuildError("Preservation export source kind is invalid")
         descendants = [] if kind == "file" else sorted(root.rglob("*"))
         stages = [path for path in descendants if is_publication_staging_directory(path)]
         descendants = [
             path for path in descendants if not any(path.is_relative_to(stage) for stage in stages)
         ]
         if any(path.is_symlink() for path in descendants):
-            raise ManifestBuildError("Symile export source contains a symlink")
+            raise ManifestBuildError("Preservation export source contains a symlink")
         files = [root] if kind == "file" else [path for path in descendants if path.is_file()]
         if not files:
-            raise ManifestBuildError("Symile export authority directory is empty")
+            raise ManifestBuildError("Preservation export authority directory is empty")
         file_documents = []
         for path in files:
             relative = Path(root.name) if kind == "file" else path.relative_to(root)
@@ -205,7 +248,7 @@ def _build_export_manifest(
             }
         )
     document = {
-        "symile_export_manifest_schema_version": SYMILE_EXPORT_MANIFEST_SCHEMA_VERSION,
+        "preservation_manifest_schema_version": PRESERVATION_MANIFEST_SCHEMA_VERSION,
         "members": documents,
     }
     _validate_export_manifest(document)
@@ -218,16 +261,16 @@ def _read_and_validate_archive(
     infos = archive.infolist()
     names = [info.filename for info in infos]
     if len(names) != len(set(names)) or names.count(EXPORT_MANIFEST_FILENAME) != 1:
-        raise ManifestBuildError("Symile export archive membership is invalid")
+        raise ManifestBuildError("Preservation archive membership is invalid")
     if any(info.is_dir() or _zip_entry_is_symlink(info) for info in infos):
-        raise ManifestBuildError("Symile export archive contains an unsafe member")
+        raise ManifestBuildError("Preservation archive contains an unsafe member")
     try:
         raw = archive.read(EXPORT_MANIFEST_FILENAME)
         document = json.loads(raw)
     except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ManifestBuildError("Symile export manifest is unreadable") from exc
+        raise ManifestBuildError("Preservation manifest is unreadable") from exc
     if raw != _canonical_json_bytes(document):
-        raise ManifestBuildError("Symile export manifest serialization is invalid")
+        raise ManifestBuildError("Preservation manifest serialization is invalid")
     members = _validate_export_manifest(document)
     expected_names = {EXPORT_MANIFEST_FILENAME}
     for member in members:
@@ -238,31 +281,29 @@ def _read_and_validate_archive(
                 observed_hash = _zip_member_sha256(archive, name)
             except KeyError as exc:
                 raise ManifestBuildError(
-                    "Symile export archive has missing or unexpected members"
+                    "Preservation archive has missing or unexpected members"
                 ) from exc
             if observed_hash != expected_hash:
-                raise ManifestBuildError("Symile export archived file hash is invalid")
+                raise ManifestBuildError("Preservation archived file hash is invalid")
     if set(names) != expected_names:
-        raise ManifestBuildError("Symile export archive has missing or unexpected members")
+        raise ManifestBuildError("Preservation archive has missing or unexpected members")
     return members
 
 
 def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMember, ...]:
     schema_version = (
-        document.get("symile_export_manifest_schema_version")
-        if isinstance(document, dict)
-        else None
+        document.get("preservation_manifest_schema_version") if isinstance(document, dict) else None
     )
     if (
         not isinstance(document, dict)
-        or set(document) != {"symile_export_manifest_schema_version", "members"}
+        or set(document) != {"preservation_manifest_schema_version", "members"}
         or isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version != SYMILE_EXPORT_MANIFEST_SCHEMA_VERSION
+        or schema_version != PRESERVATION_MANIFEST_SCHEMA_VERSION
         or not isinstance(document["members"], list)
         or not document["members"]
     ):
-        raise ManifestBuildError("Symile export manifest contract is invalid")
+        raise ManifestBuildError("Preservation manifest contract is invalid")
     values: list[_ValidatedManifestMember] = []
     archive_ids: set[str] = set()
     restore_targets: list[PurePosixPath] = []
@@ -274,10 +315,10 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             "kind",
             "files",
         }:
-            raise ManifestBuildError("Symile export member contract is invalid")
+            raise ManifestBuildError("Preservation member contract is invalid")
         identity = item["archive_identity"]
         if identity != f"member-{index:04d}" or identity in archive_ids:
-            raise ManifestBuildError("Symile export member identity is invalid")
+            raise ManifestBuildError("Preservation member identity is invalid")
         archive_ids.add(identity)
         restore = _validated_relative_path(item["restore_relative"], "restore target")
         if any(
@@ -286,16 +327,16 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             or existing.is_relative_to(restore)
             for existing in restore_targets
         ):
-            raise ManifestBuildError("Symile export restore targets collide")
+            raise ManifestBuildError("Preservation restore targets collide")
         restore_targets.append(restore)
         kind = item["kind"]
         files = item["files"]
         if kind not in {"file", "directory"} or not isinstance(files, list) or not files:
-            raise ManifestBuildError("Symile export member kind or files are invalid")
+            raise ManifestBuildError("Preservation member kind or files are invalid")
         validated_files: list[tuple[PurePosixPath, str]] = []
         for file_item in files:
             if not isinstance(file_item, Mapping) or set(file_item) != {"path", "sha256"}:
-                raise ManifestBuildError("Symile export file contract is invalid")
+                raise ManifestBuildError("Preservation file contract is invalid")
             relative = _validated_relative_path(file_item["path"], "archived file")
             digest = file_item["sha256"]
             archive_path = f"{identity}/{relative.as_posix()}"
@@ -307,24 +348,24 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
                 )
                 or not _valid_sha256(digest)
             ):
-                raise ManifestBuildError("Symile export archived file identity is invalid")
+                raise ManifestBuildError("Preservation archived file identity is invalid")
             archive_paths.add(archive_path)
             validated_files.append((relative, digest))
         if kind == "file" and (
             len(validated_files) != 1 or validated_files[0][0] != PurePosixPath(restore.name)
         ):
-            raise ManifestBuildError("Symile export file member kind is inconsistent")
+            raise ManifestBuildError("Preservation file member kind is inconsistent")
         if [path.as_posix() for path, _ in validated_files] != sorted(
             path.as_posix() for path, _ in validated_files
         ):
-            raise ManifestBuildError("Symile export archived files are not canonically ordered")
+            raise ManifestBuildError("Preservation archived files are not canonically ordered")
         values.append(_ValidatedManifestMember(identity, restore, kind, tuple(validated_files)))
     return tuple(values)
 
 
 def _validated_relative_path(value: object, context: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value:
-        raise ManifestBuildError(f"Symile export {context} is invalid")
+        raise ManifestBuildError(f"Preservation {context} is invalid")
     path = PurePosixPath(value)
     if (
         value == "."
@@ -332,7 +373,7 @@ def _validated_relative_path(value: object, context: str) -> PurePosixPath:
         or path.is_absolute()
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
-        raise ManifestBuildError(f"Symile export {context} is invalid")
+        raise ManifestBuildError(f"Preservation {context} is invalid")
     return path
 
 
@@ -347,7 +388,7 @@ def _restore_archived_file(
             digest.update(chunk)
             output.write(chunk)
     if digest.hexdigest() != expected_hash:
-        raise ManifestBuildError("Restored Symile export file hash is invalid")
+        raise ManifestBuildError("Restored preservation file hash is invalid")
 
 
 def _zip_file_info(name: str) -> zipfile.ZipInfo:
@@ -377,18 +418,16 @@ def _install_or_validate(temporary: Path, destination: Path) -> None:
             or temporary.stat().st_size != destination.stat().st_size
             or _file_sha256(temporary) != _file_sha256(destination)
         ):
-            raise ManifestBuildError(
-                "Symile export conflicts with existing preserved state"
-            ) from None
+            raise ManifestBuildError("Preservation export conflicts with existing state") from None
 
 
 def _validate_private_file(path: Path, *, expected_sha256: str | None = None) -> None:
     if path.is_symlink() or not path.is_file():
-        raise ManifestBuildError("Symile preserved archive is not a regular file")
+        raise ManifestBuildError("Preserved archive is not a regular file")
     if stat.S_IMODE(path.stat().st_mode) != 0o600:
-        raise ManifestBuildError("Symile preserved archive permissions are unsafe")
+        raise ManifestBuildError("Preserved archive permissions are unsafe")
     if expected_sha256 is not None and _file_sha256(path) != expected_sha256:
-        raise ManifestBuildError("Symile preserved archive hash is invalid")
+        raise ManifestBuildError("Preserved archive hash is invalid")
 
 
 def _write_or_validate(path: Path, content: bytes) -> None:
@@ -405,7 +444,7 @@ def _write_or_validate(path: Path, content: bytes) -> None:
         finally:
             temporary.unlink(missing_ok=True)
     if path.is_symlink() or not path.is_file() or path.read_bytes() != content:
-        raise ManifestBuildError("Symile export checksum conflicts with existing state")
+        raise ManifestBuildError("Preservation checksum conflicts with existing state")
     _validate_private_file(path)
 
 
@@ -415,7 +454,7 @@ def _canonical_json_bytes(value: Any) -> bytes:
             json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
         ).encode()
     except (TypeError, ValueError) as exc:
-        raise ManifestBuildError("Symile export manifest is not serializable") from exc
+        raise ManifestBuildError("Preservation manifest is not serializable") from exc
 
 
 def _valid_sha256(value: object) -> bool:

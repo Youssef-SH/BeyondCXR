@@ -524,8 +524,8 @@ def _run_container_serving_acceptance(
     *, artifact: Path, authority: Path, image: str, cwd: Path, docker: str
 ) -> None:
     """Restore packages and exercise all serving endpoints inside the built image."""
+    from beyondcxr.training.preservation import restore_and_validate_export
     from beyondcxr.training.symile_campaign import validate_restored_campaign
-    from beyondcxr.training.symile_export import restore_and_validate_symile_export
 
     def exercise(restored_root: Path) -> None:
         campaign = validate_restored_campaign(restored_root)
@@ -540,7 +540,7 @@ def _run_container_serving_acceptance(
             cwd,
         )
 
-    restore_and_validate_symile_export(artifact, restoration_validator=exercise)
+    restore_and_validate_export(artifact, restoration_validator=exercise)
 
 
 def _tracked_text(path: Path) -> str:

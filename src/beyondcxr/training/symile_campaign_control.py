@@ -942,6 +942,9 @@ def _validate_freeze_fields(document: Mapping[str, Any]) -> None:
     runtime_keys = {
         "device_type",
         "autocast_dtype",
+        "deterministic_algorithms",
+        "cudnn_deterministic",
+        "cudnn_benchmark",
         "cuda_runtime_version",
         "cudnn_version",
         "gpu_device_name",
@@ -952,7 +955,17 @@ def _validate_freeze_fields(document: Mapping[str, Any]) -> None:
         neural_runtime.get("autocast_dtype") if isinstance(neural_runtime, Mapping) else None
     )
     cuda_values = (
-        tuple(neural_runtime.get(key) for key in runtime_keys - {"device_type", "autocast_dtype"})
+        tuple(
+            neural_runtime.get(key)
+            for key in runtime_keys
+            - {
+                "device_type",
+                "autocast_dtype",
+                "deterministic_algorithms",
+                "cudnn_deterministic",
+                "cudnn_benchmark",
+            }
+        )
         if isinstance(neural_runtime, Mapping)
         else ()
     )
@@ -1000,6 +1013,9 @@ def _validate_freeze_fields(document: Mapping[str, Any]) -> None:
         or set(neural_runtime) != runtime_keys
         or device_type not in {"cpu", "cuda"}
         or autocast_dtype not in {None, "float16"}
+        or neural_runtime["deterministic_algorithms"] != "enabled_warn_only"
+        or neural_runtime["cudnn_deterministic"] is not True
+        or neural_runtime["cudnn_benchmark"] is not False
         or (
             device_type == "cpu"
             and (autocast_dtype is not None or any(value is not None for value in cuda_values))

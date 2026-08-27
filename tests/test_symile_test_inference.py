@@ -22,7 +22,7 @@ import beyondcxr.training.symile_final_packages as final_packages
 import beyondcxr.training.symile_test_inference as test_inference
 import beyondcxr.utils.publication as publication
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.training.symile_export import SymileExportMember, export_and_verify
+from beyondcxr.training.preservation import PreservationMember, export_and_verify
 from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
@@ -56,7 +56,7 @@ def test_interrupted_prediction_staging_is_not_evidence_or_exported_state(tmp_pa
     abandoned = publication.staging_directory(source / "result")
     (abandoned / "partial.json").write_text("unfinished")
     export_arguments = {
-        "members": [SymileExportMember(source, Path("private/synthetic"))],
+        "members": [PreservationMember(source, Path("private/synthetic"))],
         "export_root": tmp_path / "export",
         "backup_root": tmp_path / "backup",
         "export_name": "synthetic",
@@ -264,6 +264,9 @@ def test_cross_runtime_resume_is_rejected_before_inference(
     frozen_runtime = {
         "device_type": "cuda",
         "autocast_dtype": "float16",
+        "deterministic_algorithms": "enabled_warn_only",
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
         "cuda_runtime_version": "12.4",
         "cudnn_version": 9100,
         "gpu_device_name": "GPU-A",

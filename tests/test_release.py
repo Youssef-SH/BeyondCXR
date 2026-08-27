@@ -1233,7 +1233,7 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
         with tempfile.TemporaryDirectory() as restored:
             return restoration_validator(Path(restored))
 
-    monkeypatch.setattr(serving, "restore_and_validate_symile_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"
@@ -1303,7 +1303,7 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
         assert not Path(restored).exists()
         return result
 
-    monkeypatch.setattr(serving, "restore_and_validate_symile_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"

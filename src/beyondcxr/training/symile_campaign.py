@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,10 +14,32 @@ import mlflow
 
 from beyondcxr.data.bundle_contract import BUNDLES_DIRECTORY
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.symile_artifacts import validate_symile_bundle, validate_symile_bundle_reference
 from beyondcxr.data.symile_cv import CV_DIRECTORY
 from beyondcxr.data.symile_preprocess import LAB_OBSERVED_COLUMNS
-from beyondcxr.training.config import load_symile_development_config, with_runtime
-from beyondcxr.training.device import ResolvedDevice, neural_inference_runtime_policy
+from beyondcxr.data.symile_source import establish_authenticated_release_asset
+from beyondcxr.models.cxr_baseline import fingerprint_pretrained_weights
+from beyondcxr.training.config import (
+    ExperimentConfig,
+    load_symile_development_config,
+    with_runtime,
+)
+from beyondcxr.training.device import (
+    ResolvedDevice,
+    neural_inference_runtime_policy,
+    resolve_device,
+)
+from beyondcxr.training.operational_validation import (
+    validate_existing_sqlite_database,
+    validate_writable_directory_destination,
+    validate_writable_file_destination,
+)
+from beyondcxr.training.preservation import (
+    PreservationMember,
+    export_and_verify,
+    validate_exact_restored_closure,
+    validate_preservation_paths,
+)
 from beyondcxr.training.symile_analysis import analyze_symile_development
 from beyondcxr.training.symile_campaign_control import (
     PRETEST_FREEZE_PREFIX,
@@ -31,19 +54,19 @@ from beyondcxr.training.symile_campaign_control import (
     validate_global_result,
     validate_pretest_freeze,
 )
-from beyondcxr.training.symile_data import load_symile_development_cohort
+from beyondcxr.training.symile_data import (
+    SymileCxrStore,
+    load_symile_development,
+    load_symile_development_cohort,
+)
 from beyondcxr.training.symile_development import run_symile_development
+from beyondcxr.training.symile_ecg_data import SymileEcgStore
 from beyondcxr.training.symile_ecg_extension_result import (
     ValidatedEcgExtensionResult,
     publish_ecg_extension_result,
     publish_focused_subgroup_derivative,
     validate_ecg_extension_result,
     validate_focused_subgroup_derivative,
-)
-from beyondcxr.training.symile_export import (
-    SymileExportMember,
-    export_and_verify,
-    validate_export_paths,
 )
 from beyondcxr.training.symile_families import (
     FINAL_NEURAL_FAMILIES,
@@ -73,6 +96,7 @@ from beyondcxr.training.symile_test_inference import (
     resolve_held_out_neural_runtime,
 )
 from beyondcxr.utils.mlflow_utils import (
+    configure_mlflow,
     discover_repository_root,
     environment_provenance,
     git_revision,
@@ -97,6 +121,8 @@ _CONFIGS = {
     family: Path("configs") / f"symile_{family}.yaml"
     for family in (*SYMILE_CORE_DEVELOPMENT_FAMILIES, SYMILE_ECG_GATED_FAMILY)
 }
+_SYMILE_WORKSPACE_MINIMUM_FREE_BYTES = 32 * 1024**3
+_SYMILE_BACKUP_MINIMUM_FREE_BYTES = 8 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -133,24 +159,38 @@ def run_symile_campaign(
     backup_root = _repository_path(repository_root, backup_root)
     if backup_root.resolve().is_relative_to(repository_root.resolve()):
         raise ManifestBuildError("Symile backup must reside outside the repository root")
-    if any(
-        root.resolve().is_relative_to(backup_root.resolve())
-        for root in (source_root, repository_root)
-    ):
-        raise ManifestBuildError("Symile backup must not contain campaign source state")
-    validate_export_paths(
-        sources=(
+    preservation_sources = _preservation_topology_sources(
+        repository_root=repository_root,
+        configurable_roots=(
             source_root,
             manifest_root,
             model_root,
             report_root,
             private_root,
-            *(repository_root / name for name in ("data", "models", "reports", "private")),
         ),
+    )
+    validate_preservation_paths(
+        sources=preservation_sources,
         export_root=export_root,
         backup_root=backup_root,
     )
-    tracking_uri = f"sqlite:///{repository_root / 'mlflow.db'}"
+    tracking_database = repository_root / "mlflow.db"
+    for destination in (
+        model_root,
+        report_root,
+        private_root,
+        export_root,
+        backup_root,
+    ):
+        validate_writable_directory_destination(
+            destination, "Symile campaign directory destination"
+        )
+    validate_writable_file_destination(
+        tracking_database, "Symile campaign tracking database destination"
+    )
+    validate_existing_sqlite_database(tracking_database, "Symile campaign tracking database")
+    _validate_symile_storage_readiness(repository_root, backup_root)
+    tracking_uri = f"sqlite:///{tracking_database}"
     commit, dirty = git_revision(repository_root)
     if dirty:
         raise ManifestBuildError("Formal Symile campaign requires a clean Git worktree")
@@ -170,7 +210,13 @@ def run_symile_campaign(
     }
     control_root = Path(private_root) / "control" / "symile"
     test_open_path = control_root / "test-open.json"
-    if test_open_path.exists() or test_open_path.is_symlink():
+    opened = test_open_path.exists() or test_open_path.is_symlink()
+    _preflight_symile_campaign(
+        configs,
+        source_root=source_root,
+        require_pretrained_weights=not opened,
+    )
+    if opened:
         freeze, record, ecg_extension, packages = _resolve_opened_pretest_state(
             control_root=control_root,
             model_root=model_root,
@@ -268,6 +314,7 @@ def run_symile_campaign(
         packages.append(
             _tracked_final_fit(
                 config,
+                tracking_uri=tracking_uri,
                 member_seed=FINAL_TABULAR_SEED,
                 provenance=provenance,
                 fit=lambda operational, family=family, config=config: fit_final_tabular_family(
@@ -282,6 +329,7 @@ def run_symile_campaign(
         config = final_configs["cxr_densenet"]
         package = _tracked_final_fit(
             config,
+            tracking_uri=tracking_uri,
             member_seed=seed,
             provenance=provenance,
             fit=lambda operational, seed=seed, config=config: fit_final_neural_member(
@@ -304,6 +352,7 @@ def run_symile_campaign(
             packages.append(
                 _tracked_final_fit(
                     config,
+                    tracking_uri=tracking_uri,
                     member_seed=seed,
                     provenance=provenance,
                     fit=lambda operational, family=family, seed=seed, config=config: (
@@ -352,6 +401,107 @@ def run_symile_campaign(
         backup_root=backup_root,
         runtime=runtime,
     )
+
+
+def _preservation_topology_sources(
+    *,
+    repository_root: Path,
+    configurable_roots: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Return mutually nonredundant roots for early preservation topology validation."""
+    checkout_sources = tuple(
+        (repository_root / name).absolute() for name in ("data", "models", "reports", "private")
+    )
+    external: list[Path] = []
+    for configured in configurable_roots:
+        candidate = configured.absolute()
+        if any(candidate.is_relative_to(root) for root in checkout_sources):
+            continue
+        if any(candidate.is_relative_to(root) for root in external):
+            continue
+        external = [root for root in external if not root.is_relative_to(candidate)]
+        external.append(candidate)
+    return (*checkout_sources, *external)
+
+
+def _preflight_symile_campaign(
+    configs: dict[str, ExperimentConfig],
+    *,
+    source_root: Path,
+    require_pretrained_weights: bool = True,
+) -> None:
+    """Prove all formal authorities, source assets, and runtimes before development."""
+    if set(configs) != set(_CONFIGS):
+        raise ManifestBuildError("Symile campaign configuration family set is incomplete")
+    typed = [configs[family] for family in _CONFIGS]
+    coordinates = {
+        (
+            config.dataset.dataset_id,
+            config.dataset.bundle_id,
+            config.dataset.bundle_manifest_sha256,
+            config.dataset.split_assignment_id,
+            config.dataset.cv_assignment_id,
+            config.task.task_id,
+            config.task.label_policy_version,
+        )
+        for config in typed
+    }
+    if len(coordinates) != 1 or any(
+        config.family.family_id != family for family, config in configs.items()
+    ):
+        raise ManifestBuildError("Symile campaign configurations disagree on authority or family")
+    reference_config = typed[0]
+    bundle_directory = (
+        reference_config.runtime.manifest_directory
+        / "symile"
+        / BUNDLES_DIRECTORY
+        / reference_config.dataset.bundle_id
+    )
+    validate_symile_bundle(
+        bundle_directory,
+        expected_bundle_id=reference_config.dataset.bundle_id,
+    )
+    data = load_symile_development(reference_config)
+    reference = validate_symile_bundle_reference(
+        bundle_directory,
+        expected_bundle_id=reference_config.dataset.bundle_id,
+        expected_manifest_sha256=reference_config.dataset.bundle_manifest_sha256,
+    )
+    source = reference.manifest["source"]
+    for asset in source["source_assets"]:
+        establish_authenticated_release_asset(
+            source_root,
+            checksum_manifest_sha256=source["checksum_manifest_sha256"],
+            relative_path=asset["relative_path"],
+        )
+    SymileCxrStore(data.bundle, source_root)
+    SymileEcgStore(data.bundle, source_root)
+    neural_weights = {
+        str(config.family.parameters["weights"]) for config in typed if config.neural is not None
+    }
+    if len(neural_weights) != 1:
+        raise ManifestBuildError("Symile neural configurations disagree on pretrained weights")
+    if require_pretrained_weights:
+        fingerprint_pretrained_weights(next(iter(neural_weights)))
+    runtime_contracts = set()
+    for config in typed:
+        if config.neural is None:
+            continue
+        runtime = resolve_device(
+            config.runtime.device,
+            mixed_precision=config.neural.mixed_precision,
+            pin_memory_policy=config.runtime.pin_memory_policy,
+        )
+        runtime_contracts.add(
+            (
+                runtime.device.type,
+                str(runtime.autocast_dtype),
+                runtime.pin_memory_effective,
+                config.runtime.num_workers,
+            )
+        )
+    if len(runtime_contracts) != 1:
+        raise ManifestBuildError("Symile neural configurations disagree on runtime contract")
 
 
 def _resolve_opened_pretest_state(
@@ -622,12 +772,30 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
         final_packages=packages,
         test_data=test_data,
     )
+    error_review = error_reviews[0]
     validate_error_review(
-        error_reviews[0],
+        error_review,
         capability=freeze,
         predictions=predictions,
         final_packages=packages,
         test_data=test_data,
+    )
+    validate_exact_restored_closure(
+        restored_root,
+        _campaign_export_members(
+            freeze=freeze,
+            record=record,
+            ecg_extension=extension,
+            packages=packages,
+            predictions=predictions,
+            global_result=global_result,
+            error_review=error_review,
+            test_data=test_data,
+            manifest_root=manifest_root,
+            model_root=model_root,
+            report_root=report_root,
+            private_root=private_root,
+        ),
     )
     return RestoredCampaignClosure(
         freeze=freeze,
@@ -656,7 +824,7 @@ def _campaign_export_members(
     model_root: Path,
     report_root: Path,
     private_root: Path,
-) -> tuple[SymileExportMember, ...]:
+) -> tuple[PreservationMember, ...]:
     """Resolve the exact recursively validated authority closure for one campaign."""
     analysis_id = str(ecg_extension.manifest["core_analysis_id"])
     analysis = validate_analysis_result(
@@ -736,7 +904,7 @@ def _campaign_export_members(
         test_data=test_data,
     )
 
-    members: list[SymileExportMember] = []
+    members: list[PreservationMember] = []
 
     def add(path: Path, restore_relative: Path) -> None:
         if (
@@ -746,7 +914,7 @@ def _campaign_export_members(
             or ".." in restore_relative.parts
         ):
             raise ManifestBuildError("Campaign export authority path is invalid")
-        members.append(SymileExportMember(path, restore_relative))
+        members.append(PreservationMember(path, restore_relative))
 
     bundle_id = str(freeze.manifest["bundle"]["bundle_id"])
     add(
@@ -820,10 +988,15 @@ def _campaign_export_members(
 def _tracked_final_fit(
     config,
     *,
+    tracking_uri: str,
     member_seed: int,
     provenance: dict[str, object],
     fit: Callable[[dict[str, object]], ValidatedFinalPackage],
 ) -> ValidatedFinalPackage:
+    configure_mlflow(
+        experiment_name=config.runtime.experiment_name,
+        tracking_uri=tracking_uri,
+    )
     tags = {
         "run_kind": "final_training",
         "evaluation_scope": "full_development",
@@ -853,6 +1026,34 @@ def _tracked_final_fit(
         mlflow.set_tags({"package_kind": "final", "package_id": package.package_id})
         mlflow.set_tag("run_complete", "true")
     return package
+
+
+def _validate_symile_storage_readiness(
+    repository_root: Path,
+    backup_root: Path,
+) -> None:
+    """Require headroom for campaign state/local export and the external backup."""
+    workspace_volume, workspace_free = _storage_volume(repository_root)
+    backup_volume, backup_free = _storage_volume(backup_root)
+    if workspace_volume == backup_volume:
+        required = _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES + _SYMILE_BACKUP_MINIMUM_FREE_BYTES
+        if workspace_free < required:
+            raise OSError("Symile campaign requires at least 40 GiB of free shared storage")
+        return
+    if workspace_free < _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES:
+        raise OSError("Symile campaign requires at least 32 GiB of free workspace storage")
+    if backup_free < _SYMILE_BACKUP_MINIMUM_FREE_BYTES:
+        raise OSError("Symile campaign requires at least 8 GiB of free backup storage")
+
+
+def _storage_volume(path: Path) -> tuple[int, int]:
+    """Return device identity and free bytes at the nearest existing ancestor."""
+    candidate = path.absolute()
+    while not candidate.exists():
+        if candidate.parent == candidate:
+            raise OSError("Symile storage destination has no existing ancestor")
+        candidate = candidate.parent
+    return candidate.stat().st_dev, shutil.disk_usage(candidate).free
 
 
 def _repository_path(repository_root: Path, value: str | Path) -> Path:

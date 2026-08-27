@@ -11,16 +11,17 @@ from pathlib import Path
 
 import pytest
 
-import beyondcxr.training.symile_export as symile_export
+import beyondcxr.training.preservation as preservation
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.training.symile_export import (
-    SymileExportMember,
+from beyondcxr.training.preservation import (
+    PreservationMember,
     export_and_verify,
-    restore_and_validate_symile_export,
+    restore_and_validate_export,
+    validate_preservation_paths,
 )
 
 
-def _members(tmp_path: Path) -> tuple[SymileExportMember, ...]:
+def _members(tmp_path: Path) -> tuple[PreservationMember, ...]:
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "manifest.json").write_text('{"schema_version":1}\n', encoding="utf-8")
@@ -28,8 +29,8 @@ def _members(tmp_path: Path) -> tuple[SymileExportMember, ...]:
     single = tmp_path / "test-open.json"
     single.write_text('{"test_open_schema_version":1}\n', encoding="utf-8")
     return (
-        SymileExportMember(directory, Path("reports/symile/result")),
-        SymileExportMember(single, Path("private/control/symile/test-open.json")),
+        PreservationMember(directory, Path("reports/symile/result")),
+        PreservationMember(single, Path("private/control/symile/test-open.json")),
     )
 
 
@@ -61,7 +62,7 @@ def test_export_rejects_overlapping_paths_before_writing(
     artifact.write_bytes(b"synthetic")
     with pytest.raises(ManifestBuildError, match="disjoint|outside sources"):
         export_and_verify(
-            members=[SymileExportMember(source, Path("reports/symile/result"))],
+            members=[PreservationMember(source, Path("reports/symile/result"))],
             export_root=tmp_path / export,
             backup_root=tmp_path / backup,
             export_name="campaign",
@@ -97,7 +98,7 @@ def test_export_is_self_describing_private_and_byte_deterministic(tmp_path: Path
             "member-0001/test-open.json",
         ]
         manifest = json.loads(archive.read("export-manifest.json"))
-        assert manifest["symile_export_manifest_schema_version"] == 1
+        assert manifest["preservation_manifest_schema_version"] == 1
         assert manifest["members"][0]["restore_relative"] == "reports/symile/result"
         assert manifest["members"][0]["kind"] == "directory"
         assert manifest["members"][1]["restore_relative"] == (
@@ -106,12 +107,54 @@ def test_export_is_self_describing_private_and_byte_deterministic(tmp_path: Path
         assert manifest["members"][1]["kind"] == "file"
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
     assert export_and_verify(**arguments).read_bytes() == before
-    assert restorations == 2
+    assert restorations == 4
 
     os.chmod(backup, 0o644)
     with pytest.raises(ManifestBuildError, match="permissions are unsafe"):
         export_and_verify(**arguments)
     assert backup.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("source", "export", "backup"),
+    [
+        ("export/source", "export", "backup"),
+        ("backup/source", "export", "backup"),
+        ("source", "export", "export/backup"),
+        ("source", "backup/export", "backup"),
+    ],
+)
+def test_path_validation_rejects_overlap_in_both_directions(
+    tmp_path: Path, source: str, export: str, backup: str
+) -> None:
+    with pytest.raises(ManifestBuildError, match="disjoint"):
+        validate_preservation_paths(
+            sources=[tmp_path / source],
+            export_root=tmp_path / export,
+            backup_root=tmp_path / backup,
+        )
+
+
+def test_path_validation_rejects_symlinked_components(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ManifestBuildError, match="symlinks"):
+        validate_preservation_paths(
+            sources=[tmp_path / "source"],
+            export_root=link / "export",
+            backup_root=tmp_path / "backup",
+        )
+
+
+def test_path_validation_rejects_overlapping_source_members(tmp_path: Path) -> None:
+    with pytest.raises(ManifestBuildError, match="mutually disjoint"):
+        validate_preservation_paths(
+            sources=[tmp_path / "source", tmp_path / "source/nested"],
+            export_root=tmp_path / "export",
+            backup_root=tmp_path / "backup",
+        )
 
 
 def test_identical_secure_backup_is_reused_and_symlink_is_rejected(tmp_path: Path) -> None:
@@ -129,7 +172,7 @@ def test_identical_secure_backup_is_reused_and_symlink_is_rejected(tmp_path: Pat
     }
     (tmp_path / "other-backup").mkdir()
     (tmp_path / "other-backup/campaign.zip").symlink_to(backup)
-    with pytest.raises(ManifestBuildError, match="conflicts with existing preserved state"):
+    with pytest.raises(ManifestBuildError, match="conflicts with existing state"):
         export_and_verify(**other_arguments)
 
 
@@ -164,7 +207,7 @@ def test_export_rejects_unsafe_existing_checksum_permissions(tmp_path: Path) -> 
 
 def _valid_manifest() -> dict[str, object]:
     return {
-        "symile_export_manifest_schema_version": 1,
+        "preservation_manifest_schema_version": 1,
         "members": [
             {
                 "archive_identity": "member-0000",
@@ -199,11 +242,11 @@ def test_export_manifest_rejects_hostile_contracts(mutation: str) -> None:
     document = _valid_manifest()
     member = document["members"][0]
     if mutation == "wrong_version":
-        document["symile_export_manifest_schema_version"] = 2
+        document["preservation_manifest_schema_version"] = 2
     elif mutation == "boolean_version":
-        document["symile_export_manifest_schema_version"] = True
+        document["preservation_manifest_schema_version"] = True
     elif mutation == "float_version":
-        document["symile_export_manifest_schema_version"] = 1.0
+        document["preservation_manifest_schema_version"] = 1.0
     elif mutation == "missing_field":
         member.pop("files")
     elif mutation == "extra_field":
@@ -223,17 +266,19 @@ def test_export_manifest_rejects_hostile_contracts(mutation: str) -> None:
     else:
         member["kind"] = "file"
     with pytest.raises(ManifestBuildError):
-        symile_export._validate_export_manifest(document)
+        preservation._validate_export_manifest(document)
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("restore", "."),
+        ("restore", "./reports/symile/result"),
         ("restore", "reports//symile/result"),
         ("restore", "reports/./symile/result"),
         ("restore", "reports/symile/result/"),
         ("archive", "."),
+        ("archive", "./nested/manifest.json"),
         ("archive", "nested//manifest.json"),
         ("archive", "nested/./manifest.json"),
         ("archive", "nested/manifest.json/"),
@@ -248,7 +293,7 @@ def test_export_manifest_rejects_textually_noncanonical_paths(field: str, value:
         member["files"][0]["path"] = value
 
     with pytest.raises(ManifestBuildError, match="is invalid"):
-        symile_export._validate_export_manifest(document)
+        preservation._validate_export_manifest(document)
 
 
 def test_export_file_member_requires_exact_standalone_basename() -> None:
@@ -259,20 +304,20 @@ def test_export_file_member_requires_exact_standalone_basename() -> None:
     member["files"][0]["path"] = "nested/test-open.json"
 
     with pytest.raises(ManifestBuildError, match="file member kind is inconsistent"):
-        symile_export._validate_export_manifest(document)
+        preservation._validate_export_manifest(document)
 
 
 def _write_archive(
     path: Path, document: dict[str, object], entries: list[tuple[str, bytes]]
 ) -> None:
     with zipfile.ZipFile(path, "w") as archive:
-        symile_export._write_zip_bytes(
+        preservation._write_zip_bytes(
             archive,
             "export-manifest.json",
-            symile_export._canonical_json_bytes(document),
+            preservation._canonical_json_bytes(document),
         )
         for name, content in entries:
-            symile_export._write_zip_bytes(archive, name, content)
+            preservation._write_zip_bytes(archive, name, content)
     os.chmod(path, 0o600)
 
 
@@ -292,7 +337,7 @@ def test_standalone_restore_rejects_hostile_zip_membership(tmp_path: Path, mutat
     archive = tmp_path / "hostile.zip"
     _write_archive(archive, document, entries)
     with pytest.raises(ManifestBuildError):
-        restore_and_validate_symile_export(archive)
+        restore_and_validate_export(archive)
 
 
 def test_standalone_restore_uses_only_backup_manifest_after_sources_are_deleted(
@@ -310,7 +355,7 @@ def test_standalone_restore_uses_only_backup_manifest_after_sources_are_deleted(
             "open": (root / "private/control/symile/test-open.json").read_bytes(),
         }
 
-    observed = restore_and_validate_symile_export(backup, restoration_validator=validate)
+    observed = restore_and_validate_export(backup, restoration_validator=validate)
     assert observed == {
         "artifact": b"bounded-streaming-input" * 100,
         "open": b'{"test_open_schema_version":1}\n',
@@ -326,7 +371,7 @@ def test_export_cleans_temporary_file_after_archive_install_failure(
         del temporary, destination
         raise OSError("simulated archive publication failure")
 
-    monkeypatch.setattr(symile_export, "_install_or_validate", fail_archive_install)
+    monkeypatch.setattr(preservation, "_install_or_validate", fail_archive_install)
     with pytest.raises(OSError, match="simulated archive publication failure"):
         export_and_verify(**arguments)
     export_root = tmp_path / "export"
