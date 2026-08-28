@@ -154,8 +154,11 @@ timestamps, commands, paths, tool diagnostics, and `CURRENT` are excluded.
 
 Publication validates a complete sibling staging directory once, atomically renames it to its
 immutable `bundle-<sha256>` directory, then atomically updates `CURRENT`. Independent consumers
-perform complete validation when loading a bundle. Scientific runs should record an explicit
-bundle ID; `CURRENT` is the interactive selection pointer.
+perform complete validation when loading a bundle. Formal configs pin the bundle ID, exact
+`manifest.json` SHA-256, and split assignment; formal campaigns resolve only that directory and
+never consult `CURRENT`. Because generation and provenance fields may change across independent
+builds, a semantically equal bundle ID does not imply equal manifest bytes. The exact published
+authority must be preserved and transferred once its byte witness is pinned.
 
 Symile source-asset paths are canonical names within the authenticated official release, not local
 filesystem locations. Relocating the complete source root leaves semantic bundle identity

@@ -29,13 +29,28 @@ validated preservation export
 Source adapters authenticate dataset-specific files and construct typed artifacts. Bundle
 validators enforce schemas, ordering, relationships, source witnesses, split isolation, logical
 content hashes, physical byte hashes, and semantic identity. Scientific consumers pin immutable
-bundle and split identities. `CURRENT` is limited to interactive dataset operations.
+bundle and split identities plus the exact manifest-byte witness. Authority publication is a
+separate lifecycle step. `CURRENT` is limited to interactive dataset operations and is never read
+by a formal campaign.
 
 RSNA packages labeled DICOM metadata, labels, boxes, patient-disjoint splits, and a source
 inventory. A deterministic authenticated CXR cache separates raw DICOM decoding from model
 training. Symile packages the lean admission spine and raw laboratory values while retaining
 authenticated references to the large CXR and ECG tensors. Its separate CV assignment artifact fixes all
 repeat/fold assignments.
+
+Formal RSNA preflight constructs one immutable plan containing every root, exact authority
+coordinate, ordered family/seed member, loaded config witness, source revision, dependency lock,
+pretrained-weight fingerprint, and the training/evaluation and full-precision localization
+runtime witnesses. Every later phase consumes that plan;
+no phase re-resolves a root or mutable authority selector. The complete package/report freeze is
+the capability required by each held-out accessor and by localization.
+Each immutable model package contains the ordered validation sample IDs, their targets, their
+probabilities, and the minimal selection history needed to reconstruct validation claims. The
+package identity binds this scientific evidence; report and plot bytes are deterministic
+derivatives. Package-freeze validation independently rederives canonical validation membership and
+labels from the pinned bundle before accepting package evidence. The freeze binds ordered package
+membership and report coordinates, while preservation hashes witness transport bytes.
 
 Exact schemas and identity rules live in the [data contract](data_contract.md). Dataset roles,
 access, and limitations live in the [data statement](data_statement.md).
@@ -104,10 +119,21 @@ outside the public result surface.
 
 ## Supporting RSNA workflow
 
-The RSNA campaign authenticates source DICOM bytes, builds the deterministic CXR cache, fits
-metadata and three-seed neural families, freezes validation-derived thresholds, evaluates explicit
-packages on the held-out partition, and publishes aggregate evaluation, seed-summary, comparison,
-and localization results. Private aligned predictions and real-image overlays remain outside Git.
+The RSNA bundle and split are published before formal execution and every RSNA config pins that
+same bundle ID, manifest SHA-256, and split-assignment ID. A read-only campaign preflight validates
+the complete bundle, raw-source availability, configuration agreement, Git and lock provenance,
+CUDA contract, storage, and external backup destination before creating campaign output.
+
+The campaign then authenticates source DICOM bytes while building or validating the deterministic
+CXR cache, fits metadata and three-seed neural families, and publishes an immutable eight-package
+freeze before held-out access. Package-bound completion records make held-out evaluation
+append-only and resumable. Aggregate evaluations, seed summaries, comparison, and localization
+are content-addressed or validated derivatives. The preservation ZIP contains an explicit
+scientific closure—not repository roots—and is restored and recursively validated before its
+checksum and external backup are accepted.
+Private localization state includes compact per-case numerical evidence from the completed
+Grad-CAM procedure. Restoration recomputes public member and aggregate statistics from that
+evidence without requiring the original DICOM files.
 
 ## Release and serving
 

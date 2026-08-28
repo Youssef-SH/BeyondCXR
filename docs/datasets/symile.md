@@ -35,3 +35,7 @@ make symile-cv BUNDLE_ID=bundle-...
 ```
 
 `CURRENT` is available only for intentional interactive discovery when `BUNDLE_ID` is omitted.
+Formal development and campaign execution instead require the exact config-pinned bundle and CV
+directories, including the original manifest bytes. The formal campaign validates both authorities
+and all referenced external source assets before development; it does not regenerate either
+authority.

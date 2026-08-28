@@ -6,8 +6,7 @@ separate evidence and not external validation of the Symile predictor.
 
 `make rsna-campaign` produces and validates the existing RSNA aggregate authorities under
 `reports/rsna/evaluations/`, `reports/rsna/seed-summaries/`, and `reports/rsna/localization/`, with
-the deterministic comparison views at `reports/model_comparison_table.csv` and
-`reports/model_comparison_table.md`.
+the content-addressed deterministic comparison under `reports/rsna/comparisons/`.
 
 Before formal execution no Symile result files exist here. After execution, `make results`
 restores and validates one explicit preservation export and writes the result binding,
