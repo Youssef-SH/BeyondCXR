@@ -43,6 +43,31 @@ def test_immutable_directory_does_not_replace_incomplete_destination(tmp_path: P
     assert not list(destination.iterdir())
 
 
+def test_immutable_directory_preserves_empty_destination_created_during_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "object"
+    stage = staging_directory(destination)
+    (stage / "value.txt").write_text("same", encoding="utf-8")
+    real_exists = Path.exists
+    raced = False
+
+    def exists(path: Path) -> bool:
+        nonlocal raced
+        if path == destination and not raced:
+            raced = True
+            destination.mkdir()
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    with pytest.raises(FileNotFoundError):
+        install_immutable_directory(stage, destination, _validate_text_object)
+    assert destination.is_dir()
+    assert not list(destination.iterdir())
+    assert (stage / "value.txt").read_text(encoding="utf-8") == "same"
+
+
 def test_immutable_directory_concurrent_winner_is_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -57,7 +82,9 @@ def test_immutable_directory_concurrent_winner_is_reused(
         (winner / "value.txt").write_text("same", encoding="utf-8")
         raise OSError(errno.EEXIST, "concurrent winner")
 
-    monkeypatch.setattr("beyondcxr.utils.publication.os.rename", concurrent_winner)
+    monkeypatch.setattr(
+        "beyondcxr.utils.publication.rename_directory_no_replace", concurrent_winner
+    )
     assert install_immutable_directory(stage, destination, _validate_text_object) is False
     assert (destination / "value.txt").read_text(encoding="utf-8") == "same"
 
