@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
+from rsna_authorization_test_support import authorize_rsna_package
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
@@ -59,6 +60,18 @@ def _tables() -> dict[str, pa.Table]:
         "splits.parquet": pa.Table.from_pylist(splits),
         "source_inventory.parquet": pa.Table.from_pylist(inventory),
     }
+
+
+def test_heldout_reader_rejects_forged_structural_authorization() -> None:
+    config = with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42)
+    forged = SimpleNamespace(require=lambda package_id: package_id)
+
+    with pytest.raises(PermissionError, match="validated package freeze"):
+        RsnaDataset().load_test(
+            config,
+            authorization=forged,
+            package_id="model-package-forged",
+        )
 
 
 def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
@@ -116,7 +129,10 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
     monkeypatch.setattr("beyondcxr.training.rsna_datasets.pq.read_table", read_table)
 
     data = RsnaDataset().load_train_validation(config)
-    test, lineage = RsnaDataset().load_test(config)
+    authorization = authorize_rsna_package(config, "model-package-test", monkeypatch=monkeypatch)
+    test, lineage = RsnaDataset().load_test(
+        config, authorization=authorization, package_id="model-package-test"
+    )
 
     expected_bundle = tmp_path / "manifests" / "rsna" / "bundles" / config.dataset.bundle_id
     assert validated == [expected_bundle] * 4

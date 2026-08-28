@@ -8,7 +8,7 @@ from beyondcxr.evaluation.metrics import (
     target_sensitivity_threshold,
 )
 from beyondcxr.training.config import load_experiment_config
-from beyondcxr.training.rsna_train_metadata import (
+from beyondcxr.training.rsna_training_report import (
     _write_evaluation_report,
     metrics_document,
 )

@@ -29,11 +29,6 @@ from beyondcxr.utils.operational_logging import (
         ("data.symile_audit", "generate_symile_audit", []),
         ("data.symile_cv", "resolve_symile_bundle", []),
         ("training.rsna_train", "load_experiment_config", ["--config", "unused", "--seed", "42"]),
-        (
-            "training.rsna_evaluate",
-            "load_experiment_config",
-            ["--config", "unused", "--package-id", "unused"],
-        ),
         ("training.rsna_compare", "regenerate_comparison", ["--evaluation-ids", "unused"]),
         (
             "training.rsna_seed_summary",
@@ -41,11 +36,10 @@ from beyondcxr.utils.operational_logging import (
             ["--evaluation-ids", "a", "b", "c"],
         ),
         (
-            "training.rsna_localize",
-            "generate_localization_report",
-            ["--evaluation-ids", "a", "b", "c"],
+            "training.rsna_campaign",
+            "execute_rsna_campaign",
+            ["--backup-root", "unused-backup"],
         ),
-        ("training.rsna_campaign", "execute_rsna_campaign", None),
         (
             "training.symile_development",
             "load_symile_development_config",

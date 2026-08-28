@@ -23,6 +23,7 @@ from beyondcxr.release.checks import (
     _check_release_delta,
     _container_serving_command,
     _docker_verification_command,
+    _release_candidate_paths,
     check_repository,
     inspect_distribution_archives,
     run_final_acceptance,
@@ -57,6 +58,47 @@ from beyondcxr.training.symile_families import (
 
 def _identity(prefix: str, index: int) -> str:
     return prefix + f"{index:064x}"
+
+
+def test_release_candidate_scan_has_explicit_git_state_semantics(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    tracked = tmp_path / "tracked.txt"
+    deleted = tmp_path / "deleted.txt"
+    renamed_source = tmp_path / "rename-source.txt"
+    tracked.write_text("tracked\n", encoding="utf-8")
+    deleted.write_text("deleted\n", encoding="utf-8")
+    renamed_source.write_text("renamed\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "tracked.txt", "deleted.txt", "rename-source.txt", ".gitignore"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "mv", "rename-source.txt", "rename-destination.txt"], cwd=tmp_path, check=True
+    )
+    deleted.unlink()
+    untracked = tmp_path / "untracked.txt"
+    untracked.write_text("candidate\n", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("ignored\n", encoding="utf-8")
+
+    observed = {path.name for path in _release_candidate_paths(tmp_path)}
+
+    assert observed == {
+        ".gitignore",
+        "rename-destination.txt",
+        "tracked.txt",
+        "untracked.txt",
+    }
+
+
+def test_release_candidate_scan_rejects_untracked_symlink(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    target = tmp_path / "target.txt"
+    target.write_text("target\n", encoding="utf-8")
+    (tmp_path / "link.txt").symlink_to(target)
+    with pytest.raises(ManifestBuildError, match="Release-candidate symlink"):
+        _release_candidate_paths(tmp_path)
 
 
 def fixture_text(*parts: str) -> str:
@@ -1233,7 +1275,7 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
         with tempfile.TemporaryDirectory() as restored:
             return restoration_validator(Path(restored))
 
-    monkeypatch.setattr(serving, "restore_and_validate_symile_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"
@@ -1303,7 +1345,7 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
         assert not Path(restored).exists()
         return result
 
-    monkeypatch.setattr(serving, "restore_and_validate_symile_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"
@@ -1681,7 +1723,7 @@ def test_repository_check_rejects_tracked_symlinks(tmp_path: Path, broken: bool)
     link.symlink_to(target.name)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "add", "tracked-link.txt"], cwd=root, check=True)
-    with pytest.raises(ManifestBuildError, match="Tracked symlink"):
+    with pytest.raises(ManifestBuildError, match="Release-candidate symlink"):
         check_repository(root)
 
 
@@ -1704,6 +1746,8 @@ def test_repository_check_allows_synthetic_identifiers_across_text_formats(tmp_p
         "tests/fixtures/rows.py": (
             '{"sample_id": "rsna:a", "patient_id": "patient-positive", '
             '"image_id": "synthetic-image"}\n'
+            'fabricated = "rsna:" + "-".join('
+            '("00000000", "0000", "4000", "8000", "000000000000"))\n'
         ),
         "tests/fixtures/rows.json": '{"patient_id": "patient-positive"}\n',
         "tests/fixtures/rows.csv": "sample_id,target\nvalidation-negative,0\n",

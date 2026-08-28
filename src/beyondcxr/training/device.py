@@ -108,6 +108,9 @@ def neural_inference_runtime_policy(runtime: ResolvedDevice) -> dict[str, Any]:
     return {
         "device_type": runtime.device.type,
         "autocast_dtype": "float16" if runtime.mixed_precision_effective else None,
+        "deterministic_algorithms": "enabled_warn_only",
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
         "cuda_runtime_version": runtime.cuda_runtime_version,
         "cudnn_version": runtime.cudnn_version,
         "gpu_device_name": runtime.gpu_device_name,
@@ -117,3 +120,8 @@ def neural_inference_runtime_policy(runtime: ResolvedDevice) -> dict[str, Any]:
             else None
         ),
     }
+
+
+def full_precision_neural_runtime_policy(runtime: ResolvedDevice) -> dict[str, Any]:
+    """Return the bound device policy for full-precision neural procedures."""
+    return {**neural_inference_runtime_policy(runtime), "autocast_dtype": None}

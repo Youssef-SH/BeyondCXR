@@ -22,6 +22,11 @@ uv run --group acquisition kaggle competitions download \
 
 Extract the archive into `data/raw/rsna/extracted/`.
 
+Publish the dataset authority separately with `make rsna-manifest SOURCE_ROOT=...`. Record the
+resulting bundle ID, manifest SHA-256, and split-assignment ID in every RSNA experiment config, then
+transfer that exact immutable bundle directory to the formal host. `make rsna-campaign` validates
+those bytes and the external DICOM inventory; it does not rebuild the bundle or use `CURRENT`.
+
 ## Verified local layout
 
 ```text

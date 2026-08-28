@@ -97,6 +97,9 @@ def _freeze(
     neural_runtime = neural_runtime or {
         "device_type": "cpu",
         "autocast_dtype": None,
+        "deterministic_algorithms": "enabled_warn_only",
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
         "cuda_runtime_version": None,
         "cudnn_version": None,
         "gpu_device_name": None,

@@ -27,6 +27,11 @@ from beyondcxr.training.config import (
     with_runtime,
 )
 from beyondcxr.training.execution import LoaderExecutionPolicy
+from beyondcxr.training.rsna_validation_evidence import (
+    VALIDATION_EVIDENCE_FILENAME,
+    evidence_semantic_sha256,
+    validate_validation_evidence,
+)
 from beyondcxr.utils.package_identity import (
     canonical_scientific_id,
     fitted_object_state_sha256,
@@ -73,6 +78,8 @@ NEURAL_MANIFEST_FIELDS = frozenset(
         "config_source_sha256",
         "config_semantic_sha256",
         "checkpoint_sha256",
+        "validation_evidence_sha256",
+        "validation_evidence_semantic_sha256",
         "fit_config",
         "model_state_sha256",
         "preprocessor_state_sha256",
@@ -176,6 +183,7 @@ def publish_neural_model_package(
     model_root: str | Path,
     checkpoint_path: str | Path,
     source_config_bytes: bytes,
+    validation_evidence_path: str | Path,
     manifest: Mapping[str, Any],
     structured_preprocessor_path: str | Path | None = None,
 ) -> PublishedNeuralModel:
@@ -187,6 +195,8 @@ def publish_neural_model_package(
         model_path = stage / NEURAL_MODEL_FILENAME
         config_path = stage / CONFIG_FILENAME
         shutil.copyfile(checkpoint_path, model_path)
+        evidence_path = stage / VALIDATION_EVIDENCE_FILENAME
+        shutil.copyfile(validation_evidence_path, evidence_path)
         config_path.write_bytes(source_config_bytes)
         package_kind = _manifest_package_kind(manifest)
         if package_kind == "fusion":
@@ -218,6 +228,10 @@ def publish_neural_model_package(
             "modalities": list(config.family.modalities),
             "task_id": config.task.task_id,
             "checkpoint_sha256": sha256_file(model_path),
+            "validation_evidence_sha256": sha256_file(evidence_path),
+            "validation_evidence_semantic_sha256": evidence_semantic_sha256(
+                json.loads(evidence_path.read_bytes())
+            ),
             "fit_config": package_scientific_config_payload(config),
             "model_state_sha256": tensor_state_sha256(checkpoint["model_state_dict"]),
             "preprocessor_state_sha256": preprocessor_state,
@@ -225,7 +239,7 @@ def publish_neural_model_package(
         }
         document["model_package_id"] = neural_model_package_id(document)
         final = packages_root / document["model_package_id"]
-        _validate_manifest(document, model_path, config_path, checkpoint)
+        _validate_manifest(document, model_path, config_path, evidence_path, checkpoint)
         if package_kind == "fusion":
             _validate_fusion_source_package(stage, document)
         (stage / MANIFEST_FILENAME).write_text(
@@ -279,7 +293,12 @@ def validate_neural_package_metadata(
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Neural model manifest is unreadable") from exc
     package_kind = _manifest_package_kind(document) if isinstance(document, dict) else None
-    expected = {NEURAL_MODEL_FILENAME, CONFIG_FILENAME, MANIFEST_FILENAME}
+    expected = {
+        NEURAL_MODEL_FILENAME,
+        CONFIG_FILENAME,
+        MANIFEST_FILENAME,
+        VALIDATION_EVIDENCE_FILENAME,
+    }
     if package_kind == "fusion":
         expected.add(STRUCTURED_PREPROCESSOR_FILENAME)
     if actual != expected:
@@ -288,6 +307,7 @@ def validate_neural_package_metadata(
         document,
         directory / NEURAL_MODEL_FILENAME,
         directory / CONFIG_FILENAME,
+        directory / VALIDATION_EVIDENCE_FILENAME,
     )
     if package_kind == "fusion":
         _validate_fusion_source_package(directory, document)
@@ -351,6 +371,7 @@ def neural_model_package_id(document: Mapping[str, Any]) -> str:
         "training_transform_contract": document["training_transform_contract"],
         "evaluation_transform_contract": document["evaluation_transform_contract"],
         "training_policy": document["training_policy"],
+        "validation_evidence_semantic_sha256": document["validation_evidence_semantic_sha256"],
     }
     return canonical_scientific_id(NEURAL_PACKAGE_ID_PREFIX, payload)
 
@@ -389,9 +410,10 @@ def _validate_manifest(
     document: object,
     model_path: Path,
     config_path: Path,
+    evidence_path: Path,
     checkpoint: Mapping[str, Any],
 ) -> None:
-    _validate_manifest_metadata(document, model_path, config_path)
+    _validate_manifest_metadata(document, model_path, config_path, evidence_path)
     _validate_checkpoint_binding(document, checkpoint)
 
 
@@ -399,6 +421,7 @@ def _validate_manifest_metadata(
     document: object,
     model_path: Path,
     config_path: Path,
+    evidence_path: Path,
 ) -> None:
     if not isinstance(document, dict):
         raise ValueError("Neural model manifest contains an unexpected field set")
@@ -436,6 +459,8 @@ def _validate_manifest_metadata(
         "config_source_sha256",
         "config_semantic_sha256",
         "checkpoint_sha256",
+        "validation_evidence_sha256",
+        "validation_evidence_semantic_sha256",
     ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Neural model manifest {field} must be a lowercase SHA-256")
@@ -446,6 +471,7 @@ def _validate_manifest_metadata(
     training_policy = document.get("training_policy")
     seed = training_policy.get("seed") if isinstance(training_policy, dict) else None
     config = with_runtime(load_experiment_config(config_path), seed=seed)
+    validate_validation_evidence(evidence_path, package=document, config=config)
     if (
         document["dataset_id"] != config.dataset.dataset_id
         or document["bundle_id"] != config.dataset.bundle_id

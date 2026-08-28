@@ -127,7 +127,7 @@ _GENERATED_ROOT_FILES = {"mlflow.db", "mlflow.db-shm", "mlflow.db-wal"}
 def check_repository(root: str | Path, *, final: bool = False) -> None:
     """Validate documentation, privacy, packaging, result-surface, and release invariants."""
     repository = Path(root).resolve()
-    tracked = _tracked_paths(repository)
+    tracked = _release_candidate_paths(repository)
     unexpected_root_files = [
         path
         for path in tracked
@@ -302,7 +302,7 @@ def _expected_package_files(repository_root: Path) -> set[str]:
     package_root = root / "src" / "beyondcxr"
     expected = {
         path.relative_to(package_root).as_posix()
-        for path in _tracked_paths(root)
+        for path in _release_candidate_paths(root)
         if path.is_relative_to(package_root)
     }
     if not expected:
@@ -524,8 +524,8 @@ def _run_container_serving_acceptance(
     *, artifact: Path, authority: Path, image: str, cwd: Path, docker: str
 ) -> None:
     """Restore packages and exercise all serving endpoints inside the built image."""
+    from beyondcxr.training.preservation import restore_and_validate_export
     from beyondcxr.training.symile_campaign import validate_restored_campaign
-    from beyondcxr.training.symile_export import restore_and_validate_symile_export
 
     def exercise(restored_root: Path) -> None:
         campaign = validate_restored_campaign(restored_root)
@@ -540,7 +540,7 @@ def _run_container_serving_acceptance(
             cwd,
         )
 
-    restore_and_validate_symile_export(artifact, restoration_validator=exercise)
+    restore_and_validate_export(artifact, restoration_validator=exercise)
 
 
 def _tracked_text(path: Path) -> str:
@@ -694,19 +694,43 @@ def _is_generated_repository_path(root: Path, path: Path) -> bool:
     )
 
 
-def _tracked_paths(root: Path) -> list[Path]:
+def _release_candidate_paths(root: Path) -> list[Path]:
+    """Return tracked-present and untracked-nonignored files in the candidate tree.
+
+    Tracked deletions have no releasable bytes and are omitted. Git-ignored generated state is
+    outside this repository-release scan. Staged additions and rename destinations are included.
+    """
     try:
-        result = subprocess.run(
-            ["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True
+        cached = subprocess.run(
+            ["git", "ls-files", "-z", "--cached"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+        others = subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
+            cwd=root,
+            check=True,
+            capture_output=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ManifestBuildError("Release checks require a Git checkout") from exc
-    paths = [root / item.decode() for item in result.stdout.split(b"\0") if item]
+    try:
+        cached_names = {item.decode() for item in cached.stdout.split(b"\0") if item}
+        other_names = {item.decode() for item in others.stdout.split(b"\0") if item}
+    except UnicodeDecodeError as exc:
+        raise ManifestBuildError("Release-candidate path is not UTF-8") from exc
+    paths = []
+    for name in sorted(cached_names | other_names):
+        path = root / name
+        if name in cached_names and not path.exists() and not path.is_symlink():
+            continue
+        paths.append(path)
     for path in paths:
         if path.is_symlink():
-            raise ManifestBuildError(f"Tracked symlink is not allowed: {path.as_posix()}")
+            raise ManifestBuildError(f"Release-candidate symlink is not allowed: {path.as_posix()}")
         if not path.is_file():
-            raise ManifestBuildError(f"Tracked file is unavailable: {path.as_posix()}")
+            raise ManifestBuildError(f"Release-candidate file is unavailable: {path.as_posix()}")
     return paths
 
 

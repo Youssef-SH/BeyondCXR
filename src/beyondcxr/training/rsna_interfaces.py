@@ -77,7 +77,9 @@ class RsnaDatasetImplementation(Protocol):
     def load_lineage(self, config: ExperimentConfig) -> DatasetLineage:
         """Validate a pinned bundle and return task lineage."""
 
-    def load_test(self, config: ExperimentConfig) -> tuple[DatasetPartition, DatasetLineage]:
+    def load_test(
+        self, config: ExperimentConfig, *, authorization: object, package_id: str
+    ) -> tuple[DatasetPartition, DatasetLineage]:
         """Load only the test partition and its pinned lineage."""
 
     def load_cxr_train_validation(self, config: ExperimentConfig) -> CxrRunData:
@@ -88,6 +90,8 @@ class RsnaDatasetImplementation(Protocol):
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
+        authorization: object,
+        package_id: str,
     ) -> CxrTestData:
         """Load source-inventory-bound CXR test rows."""
 
@@ -99,6 +103,8 @@ class RsnaDatasetImplementation(Protocol):
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
+        authorization: object,
+        package_id: str,
     ) -> FusionTestData:
         """Load source-inventory-bound aligned fusion test rows."""
 

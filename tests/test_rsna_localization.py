@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 import torch
 import torchxrayvision as xrv
+from rsna_authorization_test_support import authorize_rsna_package, authorize_rsna_packages
 from torch import nn
 
 from beyondcxr.data.cxr_transforms import center_crop_geometry
@@ -23,8 +24,11 @@ from beyondcxr.evaluation.localization import (
 )
 from beyondcxr.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncoder
 from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.device import resolve_device
 from beyondcxr.training.rsna_datasets import RsnaDataset
+from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.training.rsna_localize import (
+    LOCALIZATION_EVIDENCE_FILENAME,
     QUALITATIVE_POLICY_VERSION,
     _evaluate_member,
     _gradcam_indices,
@@ -34,6 +38,7 @@ from beyondcxr.training.rsna_localize import (
     _report_document,
     _rsna_localization_dataset,
     _validate_localization_output_boundaries,
+    _write_localization_evidence,
     generate_localization_report,
 )
 from beyondcxr.utils.operational_logging import configure_logging
@@ -70,10 +75,10 @@ def test_localization_rejects_non_rsna_before_dataset_access(
         _rsna_localization_dataset(non_rsna)
 
 
-def test_standalone_localization_resolves_one_shared_cache(
+def test_authorized_localization_resolves_one_shared_cache(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seeds = (17, 42, 2026)
+    seeds = RSNA_NEURAL_SEEDS
     evaluation_ids_15 = {seed: "evaluation-" + format(seed, "064x") for seed in seeds}
     evaluation_ids_20 = {seed: "evaluation-" + format(seed + 10_000, "064x") for seed in seeds}
     evaluation_seeds = {
@@ -121,8 +126,9 @@ def test_standalone_localization_resolves_one_shared_cache(
     monkeypatch.setattr("beyondcxr.training.rsna_localize.prepare_rsna_cxr_cache", prepare)
     observed_caches: list[object] = []
 
-    def evaluate(package_id, package, manifest, config, *, examples, cache):
-        del package_id, package, manifest, examples
+    def evaluate(package_id, package, manifest, config, *, authorization, examples, cache, runtime):
+        del authorization
+        del package, manifest, examples, runtime
         observed_caches.append(cache)
         return {
             "public": {
@@ -141,17 +147,49 @@ def test_standalone_localization_resolves_one_shared_cache(
             },
             "private_examples": [],
             "forbidden_source_values": set(),
+            "positive_sample_ids": ("rsna:localization-positive",),
+            "evidence": {
+                "model_package_id": package_id,
+                "seed": config.runtime.seed,
+                "cases": [
+                    {
+                        "sample_id": "rsna:localization-positive",
+                        "pointing_game": 1,
+                        "activation_energy_inside_union": 0.5,
+                        "zero_heatmap": False,
+                    }
+                ],
+                "qualitative_strata_present": {
+                    "TP": True,
+                    "FN": False,
+                    "FP": False,
+                    "TN": True,
+                },
+            },
         }
 
     monkeypatch.setattr("beyondcxr.training.rsna_localize._evaluate_member", evaluate)
     log_stream = io.StringIO()
     configure_logging("INFO", stream=log_stream)
 
+    authorization = authorize_rsna_packages(
+        tuple((with_runtime(configs[seed], seed=seed), _PACKAGE_IDS[seed]) for seed in seeds),
+        monkeypatch=monkeypatch,
+    )
+    reference_neural = configs[seeds[0]].neural
+    assert reference_neural is not None
+    runtime = resolve_device(
+        configs[seeds[0]].runtime.device,
+        mixed_precision=reference_neural.mixed_precision,
+        pin_memory_policy=configs[seeds[0]].runtime.pin_memory_policy,
+    )
     result = generate_localization_report(
         list(evaluation_ids_15.values()),
+        authorization=authorization,
         output_directory=tmp_path / "reports",
         model_directory=tmp_path / "models",
         private_directory=tmp_path / "private",
+        runtime=runtime,
     )
 
     assert result.is_dir()
@@ -168,9 +206,11 @@ def test_standalone_localization_resolves_one_shared_cache(
 
     repeated = generate_localization_report(
         list(reversed(evaluation_ids_20.values())),
+        authorization=authorization,
         output_directory=tmp_path / "reports",
         model_directory=tmp_path / "models",
         private_directory=tmp_path / "private",
+        runtime=runtime,
     )
     assert repeated == result
     assert (result / "summary.json").stat().st_ino == public_inode
@@ -300,8 +340,10 @@ def test_localization_member_emits_generic_operation_completion(
             "thresholds": {"youden_j": 0.5},
         },
         config,
+        authorization=authorize_rsna_package(config, _PACKAGE_IDS[42], monkeypatch=monkeypatch),
         examples=examples,
         cache=cache,
+        runtime=resolve_device("cpu", mixed_precision=False, pin_memory_policy="disabled"),
     )
 
     progress = [
@@ -531,7 +573,7 @@ def test_public_localization_report_states_interpretation_boundary() -> None:
                     "pointing_game_accuracy": 0.5,
                     "mean_activation_energy_inside_union": 0.4,
                 }
-                for seed in (17, 42, 2026)
+                for seed in RSNA_NEURAL_SEEDS
             ],
             "aggregates": {
                 "pointing_game_accuracy": {
@@ -561,7 +603,7 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
     examples.mkdir(parents=True)
     (examples / "seed-42-example-01-tp.png").write_bytes(b"synthetic")
     members = [{"filename": "seed-42-example-01-tp.png"}]
-    package_ids = [_PACKAGE_IDS[seed] for seed in (17, 42, 2026)]
+    package_ids = [_PACKAGE_IDS[seed] for seed in RSNA_NEURAL_SEEDS]
     report_id = _localization_id(package_ids)
     public_members = [
         {
@@ -578,7 +620,7 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
                 "TN": True,
             },
         }
-        for seed in (17, 42, 2026)
+        for seed in RSNA_NEURAL_SEEDS
     ]
     document = _report_document(report_id, package_ids, public_members)
     (public / "summary.json").write_text(
@@ -597,12 +639,37 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
         ),
         encoding="utf-8",
     )
+    _write_localization_evidence(
+        private / LOCALIZATION_EVIDENCE_FILENAME,
+        report_id=report_id,
+        model_package_ids=package_ids,
+        expected_positive_sample_ids=("rsna:localization-positive",),
+        members=[
+            {
+                "model_package_id": package_id,
+                "seed": seed,
+                "cases": [
+                    {
+                        "sample_id": "rsna:localization-positive",
+                        "pointing_game": 1,
+                        "activation_energy_inside_union": 0.5,
+                        "zero_heatmap": False,
+                    }
+                ],
+                "qualitative_strata_present": public_member["qualitative_strata_present"],
+            }
+            for package_id, seed, public_member in zip(
+                package_ids, RSNA_NEURAL_SEEDS, public_members, strict=True
+            )
+        ],
+    )
 
     _validate_localization_output_boundaries(
         public,
         private,
         private_members=members,
         forbidden_source_values={"synthetic-sample"},
+        expected_positive_sample_ids=("rsna:localization-positive",),
     )
 
     (public / "summary.json").write_text(
@@ -614,6 +681,7 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
             private,
             private_members=members,
             forbidden_source_values={"synthetic-sample"},
+            expected_positive_sample_ids=("rsna:localization-positive",),
         )
     (public / "summary.json").write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
 
@@ -625,6 +693,7 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
             private,
             private_members=members,
             forbidden_source_values={"synthetic-sample"},
+            expected_positive_sample_ids=("rsna:localization-positive",),
         )
     leaked.unlink()
     example = examples / "seed-42-example-01-tp.png"
@@ -637,4 +706,5 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
             private,
             private_members=members,
             forbidden_source_values={"synthetic-sample"},
+            expected_positive_sample_ids=("rsna:localization-positive",),
         )

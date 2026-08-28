@@ -16,7 +16,7 @@ from symile_campaign_test_support import (
 import beyondcxr.training.symile_campaign_control as campaign_control
 import beyondcxr.training.symile_statistics as symile_statistics
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.training.symile_export import SymileExportMember, export_and_verify
+from beyondcxr.training.preservation import PreservationMember, export_and_verify
 from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
@@ -162,7 +162,7 @@ def test_private_review_is_preserved_and_validated_after_restore(tmp_path, resul
     )
     original_review = review.read_bytes()
     archive = export_and_verify(
-        members=[SymileExportMember(review, Path("private/error-review/symile") / review.name)],
+        members=[PreservationMember(review, Path("private/error-review/symile") / review.name)],
         export_root=tmp_path / "export",
         backup_root=tmp_path / "backup",
         export_name="private-review",

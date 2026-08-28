@@ -43,11 +43,14 @@ Only aggregate localization metrics, counts, and methodological text are publish
 and private artifact paths are excluded from public reports and MLflow artifacts. Private outputs
 remain subject to the source dataset's access and transfer terms.
 
-Campaign archives under the ignored `outbox/` directory contain private prediction and localization
-outputs as well as aggregate outputs and provenance. They remain controlled research artifacts and
-may be transferred only to destinations permitted by the source dataset terms and project policy.
+Campaign preservation ZIPs under the ignored `outbox/` directory contain explicit validated
+scientific closures, including private predictions and, for RSNA, real-image localization outputs.
+They do not snapshot broad repository roots or unrelated runs. They remain controlled research
+artifacts and may be transferred only to destinations permitted by the source dataset terms and
+project policy.
 
-Symile backups at the required operator-supplied `BACKUP_ROOT` have the same restricted status.
+RSNA and Symile backups at the required operator-supplied `BACKUP_ROOT` have the same restricted
+status.
 The destination must be separately approved, persistent, and outside the resolved repository root.
 Local MLflow databases and `mlartifacts/` are private operational state, not public exports.
 Handled scientific-command failures report exception types without copying exception text into

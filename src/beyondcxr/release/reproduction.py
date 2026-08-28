@@ -105,8 +105,8 @@ def _regenerate(
     readme_path: str | Path,
     model_card_path: str | Path,
 ) -> _Regenerated:
+    from beyondcxr.training.preservation import restore_and_validate_export
     from beyondcxr.training.symile_campaign import validate_restored_campaign
-    from beyondcxr.training.symile_export import restore_and_validate_symile_export
 
     archive = Path(artifact_root)
     witness = export_manifest_sha256(archive)
@@ -135,7 +135,7 @@ def _regenerate(
         return derived, projection
 
     try:
-        derived, projection = restore_and_validate_symile_export(
+        derived, projection = restore_and_validate_export(
             archive, restoration_validator=validate_and_render
         )
         if not results_readme.is_file():

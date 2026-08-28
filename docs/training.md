@@ -89,16 +89,22 @@ The global result rederives raw probability metrics, primary operating points, p
 bootstrap effects, and descriptive reliability. Primary thresholds come only from aggregate
 development OOF evidence. Private false-positive/false-negative review is a regenerable derivative.
 
-Formal execution uses one command and requires an approved external backup destination:
+Prepare the shared CXR initialization, then run formal execution with an approved external backup
+destination:
 
 ```bash
+make prepare-cxr-weights
 make symile-campaign \
   SOURCE_ROOT=/approved/symile/source \
   BACKUP_ROOT=/approved/persistent/backup
 ```
 
-This command is reserved for the sealed science-execution commit in a clean checkout. It resumes only the bound
-opened freeze and never substitutes a mutable bundle or package pointer.
+This command is reserved for the sealed science-execution commit in a clean checkout. Before any
+development output is created, a comprehensive read-only preflight validates every config against
+the exact bundle and CV authorities, authenticates required source assets, opens the CXR and ECG
+stores, fingerprints the already materialized CXR initialization, and resolves one coherent neural
+runtime. It resumes only the bound opened freeze without requiring the original initialization
+file and never substitutes a mutable bundle or package pointer.
 
 ## Symile neural policy
 
@@ -134,13 +140,36 @@ The three compatible seed evaluations retain every member result and are summari
 arithmetic mean and sample standard deviation. The summary selects no canonical best seed and
 produces no averaged RSNA model.
 
-The campaign authenticates every source DICOM byte, constructs the deterministic CXR cache,
-freezes all eight packages before held-out evaluation, and passes explicit identities between
-training, evaluation, summaries, comparison, and localization:
+Publish and freeze the RSNA authority first, then update all four RSNA configs with its exact bundle
+ID, manifest SHA-256, and split-assignment ID. Transfer that authority directory without rewriting
+its manifest to the formal execution host. The formal campaign does not build an authority and does
+not resolve `CURRENT`.
+
+The read-only preflight validates the exact configured authority, all source inventory paths and
+sizes, cross-config agreement, clean Git and lock provenance, mixed-precision training/evaluation
+and full-precision localization runtime policy, free space, and
+destinations before any campaign-owned output is created. Execution authenticates every source
+DICOM byte, constructs or validates the deterministic CXR cache, freezes all eight packages before
+held-out evaluation, and passes explicit identities between training, evaluation, summaries,
+comparison, and localization:
 
 ```bash
-make rsna-campaign
+make rsna-manifest SOURCE_ROOT=/approved/rsna
+make prepare-cxr-weights
+make rsna-campaign BACKUP_ROOT=/approved/persistent/backup
 ```
+
+The formal plan is the sole owner of repository, source, authority, cache, model, report, private,
+control, export, backup, and MLflow coordinates after preflight. RSNA held-out dataset accessors
+require the validated complete package-freeze capability and a member package ID. Held-out
+evaluation and localization have no standalone CLI or Make target; the formal campaign is their
+only entry point. Comparison and seed-summary commands remain authority-only renderers and do not
+read source test rows.
+
+An existing exact authority, audit, cache, or completed immutable result is reusable. An execution
+control binds the ordered configuration matrix, authority, Git commit, and lock. Once all packages
+exist, its package freeze prevents retraining during resume; package-bound evaluation records allow
+only missing held-out work to continue. Conflicting immutable output is rejected.
 
 RSNA package and evaluation details remain in the [RSNA dataset guide](datasets/rsna.md) and
 [reproducibility guide](reproducibility.md).

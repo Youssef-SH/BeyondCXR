@@ -4,10 +4,13 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from rsna_authorization_test_support import authorize_rsna_package
 from rsna_manifest_test_support import tables as _tables
+from rsna_manifest_test_support import write_header, write_sources
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
@@ -19,11 +22,13 @@ from beyondcxr.data.rsna_artifacts import (
     SPLITS_FILENAME,
     _bundle_id,
     _bundle_identity_payload,
+    build_rsna_artifacts,
     resolve_bundle,
     validate_bundle_directory,
     validate_bundle_reference,
     write_bundle,
 )
+from beyondcxr.data.rsna_cxr_cache import validate_cxr_source_availability
 from beyondcxr.data.rsna_schemas import (
     RSNA_ANNOTATION_SCHEMA,
     RSNA_LABEL_SCHEMA,
@@ -49,6 +54,72 @@ def test_parquet_round_trip_is_exact_and_nested_free(tmp_path: Path) -> None:
     assert restored_labels.schema == RSNA_LABEL_SCHEMA
     assert restored_annotations.schema == RSNA_ANNOTATION_SCHEMA
     assert not any(pa.types.is_nested(field.type) for field in restored_annotations.schema)
+
+
+def test_published_authority_exact_pin_resolves_for_formal_cache_consumption(
+    tmp_path: Path,
+) -> None:
+    source_root = write_sources(tmp_path / "source")
+    labels_path = source_root / "stage_2_train_labels.csv"
+    classes_path = source_root / "stage_2_detailed_class_info.csv"
+    labels = pd.read_csv(labels_path)
+    classes = pd.read_csv(classes_path)
+    extra_labels = []
+    extra_classes = []
+    for target in (0, 1):
+        for index in (1, 2):
+            patient_id = f"target-{target}-{index}"
+            write_header(source_root / "stage_2_train_images" / f"{patient_id}.dcm", patient_id)
+            extra_labels.append(
+                {
+                    "patientId": patient_id,
+                    "x": 1 if target else None,
+                    "y": 2 if target else None,
+                    "width": 3 if target else None,
+                    "height": 4 if target else None,
+                    "Target": target,
+                }
+            )
+            extra_classes.append(
+                {
+                    "patientId": patient_id,
+                    "class": "Lung Opacity" if target else "Normal",
+                }
+            )
+    pd.concat([labels, pd.DataFrame(extra_labels)], ignore_index=True).to_csv(
+        labels_path, index=False
+    )
+    pd.concat([classes, pd.DataFrame(extra_classes)], ignore_index=True).to_csv(
+        classes_path, index=False
+    )
+    result = build_rsna_artifacts(source_root)
+    written = write_bundle(result, tmp_path / "manifests")
+    baseline = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = with_runtime(
+        replace(
+            baseline,
+            dataset=replace(
+                baseline.dataset,
+                bundle_id=written.paths.bundle_id,
+                bundle_manifest_sha256=sha256_file(written.paths.metadata_path),
+                split_assignment_id=result.metadata["membership"]["split"]["split_assignment_id"],
+            ),
+        ),
+        seed=17,
+        manifest_directory=tmp_path / "manifests",
+        source_root=source_root,
+    )
+
+    cache_input = RsnaDataset().load_image_cache(config)
+    validate_cxr_source_availability(cache_input.frame, dataset_root=source_root)
+    assert set(cache_input.frame["split_name"]) == {"train", "validation", "test"}
+
+    wrong = replace(
+        config,
+        dataset=replace(config.dataset, bundle_manifest_sha256="0" * 64),
+    )
+    with pytest.raises(ManifestBuildError, match="manifest SHA-256"):
+        RsnaDataset().load_image_cache(wrong)
 
 
 def test_logical_arrow_hashes_are_deterministic(tmp_path: Path) -> None:
@@ -392,6 +463,7 @@ def test_cxr_test_manifest_mismatch_fails_before_partition_access(
     base = load_experiment_config("configs/rsna_cxr_densenet.yaml")
     configured = with_runtime(
         replace(base, dataset=replace(base.dataset, bundle_id=written.paths.bundle_id)),
+        seed=42,
         manifest_directory=tmp_path / "manifests",
         source_root=tmp_path / "raw",
     )
@@ -404,6 +476,10 @@ def test_cxr_test_manifest_mismatch_fails_before_partition_access(
         RsnaDataset().load_cxr_test(
             configured,
             expected_manifest_sha256="0" * 64,
+            authorization=authorize_rsna_package(
+                configured, "model-package-test", monkeypatch=monkeypatch
+            ),
+            package_id="model-package-test",
         )
 
 

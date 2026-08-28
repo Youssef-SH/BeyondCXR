@@ -70,6 +70,9 @@ def test_freeze_rejects_tampered_neural_inference_runtime(tmp_path: Path) -> Non
     document["held_out_policy"]["neural_inference_runtime"] = {
         "device_type": "cuda",
         "autocast_dtype": "float16",
+        "deterministic_algorithms": "enabled_warn_only",
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
         "cuda_runtime_version": "12.4",
         "cudnn_version": 9100,
         "gpu_device_name": "GPU-A",

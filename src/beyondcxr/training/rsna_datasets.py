@@ -276,8 +276,11 @@ class RsnaDataset:
         _, metadata = _load_pinned_bundle(config)
         return _lineage(config, metadata)
 
-    def load_test(self, config: ExperimentConfig) -> tuple[DatasetPartition, DatasetLineage]:
+    def load_test(
+        self, config: ExperimentConfig, *, authorization: object, package_id: str
+    ) -> tuple[DatasetPartition, DatasetLineage]:
         """Load the test partition from the same pinned bundle."""
+        _authorize_test_access(authorization, package_id)
         bundle, metadata = _load_pinned_bundle(config)
         frame = _task_frame(bundle, config.task.task_id, partitions=("test",))
         test = _partition(frame, "test")
@@ -317,8 +320,11 @@ class RsnaDataset:
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
+        authorization: object,
+        package_id: str,
     ) -> CxrTestData:
         """Load test image rows bound to the pinned source inventory."""
+        _authorize_test_access(authorization, package_id)
         bundle, metadata = _load_pinned_bundle(
             config,
             materialize_all_rows=False,
@@ -360,8 +366,11 @@ class RsnaDataset:
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
+        authorization: object,
+        package_id: str,
     ) -> FusionTestData:
         """Load aligned test fusion rows bound to the source inventory."""
+        _authorize_test_access(authorization, package_id)
         bundle, metadata = _load_pinned_bundle(
             config,
             materialize_all_rows=False,
@@ -385,11 +394,15 @@ class RsnaDataset:
         config: ExperimentConfig,
         *,
         expected_manifest_sha256: str,
+        authorization: object,
+        package_id: str,
     ) -> LocalizationTestData:
         """Load cache-backed test images and validated positive-box geometry."""
         images = self.load_cxr_test(
             config,
             expected_manifest_sha256=expected_manifest_sha256,
+            authorization=authorization,
+            package_id=package_id,
         )
         bundle, _ = _load_pinned_bundle(
             config,
@@ -418,6 +431,14 @@ class RsnaDataset:
         if set(annotations["sample_id"].astype(str)) != positive_ids:
             raise ManifestBuildError("Localization boxes do not cover every positive test sample")
         return LocalizationTestData(images, dimensions, annotations)
+
+
+def _authorize_test_access(authorization: object, package_id: str) -> None:
+    from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
+
+    if not isinstance(authorization, ValidatedRsnaPackageFreeze):
+        raise PermissionError("RSNA held-out access requires a validated package freeze")
+    authorization.require(package_id)
 
 
 def prepare_rsna_cxr_cache(

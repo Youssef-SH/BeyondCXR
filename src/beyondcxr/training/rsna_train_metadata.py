@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "beyondcxr-matplotlib"))
 
 import mlflow
 import numpy as np
@@ -26,7 +23,6 @@ from beyondcxr.evaluation.latency import (
     benchmark_single_sample_latency_ms,
 )
 from beyondcxr.evaluation.metrics import (
-    CALIBRATION_BINNING_STRATEGY,
     OperatingPointMetrics,
     ProbabilityMetrics,
     evaluate_operating_point,
@@ -34,10 +30,23 @@ from beyondcxr.evaluation.metrics import (
     target_sensitivity_threshold,
     youden_j_threshold,
 )
-from beyondcxr.evaluation.plots import write_evaluation_plots
 from beyondcxr.evaluation.probabilities import positive_class_probabilities
-from beyondcxr.training.config import ExperimentConfig, require_runtime_seed
+from beyondcxr.training.config import (
+    ExperimentConfig,
+    require_runtime_seed,
+)
+from beyondcxr.training.rsna_formal import rsna_run_report_root
 from beyondcxr.training.rsna_registry import get_dataset, get_model
+from beyondcxr.training.rsna_training_report import (
+    metrics_document,
+    mlflow_metrics,
+    validate_training_report,
+    write_run_reports,
+)
+from beyondcxr.training.rsna_validation_evidence import (
+    VALIDATION_EVIDENCE_FILENAME,
+    write_validation_evidence,
+)
 from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
@@ -54,18 +63,6 @@ from beyondcxr.utils.publication import publish_directory, staging_directory
 from beyondcxr.utils.rsna_model_publication import publish_model_package, threshold_contract
 from beyondcxr.utils.skops_io import load_skops, save_skops
 
-REQUIRED_REPORT_FILENAMES = frozenset(
-    {
-        "metrics.json",
-        "evaluation_report.md",
-        "confusion_summary.md",
-        "roc_curve.png",
-        "precision_recall_curve.png",
-        "calibration_curve.png",
-        "confusion_matrix_youden_j.png",
-        "confusion_matrix_target_sensitivity.png",
-    }
-)
 _LOGGER = get_operational_logger(__name__)
 
 
@@ -209,30 +206,11 @@ def train_metadata_experiment(
             youden=youden_metrics,
             target_sensitivity=sensitivity_metrics,
         )
-        report_directory = (
-            config.runtime.report_directory / config.dataset.dataset_id / "runs" / run_id
-        )
+        report_directory = rsna_run_report_root(config.runtime.report_directory) / run_id
         report_stage = staging_directory(report_directory)
         temporary_model_root = Path(tempfile.mkdtemp(prefix="beyondcxr-model-"))
         published = None
         try:
-            write_run_reports(
-                report_stage,
-                model_name=config.family.family_id,
-                targets=dataset.validation.targets,
-                probabilities=probabilities,
-                document=document,
-            )
-            validate_report_set(report_stage)
-            validate_public_reports(
-                report_stage.iterdir(),
-                forbidden_source_values={
-                    *dataset.train.sample_ids,
-                    *dataset.train.patient_ids,
-                    *dataset.validation.sample_ids,
-                    *dataset.validation.patient_ids,
-                },
-            )
             serialized = save_skops(model_fit.pipeline, temporary_model_root / "model.skops")
             restored = load_skops(serialized)
             validate_metadata_pipeline(restored)
@@ -263,6 +241,13 @@ def train_metadata_experiment(
                 model_root=config.runtime.model_directory,
                 serialized_model_path=serialized,
                 source_config_bytes=config.source_bytes,
+                validation_evidence_path=write_validation_evidence(
+                    temporary_model_root / VALIDATION_EVIDENCE_FILENAME,
+                    config=config,
+                    sample_ids=dataset.validation.sample_ids,
+                    targets=dataset.validation.targets,
+                    probabilities=probabilities,
+                ),
                 manifest={
                     "bundle_id": dataset.lineage.bundle_id,
                     "split_assignment_id": dataset.lineage.split_assignment_id,
@@ -281,6 +266,37 @@ def train_metadata_experiment(
                         sensitivity_target=config.evaluation.sensitivity_target,
                     ),
                     "input_contract": metadata_input_contract(),
+                },
+            )
+            document["training_package"] = {
+                "run_id": run_id,
+                "model_package_id": published.model_package_id,
+                "family_id": config.family.family_id,
+                "seed": seed,
+            }
+            write_run_reports(
+                report_stage,
+                model_name=config.family.family_id,
+                targets=dataset.validation.targets,
+                probabilities=probabilities,
+                document=document,
+            )
+            validate_training_report(
+                report_stage,
+                run_id=run_id,
+                model_package_id=published.model_package_id,
+                family_id=config.family.family_id,
+                seed=seed,
+                package=json.loads(published.manifest_path.read_text(encoding="utf-8")),
+                package_directory=published.package_directory,
+            )
+            validate_public_reports(
+                report_stage.iterdir(),
+                forbidden_source_values={
+                    *dataset.train.sample_ids,
+                    *dataset.train.patient_ids,
+                    *dataset.validation.sample_ids,
+                    *dataset.validation.patient_ids,
                 },
             )
             publish_directory(report_stage, report_directory)
@@ -313,188 +329,6 @@ def train_metadata_experiment(
         latency_ms=latency_ms,
         model_size_mib=published.model_size_mib,
     )
-
-
-def metrics_document(
-    *,
-    scope: str,
-    calibration_bins: int,
-    sensitivity_target: float,
-    thresholds: dict[str, float],
-    probability: ProbabilityMetrics,
-    youden: OperatingPointMetrics,
-    target_sensitivity: OperatingPointMetrics,
-) -> dict[str, Any]:
-    """Build one aggregate metrics document."""
-    return {
-        "evaluation_scope": scope,
-        "calibration": {
-            "calibration_bins": calibration_bins,
-            "calibration_binning_strategy": CALIBRATION_BINNING_STRATEGY,
-        },
-        "probability_metrics": probability.as_dict(),
-        "operating_points": {
-            "youden_j": {
-                "threshold": thresholds["youden_j"],
-                "metrics": youden.as_dict(),
-            },
-            "target_sensitivity": {
-                "configured_target_sensitivity": sensitivity_target,
-                "threshold": thresholds["target_sensitivity"],
-                "metrics": target_sensitivity.as_dict(),
-            },
-        },
-    }
-
-
-def write_run_reports(
-    directory: Path,
-    *,
-    model_name: str,
-    targets: np.ndarray,
-    probabilities: np.ndarray,
-    document: dict[str, Any],
-) -> None:
-    """Render the aggregate report set for one evaluation scope."""
-    directory.mkdir(parents=True, exist_ok=True)
-    operating = document["operating_points"]
-    write_evaluation_plots(
-        targets,
-        probabilities,
-        youden_j_threshold=operating["youden_j"]["threshold"],
-        target_sensitivity_threshold=operating["target_sensitivity"]["threshold"],
-        calibration_bins=document["calibration"]["calibration_bins"],
-        output_directory=directory,
-    )
-    (directory / "metrics.json").write_text(
-        json.dumps(document, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    _write_evaluation_report(directory / "evaluation_report.md", model_name, document)
-    _write_confusion_summary(directory / "confusion_summary.md", document)
-
-
-def validate_report_set(directory: str | Path) -> None:
-    """Require the complete aggregate report set and no additional entries."""
-    report_directory = Path(directory)
-    with os.scandir(report_directory) as entries:
-        inspected = list(entries)
-    actual = {entry.name for entry in inspected}
-    if actual != REQUIRED_REPORT_FILENAMES:
-        missing = sorted(REQUIRED_REPORT_FILENAMES - actual)
-        unexpected = sorted(actual - REQUIRED_REPORT_FILENAMES)
-        raise ValueError(f"Run report set is invalid: missing={missing}, unexpected={unexpected}")
-    if any(entry.is_symlink() or not entry.is_file(follow_symlinks=False) for entry in inspected):
-        raise ValueError("Run reports must be regular non-symlink files")
-
-
-def mlflow_metrics(
-    *,
-    scope: str,
-    document: dict[str, Any],
-    latency_ms: float | None,
-    model_size_mib: float,
-) -> dict[str, float]:
-    """Flatten one aggregate document into stable MLflow metric names."""
-    metrics = {
-        f"{scope}_{key}": float(value) for key, value in document["probability_metrics"].items()
-    }
-    for policy, values in document["operating_points"].items():
-        metrics[f"{scope}_{policy}_threshold"] = float(values["threshold"])
-        metrics.update(
-            {f"{scope}_{policy}_{key}": float(value) for key, value in values["metrics"].items()}
-        )
-    if latency_ms is not None:
-        metrics[f"{scope}_latency_ms"] = latency_ms
-    metrics["model_size_mib"] = model_size_mib
-    return metrics
-
-
-def _write_evaluation_report(path: Path, model_name: str, document: dict[str, Any]) -> None:
-    scope = document["evaluation_scope"]
-    probability = document["probability_metrics"]
-    lines = [
-        f"# {model_name} {scope} evaluation",
-        "",
-        "| Average Precision | ROC-AUC | Brier | ECE | Calibration slope | Calibration intercept |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: |",
-        f"| {probability['average_precision']:.6f} | {probability['roc_auc']:.6f} | "
-        f"{probability['brier_score']:.6f} | "
-        f"{probability['expected_calibration_error']:.6f} | "
-        f"{probability['calibration_slope']:.6f} | "
-        f"{probability['calibration_intercept']:.6f} |",
-    ]
-    for policy, title in (
-        ("youden_j", "Youden-J operating point"),
-        ("target_sensitivity", "Target-sensitivity operating point"),
-    ):
-        values = document["operating_points"][policy]
-        metrics = values["metrics"]
-        lines.extend(
-            [
-                "",
-                f"## {title}",
-                "",
-                f"Validation-derived threshold: `{values['threshold']:.10f}`.",
-                "",
-                "| Precision | Recall | Specificity | F1 |",
-                "| ---: | ---: | ---: | ---: |",
-                f"| {metrics['precision']:.6f} | {metrics['recall']:.6f} | "
-                f"{metrics['specificity']:.6f} | {metrics['f1']:.6f} |",
-            ]
-        )
-    if cxr_training := document.get("cxr_training"):
-        selection = cxr_training["selection"]
-        authentication = cxr_training["source_authentication"]
-        lines.extend(
-            [
-                "",
-                "## Neural training summary",
-                "",
-                f"- Selected state: {selection['selected_stage']} epoch "
-                f"{selection['selected_epoch']}",
-                f"- Authenticated cache files (all partitions): {authentication['file_count']}",
-                "- The shared CXR cache includes decoded test images; test samples are not "
-                "used for fitting, selection, or threshold derivation.",
-            ]
-        )
-    if cxr_evaluation := document.get("cxr_evaluation"):
-        counts = cxr_evaluation["test_counts"]
-        lines.extend(
-            [
-                "",
-                "## Verified neural test evaluation",
-                "",
-                f"- Test samples: {counts['sample_count']}",
-                f"- Positive samples: {counts['positive_count']}",
-                f"- Negative samples: {counts['negative_count']}",
-                "- Package and checkpoint verification completed before test access.",
-                "- Operating points were frozen on validation.",
-            ]
-        )
-    lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _write_confusion_summary(path: Path, document: dict[str, Any]) -> None:
-    lines = [f"# Aggregate {document['evaluation_scope']} confusion summary", ""]
-    for policy, title in (
-        ("youden_j", "Youden-J operating point"),
-        ("target_sensitivity", "Target-sensitivity operating point"),
-    ):
-        values = document["operating_points"][policy]["metrics"]
-        lines.extend(
-            [
-                f"## {title}",
-                "",
-                f"- True negatives: {values['true_negative']:,}",
-                f"- False positives: {values['false_positive']:,}",
-                f"- False negatives: {values['false_negative']:,}",
-                f"- True positives: {values['true_positive']:,}",
-                "",
-            ]
-        )
-    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _best_iteration(parameters: Any) -> int | None:

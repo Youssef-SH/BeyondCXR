@@ -11,24 +11,20 @@ import pytest
 import yaml
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
+from rsna_authorization_test_support import authorize_rsna_package, rsna_test_runtime
 
 from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_artifacts import build_and_write
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from beyondcxr.training.config import load_experiment_config, with_runtime
 from beyondcxr.training.rsna_datasets import RsnaDataset
-from beyondcxr.training.rsna_evaluate import (
-    evaluate_model_package,
-)
-from beyondcxr.training.rsna_evaluate import (
-    main as evaluate_main,
-)
+from beyondcxr.training.rsna_evaluate import evaluate_model_package
 from beyondcxr.training.rsna_evaluation_result import (
-    CompletedRsnaEvaluation,
     validate_rsna_evaluation,
 )
 from beyondcxr.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
-from beyondcxr.training.rsna_train_metadata import train_metadata_experiment, validate_report_set
+from beyondcxr.training.rsna_train_metadata import train_metadata_experiment
+from beyondcxr.training.rsna_training_report import validate_report_set
 from beyondcxr.utils.mlflow_utils import configure_mlflow
 from beyondcxr.utils.operational_logging import configure_logging
 from beyondcxr.utils.private_predictions import validate_prediction_evidence
@@ -39,9 +35,6 @@ from beyondcxr.utils.rsna_model_publication import (
 
 _SHA256 = "a" * 64
 _SPLIT_ASSIGNMENT_ID = "split-assignment-" + "b" * 64
-_RESULT_PACKAGE_ID = "model-package-" + "c" * 64
-_RESULT_PREDICTION_ID = "prediction-" + "d" * 64
-_RESULT_EVALUATION_ID = "evaluation-" + "e" * 64
 
 
 def _partition(name: str) -> DatasetPartition:
@@ -144,7 +137,7 @@ def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, D
     monkeypatch.setattr(
         RsnaDataset,
         "load_test",
-        lambda self, config: (test, lineage),
+        lambda self, config, **kwargs: (test, lineage),
     )
     monkeypatch.setattr(
         RsnaDataset,
@@ -176,10 +169,10 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
     test_loads = 0
     original_test_loader = RsnaDataset.load_test
 
-    def count_test_load(self, dataset_config):
+    def count_test_load(self, dataset_config, **kwargs):
         nonlocal test_loads
         test_loads += 1
-        return original_test_loader(self, dataset_config)
+        return original_test_loader(self, dataset_config, **kwargs)
 
     monkeypatch.setattr(RsnaDataset, "load_test", count_test_load)
     training = _train(config, tmp_path)
@@ -190,7 +183,11 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
     configure_mlflow(tracking_uri=f"sqlite:///{(tmp_path / 'other.db').as_posix()}")
     evaluation = evaluate_model_package(
         training.model_package_id,
+        authorization=authorize_rsna_package(
+            config, training.model_package_id, monkeypatch=monkeypatch
+        ),
         evaluation_config=config,
+        runtime=rsna_test_runtime(config),
         tracking_uri=_tracking_uri(tmp_path),
         model_directory=config.runtime.model_directory,
         report_directory=config.runtime.report_directory,
@@ -255,6 +252,7 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
         "model.skops",
         "resolved_config.yaml",
         "manifest.json",
+        "validation-evidence.json",
     }
     assert set(manifest["thresholds"]) == {"youden_j", "target_sensitivity"}
     assert manifest["model_package_id"] == training.model_package_id
@@ -379,7 +377,11 @@ def test_explicit_evaluation_policy_controls_identity_and_package_compatibility(
         for bins, evaluation_config in ((15, config_15), (20, config_20)):
             result = evaluate_model_package(
                 training.model_package_id,
+                authorization=authorize_rsna_package(
+                    evaluation_config, training.model_package_id, monkeypatch=monkeypatch
+                ),
                 evaluation_config=evaluation_config,
+                runtime=rsna_test_runtime(evaluation_config),
                 tracking_uri=tracking_uri,
                 model_directory=model_root,
                 private_output_directory=tmp_path / archive / "private",
@@ -401,12 +403,16 @@ def test_explicit_evaluation_policy_controls_identity_and_package_compatibility(
     monkeypatch.setattr(
         RsnaDataset,
         "load_test",
-        lambda self, config: pytest.fail("held-out test must not be accessed"),
+        lambda self, config, **kwargs: pytest.fail("held-out test must not be accessed"),
     )
     with pytest.raises(ValueError, match="incompatible"):
         evaluate_model_package(
             training_15.model_package_id,
+            authorization=authorize_rsna_package(
+                incompatible, training_15.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=incompatible,
+            runtime=rsna_test_runtime(incompatible),
             tracking_uri=_tracking_uri(tmp_path / "config-15"),
             model_directory=training_15.model_path.parent.parent.parent,
         )
@@ -423,13 +429,17 @@ def test_evaluation_rejects_sensitivity_target_mismatch_before_test_access(
     monkeypatch.setattr(
         RsnaDataset,
         "load_test",
-        lambda self, config: pytest.fail("held-out test must not be accessed"),
+        lambda self, config, **kwargs: pytest.fail("held-out test must not be accessed"),
     )
 
     with pytest.raises(ValueError, match="sensitivity target differs from the frozen"):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                evaluation_config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=evaluation_config,
+            runtime=rsna_test_runtime(evaluation_config),
             tracking_uri=_tracking_uri(tmp_path / "training"),
             model_directory=training.model_path.parent.parent.parent,
         )
@@ -651,7 +661,7 @@ def test_evaluator_rejects_lightgbm_best_iteration_mismatch_before_test_loading(
     monkeypatch.setattr(
         RsnaDataset,
         "load_test",
-        lambda self, dataset_config: (_ for _ in ()).throw(
+        lambda self, dataset_config, **kwargs: (_ for _ in ()).throw(
             AssertionError("test data must not be loaded")
         ),
     )
@@ -659,7 +669,11 @@ def test_evaluator_rejects_lightgbm_best_iteration_mismatch_before_test_loading(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             tracking_uri=_tracking_uri(tmp_path),
             model_directory=config.runtime.model_directory,
         )
@@ -680,7 +694,11 @@ def test_evaluation_report_publication_failure_does_not_complete_run(
     with pytest.raises(RuntimeError):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             tracking_uri=_tracking_uri(tmp_path),
             model_directory=config.runtime.model_directory,
         )
@@ -709,7 +727,11 @@ def test_operational_completion_failure_preserves_published_scientific_objects(
     with pytest.raises(RuntimeError, match="ledger write failed"):
         evaluate_model_package(
             training.model_package_id,
+            authorization=authorize_rsna_package(
+                config, training.model_package_id, monkeypatch=monkeypatch
+            ),
             evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             tracking_uri=_tracking_uri(tmp_path),
             model_directory=config.runtime.model_directory,
             private_output_directory=config.runtime.private_output_directory,
@@ -754,77 +776,21 @@ def test_operational_completion_failure_preserves_published_scientific_objects(
 )
 def test_evaluator_rejects_noncanonical_package_identity_before_filesystem_access(
     model_package_id: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class UnavailableModelRoot:
         def __fspath__(self) -> str:
             raise AssertionError("model root must not be inspected")
 
+    config = with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42)
     with pytest.raises(ValueError, match="model package"):
         evaluate_model_package(
             model_package_id,
-            evaluation_config=load_experiment_config("configs/rsna_metadata_logistic.yaml"),
+            authorization=authorize_rsna_package(config, model_package_id, monkeypatch=monkeypatch),
+            evaluation_config=config,
+            runtime=rsna_test_runtime(config),
             model_directory=UnavailableModelRoot(),
         )
-
-
-def test_evaluator_cli_serializes_completed_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    result = CompletedRsnaEvaluation(
-        evaluation_id=_RESULT_EVALUATION_ID,
-        prediction_id=_RESULT_PREDICTION_ID,
-        model_package_id=_RESULT_PACKAGE_ID,
-        mlflow_run_id="evaluation-run",
-        artifact_directory=tmp_path / "reports",
-        private_prediction_directory=tmp_path / "private",
-        average_precision=0.75,
-    )
-
-    def evaluate(
-        package_id: str,
-        *,
-        evaluation_config,
-        tracking_uri: str,
-        model_directory: Path,
-        private_output_directory: Path | None,
-        report_directory: Path | None,
-    ) -> CompletedRsnaEvaluation:
-        assert package_id == _RESULT_PACKAGE_ID
-        assert evaluation_config.source_path == Path("configs/rsna_metadata_logistic.yaml")
-        assert tracking_uri == "sqlite:///test.db"
-        assert model_directory == Path("models/rsna")
-        assert private_output_directory is None
-        assert report_directory is None
-        return result
-
-    monkeypatch.setattr("beyondcxr.training.rsna_evaluate.evaluate_model_package", evaluate)
-
-    with pytest.raises(SystemExit):
-        evaluate_main(["--package-id", _RESULT_PACKAGE_ID])
-
-    assert (
-        evaluate_main(
-            [
-                "--package-id",
-                _RESULT_PACKAGE_ID,
-                "--config",
-                "configs/rsna_metadata_logistic.yaml",
-                "--tracking-uri",
-                "sqlite:///test.db",
-            ]
-        )
-        == 0
-    )
-    assert json.loads(capsys.readouterr().out) == {
-        "model_package_id": _RESULT_PACKAGE_ID,
-        "prediction_id": _RESULT_PREDICTION_ID,
-        "evaluation_id": _RESULT_EVALUATION_ID,
-        "mlflow_run_id": "evaluation-run",
-        "test_average_precision": 0.75,
-        "artifact_directory": (tmp_path / "reports").as_posix(),
-    }
 
 
 def test_synthetic_raw_source_to_bundle_training_and_explicit_test_evaluation(
@@ -848,7 +814,11 @@ def test_synthetic_raw_source_to_bundle_training_and_explicit_test_evaluation(
     monkeypatch.chdir(tmp_path)
     evaluation = evaluate_model_package(
         training.model_package_id,
+        authorization=authorize_rsna_package(
+            config, training.model_package_id, monkeypatch=monkeypatch
+        ),
         evaluation_config=config,
+        runtime=rsna_test_runtime(config),
         tracking_uri=tracking_uri,
         model_directory=config.runtime.model_directory,
         report_directory=config.runtime.report_directory,

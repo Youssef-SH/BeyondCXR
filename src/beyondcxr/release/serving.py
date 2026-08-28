@@ -25,8 +25,8 @@ from beyondcxr.serving.authority import (
     validate_serving_authority,
 )
 from beyondcxr.serving.predictor import SymileServingPredictor
+from beyondcxr.training.preservation import restore_and_validate_export
 from beyondcxr.training.symile_campaign import validate_restored_campaign
-from beyondcxr.training.symile_export import restore_and_validate_symile_export
 
 
 def publish_and_smoke_test_serving_authority(
@@ -83,7 +83,7 @@ def publish_and_smoke_test_serving_authority(
                 os.replace(authority.directory, final)
             return final
 
-        return restore_and_validate_symile_export(artifact_root, restoration_validator=publish)
+        return restore_and_validate_export(artifact_root, restoration_validator=publish)
 
 
 def clean_release_provenance(repository_root: str | Path) -> dict[str, str]:

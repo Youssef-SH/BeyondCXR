@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import tempfile
@@ -29,7 +30,7 @@ from beyondcxr.training.config import (
     ExperimentConfig,
     require_runtime_seed,
 )
-from beyondcxr.training.device import resolve_device
+from beyondcxr.training.device import ResolvedDevice, resolve_device
 from beyondcxr.training.execution import LoaderExecutionPolicy, reused_loader_policy
 from beyondcxr.training.neural import (
     CLASS_WEIGHT_POLICY_VERSION,
@@ -49,13 +50,19 @@ from beyondcxr.training.rsna_datasets import (
     expected_rsna_cxr_cache_identity,
     prepare_rsna_cxr_cache,
 )
+from beyondcxr.training.rsna_formal import rsna_run_report_root
 from beyondcxr.training.rsna_interfaces import RsnaCxrModelImplementation
 from beyondcxr.training.rsna_registry import get_dataset, get_model
-from beyondcxr.training.rsna_train_metadata import (
+from beyondcxr.training.rsna_training_report import (
+    CXR_REPORT_LIMITATIONS,
     metrics_document,
     mlflow_metrics,
-    validate_report_set,
+    validate_training_report,
     write_run_reports,
+)
+from beyondcxr.training.rsna_validation_evidence import (
+    VALIDATION_EVIDENCE_FILENAME,
+    write_validation_evidence,
 )
 from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
@@ -109,6 +116,7 @@ def train_cxr_experiment(
     tracking_uri: str = DEFAULT_TRACKING_URI,
     cache: ValidatedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
+    runtime: ResolvedDevice | None = None,
 ) -> CxrModelResult:
     """Train on CXR train/validation partitions and publish one selected package."""
     if config.family.family_id != "cxr_densenet" or config.neural is None:
@@ -195,7 +203,7 @@ def train_cxr_experiment(
                 transform=evaluation_transform,
                 training_seed=seed,
             )
-            runtime = resolve_device(
+            runtime = runtime or resolve_device(
                 config.runtime.device,
                 mixed_precision=neural.mixed_precision,
                 pin_memory_policy=config.runtime.pin_memory_policy,
@@ -461,15 +469,9 @@ def train_cxr_experiment(
                 "selected_stage": fit.selected_stage,
                 "validation_average_precision": final_validation.average_precision,
             },
-            "limitations": [
-                "The challenge target is radiology-derived.",
-                "The shared CXR cache authenticates and decodes all partitions; "
-                "test samples are not used for fitting, selection, or threshold derivation.",
-            ],
+            "limitations": CXR_REPORT_LIMITATIONS,
         }
-        report_directory = (
-            config.runtime.report_directory / config.dataset.dataset_id / "runs" / run_id
-        )
+        report_directory = rsna_run_report_root(config.runtime.report_directory) / run_id
         if report_directory.exists():
             raise FileExistsError(f"CXR validation report already exists: {report_directory}")
         report_stage = staging_directory(report_directory)
@@ -515,13 +517,21 @@ def train_cxr_experiment(
                 model_root=config.runtime.model_directory,
                 checkpoint_path=checkpoint_path,
                 source_config_bytes=config.source_bytes,
+                validation_evidence_path=write_validation_evidence(
+                    temporary_model_root / VALIDATION_EVIDENCE_FILENAME,
+                    config=config,
+                    sample_ids=final_validation.sample_ids,
+                    targets=final_validation.targets,
+                    probabilities=final_validation.probabilities,
+                    epoch_history=document["cxr_training"]["epoch_history"],
+                ),
                 manifest=manifest,
             )
-            document["cxr_training"]["package"] = {
-                "training_run_id": run_id,
+            document["training_package"] = {
+                "run_id": run_id,
                 "model_package_id": published.model_package_id,
-                "checkpoint_sha256": published.checkpoint_sha256,
-                "checkpoint_byte_size": published.model_path.stat().st_size,
+                "family_id": family.family_id,
+                "seed": seed,
             }
             write_run_reports(
                 report_stage,
@@ -530,7 +540,15 @@ def train_cxr_experiment(
                 probabilities=final_validation.probabilities,
                 document=document,
             )
-            validate_report_set(report_stage)
+            validate_training_report(
+                report_stage,
+                run_id=run_id,
+                model_package_id=published.model_package_id,
+                family_id=family.family_id,
+                seed=seed,
+                package=json.loads(published.manifest_path.read_text(encoding="utf-8")),
+                package_directory=published.package_directory,
+            )
             validate_public_reports(
                 report_stage.iterdir(),
                 forbidden_source_values={

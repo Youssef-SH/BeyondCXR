@@ -14,6 +14,11 @@ from typing import Any
 from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
 from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.rsna_validation_evidence import (
+    VALIDATION_EVIDENCE_FILENAME,
+    evidence_semantic_sha256,
+    validate_validation_evidence,
+)
 from beyondcxr.utils.package_identity import (
     canonical_scientific_id,
     fitted_object_state_sha256,
@@ -51,6 +56,8 @@ REQUIRED_MANIFEST_FIELDS = frozenset(
         "model_state_sha256",
         "source_package_id",
         "model_sha256",
+        "validation_evidence_sha256",
+        "validation_evidence_semantic_sha256",
         "config_source_sha256",
         "config_semantic_sha256",
         "git_commit",
@@ -83,6 +90,7 @@ def publish_model_package(
     model_root: str | Path,
     serialized_model_path: str | Path,
     source_config_bytes: bytes,
+    validation_evidence_path: str | Path,
     manifest: Mapping[str, Any],
 ) -> PublishedModel:
     """Publish one fitted model under its semantic package identity."""
@@ -93,6 +101,8 @@ def publish_model_package(
         model_path = stage / MODEL_FILENAME
         config_path = stage / CONFIG_FILENAME
         shutil.copyfile(serialized_model_path, model_path)
+        evidence_path = stage / VALIDATION_EVIDENCE_FILENAME
+        shutil.copyfile(validation_evidence_path, evidence_path)
         config_path.write_bytes(source_config_bytes)
         trusted_types_for_file(model_path)
         fitted = load_skops(model_path)
@@ -120,10 +130,14 @@ def publish_model_package(
             ),
             "source_package_id": None,
             "model_sha256": sha256_file(model_path),
+            "validation_evidence_sha256": sha256_file(evidence_path),
+            "validation_evidence_semantic_sha256": evidence_semantic_sha256(
+                json.loads(evidence_path.read_bytes())
+            ),
         }
         document["model_package_id"] = model_package_id(document)
         destination = packages_root / document["model_package_id"]
-        _validate_manifest(document, model_path, config_path)
+        _validate_manifest(document, model_path, config_path, evidence_path)
         (stage / MANIFEST_FILENAME).write_text(
             json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
@@ -152,7 +166,12 @@ def validate_published_model(
     directory = Path(package_directory)
     if directory.parent.name != "packages" or directory.is_symlink() or not directory.is_dir():
         raise ValueError("Model package must be a physical directory beneath packages")
-    expected = {MODEL_FILENAME, CONFIG_FILENAME, MANIFEST_FILENAME}
+    expected = {
+        MODEL_FILENAME,
+        CONFIG_FILENAME,
+        MANIFEST_FILENAME,
+        VALIDATION_EVIDENCE_FILENAME,
+    }
     with os.scandir(directory) as entries:
         inspected = list(entries)
     if {entry.name for entry in inspected} != expected or any(
@@ -163,7 +182,12 @@ def validate_published_model(
         document = json.loads((directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("Model manifest is unreadable") from exc
-    _validate_manifest(document, directory / MODEL_FILENAME, directory / CONFIG_FILENAME)
+    _validate_manifest(
+        document,
+        directory / MODEL_FILENAME,
+        directory / CONFIG_FILENAME,
+        directory / VALIDATION_EVIDENCE_FILENAME,
+    )
     if enforce_directory_name and directory.name != document["model_package_id"]:
         raise ValueError("Model package directory differs from its semantic identity")
     trusted_types_for_file(directory / MODEL_FILENAME)
@@ -192,11 +216,14 @@ def model_package_id(document: Mapping[str, Any]) -> str:
         "best_iteration": document["best_iteration"],
         "thresholds": document["thresholds"],
         "threshold_contract": document["threshold_contract"],
+        "validation_evidence_semantic_sha256": document["validation_evidence_semantic_sha256"],
     }
     return canonical_scientific_id(MODEL_PACKAGE_ID_PREFIX, payload)
 
 
-def _validate_manifest(document: object, model_path: Path, config_path: Path) -> None:
+def _validate_manifest(
+    document: object, model_path: Path, config_path: Path, evidence_path: Path
+) -> None:
     if not isinstance(document, dict) or set(document) != REQUIRED_MANIFEST_FIELDS:
         raise ValueError("Model manifest contains an unexpected field set")
     schema_version = document["model_package_schema_version"]
@@ -231,6 +258,8 @@ def _validate_manifest(document: object, model_path: Path, config_path: Path) ->
         "preprocessor_state_sha256",
         "model_state_sha256",
         "dependency_lock_sha256",
+        "validation_evidence_sha256",
+        "validation_evidence_semantic_sha256",
     ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Model manifest {field} must be a lowercase SHA-256")
@@ -272,6 +301,7 @@ def _validate_manifest(document: object, model_path: Path, config_path: Path) ->
     )
     if contract["sensitivity_target"] != config.evaluation.sensitivity_target:
         raise ValueError("Model package threshold contract differs from archived configuration")
+    validate_validation_evidence(evidence_path, package=document, config=config)
     if document["input_contract"] != metadata_input_contract():
         raise ValueError("Model manifest input contract is invalid")
     if document["model_package_id"] != model_package_id(document):

@@ -9,17 +9,27 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
 from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
 from beyondcxr.training import rsna_evaluation_result
 from beyondcxr.training.config import load_experiment_config
-from beyondcxr.training.rsna_compare import COMPARISON_COLUMNS, regenerate_comparison
+from beyondcxr.training.rsna_compare import (
+    COMPARISON_COLUMNS,
+    COMPARISON_POLICY_VERSION,
+    COMPARISON_PREFIX,
+    _comparison_records,
+    _write_comparison,
+    regenerate_comparison,
+    validate_comparison,
+)
 from beyondcxr.training.rsna_evaluation_result import (
     publish_rsna_evaluation,
     validate_rsna_evaluation,
 )
+from beyondcxr.utils.package_identity import canonical_scientific_id
 from beyondcxr.utils.private_predictions import publish_prediction_evidence
 from beyondcxr.utils.rsna_model_publication import publish_model_package, threshold_contract
 from beyondcxr.utils.skops_io import save_skops
@@ -42,6 +52,9 @@ def _package(tmp_path: Path, *, variant: int = 0):
         model_root=tmp_path / "models/rsna",
         serialized_model_path=serialized,
         source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / f"validation-evidence-{variant}.json", config_path, seed=42
+        ),
         manifest={
             "bundle_id": config.dataset.bundle_id,
             "split_assignment_id": config.dataset.split_assignment_id,
@@ -109,15 +122,15 @@ def test_comparison_consumes_explicit_evaluation_identities(tmp_path: Path) -> N
         variant=1,
     )
 
-    csv_path, markdown_path, count = regenerate_comparison(
+    result = regenerate_comparison(
         [second.manifest["evaluation_id"], first.manifest["evaluation_id"]],
         output_directory=tmp_path / "reports",
         private_directory=tmp_path / "private",
         model_directory=tmp_path / "models/rsna",
     )
-    frame = pd.read_csv(csv_path)
+    frame = pd.read_csv(result.csv_path)
 
-    assert count == 2
+    assert result.row_count == 2
     assert tuple(frame.columns) == COMPARISON_COLUMNS
     assert frame["evaluation_id"].tolist() == sorted(
         [first.manifest["evaluation_id"], second.manifest["evaluation_id"]]
@@ -126,13 +139,13 @@ def test_comparison_consumes_explicit_evaluation_identities(tmp_path: Path) -> N
         first.manifest["model_package_id"],
         second.manifest["model_package_id"],
     }
-    assert markdown_path.read_text(encoding="utf-8").startswith(
+    assert result.markdown_path.read_text(encoding="utf-8").startswith(
         "# Evaluation comparison\n\n| dataset_id |"
     )
 
 
 def test_comparison_regeneration_is_deterministic(tmp_path: Path) -> None:
-    result = _evaluation(
+    evaluation = _evaluation(
         tmp_path,
         logits=(-2.0, 1.0, -1.0, 2.0),
     )
@@ -141,14 +154,120 @@ def test_comparison_regeneration_is_deterministic(tmp_path: Path) -> None:
         "private_directory": tmp_path / "private",
         "model_directory": tmp_path / "models/rsna",
     }
-    csv_path, markdown_path, _ = regenerate_comparison(
-        [result.manifest["evaluation_id"]], **arguments
+    result = regenerate_comparison([evaluation.manifest["evaluation_id"]], **arguments)
+    first_csv = result.csv_path.read_bytes()
+    first_markdown = result.markdown_path.read_bytes()
+    regenerate_comparison([evaluation.manifest["evaluation_id"]], **arguments)
+    assert result.csv_path.read_bytes() == first_csv
+    assert result.markdown_path.read_bytes() == first_markdown
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "schema-version",
+        "policy-version",
+        "row-count",
+        "evaluation-order",
+        "comparison-id",
+        "csv-rendering",
+        "markdown-rendering",
+    ),
+)
+def test_comparison_validation_rejects_contract_tampering(tmp_path: Path, tamper: str) -> None:
+    first = _evaluation(tmp_path, logits=(-2.0, 1.0, -1.0, 2.0))
+    second = _evaluation(tmp_path, logits=(-1.5, 0.5, -0.5, 1.5), variant=1)
+    result = regenerate_comparison(
+        [first.manifest["evaluation_id"], second.manifest["evaluation_id"]],
+        output_directory=tmp_path / "reports",
+        private_directory=tmp_path / "private",
+        model_directory=tmp_path / "models/rsna",
     )
-    first_csv = csv_path.read_bytes()
-    first_markdown = markdown_path.read_bytes()
-    regenerate_comparison([result.manifest["evaluation_id"]], **arguments)
-    assert csv_path.read_bytes() == first_csv
-    assert markdown_path.read_bytes() == first_markdown
+    manifest_path = result.directory / "manifest.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper == "schema-version":
+        document["comparison_schema_version"] = True
+    elif tamper == "policy-version":
+        document["comparison_policy_version"] = 2
+    elif tamper == "row-count":
+        document["row_count"] = True
+    elif tamper == "evaluation-order":
+        document["evaluation_ids"].reverse()
+    elif tamper == "comparison-id":
+        document["comparison_id"] = "comparison-" + "0" * 64
+    elif tamper == "csv-rendering":
+        result.csv_path.write_bytes(result.csv_path.read_bytes() + b"\n")
+    else:
+        result.markdown_path.write_bytes(result.markdown_path.read_bytes() + b"\n")
+    if tamper not in {"csv-rendering", "markdown-rendering"}:
+        manifest_path.write_text(
+            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError):
+        validate_comparison(
+            result.directory,
+            report_root=tmp_path / "reports",
+            private_root=tmp_path / "private",
+            model_root=tmp_path / "models/rsna",
+            enforce_directory_name=False,
+        )
+
+
+@pytest.mark.parametrize("membership", ("empty", "duplicate"))
+def test_comparison_validation_rejects_invalid_producer_membership(
+    tmp_path: Path, membership: str
+) -> None:
+    first = _evaluation(tmp_path, logits=(-2.0, 1.0, -1.0, 2.0))
+    second = _evaluation(tmp_path, logits=(-1.5, 0.5, -0.5, 1.5), variant=1)
+    result = regenerate_comparison(
+        [first.manifest["evaluation_id"], second.manifest["evaluation_id"]],
+        output_directory=tmp_path / "reports",
+        private_directory=tmp_path / "private",
+        model_directory=tmp_path / "models/rsna",
+    )
+    identities = (
+        ()
+        if membership == "empty"
+        else (
+            first.manifest["evaluation_id"],
+            second.manifest["evaluation_id"],
+            second.manifest["evaluation_id"],
+        )
+    )
+    records = _comparison_records(
+        identities,
+        output_directory=tmp_path / "reports",
+        private_directory=tmp_path / "private",
+        model_directory=tmp_path / "models/rsna",
+    )
+    ordered_ids = [str(record["evaluation_id"]) for record in records]
+    document = {
+        "comparison_schema_version": 1,
+        "comparison_policy_version": COMPARISON_POLICY_VERSION,
+        "comparison_id": canonical_scientific_id(
+            COMPARISON_PREFIX,
+            {
+                "comparison_policy_version": COMPARISON_POLICY_VERSION,
+                "evaluation_ids": ordered_ids,
+                "columns": list(COMPARISON_COLUMNS),
+            },
+        ),
+        "evaluation_ids": ordered_ids,
+        "columns": list(COMPARISON_COLUMNS),
+        "row_count": len(records),
+    }
+    _write_comparison(result.directory, document, records)
+
+    with pytest.raises(ValueError, match="manifest contract"):
+        validate_comparison(
+            result.directory,
+            report_root=tmp_path / "reports",
+            private_root=tmp_path / "private",
+            model_root=tmp_path / "models/rsna",
+            enforce_directory_name=False,
+        )
 
 
 @pytest.mark.parametrize(
