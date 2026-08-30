@@ -23,7 +23,9 @@ def write_synthetic_validation_evidence(
         config_path.write_bytes(config_source)
     else:
         config_path = config_source
-    config = with_runtime(load_experiment_config(config_path), seed=seed)
+    config = with_runtime(
+        load_experiment_config(config_path, bundle_id="bundle-" + "a" * 64), seed=seed
+    )
     history = epoch_history
     if history is None:
         history = (

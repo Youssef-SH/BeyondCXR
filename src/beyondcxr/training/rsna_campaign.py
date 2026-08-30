@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,8 +22,9 @@ from beyondcxr.data.rsna_artifacts import (
     validate_bundle_reference,
 )
 from beyondcxr.data.rsna_audit import generate_rsna_audit
-from beyondcxr.data.rsna_cxr_cache import preprocessing_identity, validate_cxr_source_availability
+from beyondcxr.data.rsna_cxr_cache import preprocessing_identity
 from beyondcxr.models.cxr_baseline import fingerprint_pretrained_weights
+from beyondcxr.training.campaign_lock import campaign_lock
 from beyondcxr.training.config import (
     ExperimentConfig,
     load_experiment_config,
@@ -45,21 +47,32 @@ from beyondcxr.training.preservation import (
     validate_preservation_paths,
 )
 from beyondcxr.training.rsna_campaign_control import (
+    FrozenScientificPackage,
+    ValidatedRsnaFreeze,
+    authorize_rsna_held_out,
     load_evaluation_record,
     publish_evaluation_record,
     publish_or_validate_execution,
-    publish_or_validate_package_freeze,
-    validate_package_freeze,
+    publish_or_validate_freeze,
+    resolve_completed_rsna_packages,
+    validate_freeze,
 )
 from beyondcxr.training.rsna_compare import ComparisonResult, regenerate_comparison
-from beyondcxr.training.rsna_datasets import RsnaDataset, prepare_rsna_cxr_cache
+from beyondcxr.training.rsna_datasets import (
+    RsnaDataset,
+    prepare_rsna_cxr_cache,
+    validate_rsna_cache_source_availability,
+)
 from beyondcxr.training.rsna_evaluate import evaluate_model_package
+from beyondcxr.training.rsna_evaluation_result import validate_rsna_model_package
 from beyondcxr.training.rsna_formal import (
     _FORMAL_PLAN_GUARD,
     RSNA_FORMAL_RUN_PLAN,
     RsnaAuthorityCoordinates,
     RsnaFormalRoots,
+    RsnaFormalRunSpec,
     ValidatedRsnaPlan,
+    rsna_run_report_root,
 )
 from beyondcxr.training.rsna_localize import generate_localization_report
 from beyondcxr.training.rsna_preservation import (
@@ -70,21 +83,30 @@ from beyondcxr.training.rsna_registry import get_dataset
 from beyondcxr.training.rsna_seed_summary import publish_seed_summary
 from beyondcxr.training.rsna_train_cxr import train_cxr_experiment
 from beyondcxr.training.rsna_train_fusion import train_fusion_experiment
-from beyondcxr.training.rsna_train_metadata import MetadataModelResult, train_metadata_experiment
-from beyondcxr.utils.mlflow_utils import (
-    discover_repository_root,
-    git_revision,
-    uv_lock_sha256,
+from beyondcxr.training.rsna_train_metadata import train_metadata_experiment
+from beyondcxr.training.rsna_training_report import (
+    regenerate_training_report,
+    validate_training_report,
 )
+from beyondcxr.training.rsna_validation_evidence import load_canonical_validation_cohort
+from beyondcxr.utils.mlflow_utils import discover_repository_root
 from beyondcxr.utils.operational_logging import (
     configure_logging,
     get_operational_logger,
     log_event,
     timed_phase,
 )
+from beyondcxr.utils.package_identity import package_scientific_config_payload
+from beyondcxr.utils.provenance import git_revision, uv_lock_sha256
+from beyondcxr.utils.publication import install_immutable_directory, staging_directory
 
 _MINIMUM_FREE_BYTES = 16 * 1024**3
 _LOGGER = get_operational_logger(__name__)
+
+
+def _rsna_export_name(*, freeze_id: str, execution_id: str) -> str:
+    """Return the specification-defined stable RSNA preservation name."""
+    return f"rsna-{freeze_id}-{execution_id}"
 
 
 @dataclass(frozen=True)
@@ -99,6 +121,14 @@ class CampaignResult:
     archive_path: Path
     checksum_path: Path
     campaign_log_path: Path
+
+
+@dataclass(frozen=True)
+class _TrainingDerivative:
+    run_id: str
+    model_package_id: str
+    model_path: Path
+    artifact_directory: Path
 
 
 class _TeeStream:
@@ -122,9 +152,26 @@ class _TeeStream:
             stream.flush()
 
 
-def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
+def execute_rsna_campaign(
+    *,
+    backup_root: str | Path,
+    bundle_id: str,
+    source_root: str | Path = "data/raw/rsna/extracted",
+) -> CampaignResult:
     """Run or resume one exact RSNA execution after mutation-free preflight."""
-    plan = _preflight_rsna_campaign(backup_root=backup_root)
+    plan = _preflight_rsna_campaign(
+        backup_root=backup_root, source_root=source_root, bundle_id=bundle_id
+    )
+    with campaign_lock(
+        plan.roots.control_root,
+        "RSNA",
+        trusted_root=plan.roots.repository_root,
+    ):
+        return _execute_locked_rsna_campaign(plan)
+
+
+def _execute_locked_rsna_campaign(plan: ValidatedRsnaPlan) -> CampaignResult:
+    """Mutate one RSNA execution while holding its campaign lock."""
     campaign_id = "campaign-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     campaign_directory = plan.roots.report_root / "rsna" / "campaigns" / campaign_id
     campaign_directory.mkdir(parents=True, exist_ok=False)
@@ -153,56 +200,64 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                 for spec, config in zip(plan.runs, plan.configs, strict=True)
                 if spec.family_id == "cxr_densenet"
             )
-            fusion_configs = tuple(
-                config
-                for spec, config in zip(plan.runs, plan.configs, strict=True)
-                if spec.family_id == "cxr_metadata_concat"
-            )
             cxr_reference = cxr_configs[0]
             transform = _transform(cxr_reference, training=False)
             with timed_phase(_LOGGER, "cxr_cache_preparation"):
                 cache = prepare_rsna_cxr_cache(
                     plan.dataset, cxr_reference, transform, cache_root=plan.roots.cache_root
                 )
-            freeze_path = execution.directory / "package-freeze.json"
-            if freeze_path.exists() or freeze_path.is_symlink():
-                freeze = validate_package_freeze(
-                    execution,
-                    model_root=plan.roots.model_root,
-                    report_root=plan.roots.report_root,
-                    bundle_directory=plan.authority.bundle_directory,
+            existing_freezes = _validated_rsna_freezes(plan)
+            if existing_freezes:
+                freeze = existing_freezes[0]
+                training_results = _ensure_training_report_derivatives(
+                    plan, freeze.packages, plan.runs
                 )
-                log_event(_LOGGER, "training_resumed_from_package_freeze", total=8)
+                log_event(_LOGGER, "training_resumed_from_scientific_freeze", total=8)
             else:
-                metadata_training = _train_metadata(plan)
-                cxr_training = tuple(
-                    train_cxr_experiment(
-                        config,
-                        tracking_uri=plan.roots.tracking_uri,
-                        cache=cache,
-                        execution=plan.training_execution,
-                        runtime=plan.runtime,
-                    )
-                    for config in cxr_configs
-                )
-                fusion_training = tuple(
-                    train_fusion_experiment(
-                        config,
-                        source_cxr_package_id=source.model_package_id,
-                        tracking_uri=plan.roots.tracking_uri,
-                        cache=cache,
-                        execution=plan.training_execution,
-                        runtime=plan.runtime,
-                    )
-                    for config, source in zip(fusion_configs, cxr_training, strict=True)
-                )
-                completed = (*metadata_training, *cxr_training, *fusion_training)
-                freeze = publish_or_validate_package_freeze(
+                completed_packages = resolve_completed_rsna_packages(plan, execution)
+                completed_list = []
+                cxr_packages = {}
+                for spec, config, existing in zip(
+                    plan.runs, plan.configs, completed_packages, strict=True
+                ):
+                    if existing is not None:
+                        result = _ensure_training_report_derivatives(plan, (existing,), (spec,))[0]
+                    elif spec.family_id in {"metadata_logistic", "metadata_lightgbm"}:
+                        result = train_metadata_experiment(
+                            config, tracking_uri=plan.roots.tracking_uri
+                        )
+                    elif spec.family_id == "cxr_densenet":
+                        result = train_cxr_experiment(
+                            config,
+                            tracking_uri=plan.roots.tracking_uri,
+                            cache=cache,
+                            execution=plan.training_execution,
+                            runtime=plan.runtime,
+                        )
+                    else:
+                        result = train_fusion_experiment(
+                            config,
+                            source_cxr_package_id=cxr_packages[spec.seed],
+                            tracking_uri=plan.roots.tracking_uri,
+                            cache=cache,
+                            execution=plan.training_execution,
+                            runtime=plan.runtime,
+                        )
+                    if spec.family_id == "cxr_densenet":
+                        cxr_packages[spec.seed] = result.model_package_id
+                    completed_list.append(result)
+                completed = tuple(completed_list)
+                freeze = publish_or_validate_freeze(
                     plan=plan,
                     execution=execution,
                     results=completed,
                 )
-            training_results = freeze.packages
+                training_results = completed
+            held_out = authorize_rsna_held_out(
+                plan=plan,
+                execution=execution,
+                freeze=freeze,
+            )
             log_event(_LOGGER, "training_boundary_completed", total=len(training_results))
             evaluation_results_list = []
             for result, config in zip(
@@ -212,6 +267,7 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
             ):
                 evaluation = load_evaluation_record(
                     execution,
+                    freeze=freeze,
                     package_id=result.model_package_id,
                     report_root=plan.roots.report_root,
                     private_root=plan.roots.private_root,
@@ -220,7 +276,7 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                 if evaluation is None:
                     evaluation = evaluate_model_package(
                         result.model_package_id,
-                        authorization=freeze,
+                        authorization=held_out,
                         evaluation_config=config,
                         runtime=plan.runtime,
                         tracking_uri=plan.roots.tracking_uri,
@@ -230,7 +286,14 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                         private_output_directory=plan.roots.private_root,
                         report_directory=plan.roots.report_root,
                     )
-                    publish_evaluation_record(execution, evaluation)
+                    publish_evaluation_record(
+                        execution,
+                        evaluation,
+                        freeze=freeze,
+                        report_root=plan.roots.report_root,
+                        private_root=plan.roots.private_root,
+                        model_root=plan.roots.model_root,
+                    )
                 evaluation_results_list.append(evaluation)
             evaluation_results = tuple(evaluation_results_list)
             cxr_tests = evaluation_results[2:5]
@@ -242,18 +305,24 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                 output_directory=plan.roots.report_root,
                 model_directory=plan.roots.model_root,
                 private_directory=plan.roots.private_root,
+                freeze=freeze,
+                execution=execution,
             )
             fusion_summary = publish_seed_summary(
                 fusion_evaluation_ids,
                 output_directory=plan.roots.report_root,
                 model_directory=plan.roots.model_root,
                 private_directory=plan.roots.private_root,
+                freeze=freeze,
+                execution=execution,
             )
             localization = generate_localization_report(
                 cxr_evaluation_ids,
-                authorization=freeze,
+                authorization=held_out,
                 output_directory=plan.roots.report_root,
                 model_directory=plan.roots.model_root,
+                freeze=freeze,
+                execution=execution,
                 private_directory=plan.roots.private_root,
                 cache=cache,
                 runtime=plan.runtime,
@@ -263,6 +332,8 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                 output_directory=plan.roots.report_root,
                 private_directory=plan.roots.private_root,
                 model_directory=plan.roots.model_root,
+                freeze=freeze,
+                execution=execution,
             )
             with timed_phase(_LOGGER, "output_validation"):
                 _validate_outputs(
@@ -282,7 +353,9 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
             summaries = (cxr_summary, fusion_summary)
             archive = export_and_verify(
                 members=campaign_export_members(
-                    package_freeze=freeze,
+                    execution=execution,
+                    freeze=freeze,
+                    training_results=training_results,
                     evaluations=evaluation_results,
                     summaries=summaries,
                     localization=localization,
@@ -290,10 +363,14 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
                     audit_directory=audit_directory,
                     campaign_log=log_path,
                     private_root=plan.roots.private_root,
+                    report_root=plan.roots.report_root,
                 ),
                 export_root=plan.roots.export_root,
                 backup_root=plan.roots.backup_root,
-                export_name=f"rsna-{execution.execution_id}-{campaign_id}",
+                export_name=_rsna_export_name(
+                    freeze_id=freeze.freeze_id,
+                    execution_id=execution.execution_id,
+                ),
                 restoration_validator=validate_restored_rsna_campaign,
             )
             log_event(
@@ -331,28 +408,172 @@ def execute_rsna_campaign(*, backup_root: str | Path) -> CampaignResult:
     )
 
 
-def _train_metadata(plan: ValidatedRsnaPlan) -> tuple[MetadataModelResult, MetadataModelResult]:
-    configs = tuple(
-        config
-        for spec, config in zip(plan.runs, plan.configs, strict=True)
-        if spec.family_id in {"metadata_logistic", "metadata_lightgbm"}
-    )
-    if len(configs) != 2:
-        raise ManifestBuildError("RSNA formal plan must contain exactly two metadata runs")
-    first_config, second_config = configs
-    return (
-        train_metadata_experiment(first_config, tracking_uri=plan.roots.tracking_uri),
-        train_metadata_experiment(second_config, tracking_uri=plan.roots.tracking_uri),
-    )
+def _validated_rsna_freezes(
+    plan: ValidatedRsnaPlan,
+) -> tuple[ValidatedRsnaFreeze, ...]:
+    root = plan.roots.control_root / "freezes"
+    if not root.exists() and not root.is_symlink():
+        return ()
+    if root.is_symlink() or not root.is_dir():
+        raise ManifestBuildError("RSNA scientific freeze root is invalid")
+    matches = []
+    for directory in sorted(root.iterdir()):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ManifestBuildError("RSNA scientific freeze root contains invalid state")
+        try:
+            freeze = validate_freeze(
+                directory,
+                model_root=plan.roots.model_root,
+                bundle_directory=plan.authority.bundle_directory,
+            )
+        except (OSError, ValueError, KeyError, ManifestBuildError) as exc:
+            raise ManifestBuildError("Persisted RSNA scientific freeze is invalid") from exc
+        matches.append(freeze)
+    if len(matches) > 1:
+        raise ManifestBuildError("RSNA execution has ambiguous scientific freezes")
+    return tuple(matches)
 
 
-def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
+def _ensure_training_report_derivatives(
+    plan: ValidatedRsnaPlan,
+    packages: Sequence[FrozenScientificPackage],
+    runs: Sequence[RsnaFormalRunSpec],
+) -> tuple[_TrainingDerivative, ...]:
+    cohort = load_canonical_validation_cohort(
+        plan.authority.bundle_directory,
+        expected_bundle_id=plan.authority.bundle_id,
+        expected_task_id=plan.authority.task_id,
+        expected_label_policy_version=plan.authority.label_policy_version,
+    )
+    root = rsna_run_report_root(plan.roots.report_root)
+    derivatives = []
+    for frozen, spec in zip(packages, runs, strict=True):
+        package = validate_rsna_model_package(plan.roots.model_root, frozen.model_package_id)
+        package_directory = plan.roots.model_root / "packages" / frozen.model_package_id
+        matches: list[Path] = []
+        if root.is_dir() and not root.is_symlink():
+            for candidate in sorted(root.iterdir()):
+                if candidate.is_symlink() or not candidate.is_dir():
+                    continue
+                try:
+                    report_document = json.loads((candidate / "metrics.json").read_bytes())
+                    binding = (
+                        report_document.get("training_package")
+                        if isinstance(report_document, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(binding, dict)
+                        or binding.get("model_package_id") != frozen.model_package_id
+                    ):
+                        continue
+                    validate_training_report(
+                        candidate,
+                        run_id=candidate.name,
+                        model_package_id=frozen.model_package_id,
+                        family_id=spec.family_id,
+                        seed=spec.seed,
+                        package=package,
+                        package_directory=package_directory,
+                        canonical_validation_cohort=cohort,
+                    )
+                except (OSError, ValueError, KeyError, TypeError, ManifestBuildError):
+                    continue
+                matches.append(candidate)
+        if not matches:
+            destination = root / frozen.model_package_id
+            if destination.exists() or destination.is_symlink():
+                _quarantine_invalid_training_report(destination)
+            stage = staging_directory(destination)
+            try:
+                regenerate_training_report(
+                    stage,
+                    run_id=destination.name,
+                    model_package_id=frozen.model_package_id,
+                    family_id=spec.family_id,
+                    seed=spec.seed,
+                    package=package,
+                    package_directory=package_directory,
+                    canonical_validation_cohort=cohort,
+                )
+
+                def validate_derivative(
+                    path: Path,
+                    *,
+                    _run_id: str = destination.name,
+                    _package_id: str = frozen.model_package_id,
+                    _family_id: str = spec.family_id,
+                    _seed: int = spec.seed,
+                    _package: Mapping[str, Any] = package,
+                    _package_directory: Path = package_directory,
+                    **_kwargs: object,
+                ) -> None:
+                    validate_training_report(
+                        path,
+                        run_id=_run_id,
+                        model_package_id=_package_id,
+                        family_id=_family_id,
+                        seed=_seed,
+                        package=_package,
+                        package_directory=_package_directory,
+                        canonical_validation_cohort=cohort,
+                    )
+
+                install_immutable_directory(stage, destination, validate_derivative)
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage)
+            matches.append(destination)
+        selected = min(matches, key=lambda path: path.name)
+        derivatives.append(
+            _TrainingDerivative(
+                selected.name,
+                frozen.model_package_id,
+                frozen.model_path,
+                selected,
+            )
+        )
+    return tuple(derivatives)
+
+
+def _quarantine_invalid_training_report(destination: Path) -> Path:
+    """Move a colliding unusable derivative aside before canonical regeneration."""
+    root = destination.parent
+    quarantine = root / ".invalid-training-reports"
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise ManifestBuildError("RSNA training report root is invalid")
+    quarantine.mkdir(parents=True, exist_ok=True)
+    if quarantine.is_symlink() or not quarantine.is_dir():
+        raise ManifestBuildError("RSNA training report quarantine is invalid")
+    for ordinal in range(1_000_000):
+        target = quarantine / f"{destination.name}-{ordinal:06d}"
+        if target.exists() or target.is_symlink():
+            continue
+        try:
+            os.replace(destination, target)
+        except OSError as exc:
+            raise ManifestBuildError(
+                "Invalid RSNA training report could not be quarantined"
+            ) from exc
+        return target
+    raise ManifestBuildError("RSNA training report quarantine is exhausted")
+
+
+def _preflight_rsna_campaign(
+    *,
+    backup_root: str | Path,
+    bundle_id: str,
+    source_root: str | Path = "data/raw/rsna/extracted",
+) -> ValidatedRsnaPlan:
     """Validate every formal input before creating campaign-owned output."""
     repository_root = discover_repository_root()
     if Path.cwd().resolve() != repository_root:
         raise ManifestBuildError("Formal RSNA campaign must run from the repository root")
     _validate_canonical_rsna_layout(repository_root)
-    source_root = repository_root / "data/raw/rsna/extracted"
+    source_input = Path(source_root)
+    source_root = (
+        source_input if source_input.is_absolute() else repository_root / source_input
+    ).resolve()
     manifest_root = repository_root / "data/manifests"
     cache_root = repository_root / "data/cache/rsna"
     model_root = repository_root / "models/rsna"
@@ -406,7 +627,7 @@ def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
         raise FileNotFoundError(f"RSNA campaign configs are missing: {missing}")
     configs = tuple(
         with_runtime(
-            load_experiment_config(path),
+            load_experiment_config(path, bundle_id=bundle_id),
             seed=spec.seed,
             manifest_directory=manifest_root,
             source_root=source_root,
@@ -426,21 +647,11 @@ def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
         / BUNDLES_DIRECTORY
         / reference.dataset.bundle_id
     )
-    validated = validate_bundle_reference(
-        bundle_directory,
-        expected_bundle_id=reference.dataset.bundle_id,
-        expected_manifest_sha256=reference.dataset.bundle_manifest_sha256,
-    )
-    manifest = validate_bundle_directory(
+    validate_bundle_reference(bundle_directory, expected_bundle_id=reference.dataset.bundle_id)
+    validate_bundle_directory(
         bundle_directory,
         expected_bundle_id=reference.dataset.bundle_id,
     )
-    if (
-        validated.manifest_sha256 != reference.dataset.bundle_manifest_sha256
-        or manifest["membership"]["split"]["split_assignment_id"]
-        != reference.dataset.split_assignment_id
-    ):
-        raise ManifestBuildError("Configured RSNA authority lineage is inconsistent")
     dataset = get_dataset("rsna")
     if not isinstance(dataset, RsnaDataset):
         raise TypeError("RSNA campaign requires the concrete RSNA dataset adapter")
@@ -449,13 +660,9 @@ def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
         for spec, config in zip(RSNA_FORMAL_RUN_PLAN, configs, strict=True)
         if spec.family_id == "cxr_densenet"
     )
-    cache_input = dataset.load_image_cache(cxr_reference)
     if cxr_reference.runtime.source_root is None:
         raise ManifestBuildError("RSNA campaign requires an explicit source root")
-    validate_cxr_source_availability(
-        cache_input.frame,
-        dataset_root=cxr_reference.runtime.source_root,
-    )
+    validate_rsna_cache_source_availability(cxr_reference)
     if shutil.disk_usage(Path.cwd()).free < _MINIMUM_FREE_BYTES:
         raise OSError("RSNA campaign requires at least 16 GiB of free workspace storage")
     runtime = _required_cuda_runtime(cxr_reference)
@@ -476,8 +683,6 @@ def _preflight_rsna_campaign(*, backup_root: str | Path) -> ValidatedRsnaPlan:
     authority = RsnaAuthorityCoordinates(
         dataset_id=reference.dataset.dataset_id,
         bundle_id=reference.dataset.bundle_id,
-        bundle_manifest_sha256=reference.dataset.bundle_manifest_sha256,
-        split_assignment_id=reference.dataset.split_assignment_id,
         task_id=reference.task.task_id,
         label_policy_version=reference.task.label_policy_version,
         bundle_directory=bundle_directory,
@@ -565,9 +770,15 @@ def _validate_neural_campaign_configs(configs: Sequence[ExperimentConfig]) -> No
         or tuple(require_runtime_seed(config) for config in fusions) != expected_seeds
     ):
         raise ValueError("RSNA campaign neural seeds differ from the formal run plan")
-    if len({config.config_semantic_sha256 for config in cxr}) != 1:
+    cxr_configs = {
+        json.dumps(package_scientific_config_payload(config), sort_keys=True) for config in cxr
+    }
+    fusion_configs = {
+        json.dumps(package_scientific_config_payload(config), sort_keys=True) for config in fusions
+    }
+    if len(cxr_configs) != 1:
         raise ValueError("RSNA CXR configurations do not form one scientific family")
-    if len({config.config_semantic_sha256 for config in fusions}) != 1:
+    if len(fusion_configs) != 1:
         raise ValueError("RSNA fusion configurations do not form one scientific family")
     neural_configs = (*cxr, *fusions)
     neural_settings = tuple(config.neural for config in neural_configs)
@@ -606,8 +817,6 @@ def _validate_config_agreement(configs: Sequence[ExperimentConfig]) -> None:
         (
             config.dataset.dataset_id,
             config.dataset.bundle_id,
-            config.dataset.bundle_manifest_sha256,
-            config.dataset.split_assignment_id,
             config.task.task_id,
             config.task.label_policy_version,
         )
@@ -712,10 +921,11 @@ def _validate_outputs(
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the campaign and print its final transport paths."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle-id", required=True)
     parser.add_argument("--backup-root", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        result = execute_rsna_campaign(backup_root=args.backup_root)
+        result = execute_rsna_campaign(backup_root=args.backup_root, bundle_id=args.bundle_id)
     except Exception as exc:
         print(f"RSNA campaign failed: {type(exc).__name__}", file=sys.stderr)
         return 1

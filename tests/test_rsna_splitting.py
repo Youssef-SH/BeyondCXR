@@ -6,15 +6,41 @@ import pyarrow as pa
 import pytest
 
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.hashing import LogicalTableContract, logical_table_sha256
 from beyondcxr.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
 from beyondcxr.data.rsna_splitting import (
     SPLIT_ALGORITHM_VERSION,
     SPLIT_NAMES,
     SplitConfig,
-    create_patient_stratified_splits,
-    split_assignment_id,
+    _canonical_split_assignments,
     validate_split_table,
 )
+
+_SPLIT_CONTRACT = LogicalTableContract(
+    "rsna.splits", 1, RSNA_SPLIT_SCHEMA, ("sample_id",), ("sample_id",)
+)
+
+
+def create_patient_stratified_splits(
+    samples: pa.Table,
+    labels: pa.Table,
+    config: SplitConfig | None = None,
+) -> pa.Table:
+    """Construct a table fixture from the production-owned assignment mathematics."""
+    resolved = config or SplitConfig()
+    assignments = _canonical_split_assignments(samples, labels, resolved)
+    table = pa.Table.from_pylist(
+        sorted(
+            (
+                {"sample_id": sample_id, "split_name": split_name}
+                for sample_id, split_name in assignments.items()
+            ),
+            key=lambda row: row["sample_id"],
+        ),
+        schema=RSNA_SPLIT_SCHEMA,
+    )
+    validate_split_table(table, samples, labels, config=resolved)
+    return table
 
 
 def _cohort(patient_count: int = 20) -> tuple[pa.Table, pa.Table]:
@@ -90,9 +116,9 @@ def test_split_seed_changes_assignments_and_recipe_identity() -> None:
     second = create_patient_stratified_splits(samples, labels, SplitConfig(seed=43))
 
     assert SplitConfig(seed=42).recipe_id != SplitConfig(seed=43).recipe_id
-    first_assignments = {row["sample_id"]: row["split_name"] for row in first.to_pylist()}
-    second_assignments = {row["sample_id"]: row["split_name"] for row in second.to_pylist()}
-    assert split_assignment_id(first_assignments) != split_assignment_id(second_assignments)
+    assert logical_table_sha256(first, _SPLIT_CONTRACT) != logical_table_sha256(
+        second, _SPLIT_CONTRACT
+    )
     assert first.column("split_name").to_pylist() != second.column("split_name").to_pylist()
 
 
@@ -181,9 +207,9 @@ def test_different_cohorts_change_assignment_identity() -> None:
     smaller_labels = pa.Table.from_pylist(label_rows, RSNA_LABEL_SCHEMA)
     first = create_patient_stratified_splits(samples, labels)
     second = create_patient_stratified_splits(smaller_samples, smaller_labels)
-    first_assignments = {row["sample_id"]: row["split_name"] for row in first.to_pylist()}
-    second_assignments = {row["sample_id"]: row["split_name"] for row in second.to_pylist()}
-    assert split_assignment_id(first_assignments) != split_assignment_id(second_assignments)
+    assert logical_table_sha256(first, _SPLIT_CONTRACT) != logical_table_sha256(
+        second, _SPLIT_CONTRACT
+    )
 
 
 def test_assignment_tampering_is_detected_against_declared_recipe() -> None:

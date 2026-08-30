@@ -29,6 +29,11 @@ from beyondcxr.models.cxr_baseline import CxrBinaryClassifier, StandardCxrEncode
 from beyondcxr.models.symile_ecg_fusion import build_symile_trimodal_gated_model
 from beyondcxr.models.symile_fusion import build_symile_concat_model, build_symile_gated_model
 from beyondcxr.training.config import ExperimentConfig
+from beyondcxr.training.symile_execution import (
+    ValidatedSymileProspectiveMutation,
+    require_symile_prospective_mutation,
+    require_symile_prospective_path,
+)
 from beyondcxr.training.symile_families import (
     FINAL_FUSION_FAMILIES,
     FINAL_NEURAL_FAMILIES,
@@ -37,14 +42,15 @@ from beyondcxr.training.symile_families import (
     FINAL_TABULAR_SEED,
     SYMILE_ECG_GATED_FAMILY,
 )
+from beyondcxr.utils.immutable_json import json_projection
 from beyondcxr.utils.package_identity import (
-    canonical_scientific_id,
     fitted_object_state_sha256,
     package_scientific_config_payload,
     pretrained_weight_semantic_identity,
     tensor_state_sha256,
 )
 from beyondcxr.utils.publication import install_immutable_directory, staging_directory
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops, save_skops
 
 FINAL_PACKAGE_PREFIX = "final-package-"
@@ -73,7 +79,6 @@ class ValidatedFinalPackage:
 
     directory: Path
     manifest: Mapping[str, Any]
-    manifest_sha256: str
 
     @property
     def package_id(self) -> str:
@@ -86,8 +91,6 @@ class FinalPackageConfig:
 
     dataset_id: str
     bundle_id: str
-    bundle_manifest_sha256: str
-    split_assignment_id: str
     task_id: str
     label_policy_version: str
     family_id: str
@@ -135,6 +138,7 @@ def final_training_plan(family_id: str, budget: int | None) -> FinalTrainingPlan
 
 def publish_final_neural_package(
     *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
     model_root: str | Path,
     config: ExperimentConfig,
     family_development_id: str,
@@ -147,8 +151,13 @@ def publish_final_neural_package(
     operational: Mapping[str, object],
 ) -> ValidatedFinalPackage:
     """Publish one terminal neural member with no validation-derived state."""
+    prospective_mutation = require_symile_prospective_mutation(prospective_mutation)
+    require_symile_prospective_path(
+        prospective_mutation, model_root, "Symile final package model root"
+    )
     _validate_neural_plan(config, family_development_id, plan, seed, source_cxr_package_id)
     _validate_execution_provenance(operational, neural=True)
+    _validate_producing_python(prospective_mutation, operational)
     _validate_pretrained_weight(config, pretrained_weight)
     _validate_state_dict(state_dict)
     if config.family.family_id in FINAL_FUSION_FAMILIES:
@@ -171,7 +180,9 @@ def publish_final_neural_package(
         model_hash=model_hash,
         preprocessor_hash=preprocessor_hash,
     )
-    package_id = canonical_scientific_id(FINAL_PACKAGE_PREFIX, semantic)
+    package_id = canonical_scientific_id(
+        FINAL_PACKAGE_PREFIX, semantic, domain="final-package", schema_version=1
+    )
     destination = _package_destination(model_root, package_id)
     stage = staging_directory(destination)
     try:
@@ -193,7 +204,6 @@ def publish_final_neural_package(
         document = _neural_document(
             package_id=package_id,
             semantic=semantic,
-            bundle_manifest_sha256=config.dataset.bundle_manifest_sha256,
             pretrained_weight=pretrained_weight,
             artifacts=_artifact_hashes(stage),
         )
@@ -208,6 +218,7 @@ def publish_final_neural_package(
 
 def publish_final_tabular_package(
     *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
     model_root: str | Path,
     config: ExperimentConfig,
     family_development_id: str | None,
@@ -216,15 +227,20 @@ def publish_final_tabular_package(
     operational: Mapping[str, object],
 ) -> ValidatedFinalPackage:
     """Publish one final LR or fixed-iteration LightGBM package."""
+    prospective_mutation = require_symile_prospective_mutation(prospective_mutation)
+    require_symile_prospective_path(
+        prospective_mutation, model_root, "Symile final package model root"
+    )
     _validate_execution_provenance(operational, neural=False)
+    _validate_producing_python(prospective_mutation, operational)
     family = config.family.family_id
     if family not in FINAL_TABULAR_FAMILIES or plan.family_id != family:
         raise ManifestBuildError("Final tabular package family is invalid")
     classifier = model.named_steps.get("classifier") if isinstance(model, Pipeline) else None
     if family == "labs_logistic":
-        if family_development_id is not None or plan.budget is not None:
+        if plan.budget is not None:
             raise ManifestBuildError("Final Labs Logistic Regression contract is invalid")
-    elif family_development_id is None or plan.budget is None:
+    elif not _identity(family_development_id, "development-") or plan.budget is None:
         raise ManifestBuildError("Final Labs LightGBM contract is invalid")
     _validate_final_tabular_estimator(classifier, config, plan)
     preprocessor = model.named_steps.get("preprocess")
@@ -236,7 +252,6 @@ def publish_final_tabular_package(
         "dataset_id": "symile",
         "execution_scope": "full_development",
         "input": _final_input_projection(config),
-        "family_development_id": family_development_id,
         "final_training_budget": plan.budget,
         "final_stage_budgets": None,
         "seed_policy": FINAL_TABULAR_SEED,
@@ -246,7 +261,11 @@ def publish_final_tabular_package(
         "source_cxr_package_id": None,
         "pretrained_scientific_identity": None,
     }
-    package_id = canonical_scientific_id(FINAL_PACKAGE_PREFIX, semantic)
+    if family != "labs_logistic":
+        semantic["family_development_id"] = family_development_id
+    package_id = canonical_scientific_id(
+        FINAL_PACKAGE_PREFIX, semantic, domain="final-package", schema_version=1
+    )
     destination = _package_destination(model_root, package_id)
     stage = staging_directory(destination)
     try:
@@ -256,8 +275,8 @@ def publish_final_tabular_package(
             "final_package_schema_version": FINAL_PACKAGE_SCHEMA_VERSION,
             "final_package_id": package_id,
             "package_kind": "tabular",
-            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
             **semantic,
+            "family_development_id": (None if family == "labs_logistic" else family_development_id),
             "pretrained_weight_fingerprint": None,
             "artifacts": _artifact_hashes(stage),
             "execution_provenance": dict(operational),
@@ -280,6 +299,8 @@ def validate_final_package(
     root = Path(directory)
     if root.is_symlink() or not root.is_dir():
         raise ManifestBuildError("Final package directory is invalid")
+    if any(member.is_symlink() or not member.is_file() for member in root.iterdir()):
+        raise ManifestBuildError("Final package members must be regular files")
     raw = (root / _MANIFEST_FILENAME).read_bytes()
     try:
         document = json.loads(raw.decode("utf-8"))
@@ -290,7 +311,6 @@ def validate_final_package(
         "final_package_id",
         "package_kind",
         "dataset_id",
-        "bundle_manifest_sha256",
         "execution_scope",
         "input",
         "family_development_id",
@@ -316,7 +336,6 @@ def validate_final_package(
         or not isinstance(schema_version, int)
         or schema_version != FINAL_PACKAGE_SCHEMA_VERSION
         or document["dataset_id"] != "symile"
-        or not _sha256_text(document["bundle_manifest_sha256"])
         or document["execution_scope"] != "full_development"
         or document["terminal_fixed_budget_policy"]
         != "no_validation_no_scheduler_no_early_stopping"
@@ -343,7 +362,6 @@ def validate_final_package(
             "dataset_id",
             "execution_scope",
             "input",
-            "family_development_id",
             "final_training_budget",
             "final_stage_budgets",
             "seed_policy",
@@ -354,14 +372,18 @@ def validate_final_package(
             "pretrained_scientific_identity",
         )
     }
-    expected = canonical_scientific_id(FINAL_PACKAGE_PREFIX, semantic)
+    if config.family_id != "labs_logistic":
+        semantic["family_development_id"] = document["family_development_id"]
+    expected = canonical_scientific_id(
+        FINAL_PACKAGE_PREFIX, semantic, domain="final-package", schema_version=1
+    )
     if (
         document["final_package_id"] != expected
         or (expected_package_id is not None and expected != expected_package_id)
         or (enforce_directory_name and root.name != expected)
     ):
         raise ManifestBuildError("Final package semantic identity is invalid")
-    return ValidatedFinalPackage(root, document, hashlib.sha256(raw).hexdigest())
+    return ValidatedFinalPackage(root, document)
 
 
 def load_final_neural_state(package: ValidatedFinalPackage) -> Mapping[str, torch.Tensor]:
@@ -378,7 +400,13 @@ def load_final_package_config(package: ValidatedFinalPackage) -> FinalPackageCon
 
 def validate_final_fit_provenance(value: object) -> None:
     """Validate provenance that every successful final fit must receive up front."""
-    base = {"git_commit", "git_dirty", "dependency_lock_sha256", "mlflow_run_id"}
+    base = {
+        "git_commit",
+        "git_dirty",
+        "dependency_lock_sha256",
+        "python_version",
+        "mlflow_run_id",
+    }
     if not isinstance(value, Mapping) or set(value) != base:
         raise ManifestBuildError("Final fit execution provenance is invalid")
     if (
@@ -389,13 +417,21 @@ def validate_final_fit_provenance(value: object) -> None:
         or len(value["git_commit"]) != 40
         or any(character not in "0123456789abcdef" for character in value["git_commit"])
         or not isinstance(value["git_dirty"], bool)
+        or not isinstance(value["python_version"], str)
+        or not value["python_version"]
     ):
         raise ManifestBuildError("Final fit operational lineage is invalid")
 
 
 def _validate_execution_provenance(value: object, *, neural: bool) -> None:
     """Validate bounded nonidentity execution provenance."""
-    base = {"git_commit", "git_dirty", "dependency_lock_sha256", "mlflow_run_id"}
+    base = {
+        "git_commit",
+        "git_dirty",
+        "dependency_lock_sha256",
+        "python_version",
+        "mlflow_run_id",
+    }
     expected = base | ({"runtime_provenance", "loader_execution"} if neural else set())
     if not isinstance(value, Mapping) or set(value) != expected:
         raise ManifestBuildError("Final package execution provenance is invalid")
@@ -443,6 +479,17 @@ def _validate_execution_provenance(value: object, *, neural: bool) -> None:
             raise ManifestBuildError("Final neural loader execution contract is invalid")
 
 
+def _validate_producing_python(
+    prospective_mutation: ValidatedSymileProspectiveMutation,
+    operational: Mapping[str, object],
+) -> None:
+    expected = prospective_mutation.lifecycle.current_execution.execution.manifest[
+        "framework_versions"
+    ]["python"]
+    if operational["python_version"] != expected:
+        raise ManifestBuildError("Final package Python provenance differs from execution")
+
+
 def load_final_neural_model(package: ValidatedFinalPackage) -> torch.nn.Module:
     """Reconstruct a final neural model using only its packaged state."""
     config = load_final_package_config(package)
@@ -459,7 +506,7 @@ def load_final_neural_model(package: ValidatedFinalPackage) -> torch.nn.Module:
 
 
 def load_final_tabular_model(package: ValidatedFinalPackage) -> Pipeline:
-    """Load a validated final tabular pipeline without mutable estimator state."""
+    """Load a fresh fitted pipeline from the validated final package."""
     if package.manifest["package_kind"] != "tabular":
         raise ManifestBuildError("Final package is not tabular")
     try:
@@ -484,7 +531,6 @@ def _neural_document(
     *,
     package_id: str,
     semantic: Mapping[str, object],
-    bundle_manifest_sha256: str,
     pretrained_weight: Mapping[str, object] | None,
     artifacts: Mapping[str, str],
 ) -> dict[str, object]:
@@ -492,7 +538,6 @@ def _neural_document(
         "final_package_schema_version": FINAL_PACKAGE_SCHEMA_VERSION,
         "final_package_id": package_id,
         "package_kind": "neural",
-        "bundle_manifest_sha256": bundle_manifest_sha256,
         **semantic,
         "pretrained_weight_fingerprint": (
             dict(pretrained_weight) if pretrained_weight is not None else None
@@ -567,7 +612,6 @@ def final_input_projection_from_development(
         "dataset": {
             "dataset_id": dataset["dataset_id"],
             "bundle_id": dataset["bundle_id"],
-            "split_assignment_id": dataset["split_assignment_id"],
             "cohort": "official_train_plus_validation_strict_pneumonia",
         },
         "task": dict(task),
@@ -585,15 +629,12 @@ def final_input_projection_from_development(
     }
 
 
-def final_cxr_ancestry_projection(
-    final_input: Mapping[str, object], bundle_manifest_sha256: str
-) -> dict[str, object]:
+def final_cxr_ancestry_projection(final_input: Mapping[str, object]) -> dict[str, object]:
     """Return only shared, package-owned CXR semantics required by fusion ancestry."""
     family = final_input["family"]
     parameters = family["parameters"]
     return {
         "dataset": final_input["dataset"],
-        "bundle_manifest_sha256": bundle_manifest_sha256,
         "task": final_input["task"],
         "encoder": {
             key: parameters[key]
@@ -606,7 +647,6 @@ def final_cxr_ancestry_projection(
 def _final_config_bytes(config: ExperimentConfig) -> bytes:
     document = {
         "final_fit_config_schema_version": 1,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
         **_final_input_projection(config),
     }
     return (json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
@@ -697,6 +737,11 @@ def _validate_tabular_final(
     plan = final_training_plan(family, document["final_training_budget"])
     if document["final_stage_budgets"] is not None:
         raise ManifestBuildError("Final tabular package cannot declare neural stage budgets")
+    if family == "labs_logistic":
+        if document["family_development_id"] is not None:
+            raise ManifestBuildError("Final Labs Logistic package declares irrelevant ancestry")
+    elif not _identity(document["family_development_id"], "development-"):
+        raise ManifestBuildError("Final tabular package lacks its family development authority")
     if (
         document["pretrained_scientific_identity"] is not None
         or document["pretrained_weight_fingerprint"] is not None
@@ -787,32 +832,25 @@ def _validated_config(root: Path, document: Mapping[str, object]) -> FinalPackag
         or set(packaged)
         != {
             "final_fit_config_schema_version",
-            "bundle_manifest_sha256",
             *document["input"],
         }
         or isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
         or schema_version != 1
-        or packaged["bundle_manifest_sha256"] != document["bundle_manifest_sha256"]
         or {
             key: value
             for key, value in packaged.items()
-            if key not in {"final_fit_config_schema_version", "bundle_manifest_sha256"}
+            if key != "final_fit_config_schema_version"
         }
-        != document["input"]
+        != json_projection(document["input"])
     ):
         raise ManifestBuildError("Final package configuration differs from manifest")
     return _final_package_config_from_input(
-        document["input"],
-        bundle_manifest_sha256=str(document["bundle_manifest_sha256"]),
+        {key: value for key, value in packaged.items() if key != "final_fit_config_schema_version"}
     )
 
 
-def _final_package_config_from_input(
-    value: object,
-    *,
-    bundle_manifest_sha256: str,
-) -> FinalPackageConfig:
+def _final_package_config_from_input(value: object) -> FinalPackageConfig:
     """Build the truthful reconstruction view from an authenticated final-fit contract."""
     if not isinstance(value, Mapping) or set(value) != {
         "dataset",
@@ -833,7 +871,6 @@ def _final_package_config_from_input(
         != {
             "dataset_id",
             "bundle_id",
-            "split_assignment_id",
             "cohort",
         }
         or dataset["dataset_id"] != "symile"
@@ -881,8 +918,6 @@ def _final_package_config_from_input(
     return FinalPackageConfig(
         dataset_id="symile",
         bundle_id=str(dataset["bundle_id"]),
-        bundle_manifest_sha256=bundle_manifest_sha256,
-        split_assignment_id=str(dataset["split_assignment_id"]),
         task_id=str(task["task_id"]),
         label_policy_version=str(task["label_policy_version"]),
         family_id=str(family["family_id"]),

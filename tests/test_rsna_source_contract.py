@@ -5,15 +5,14 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pytest
+from rsna_manifest_test_support import build_rsna_artifacts
 from rsna_manifest_test_support import replace_table_row as _replace_table_row
 from rsna_manifest_test_support import tables as _tables
 from rsna_manifest_test_support import write_header as _write_header
 from rsna_manifest_test_support import write_sources as _write_sources
 
+import beyondcxr.data.rsna_artifacts as rsna_artifacts
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.rsna_artifacts import (
-    build_rsna_artifacts,
-)
 from beyondcxr.data.rsna_schemas import (
     PNEUMONIA_TASK_ID,
     RSNA_ANNOTATION_SCHEMA,
@@ -29,6 +28,15 @@ from beyondcxr.data.rsna_validation import (
     validate_label_table,
     validate_sample_table,
 )
+
+
+def test_canonical_builder_returns_only_published_authority_and_aggregates(tmp_path: Path) -> None:
+    root = _write_sources(tmp_path / "extracted")
+    written = rsna_artifacts.build_and_write(root, tmp_path / "manifests")
+    assert not any(
+        hasattr(written, field)
+        for field in ("samples", "labels", "annotations", "splits", "source_inventory")
+    )
 
 
 def test_happy_path_builds_canonical_samples_and_multiple_annotations(tmp_path: Path) -> None:

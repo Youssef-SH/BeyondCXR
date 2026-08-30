@@ -25,12 +25,10 @@ BUNDLE_MANIFEST_FIELDS = frozenset(
         "privacy",
         "bundle",
         "artifacts",
-        "provenance",
-        "generation",
         "qualification",
     }
 )
-ARTIFACT_FIELDS = frozenset({"logical_arrow_sha256", "physical_file_sha256", "row_count"})
+ARTIFACT_FIELDS = frozenset({"semantic_sha256", "row_count"})
 
 
 def validate_common_bundle_envelope(

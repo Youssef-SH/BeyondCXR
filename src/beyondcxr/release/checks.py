@@ -8,6 +8,7 @@ import io
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -20,13 +21,13 @@ from pathlib import Path, PurePosixPath
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.release.binding import load_result_binding
-from beyondcxr.release.filesystem import directory_bytes
 from beyondcxr.release.render import (
     RESULT_END,
     RESULT_START,
     parse_result_region,
     public_result_surface,
 )
+from beyondcxr.utils.provenance import PROJECT_ROOT_FILES, git_revision, project_untracked_paths
 
 _LINK = re.compile(r"\[[^]]+\]\((?!https?://|#|mailto:)([^)#]+)(?:#[^)]+)?\)")
 _MAKE_COMMAND = re.compile(r"^\s*make\s+([a-z][a-z0-9-]+)", re.MULTILINE)
@@ -70,21 +71,7 @@ _IDENTIFIER_KEY_VALUE = re.compile(
     rf"(?P<field>{_IDENTIFIER_FIELD_PATTERN})(?P=key_quote)(?![A-Za-z0-9_])"
     r"\s*[:=]\s*(?P<value>['\"][^'\"\r\n]*['\"]|[A-Za-z0-9_.:-]+)"
 )
-_ROOT_FILE_ALLOWLIST = {
-    ".dockerignore",
-    ".gitignore",
-    ".pre-commit-config.yaml",
-    ".python-version",
-    "CHANGELOG.md",
-    "CITATION.cff",
-    "Dockerfile",
-    "LICENSE",
-    "Makefile",
-    "README.md",
-    "THIRD_PARTY_NOTICES.md",
-    "pyproject.toml",
-    "uv.lock",
-}
+
 _RESTRICTED_SUFFIXES = {
     ".dcm",
     ".dicom",
@@ -124,14 +111,19 @@ _GENERATED_DATA_ROOTS = {"cache", "interim", "manifests", "processed", "raw"}
 _GENERATED_ROOT_FILES = {"mlflow.db", "mlflow.db-shm", "mlflow.db-wal"}
 
 
-def check_repository(root: str | Path, *, final: bool = False) -> None:
+def check_repository(
+    root: str | Path,
+    *,
+    final: bool = False,
+    formal_execution_git_commit: str | None = None,
+) -> None:
     """Validate documentation, privacy, packaging, result-surface, and release invariants."""
     repository = Path(root).resolve()
     tracked = _release_candidate_paths(repository)
     unexpected_root_files = [
         path
         for path in tracked
-        if path.parent == repository and path.name not in _ROOT_FILE_ALLOWLIST
+        if path.parent == repository and path.name not in PROJECT_ROOT_FILES
     ]
     restricted = [path for path in tracked if path.suffix.lower() in _RESTRICTED_SUFFIXES]
     if restricted:
@@ -183,15 +175,11 @@ def check_repository(root: str | Path, *, final: bool = False) -> None:
     _check_result_markers(repository, final=final)
     _check_result_surface(repository, final=final)
     if final:
-        _check_release_delta(repository)
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        if status:
+        if formal_execution_git_commit is None:
+            raise ManifestBuildError("Final release checks require validated formal execution")
+        _check_release_delta(repository, formal_execution_git_commit)
+        _, dirty = git_revision(repository)
+        if dirty:
             raise ManifestBuildError("Final release checks require a clean Git tree")
 
 
@@ -210,6 +198,11 @@ def inspect_distribution_archives(paths: list[str | Path], *, repository_root: s
         if archive.suffix == ".whl":
             with zipfile.ZipFile(archive) as stream:
                 members = stream.infolist()
+                if any(
+                    stat.S_IFMT(member.external_attr >> 16) not in {0, stat.S_IFREG, stat.S_IFDIR}
+                    for member in members
+                ):
+                    raise ManifestBuildError("Wheel distribution contains a special member")
                 names = _canonical_archive_names(member.filename for member in members)
                 metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
                 if len(metadata_names) != 1:
@@ -346,13 +339,39 @@ def run_final_acceptance(
     artifact_root: str | Path,
     authority_root: str | Path,
 ) -> None:
-    """Run full release acceptance in a fresh local clone."""
+    """Materialize and reproduce results, then accept a clean final release in a clone."""
     repository = Path(root).resolve()
-    artifact = Path(artifact_root).resolve()
+    from beyondcxr.release.reproduction import publish_results_from_campaign, reproduce_results
+    from beyondcxr.release.resolution import resolved_release
+
     authority = Path(authority_root).resolve()
-    check_repository(repository, final=True)
     if authority.is_relative_to(repository):
         raise ManifestBuildError("Serving authorities must be published outside the repository")
+    binding = repository / "results/symile/binding.json"
+    _check_result_surface(repository, final=False)
+    with resolved_release(artifact_root) as (artifact, campaign):
+        artifact = artifact.resolve()
+        formal_execution_git_commit = str(campaign.execution.manifest["git_commit"])
+        result_paths = {
+            "artifact_root": artifact,
+            "output_root": repository / "results",
+            "readme_path": repository / "README.md",
+            "model_card_path": repository / "docs/model_card.md",
+        }
+        if not binding.exists() and not binding.is_symlink():
+            publish_results_from_campaign(
+                archive=artifact,
+                campaign=campaign,
+                output_root=result_paths["output_root"],
+                readme_path=result_paths["readme_path"],
+                model_card_path=result_paths["model_card_path"],
+            )
+    reproduce_results(binding_path=binding, **result_paths)
+    check_repository(
+        repository,
+        final=True,
+        formal_execution_git_commit=formal_execution_git_commit,
+    )
     authority.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         dir=authority.parent, prefix=".beyondcxr-release-"
@@ -361,31 +380,14 @@ def run_final_acceptance(
         _run(["git", "clone", "--no-hardlinks", str(repository), str(checkout)], repository)
         commands = (
             ["uv", "sync", "--locked", "--group", "dev", "--extra", "serving"],
-            ["make", "lock-check"],
-            ["make", "lint"],
-            ["make", "format-check"],
-            ["make", "test"],
-            ["make", "pre-commit"],
+            ["make", "check"],
+            ["uv", "run", "pre-commit", "run", "--all-files"],
             ["uv", "build"],
         )
         for command in commands:
             _run(command, checkout)
         inspect_distribution_archives(
             sorted((checkout / "dist").iterdir()), repository_root=checkout
-        )
-        _run(
-            [
-                "uv",
-                "run",
-                "--locked",
-                "python",
-                "-m",
-                "beyondcxr.release.cli",
-                "reproduce",
-                "--artifact-root",
-                str(artifact),
-            ],
-            checkout,
         )
         staged_authorities = Path(temporary) / "authorities"
         authority_name = _run_capture(
@@ -409,6 +411,15 @@ def run_final_acceptance(
             checkout,
         ).strip()
         candidate_authority = staged_authorities / authority_name
+        provenance_candidates = tuple(
+            (staged_authorities / "deployment-provenance" / authority_name).glob("*.json")
+        )
+        if len(provenance_candidates) != 1:
+            raise ManifestBuildError("Serving deployment provenance is missing or ambiguous")
+        candidate_provenance = provenance_candidates[0]
+        result_binding = staged_authorities / "release-evidence" / authority_name / "binding.json"
+        if not result_binding.is_file():
+            raise ManifestBuildError("Serving result binding is missing")
         docker = shutil.which("docker")
         if docker is None:
             raise ManifestBuildError("Final acceptance requires docker")
@@ -431,6 +442,8 @@ def run_final_acceptance(
             _run_container_serving_acceptance(
                 artifact=artifact,
                 authority=candidate_authority,
+                deployment_provenance=candidate_provenance,
+                result_binding=result_binding,
                 image=image,
                 cwd=checkout,
                 docker=docker,
@@ -445,20 +458,20 @@ def run_final_acceptance(
                 )
             except OSError:
                 pass
-        check_repository(checkout, final=True)
-        _publish_accepted_authority(candidate_authority, authority)
+        check_repository(
+            checkout,
+            final=True,
+            formal_execution_git_commit=formal_execution_git_commit,
+        )
+        from beyondcxr.release.serving import publish_accepted_serving_state
 
-
-def _publish_accepted_authority(candidate: Path, authority_root: Path) -> Path:
-    """Atomically install an accepted authority without replacing an existing authority."""
-    authority_root.mkdir(parents=True, exist_ok=True)
-    final = authority_root / candidate.name
-    if final.exists() or final.is_symlink():
-        if directory_bytes(final) != directory_bytes(candidate):
-            raise ManifestBuildError("Existing serving authority differs from accepted candidate")
-        return final
-    os.replace(candidate, final)
-    return final
+        publish_accepted_serving_state(
+            candidate_authority=candidate_authority,
+            candidate_deployment_provenance=candidate_provenance,
+            candidate_result_binding=result_binding,
+            release_archive=artifact,
+            authority_root=authority,
+        )
 
 
 def _run(command: list[str], cwd: Path) -> None:
@@ -495,7 +508,13 @@ def _docker_verification_command() -> str:
 
 
 def _container_serving_command(
-    *, image: str, authority: Path, package_root: Path, docker: str = "docker"
+    *,
+    image: str,
+    authority: Path,
+    deployment_provenance: Path,
+    result_binding: Path,
+    release_archive: Path,
+    docker: str = "docker",
 ) -> list[str]:
     """Construct the read-only containerized serving acceptance command."""
     return [
@@ -507,7 +526,11 @@ def _container_serving_command(
         "--mount",
         f"type=bind,src={authority},dst=/artifacts/authority,readonly",
         "--mount",
-        f"type=bind,src={package_root},dst=/artifacts/packages,readonly",
+        f"type=bind,src={deployment_provenance},dst=/artifacts/deployment.json,readonly",
+        "--mount",
+        f"type=bind,src={result_binding},dst=/artifacts/binding.json,readonly",
+        "--mount",
+        f"type=bind,src={release_archive},dst=/artifacts/release.zip,readonly",
         "--entrypoint",
         "/app/.venv/bin/python",
         image,
@@ -515,26 +538,38 @@ def _container_serving_command(
         "beyondcxr.release.container_acceptance",
         "--authority",
         "/artifacts/authority",
-        "--package-root",
-        "/artifacts/packages",
+        "--deployment-provenance",
+        "/artifacts/deployment.json",
+        "--result-binding",
+        "/artifacts/binding.json",
+        "--release-archive",
+        "/artifacts/release.zip",
     ]
 
 
 def _run_container_serving_acceptance(
-    *, artifact: Path, authority: Path, image: str, cwd: Path, docker: str
+    *,
+    artifact: Path,
+    authority: Path,
+    deployment_provenance: Path,
+    result_binding: Path,
+    image: str,
+    cwd: Path,
+    docker: str,
 ) -> None:
-    """Restore packages and exercise all serving endpoints inside the built image."""
+    """Revalidate the archive and exercise the self-contained accepted authority."""
     from beyondcxr.training.preservation import restore_and_validate_export
     from beyondcxr.training.symile_campaign import validate_restored_campaign
 
     def exercise(restored_root: Path) -> None:
-        campaign = validate_restored_campaign(restored_root)
-        package_root = campaign.packages[0].directory.parent
+        validate_restored_campaign(restored_root)
         _run(
             _container_serving_command(
                 image=image,
                 authority=authority,
-                package_root=package_root,
+                deployment_provenance=deployment_provenance,
+                result_binding=result_binding,
+                release_archive=artifact,
                 docker=docker,
             ),
             cwd,
@@ -695,10 +730,12 @@ def _is_generated_repository_path(root: Path, path: Path) -> bool:
 
 
 def _release_candidate_paths(root: Path) -> list[Path]:
-    """Return tracked-present and untracked-nonignored files in the candidate tree.
+    """Return present indexed files and untracked project-source files.
 
     Tracked deletions have no releasable bytes and are omitted. Git-ignored generated state is
-    outside this repository-release scan. Staged additions and rename destinations are included.
+    outside this repository-release scan. Staged additions and rename destinations are already
+    represented by the Git index and are included. Non-ignored untracked project source is
+    inspected too; other untracked workspace material is outside the project surface.
     """
     try:
         cached = subprocess.run(
@@ -707,23 +744,17 @@ def _release_candidate_paths(root: Path) -> list[Path]:
             check=True,
             capture_output=True,
         )
-        others = subprocess.run(
-            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ManifestBuildError("Release checks require a Git checkout") from exc
     try:
         cached_names = {item.decode() for item in cached.stdout.split(b"\0") if item}
-        other_names = {item.decode() for item in others.stdout.split(b"\0") if item}
+        cached_names.update(project_untracked_paths(root))
     except UnicodeDecodeError as exc:
         raise ManifestBuildError("Release-candidate path is not UTF-8") from exc
     paths = []
-    for name in sorted(cached_names | other_names):
+    for name in sorted(cached_names):
         path = root / name
-        if name in cached_names and not path.exists() and not path.is_symlink():
+        if not path.exists() and not path.is_symlink():
             continue
         paths.append(path)
     for path in paths:
@@ -887,10 +918,10 @@ def _check_result_surface(root: Path, *, final: bool) -> None:
         raise ManifestBuildError("Public result file membership is incomplete or unexpected")
 
 
-def _check_release_delta(root: Path) -> None:
+def _check_release_delta(root: Path, formal_execution_git_commit: str) -> None:
     """Validate the permitted post-execution release delta."""
-    binding = load_result_binding(root / "results" / "symile" / "binding.json")
-    science = binding.science_execution.git_commit
+    load_result_binding(root / "results" / "symile" / "binding.json")
+    science = formal_execution_git_commit
     try:
         subprocess.run(
             ["git", "cat-file", "-e", f"{science}^{{commit}}"],

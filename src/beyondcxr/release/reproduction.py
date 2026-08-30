@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.release.binding import ResultBinding, load_result_binding
@@ -23,6 +24,10 @@ from beyondcxr.release.render import (
     render_public_results,
     replace_result_region,
 )
+from beyondcxr.release.resolution import resolved_release
+
+if TYPE_CHECKING:
+    from beyondcxr.training.symile_campaign import RestoredCampaignClosure
 
 
 @dataclass
@@ -41,12 +46,33 @@ def publish_results(
     model_card_path: str | Path,
 ) -> None:
     """Derive the binding, prepare every public byte, then install as one rollback unit."""
-    regenerated = _regenerate(
-        artifact_root=artifact_root,
+    with resolved_release(artifact_root) as (archive, campaign):
+        publish_results_from_campaign(
+            archive=archive,
+            campaign=campaign,
+            output_root=output_root,
+            readme_path=readme_path,
+            model_card_path=model_card_path,
+        )
+
+
+def publish_results_from_campaign(
+    *,
+    archive: Path,
+    campaign: RestoredCampaignClosure,
+    output_root: str | Path,
+    readme_path: str | Path,
+    model_card_path: str | Path,
+) -> None:
+    """Render and install public bytes within the selected restoration lifetime."""
+    regenerated = _regenerate_from_campaign(
+        campaign=campaign,
+        restored_root=campaign.restored_root,
         binding=None,
+        export_manifest_sha256=export_manifest_sha256(archive),
         results_readme=Path(output_root) / "README.md",
-        readme_path=readme_path,
-        model_card_path=model_card_path,
+        readme_path=Path(readme_path),
+        model_card_path=Path(model_card_path),
     )
     try:
         _install_with_rollback(
@@ -79,20 +105,43 @@ def reproduce_results(
         model_card_path=model_card_path,
     )
     try:
-        expected = directory_bytes(regenerated.root)
-        observed = directory_bytes(Path(output_root))
-        if observed != expected:
-            raise ManifestBuildError("Committed public results do not reproduce exactly")
-        observed_readme = Path(readme_path).read_bytes()
-        parse_result_region(observed_readme.decode())
-        parse_result_region(regenerated.readme.decode())
-        if observed_readme != regenerated.readme:
-            raise ManifestBuildError("README result region does not reproduce exactly")
-        observed_model_card = Path(model_card_path).read_bytes()
-        parse_result_region(observed_model_card.decode())
-        parse_result_region(regenerated.model_card.decode())
-        if observed_model_card != regenerated.model_card:
-            raise ManifestBuildError("Model-card result region does not reproduce exactly")
+        _assert_reproduced(
+            regenerated,
+            output_root=Path(output_root),
+            readme_path=Path(readme_path),
+            model_card_path=Path(model_card_path),
+        )
+    finally:
+        regenerated.temporary.cleanup()
+
+
+def reproduce_results_from_campaign(
+    *,
+    binding: ResultBinding,
+    campaign: RestoredCampaignClosure,
+    restored_root: Path,
+    export_manifest_sha256: str,
+    output_root: Path,
+    readme_path: Path,
+    model_card_path: Path,
+) -> None:
+    """Reuse one already-certified restoration for exact result reproduction."""
+    regenerated = _regenerate_from_campaign(
+        campaign=campaign,
+        restored_root=restored_root,
+        binding=binding,
+        export_manifest_sha256=export_manifest_sha256,
+        results_readme=output_root / "README.md",
+        readme_path=readme_path,
+        model_card_path=model_card_path,
+    )
+    try:
+        _assert_reproduced(
+            regenerated,
+            output_root=output_root,
+            readme_path=readme_path,
+            model_card_path=model_card_path,
+        )
     finally:
         regenerated.temporary.cleanup()
 
@@ -105,24 +154,40 @@ def _regenerate(
     readme_path: str | Path,
     model_card_path: str | Path,
 ) -> _Regenerated:
-    from beyondcxr.training.preservation import restore_and_validate_export
-    from beyondcxr.training.symile_campaign import validate_restored_campaign
+    with resolved_release(artifact_root) as (archive, campaign):
+        return _regenerate_from_campaign(
+            campaign=campaign,
+            restored_root=campaign.restored_root,
+            binding=binding,
+            export_manifest_sha256=export_manifest_sha256(archive),
+            results_readme=results_readme,
+            readme_path=Path(readme_path),
+            model_card_path=Path(model_card_path),
+        )
 
-    archive = Path(artifact_root)
-    witness = export_manifest_sha256(archive)
+
+def _regenerate_from_campaign(
+    *,
+    campaign: RestoredCampaignClosure,
+    restored_root: Path,
+    binding: ResultBinding | None,
+    export_manifest_sha256: str,
+    results_readme: Path,
+    readme_path: Path,
+    model_card_path: Path,
+) -> _Regenerated:
     temporary = tempfile.TemporaryDirectory()
     generated = Path(temporary.name) / "results"
     generated_symile = generated / "symile"
-
-    def validate_and_render(
-        restored_root: Path,
-    ) -> tuple[ResultBinding, PublicResultProjection]:
-        campaign = validate_restored_campaign(restored_root)
+    try:
         derived = derive_result_binding(campaign)
         if binding is not None and binding != derived:
             raise ManifestBuildError("Committed binding differs from the validated campaign")
         projection = validate_release_inputs(
-            derived, campaign, restored_root, export_manifest_sha256=witness
+            derived,
+            campaign,
+            restored_root,
+            export_manifest_sha256=export_manifest_sha256,
         )
         render_public_results(projection, generated_symile)
         observed = {
@@ -132,12 +197,6 @@ def _regenerate(
         }
         if observed != public_result_surface():
             raise ManifestBuildError("Generated public result membership is invalid")
-        return derived, projection
-
-    try:
-        derived, projection = restore_and_validate_export(
-            archive, restoration_validator=validate_and_render
-        )
         if not results_readme.is_file():
             raise ManifestBuildError("Public result README template is unavailable")
         shutil.copyfile(results_readme, generated / "README.md")
@@ -152,6 +211,29 @@ def _regenerate(
     except Exception:
         temporary.cleanup()
         raise
+
+
+def _assert_reproduced(
+    regenerated: _Regenerated,
+    *,
+    output_root: Path,
+    readme_path: Path,
+    model_card_path: Path,
+) -> None:
+    expected = directory_bytes(regenerated.root)
+    observed = directory_bytes(output_root)
+    if observed != expected:
+        raise ManifestBuildError("Committed public results do not reproduce exactly")
+    observed_readme = readme_path.read_bytes()
+    parse_result_region(observed_readme.decode())
+    parse_result_region(regenerated.readme.decode())
+    if observed_readme != regenerated.readme:
+        raise ManifestBuildError("README result region does not reproduce exactly")
+    observed_model_card = model_card_path.read_bytes()
+    parse_result_region(observed_model_card.decode())
+    parse_result_region(regenerated.model_card.decode())
+    if observed_model_card != regenerated.model_card:
+        raise ManifestBuildError("Model-card result region does not reproduce exactly")
 
 
 def _readme_fragment(projection: PublicResultProjection) -> str:
@@ -265,7 +347,6 @@ def _model_card_fragment(projection: PublicResultProjection) -> str:
         "",
         "- Ordered primary packages: " + ", ".join(f"`{item}`" for item in packages),
         f"- Bundle: `{provenance['bundle_id']}`",
-        f"- Split assignment: `{provenance['split_assignment_id']}`",
         f"- CV assignment: `{provenance['cv_assignment_id']}`",
         f"- Pre-test freeze: `{provenance['pretest_freeze_id']}`",
         f"- Global result: `{provenance['global_result_id']}`",
@@ -285,7 +366,6 @@ def _model_card_fragment(projection: PublicResultProjection) -> str:
         "### Reproducibility and fixity witnesses",
         "",
         f"- Science lock SHA-256: `{provenance['science_dependency_lock_sha256']}`",
-        f"- Bundle-manifest SHA-256: `{provenance['bundle_manifest_sha256']}`",
         f"- Export-manifest SHA-256: `{provenance['export_manifest_sha256']}`",
         "",
         (

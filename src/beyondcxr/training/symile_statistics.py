@@ -30,10 +30,10 @@ SUBGROUP_POLICY = {
     "minimum_samples": 100,
     "minimum_positives": 20,
     "minimum_negatives": 20,
-    "age": [(18, 49), (50, 64), (65, 79), (80, None)],
+    "age": [[18, 49], [50, 64], [65, 79], [80, None]],
     "sex": ["F", "M"],
     "view_position": ["AP", "PA"],
-    "observed_lab_count": [(1, 29), (30, 34), (35, 40), (41, 50)],
+    "observed_lab_count": [[1, 29], [30, 34], [35, 40], [41, 50]],
 }
 
 ERROR_REVIEW_POLICY = {

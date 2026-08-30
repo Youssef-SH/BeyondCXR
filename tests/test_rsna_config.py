@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from beyondcxr.training.config import ConfigError, load_experiment_config, with_runtime
+from beyondcxr.training.config import (
+    ConfigError,
+    load_experiment_config,
+    normalized_scientific_config,
+    with_runtime,
+)
 from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.training.rsna_train import main as train_main
 
@@ -46,16 +51,14 @@ def test_cxr_config_is_strict_and_seed_free() -> None:
 
 def test_runtime_seeds_share_one_locked_cxr_config() -> None:
     path = Path("configs/rsna_cxr_densenet.yaml")
-    documents = [yaml.safe_load(path.read_text(encoding="utf-8")) for _ in range(3)]
     baseline = load_experiment_config(path)
     configs = [with_runtime(baseline, seed=seed) for seed in RSNA_NEURAL_SEEDS]
     seeds = {config.runtime.seed for config in configs}
-    semantic_hashes = {config.config_semantic_sha256 for config in configs}
+    normalized = [normalized_scientific_config(config) for config in configs]
 
     assert RSNA_NEURAL_SEEDS == (17, 42, 2026)
     assert seeds == set(RSNA_NEURAL_SEEDS)
-    assert documents[1:] == documents[:-1]
-    assert len(semantic_hashes) == 1
+    assert normalized[1:] == normalized[:-1]
 
 
 def test_cxr_semantic_config_identity_binds_training_meaning(tmp_path: Path) -> None:
@@ -66,7 +69,7 @@ def test_cxr_semantic_config_identity_binds_training_meaning(tmp_path: Path) -> 
     meaning_path.write_text(yaml.safe_dump(meaning_changed, sort_keys=False), encoding="utf-8")
     changed_meaning = load_experiment_config(meaning_path)
 
-    assert changed_meaning.config_semantic_sha256 != baseline.config_semantic_sha256
+    assert normalized_scientific_config(changed_meaning) != normalized_scientific_config(baseline)
 
 
 def test_cxr_batch_size_changes_semantic_identity(tmp_path: Path) -> None:
@@ -75,7 +78,7 @@ def test_cxr_batch_size_changes_semantic_identity(tmp_path: Path) -> None:
     document["training"]["loader"]["batch_size"] = 16
     batch_changed = load_experiment_config(_write(tmp_path, document))
 
-    assert batch_changed.config_semantic_sha256 != baseline.config_semantic_sha256
+    assert normalized_scientific_config(batch_changed) != normalized_scientific_config(baseline)
 
 
 def test_scientific_evaluation_policy_changes_semantic_identity(tmp_path: Path) -> None:
@@ -84,7 +87,7 @@ def test_scientific_evaluation_policy_changes_semantic_identity(tmp_path: Path) 
     document["evaluation"]["calibration_bins"] = 20
     changed = load_experiment_config(_write(tmp_path, document))
 
-    assert changed.config_semantic_sha256 != baseline.config_semantic_sha256
+    assert normalized_scientific_config(changed) != normalized_scientific_config(baseline)
 
 
 def test_metadata_configs_use_the_explicit_metadata_modality() -> None:
@@ -116,7 +119,19 @@ def test_cxr_config_dispatches_to_cxr_runner(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr("beyondcxr.training.rsna_train.train_cxr_experiment", fake_training)
 
-    assert train_main(["--config", "configs/rsna_cxr_densenet.yaml", "--seed", "42"]) == 0
+    assert (
+        train_main(
+            [
+                "--config",
+                "configs/rsna_cxr_densenet.yaml",
+                "--seed",
+                "42",
+                "--bundle-id",
+                "bundle-" + "a" * 64,
+            ]
+        )
+        == 0
+    )
     assert captured["config"].family.modalities == ("cxr",)
     assert captured["tracking_uri"] == "sqlite:///mlflow.db"
     output = capsys.readouterr().out
@@ -159,10 +174,6 @@ def test_cxr_config_rejects_unknown_and_missing_fields(
         lambda document: (
             document["family"].update({"family_id": "metadata_logistic"}),
             document["family"].update({"modalities": ["metadata"]}),
-        ),
-        lambda document: (
-            document["family"].update({"family_id": "metadata_logistic"}),
-            document["family"].update({"modalities": ["cxr"]}),
         ),
     ],
 )

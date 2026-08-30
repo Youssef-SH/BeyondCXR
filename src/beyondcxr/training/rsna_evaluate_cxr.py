@@ -9,7 +9,7 @@ import mlflow
 from torch import nn
 
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
-from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
+from beyondcxr.data.rsna_cxr_cache import PreparedCxrCache
 from beyondcxr.training.config import (
     ExperimentConfig,
     require_runtime_seed,
@@ -21,7 +21,7 @@ from beyondcxr.training.neural import (
     build_evaluation_loader,
     deterministic_inference,
 )
-from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
+from beyondcxr.training.rsna_campaign_control import ValidatedRsnaHeldOutCapability
 from beyondcxr.training.rsna_datasets import (
     RsnaCachedImageDataset,
     RsnaDataset,
@@ -31,6 +31,7 @@ from beyondcxr.training.rsna_datasets import (
 from beyondcxr.training.rsna_evaluation_result import (
     CompletedRsnaEvaluation,
     publish_rsna_evaluation,
+    publish_rsna_prediction_evidence,
     validate_rsna_model_package,
     validated_rsna_evaluation_policy,
 )
@@ -52,7 +53,6 @@ from beyondcxr.utils.operational_logging import (
     log_event,
     timed_phase,
 )
-from beyondcxr.utils.private_predictions import publish_prediction_evidence
 from beyondcxr.utils.rsna_neural_publication import (
     load_validated_neural_checkpoint,
     strict_load_checkpoint,
@@ -64,11 +64,11 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_cxr_model_package(
     model_package_id: str,
     *,
-    authorization: ValidatedRsnaPackageFreeze,
+    authorization: ValidatedRsnaHeldOutCapability,
     evaluation_config: ExperimentConfig,
     runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
-    cache: ValidatedCxrCache | None = None,
+    cache: PreparedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
     private_output_directory: str | Path | None = None,
     model_directory: str | Path = "models/rsna",
@@ -94,14 +94,10 @@ def evaluate_cxr_model_package(
         "evaluation_scope": "test",
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": manifest["bundle_id"],
-        "bundle_manifest_sha256": manifest["bundle_manifest_sha256"],
-        "split_assignment_id": manifest["split_assignment_id"],
         "task_id": manifest["task_id"],
         "family_id": manifest["family_id"],
         "modalities": serialize_modalities(manifest["modalities"]),
         "seed": str(manifest["training_policy"]["seed"]),
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "git_commit": manifest["source_provenance"]["git_commit"],
         "dependency_lock_sha256": manifest["source_provenance"]["dependency_lock_sha256"],
         "package_kind": "model",
@@ -129,16 +125,13 @@ def evaluate_cxr_model_package(
         with timed_phase(_LOGGER, "dataset_loading", **context):
             cxr_data = dataset_adapter.load_cxr_test(
                 config,
-                expected_manifest_sha256=manifest["bundle_manifest_sha256"],
                 authorization=authorization,
                 package_id=model_package_id,
             )
         if (
             cxr_data.lineage.bundle_id != manifest["bundle_id"]
-            or cxr_data.lineage.split_assignment_id != manifest["split_assignment_id"]
             or cxr_data.lineage.task_id != manifest["task_id"]
             or cxr_data.lineage.label_policy_version != manifest["label_policy_version"]
-            or cxr_data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
         ):
             raise ValueError("Test bundle lineage differs from the neural package")
         neural = config.neural
@@ -160,7 +153,6 @@ def evaluate_cxr_model_package(
         )
         expected_cache_identity = expected_rsna_cxr_cache_identity(
             lineage=cxr_data.lineage,
-            bundle_manifest_sha256=cxr_data.bundle_manifest_sha256,
             source_inventory=cxr_data.source_inventory,
             transform=evaluation_transform,
         )
@@ -175,6 +167,8 @@ def evaluate_cxr_model_package(
             partition="test",
             transform=evaluation_transform,
             training_seed=require_runtime_seed(config),
+            held_out_authorization=authorization,
+            package_id=model_package_id,
         )
         loader_execution = execution or one_shot_loader_policy(
             pin_memory=runtime.pin_memory_effective
@@ -208,14 +202,10 @@ def evaluate_cxr_model_package(
                 runtime=runtime,
                 progress_callback=report_inference_progress,
             )
-        evidence = publish_prediction_evidence(
+        evidence = publish_rsna_prediction_evidence(
+            authorization=authorization,
             private_root=config.runtime.private_output_directory,
-            dataset_id="rsna",
             model_package_id=model_package_id,
-            task_id=manifest["task_id"],
-            bundle_id=manifest["bundle_id"],
-            split_assignment_id=manifest["split_assignment_id"],
-            scope="test",
             sample_ids=inference.sample_ids,
             targets=inference.targets,
             logits=inference.logits,
@@ -225,6 +215,7 @@ def evaluate_cxr_model_package(
             model_root=config.runtime.model_directory,
             private_root=config.runtime.private_output_directory,
             evidence=evidence,
+            authorization=authorization,
             evaluation_policy=policy,
             forbidden_source_values=(*inference.sample_ids, *inference.patient_ids),
         )
@@ -239,7 +230,6 @@ def evaluate_cxr_model_package(
         )
         mlflow.log_params(
             {
-                "bundle_manifest_sha256": cxr_data.bundle_manifest_sha256,
                 "evaluation_cxr_cache_id": resolved_cache.identity.cache_id,
                 **{
                     f"evaluation_runtime_{key}": value

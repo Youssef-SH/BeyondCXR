@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -8,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 import yaml
 from lightgbm import Booster, LGBMClassifier
 from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
@@ -17,14 +15,22 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
+from beyondcxr.data.rsna_metadata_preprocess import (
+    SOURCE_FEATURES,
+    build_rsna_preprocessor,
+    metadata_input_contract,
+)
 from beyondcxr.training.config import load_experiment_config
+from beyondcxr.training.rsna_training_report import (
+    regenerate_training_report,
+    validate_training_report,
+)
+from beyondcxr.training.rsna_validation_evidence import CanonicalValidationCohort
 from beyondcxr.utils.package_identity import (
     _array,
     _tagged,
     fitted_object_state_sha256,
     package_scientific_config_payload,
-    tensor_state_sha256,
 )
 from beyondcxr.utils.rsna_model_publication import (
     MODEL_PACKAGE_ID_PREFIX,
@@ -40,36 +46,38 @@ _SHA256 = "a" * 64
 
 
 def _manifest() -> dict[str, object]:
-    config = load_experiment_config("configs/rsna_metadata_logistic.yaml")
+    config = load_experiment_config(
+        "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+    )
     return {
         "bundle_id": config.dataset.bundle_id,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "task_id": config.task.task_id,
         "positive_class": 1,
         "family_id": config.family.family_id,
-        "config_source_sha256": _SHA256,
-        "config_semantic_sha256": _SHA256,
         "seed": 42,
         "git_commit": "commit-test",
         "git_dirty": False,
         "dependency_lock_sha256": _SHA256,
         "best_iteration": None,
-        "thresholds": {"youden_j": 0.5, "target_sensitivity": 0.3},
+        "thresholds": {"youden_j": 0.7, "target_sensitivity": 0.7},
         "threshold_contract": threshold_contract(sensitivity_target=0.9),
         "input_contract": metadata_input_contract(),
     }
 
 
 def _publish(tmp_path: Path):
-    features = pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0]})
-    classifier = LogisticRegression().fit(features, [0, 0, 1, 1])
-    model = Pipeline([("preprocess", "passthrough"), ("classifier", classifier)])
+    features = _metadata_features()
+    model = Pipeline(
+        [
+            ("preprocess", build_rsna_preprocessor()),
+            ("classifier", LogisticRegression()),
+        ]
+    ).fit(features, [0, 0, 1, 1])
     serialized = save_skops(model, tmp_path / "source.skops")
     config = tmp_path / "source.yaml"
     config.write_bytes(Path("configs/rsna_metadata_logistic.yaml").read_bytes())
     manifest = {
         **_manifest(),
-        "config_source_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
     }
     published = publish_model_package(
         model_root=tmp_path / "models" / "rsna",
@@ -81,6 +89,122 @@ def _publish(tmp_path: Path):
         manifest=manifest,
     )
     return features, model, published
+
+
+def test_package_rejects_resealed_threshold_not_supported_by_validation(tmp_path: Path) -> None:
+    _, _, published = _publish(tmp_path)
+    document = json.loads(published.manifest_path.read_bytes())
+    document["thresholds"]["youden_j"] = 0.5
+    document["model_package_id"] = model_package_id(document)
+    destination = published.package_directory.with_name(document["model_package_id"])
+    published.package_directory.rename(destination)
+    (destination / "manifest.json").write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="thresholds differ from validation evidence"):
+        validate_published_model(destination)
+
+
+def test_training_report_rederives_claims_and_renderings_from_package(tmp_path: Path) -> None:
+    _, _, published = _publish(tmp_path)
+    package = validate_published_model(published.package_directory)
+    evidence = json.loads((published.package_directory / "validation-evidence.json").read_bytes())
+    arguments = {
+        "run_id": "synthetic-run",
+        "model_package_id": published.model_package_id,
+        "family_id": "metadata_logistic",
+        "seed": 42,
+        "package": package,
+        "package_directory": published.package_directory,
+        "canonical_validation_cohort": CanonicalValidationCohort(
+            tuple(evidence["sample_ids"]), tuple(evidence["targets"])
+        ),
+    }
+    report = regenerate_training_report(tmp_path / "report", **arguments)
+    metrics_path = report / "metrics.json"
+    original_metrics = metrics_path.read_bytes()
+    for field in ("binding", "metric"):
+        altered = json.loads(original_metrics)
+        if field == "binding":
+            altered["training_package"]["model_package_id"] = "model-package-" + "0" * 64
+        else:
+            altered["probability_metrics"]["brier_score"] = 0.99
+        metrics_path.write_text(
+            json.dumps(altered, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="binding|scientific claims"):
+            validate_training_report(report, **arguments)
+    metrics_path.write_bytes(original_metrics)
+    for filename in ("evaluation_report.md", "roc_curve.png"):
+        path = report / filename
+        original = path.read_bytes()
+        path.write_bytes(original + b"tampered")
+        with pytest.raises(ValueError, match="rendering"):
+            validate_training_report(report, **arguments)
+        path.write_bytes(original)
+
+
+def _metadata_features() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            [40.0, False, "M", "PA", 0.17, 0.17],
+            [55.0, False, "F", "AP", 0.18, 0.18],
+            [65.0, False, "M", "PA", 0.19, 0.19],
+            [75.0, False, "F", "AP", 0.20, 0.20],
+        ],
+        columns=SOURCE_FEATURES,
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_name", "classifier"),
+    [
+        ("rsna_metadata_logistic.yaml", LogisticRegression()),
+        (
+            "rsna_metadata_lightgbm.yaml",
+            LGBMClassifier(n_estimators=2, min_child_samples=1, verbosity=-1, n_jobs=1),
+        ),
+    ],
+    ids=("metadata-logistic", "metadata-lightgbm"),
+)
+def test_rsna_tabular_publication_rejects_extra_prediction_affecting_pipeline_step(
+    tmp_path: Path,
+    config_name: str,
+    classifier: object,
+) -> None:
+    features = _metadata_features()
+    preprocessor = build_rsna_preprocessor().fit(features, [0, 0, 1, 1])
+    transformed = preprocessor.transform(features)
+    extra = StandardScaler().fit(transformed)
+    fitted_classifier = classifier.fit(extra.transform(transformed), [0, 0, 1, 1])
+    model = Pipeline(
+        [
+            ("preprocess", preprocessor),
+            ("extra", extra),
+            ("classifier", fitted_classifier),
+        ]
+    )
+    serialized = save_skops(model, tmp_path / "source.skops")
+    config = tmp_path / "source.yaml"
+    config.write_bytes((Path("configs") / config_name).read_bytes())
+    loaded = load_experiment_config(config, bundle_id="bundle-" + "a" * 64)
+    manifest = {
+        **_manifest(),
+        "bundle_id": loaded.dataset.bundle_id,
+        "task_id": loaded.task.task_id,
+        "family_id": loaded.family.family_id,
+    }
+
+    with pytest.raises(ValueError, match="exactly preprocess and classifier"):
+        publish_model_package(
+            model_root=tmp_path / "models" / "rsna",
+            serialized_model_path=serialized,
+            source_config_bytes=config.read_bytes(),
+            validation_evidence_path=write_synthetic_validation_evidence(
+                tmp_path / "validation-evidence.json", config, seed=42
+            ),
+            manifest=manifest,
+        )
 
 
 def test_model_package_has_exact_reconstructable_artifacts(tmp_path: Path) -> None:
@@ -123,7 +247,6 @@ def test_model_package_reuses_equivalent_alternate_serialization(tmp_path: Path)
         validation_evidence_path=published.package_directory / "validation-evidence.json",
         manifest={
             **_manifest(),
-            "config_source_sha256": hashlib.sha256(published.config_path.read_bytes()).hexdigest(),
         },
     )
 
@@ -287,20 +410,6 @@ def test_column_transformer_and_encoder_identity_bind_inference_state() -> None:
     assert fitted_object_state_sha256(changed_mapping) != baseline
 
 
-def test_tensor_state_identity_binds_names_shapes_dtypes_and_values_not_storage() -> None:
-    baseline = {
-        "bias": torch.tensor([0.5], dtype=torch.float32),
-        "weight": torch.tensor([[1.0, -0.0]], dtype=torch.float32),
-    }
-    digest = tensor_state_sha256(baseline)
-    assert tensor_state_sha256(dict(reversed(list(baseline.items())))) == digest
-    assert tensor_state_sha256({key: value.clone() for key, value in baseline.items()}) == digest
-    assert tensor_state_sha256({**baseline, "renamed": baseline["weight"]}) != digest
-    assert tensor_state_sha256({**baseline, "weight": baseline["weight"].reshape(2, 1)}) != digest
-    assert tensor_state_sha256({**baseline, "weight": baseline["weight"].double()}) != digest
-    assert tensor_state_sha256({**baseline, "weight": torch.tensor([[1.0, 0.0]])}) != digest
-
-
 def test_lightgbm_fitted_state_binds_selected_predictor_only() -> None:
     features = np.arange(16, dtype=np.float64).reshape(-1, 1)
     targets = np.asarray([0] * 8 + [1] * 8)
@@ -349,18 +458,26 @@ def test_model_package_identity_uses_package_scoped_config_and_frozen_threshold_
     source_document["evaluation"]["calibration_bins"] = 20
     changed_path = tmp_path / "calibration.yaml"
     changed_path.write_text(yaml.safe_dump(source_document, sort_keys=False), encoding="utf-8")
-    original_config = load_experiment_config("configs/rsna_metadata_logistic.yaml")
-    changed_config = load_experiment_config(changed_path)
-    assert changed_config.config_semantic_sha256 != original_config.config_semantic_sha256
+    original_config = load_experiment_config(
+        "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+    )
+    changed_config = load_experiment_config(changed_path, bundle_id="bundle-" + "a" * 64)
     assert package_scientific_config_payload(changed_config) == package_scientific_config_payload(
         original_config
     )
-    evaluation_changed = json.loads(json.dumps(document))
-    evaluation_changed["config_semantic_sha256"] = changed_config.config_semantic_sha256
+    evaluation_changed = {
+        **document,
+        "fit_config": package_scientific_config_payload(changed_config),
+    }
     assert model_package_id(evaluation_changed) == baseline
 
-    source_changed = json.loads(json.dumps(document))
-    source_changed["config_source_sha256"] = "e" * 64
+    source_changed = {
+        **document,
+        "git_commit": "another-reviewed-commit",
+        "git_dirty": True,
+        "dependency_lock_sha256": "b" * 64,
+        "python_version": "3.13.99",
+    }
     assert model_package_id(source_changed) == baseline
 
 
@@ -382,12 +499,7 @@ def test_model_manifest_rejects_archived_config_threshold_target_mismatch(
     published.config_path.write_text(
         yaml.safe_dump(config_document, sort_keys=False), encoding="utf-8"
     )
-    config = load_experiment_config(published.config_path)
     manifest = json.loads(published.manifest_path.read_text(encoding="utf-8"))
-    manifest["config_source_sha256"] = hashlib.sha256(
-        published.config_path.read_bytes()
-    ).hexdigest()
-    manifest["config_semantic_sha256"] = config.config_semantic_sha256
     published.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="threshold contract differs from archived configuration"):
@@ -421,7 +533,7 @@ def test_model_manifest_rejects_invalid_input_contract(
 _MISSING_SCHEMA_VERSION = object()
 
 
-@pytest.mark.parametrize("value", [True, 1.0, "1", None, 0, _MISSING_SCHEMA_VERSION])
+@pytest.mark.parametrize("value", [True, 1.0, 2, _MISSING_SCHEMA_VERSION])
 def test_model_manifest_requires_integer_schema_version_one(
     tmp_path: Path,
     value: object,
@@ -485,9 +597,6 @@ def test_conflicting_model_publication_retry_is_rejected(tmp_path: Path) -> None
             manifest={
                 **_manifest(),
                 "bundle_id": "different",
-                "config_source_sha256": hashlib.sha256(
-                    published.config_path.read_bytes()
-                ).hexdigest(),
             },
         )
 

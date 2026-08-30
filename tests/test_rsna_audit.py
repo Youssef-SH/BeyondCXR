@@ -18,7 +18,7 @@ from beyondcxr.data.rsna_audit import (
     generate_rsna_audit,
 )
 from beyondcxr.data.rsna_schemas import RSNA_LABEL_SCHEMA, RSNA_SAMPLE_SCHEMA, RSNA_SPLIT_SCHEMA
-from beyondcxr.data.rsna_splitting import SplitConfig, split_assignment_id
+from beyondcxr.data.rsna_splitting import SplitConfig
 
 
 def _audit_bundle(tmp_path: Path) -> SimpleNamespace:
@@ -75,8 +75,6 @@ def _audit_bundle(tmp_path: Path) -> SimpleNamespace:
     pq.write_table(label_table, paths["labels_path"])
     pq.write_table(pa.Table.from_pylist(annotations), paths["annotations_path"])
     recipe_id = SplitConfig().recipe_id
-    assignments = {row["sample_id"]: row["split_name"] for row in splits}
-    assignment_id = split_assignment_id(assignments)
     pq.write_table(
         pa.Table.from_pylist(sorted(splits, key=lambda row: row["sample_id"]), RSNA_SPLIT_SCHEMA),
         paths["splits_path"],
@@ -87,7 +85,6 @@ def _audit_bundle(tmp_path: Path) -> SimpleNamespace:
                 "membership": {
                     "split": {
                         "split_recipe_id": recipe_id,
-                        "split_assignment_id": assignment_id,
                     },
                 },
                 "qualification": {"age_parsing": {"implausible_age_count": 0}},
@@ -219,8 +216,16 @@ def test_audit_publication_owns_only_the_bundle_specific_output(
     assert {path.name: path.read_bytes() for path in destination.iterdir()} == before
 
     (destination / "dataset_summary.md").write_text("conflict\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="differs"):
-        generate_rsna_audit(tmp_path / "manifests", output)
+    generate_rsna_audit(tmp_path / "manifests", output)
+    assert {path.name: path.read_bytes() for path in destination.iterdir()} == before
+
+    detached = tmp_path / "detached-audit"
+    destination.rename(detached)
+    destination.symlink_to(detached, target_is_directory=True)
+    generate_rsna_audit(tmp_path / "manifests", output)
+    assert not destination.is_symlink()
+    assert {path.name: path.read_bytes() for path in detached.iterdir()} == before
+    assert {path.name: path.read_bytes() for path in destination.iterdir()} == before
 
 
 def test_audit_failure_preserves_previous_output(

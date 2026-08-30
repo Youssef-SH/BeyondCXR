@@ -1,9 +1,10 @@
-"""Small shared seam for semantic package and fitted-state identities."""
+"""Semantic package configuration and fitted-state hashing."""
 
 from __future__ import annotations
 
 import hashlib
-import json
+import struct
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,50 +17,71 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
-from beyondcxr.training.config import ExperimentConfig
-
-
-def canonical_scientific_id(prefix: str, payload: Mapping[str, Any]) -> str:
-    """Hash one canonical JSON scientific payload under a validated prefix."""
-    if not prefix or not prefix.endswith("-"):
-        raise ValueError("Scientific identity prefix must be non-empty and end with '-'")
-    try:
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Scientific identity payload is not canonical JSON") from exc
-    return prefix + hashlib.sha256(encoded).hexdigest()
+from beyondcxr.training.config import ExperimentConfig, normalized_scientific_config
+from beyondcxr.utils.semantic_identity import canonical_json_bytes, semantic_sha256
 
 
 def package_scientific_config_payload(config: ExperimentConfig) -> dict[str, object]:
     """Project validated configuration meaning owned by a fitted model package."""
+    return package_scientific_config_from_normalized(normalized_scientific_config(config))
+
+
+def package_scientific_config_from_normalized(
+    normalized: Mapping[str, object],
+) -> dict[str, object]:
+    """Project package-owned science from an execution's normalized configuration."""
+    required = {
+        "config_schema_version",
+        "dataset",
+        "task",
+        "family",
+        "preprocessing",
+        "training",
+        "evaluation",
+    }
+    if not isinstance(normalized, Mapping) or set(normalized) != required:
+        raise ValueError("Normalized scientific configuration is invalid")
+    dataset = normalized["dataset"]
+    task = normalized["task"]
+    family = normalized["family"]
+    training = normalized["training"]
+    preprocessing = normalized["preprocessing"]
+    if (
+        not isinstance(dataset, Mapping)
+        or set(dataset) != {"dataset_id", "bundle_id", "cv_assignment_id"}
+        or not isinstance(task, Mapping)
+        or set(task) != {"task_id", "label_policy_version"}
+        or not isinstance(family, Mapping)
+        or set(family) != {"family_id", "modalities", "parameters"}
+        or not isinstance(family["modalities"], list)
+        or not isinstance(family["parameters"], Mapping)
+        or not isinstance(preprocessing, Mapping)
+        or not isinstance(training, Mapping)
+        or set(training) != {"selection_metric", "parameters", "loader", "augmentation"}
+        or any(
+            not isinstance(training[field], Mapping)
+            for field in ("parameters", "loader", "augmentation")
+        )
+    ):
+        raise ValueError("Normalized scientific configuration is invalid")
     return {
         "dataset": {
-            "dataset_id": config.dataset.dataset_id,
-            "bundle_id": config.dataset.bundle_id,
-            "split_assignment_id": config.dataset.split_assignment_id,
-            "cv_assignment_id": config.dataset.cv_assignment_id,
+            "dataset_id": dataset["dataset_id"],
+            "bundle_id": dataset["bundle_id"],
+            "cv_assignment_id": dataset["cv_assignment_id"],
         },
-        "task": {
-            "task_id": config.task.task_id,
-            "label_policy_version": config.task.label_policy_version,
-        },
+        "task": dict(task),
         "family": {
-            "family_id": config.family.family_id,
-            "modalities": list(config.family.modalities),
-            "parameters": dict(config.family.parameters),
+            "family_id": family["family_id"],
+            "modalities": list(family["modalities"]),
+            "parameters": dict(family["parameters"]),
         },
-        "preprocessing": dict(config.preprocessing),
+        "preprocessing": dict(preprocessing),
         "training": {
-            "selection_metric": config.training.selection_metric,
-            "parameters": dict(config.training.parameters),
-            "loader": dict(config.training.loader),
-            "augmentation": dict(config.training.augmentation),
+            "selection_metric": training["selection_metric"],
+            "parameters": dict(training["parameters"]),
+            "loader": dict(training["loader"]),
+            "augmentation": dict(training["augmentation"]),
         },
     }
 
@@ -93,38 +115,60 @@ def fitted_object_state_sha256(value: object, *, selected_iteration: int | None 
     """Hash explicitly supported fitted scientific state directly with SHA-256."""
     try:
         payload = _fitted_state(value, selected_iteration=selected_iteration)
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8")
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("Fitted object state is not canonically hashable") from exc
-    return hashlib.sha256(b"beyondcxr-fitted-state-v1\0" + encoded).hexdigest()
+    return semantic_sha256("fitted-object-state", 1, payload)
 
 
 def tensor_state_sha256(state: Mapping[str, torch.Tensor]) -> str:
-    """Hash ordered tensor keys, dtypes, shapes, and exact CPU values."""
+    """Hash ordered tensor metadata and exact contiguous CPU logical bytes."""
     if not isinstance(state, Mapping) or not state:
         raise ValueError("Tensor state must be a non-empty mapping")
-    digest = hashlib.sha256(b"beyondcxr-tensor-state-v1\0")
-    for key in sorted(state):
-        tensor = state[key]
+    normalized: dict[str, torch.Tensor] = {}
+    for key, tensor in state.items():
         if not isinstance(key, str) or not key or not isinstance(tensor, torch.Tensor):
             raise ValueError("Tensor state entries are invalid")
+        name = unicodedata.normalize("NFC", key)
+        if name in normalized:
+            raise ValueError("Tensor state names collide after NFC normalization")
+        normalized[name] = tensor
+    digest = hashlib.sha256()
+    _update_framed_hash(
+        digest,
+        canonical_json_bytes(
+            {
+                "domain": "tensor-state",
+                "schema_version": 1,
+                "entry_count": len(state),
+            }
+        ),
+    )
+    for key in sorted(normalized):
+        tensor = normalized[key]
         value = tensor.detach().cpu().contiguous()
         if not torch.isfinite(value).all():
             raise ValueError("Tensor state contains non-finite values")
         array = value.numpy()
-        digest.update(key.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(
-            json.dumps(_array(array), sort_keys=True, separators=(",", ":")).encode("ascii")
+        raw = array.tobytes(order="C")
+        _update_framed_hash(
+            digest,
+            canonical_json_bytes(
+                {
+                    "name": key,
+                    "dtype": array.dtype.str,
+                    "shape": list(array.shape),
+                    "byte_length": len(raw),
+                }
+            ),
         )
-        digest.update(b"\0")
+        _update_framed_hash(digest, raw)
     return digest.hexdigest()
+
+
+def _update_framed_hash(digest: Any, payload: bytes) -> None:
+    """Add one unambiguous length-prefixed byte field to a SHA-256 state."""
+    digest.update(struct.pack(">Q", len(payload)))
+    digest.update(payload)
 
 
 def _fitted_state(value: object, *, selected_iteration: int | None = None) -> dict[str, Any]:
@@ -255,11 +299,7 @@ def _optional_array_list(value: object) -> list[dict[str, Any] | None] | None:
 
 def _tagged_mapping(value: Mapping[object, object]) -> list[list[object]]:
     tagged = [(_tagged(key), _tagged(item)) for key, item in value.items()]
-    tagged.sort(
-        key=lambda pair: json.dumps(
-            pair[0], sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-        )
-    )
+    tagged.sort(key=lambda pair: canonical_json_bytes(pair[0]))
     return [[key, item] for key, item in tagged]
 
 

@@ -2,9 +2,6 @@ config_schema_version: 1
 
 dataset:
   dataset_id: rsna
-  bundle_id: bundle-a0adf886a59d56cd117c6dc4f3a1d032dac3d279de923ace86b9154930ca3077
-  bundle_manifest_sha256: 66c3d2fa739732f952be5b244870fea91d7881c06d500200b95e1fd58858bb27
-  split_assignment_id: split-assignment-b36a1ab52e0a2310f3cf1631b40c9b96b027ce67cc65616cdc13c89787396bfd
 
 task:
   task_id: pneumonia

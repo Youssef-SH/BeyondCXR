@@ -57,6 +57,7 @@ from beyondcxr.training.rsna_train_fusion import (
     load_validated_rsna_fusion_preprocessor,
     train_fusion_experiment,
 )
+from beyondcxr.training.rsna_validation_evidence import CanonicalHeldOutCohort
 from beyondcxr.utils.mlflow_utils import configure_mlflow
 from beyondcxr.utils.private_predictions import validate_prediction_evidence
 from beyondcxr.utils.rsna_neural_publication import (
@@ -70,7 +71,6 @@ from beyondcxr.utils.rsna_neural_publication import (
 )
 
 _SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64
-_SYNTHETIC_SPLIT_ID = "split-assignment-" + "b" * 64
 
 
 class _TinyEncoder(nn.Module):
@@ -98,7 +98,6 @@ def _publish_source_cxr_package(
     model_root: Path,
     fusion_config,
     lineage: DatasetLineage,
-    bundle_manifest_sha256: str,
     source_inventory: SourceInventoryIdentity,
     source_authentication: dict[str, object],
     weight_identity: dict[str, object],
@@ -115,7 +114,9 @@ def _publish_source_cxr_package(
     }
     source_path = tmp_path / "source-cxr.yaml"
     source_path.write_text(yaml.safe_dump(source_document, sort_keys=False), encoding="utf-8")
-    source_config = with_runtime(load_experiment_config(source_path), seed=seed)
+    source_config = with_runtime(
+        load_experiment_config(source_path, bundle_id="bundle-" + "a" * 64), seed=seed
+    )
     checkpoint = checkpoint_document(
         nn.Linear(2, 1).state_dict(),
         selected_epoch=1,
@@ -143,7 +144,6 @@ def _publish_source_cxr_package(
             pd.DataFrame(),
             pd.DataFrame(),
             lineage,
-            bundle_manifest_sha256,
             source_inventory,
         ),
         source_authentication=source_authentication,
@@ -160,7 +160,7 @@ def _publish_source_cxr_package(
         pos_weight=1.0,
         fit=SimpleNamespace(selected_epoch=1, selected_stage="warmup"),
         final_average_precision=0.7,
-        thresholds={"youden_j": 0.5, "target_sensitivity": 0.3},
+        thresholds={"youden_j": 0.7, "target_sensitivity": 0.7},
     )
     return publish_neural_model_package(
         model_root=model_root,
@@ -179,15 +179,13 @@ def _publish_source_cxr_package(
 
 
 def test_locked_fusion_config_is_seed_free_and_runtime_compatible() -> None:
-    paths = [Path("configs/rsna_cxr_metadata_concat.yaml")] * 3
-    documents = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in paths]
-    configs = [load_experiment_config(path) for path in paths]
+    config = load_experiment_config(
+        "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+    )
 
-    assert {config.runtime.seed for config in configs} == {None}
-    assert {config.family.modalities for config in configs} == {("cxr", "metadata")}
-    assert {config.family.family_id for config in configs} == {"cxr_metadata_concat"}
-    assert len({config.config_semantic_sha256 for config in configs}) == 1
-    assert documents[1:] == documents[:-1]
+    assert config.runtime.seed is None
+    assert config.family.modalities == ("cxr", "metadata")
+    assert config.family.family_id == "cxr_metadata_concat"
 
 
 @pytest.mark.parametrize(
@@ -206,16 +204,31 @@ def test_fusion_config_rejects_unknown_missing_and_nonfixed_fields(
     document = _document()
     mutation(document)
     with pytest.raises(ConfigError):
-        load_experiment_config(_write(tmp_path, document))
+        load_experiment_config(_write(tmp_path, document), bundle_id="bundle-" + "a" * 64)
 
 
 def test_fusion_training_requires_explicit_runtime_source_package(capsys) -> None:
-    assert train_main(["--config", "configs/rsna_cxr_metadata_concat.yaml", "--seed", "42"]) == 1
+    assert (
+        train_main(
+            [
+                "--config",
+                "configs/rsna_cxr_metadata_concat.yaml",
+                "--seed",
+                "42",
+                "--bundle-id",
+                "bundle-" + "a" * 64,
+            ]
+        )
+        == 1
+    )
     assert "Experiment failed: ValueError" in capsys.readouterr().err
 
 
+@pytest.mark.integration
 def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership() -> None:
-    config = load_experiment_config("configs/rsna_cxr_metadata_concat.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+    )
     model = RsnaCxrMetadataConcatModel(encoder_factory=_TinyEncoder).build(
         config.family,
         structured_dimension=7,
@@ -246,8 +259,11 @@ def test_fixed_fusion_model_has_dynamic_structured_width_and_two_stage_ownership
     assert all(parameter.requires_grad for parameter in model.encoder.parameters())
 
 
+@pytest.mark.integration
 def test_fusion_encoder_initialization_loads_only_exact_source_encoder_state() -> None:
-    config = load_experiment_config("configs/rsna_cxr_metadata_concat.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+    )
     source = RsnaConcatFusionModel(
         _TinyEncoder(),
         fusion_architecture_contract(config.family, structured_input_dimension=2),
@@ -267,11 +283,14 @@ def test_fusion_encoder_initialization_loads_only_exact_source_encoder_state() -
         assert torch.equal(destination.encoder.state_dict()[key], value)
 
 
+@pytest.mark.integration
 def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
     tmp_path: Path,
 ) -> None:
     config_path = Path("configs/rsna_cxr_metadata_concat.yaml")
-    config = with_runtime(load_experiment_config(config_path), seed=42)
+    config = with_runtime(
+        load_experiment_config(config_path, bundle_id=_SYNTHETIC_BUNDLE_ID), seed=42
+    )
     features = pd.DataFrame(
         {
             "age_years": [20.0, 40.0, 60.0, 80.0],
@@ -293,26 +312,22 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
     )
     checkpoint_path = save_neural_checkpoint(checkpoint, tmp_path / "model.pt")
     source_inventory = SourceInventoryIdentity(
-        source_inventory_arrow_sha256="1" * 64,
-        source_inventory_file_sha256="2" * 64,
+        source_inventory_semantic_sha256="1" * 64,
     )
     source_authentication = {
         "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
         "partitions": ["train", "validation", "test"],
         "file_count": 4,
-        "source_inventory_arrow_sha256": "1" * 64,
-        "source_inventory_file_sha256": "2" * 64,
+        "source_inventory_semantic_sha256": "1" * 64,
     }
     data = FusionRunData(
         train=features,
         validation=features,
         lineage=DatasetLineage(
             bundle_id=config.dataset.bundle_id,
-            split_assignment_id=config.dataset.split_assignment_id,
             label_policy_version=config.task.label_policy_version,
             task_id="pneumonia",
         ),
-        bundle_manifest_sha256=config.dataset.bundle_manifest_sha256,
         source_inventory=source_inventory,
     )
     neural = config.neural
@@ -336,7 +351,6 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
         model_root=tmp_path / "models",
         fusion_config=config,
         lineage=data.lineage,
-        bundle_manifest_sha256=data.bundle_manifest_sha256,
         source_inventory=source_inventory,
         source_authentication=source_authentication,
         weight_identity=source_weight,
@@ -374,7 +388,7 @@ def test_fusion_package_has_exact_artifacts_and_embedded_fitted_preprocessor(
             selected_stage="fine_tune",
             selected_validation_metric=0.7,
         ),
-        thresholds={"youden_j": 0.5, "target_sensitivity": 0.3},
+        thresholds={"youden_j": 0.7, "target_sensitivity": 0.7},
     )
     published = publish_neural_model_package(
         model_root=tmp_path / "models",
@@ -430,7 +444,6 @@ def test_fusion_package_identity_binds_source_package() -> None:
     document["model_package_schema_version"] = 1
     document["dataset_id"] = "rsna"
     document["bundle_id"] = "bundle-a"
-    document["split_assignment_id"] = "split-a"
     document["task_id"] = "pneumonia"
     document["label_policy_version"] = "label-a"
     document["positive_class"] = 1
@@ -460,22 +473,23 @@ def test_fusion_package_identity_binds_source_package() -> None:
 
 
 @pytest.mark.parametrize("source_state", ["missing", "invalid", "incompatible"])
+@pytest.mark.integration
 def test_fusion_validation_resolves_source_cxr_package(tmp_path: Path, source_state: str) -> None:
     fusion_path = Path("configs/rsna_cxr_metadata_concat.yaml")
-    fusion_config = with_runtime(load_experiment_config(fusion_path), seed=42)
+    fusion_config = with_runtime(
+        load_experiment_config(fusion_path, bundle_id="bundle-" + "a" * 64), seed=42
+    )
     lineage = DatasetLineage(
         bundle_id=fusion_config.dataset.bundle_id,
-        split_assignment_id=fusion_config.dataset.split_assignment_id,
         label_policy_version=fusion_config.task.label_policy_version,
         task_id=fusion_config.task.task_id,
     )
-    inventory = SourceInventoryIdentity("1" * 64, "2" * 64)
+    inventory = SourceInventoryIdentity("1" * 64)
     authentication = {
         "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
         "partitions": ["train", "validation", "test"],
         "file_count": 4,
-        "source_inventory_arrow_sha256": "1" * 64,
-        "source_inventory_file_sha256": "2" * 64,
+        "source_inventory_semantic_sha256": "1" * 64,
     }
     weight = {
         "declared_name": "densenet121-res224-chex",
@@ -489,7 +503,6 @@ def test_fusion_validation_resolves_source_cxr_package(tmp_path: Path, source_st
         model_root=tmp_path / "models",
         fusion_config=fusion_config,
         lineage=lineage,
-        bundle_manifest_sha256=fusion_config.dataset.bundle_manifest_sha256,
         source_inventory=inventory,
         source_authentication=authentication,
         weight_identity=weight,
@@ -523,7 +536,6 @@ def test_fusion_validation_resolves_source_cxr_package(tmp_path: Path, source_st
         ("dataset_id", "other"),
         ("task_id", "other"),
         ("bundle_id", "bundle-other"),
-        ("split_assignment_id", "split-other"),
         ("label_policy_version", "label-other"),
         ("model_package_id", "package-other"),
         ("modalities", ["cxr", "labs"]),
@@ -531,9 +543,15 @@ def test_fusion_validation_resolves_source_cxr_package(tmp_path: Path, source_st
     ],
 )
 def test_source_cxr_contract_mismatch_is_rejected(field: str, replacement: object) -> None:
-    source_config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=42)
+    source_config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
+        seed=42,
+    )
     fusion_config = with_runtime(
-        load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42
+        load_experiment_config(
+            "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+        ),
+        seed=42,
     )
     manifest: dict[str, object] = {
         "dataset_id": fusion_config.dataset.dataset_id,
@@ -541,11 +559,7 @@ def test_source_cxr_contract_mismatch_is_rejected(field: str, replacement: objec
         "modalities": ["cxr"],
         "task_id": fusion_config.task.task_id,
         "bundle_id": fusion_config.dataset.bundle_id,
-        "bundle_manifest_sha256": "4" * 64,
-        "split_assignment_id": fusion_config.dataset.split_assignment_id,
         "label_policy_version": fusion_config.task.label_policy_version,
-        "config_source_sha256": source_config.config_source_sha256,
-        "config_semantic_sha256": source_config.config_semantic_sha256,
         "checkpoint_sha256": "6" * 64,
         "model_package_id": "model-package-" + "a" * 64,
         "training_policy": {"seed": 42},
@@ -568,9 +582,15 @@ def test_source_cxr_contract_mismatch_is_rejected(field: str, replacement: objec
 
 
 def test_source_cxr_scientific_contract_is_stable_across_reproducibility_witnesses() -> None:
-    source_config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=42)
+    source_config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
+        seed=42,
+    )
     fusion_config = with_runtime(
-        load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42
+        load_experiment_config(
+            "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+        ),
+        seed=42,
     )
     manifest = {
         "dataset_id": fusion_config.dataset.dataset_id,
@@ -578,11 +598,7 @@ def test_source_cxr_scientific_contract_is_stable_across_reproducibility_witness
         "modalities": ["cxr"],
         "task_id": fusion_config.task.task_id,
         "bundle_id": fusion_config.dataset.bundle_id,
-        "bundle_manifest_sha256": "4" * 64,
-        "split_assignment_id": fusion_config.dataset.split_assignment_id,
         "label_policy_version": fusion_config.task.label_policy_version,
-        "config_source_sha256": source_config.config_source_sha256,
-        "config_semantic_sha256": source_config.config_semantic_sha256,
         "checkpoint_sha256": "6" * 64,
         "model_package_id": "model-package-" + "a" * 64,
         "training_policy": {"seed": 42},
@@ -603,14 +619,19 @@ def test_source_cxr_scientific_contract_is_stable_across_reproducibility_witness
 
 
 def test_source_cxr_seed_mismatch_is_rejected_before_package_access() -> None:
-    source_config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=17)
+    source_config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
+        seed=17,
+    )
     fusion_config = with_runtime(
-        load_experiment_config("configs/rsna_cxr_metadata_concat.yaml"), seed=42
+        load_experiment_config(
+            "configs/rsna_cxr_metadata_concat.yaml", bundle_id="bundle-" + "a" * 64
+        ),
+        seed=42,
     )
     manifest = {
         "dataset_id": fusion_config.dataset.dataset_id,
         "bundle_id": fusion_config.dataset.bundle_id,
-        "split_assignment_id": fusion_config.dataset.split_assignment_id,
         "task_id": fusion_config.task.task_id,
         "label_policy_version": fusion_config.task.label_policy_version,
         "family_id": "cxr_densenet",
@@ -649,14 +670,12 @@ class _FusionTensorDataset(Dataset[dict[str, object]]):
         }
 
 
+@pytest.mark.integration
 def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     document = _document()
-    document["dataset"]["bundle_id"] = _SYNTHETIC_BUNDLE_ID
-    document["dataset"]["bundle_manifest_sha256"] = "5" * 64
-    document["dataset"]["split_assignment_id"] = _SYNTHETIC_SPLIT_ID
     document["training"]["loader"].update({"batch_size": 2})
     document["training"]["parameters"].update(
         {
@@ -668,7 +687,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     )
     config_path = _write(tmp_path, document)
     config = with_runtime(
-        load_experiment_config(config_path),
+        load_experiment_config(config_path, bundle_id=_SYNTHETIC_BUNDLE_ID),
         seed=42,
         source_root=tmp_path / "raw",
         manifest_directory=tmp_path / "manifests",
@@ -681,7 +700,6 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     )
     lineage = DatasetLineage(
         bundle_id=_SYNTHETIC_BUNDLE_ID,
-        split_assignment_id=_SYNTHETIC_SPLIT_ID,
         label_policy_version=config.task.label_policy_version,
         task_id="pneumonia",
     )
@@ -717,8 +735,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         ]
 
     source_inventory = SourceInventoryIdentity(
-        source_inventory_arrow_sha256="1" * 64,
-        source_inventory_file_sha256="2" * 64,
+        source_inventory_semantic_sha256="1" * 64,
     )
 
     class Adapter:
@@ -729,17 +746,13 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
                 frame("train"),
                 frame("validation"),
                 lineage,
-                "5" * 64,
                 source_inventory,
             )
 
-        def load_fusion_test(
-            self, dataset_config, *, expected_manifest_sha256, authorization, package_id
-        ):
+        def load_fusion_test(self, dataset_config, *, authorization, package_id):
             authorization.require(package_id)
-            assert expected_manifest_sha256 == "5" * 64
             self.test_calls += 1
-            return FusionTestData(frame("test"), lineage, "5" * 64, source_inventory)
+            return FusionTestData(frame("test"), lineage, source_inventory)
 
     source_model = RsnaConcatFusionModel(
         _TinyEncoder(),
@@ -757,14 +770,12 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         model_root=config.runtime.model_directory,
         fusion_config=config,
         lineage=lineage,
-        bundle_manifest_sha256="5" * 64,
         source_inventory=source_inventory,
         source_authentication={
             "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
             "partitions": ["train", "validation", "test"],
             "file_count": 12,
-            "source_inventory_arrow_sha256": "1" * 64,
-            "source_inventory_file_sha256": "2" * 64,
+            "source_inventory_semantic_sha256": "1" * 64,
         },
         weight_identity=source_weight,
     )
@@ -782,6 +793,15 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         },
     )
     adapter = Adapter()
+    test_frame = frame("test")
+    cohort = CanonicalHeldOutCohort(
+        tuple(test_frame["sample_id"].astype(str)),
+        tuple(int(value) for value in test_frame["target"]),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_validation_evidence._derive_canonical_held_out_cohort",
+        lambda *args, **kwargs: cohort,
+    )
     builder = RsnaCxrMetadataConcatModel(encoder_factory=_TinyEncoder)
 
     def synthetic_dataset(frame_value, structured, **kwargs):
@@ -801,9 +821,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
             transform = args[2]
             identity = CxrCacheIdentity(
                 bundle_id=_SYNTHETIC_BUNDLE_ID,
-                bundle_manifest_sha256="5" * 64,
-                source_inventory_file_sha256="2" * 64,
-                source_inventory_arrow_sha256="1" * 64,
+                source_inventory_semantic_sha256="1" * 64,
                 preprocessing_sha256=preprocessing_identity(transform),
             )
             return SimpleNamespace(
@@ -812,8 +830,7 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
                     policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
                     partitions=("train", "validation", "test"),
                     file_count=12,
-                    source_inventory_arrow_sha256="1" * 64,
-                    source_inventory_file_sha256="2" * 64,
+                    source_inventory_semantic_sha256="1" * 64,
                 ),
             )
 
@@ -859,11 +876,16 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
     assert adapter.test_calls == 0
     manifest_path.write_bytes(original_manifest)
 
+    authorization = authorize_rsna_package(
+        config,
+        training.model_package_id,
+        monkeypatch=monkeypatch,
+        held_out_sample_ids=cohort.sample_ids,
+        held_out_targets=cohort.targets,
+    )
     evaluation = evaluate_model_package(
         training.model_package_id,
-        authorization=authorize_rsna_package(
-            config, training.model_package_id, monkeypatch=monkeypatch
-        ),
+        authorization=authorization,
         evaluation_config=config,
         runtime=rsna_test_runtime(config),
         tracking_uri=tracking_uri,
@@ -893,6 +915,8 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         output_directory=config.runtime.report_directory,
         private_directory=config.runtime.private_output_directory,
         model_directory=config.runtime.model_directory,
+        freeze=authorization.freeze,
+        execution=authorization.current_execution.execution,
     )
     assert comparison_result.row_count == 1
     assert pd.read_csv(comparison_result.csv_path)["model_package_id"].tolist() == [
@@ -909,7 +933,11 @@ def test_synthetic_fusion_training_package_explicit_evaluation_and_comparison(
         evaluate_model_package(
             training.model_package_id,
             authorization=authorize_rsna_package(
-                config, training.model_package_id, monkeypatch=monkeypatch
+                config,
+                training.model_package_id,
+                monkeypatch=monkeypatch,
+                held_out_sample_ids=cohort.sample_ids,
+                held_out_targets=cohort.targets,
             ),
             evaluation_config=config,
             runtime=rsna_test_runtime(config),

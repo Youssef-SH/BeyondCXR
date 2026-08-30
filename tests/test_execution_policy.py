@@ -4,7 +4,11 @@ import pytest
 import torch
 from torch.utils.data import TensorDataset
 
-from beyondcxr.training.config import load_experiment_config, with_runtime
+from beyondcxr.training.config import (
+    load_experiment_config,
+    normalized_scientific_config,
+    with_runtime,
+)
 from beyondcxr.training.device import resolve_device
 from beyondcxr.training.execution import (
     LoaderExecutionPolicy,
@@ -35,7 +39,9 @@ def test_one_shot_loader_policy_is_synchronous() -> None:
 
 
 def test_loader_builders_apply_distinct_lifecycle_topologies() -> None:
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
     dataset = TensorDataset(torch.arange(4))
     runtime = resolve_device("cpu", mixed_precision=False, pin_memory_policy="disabled")
@@ -89,9 +95,11 @@ def test_loader_execution_provenance_rejects_redundant_derived_fields() -> None:
 
 
 def test_execution_knobs_do_not_change_neural_semantic_identity() -> None:
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
-    baseline = config.config_semantic_sha256
+    baseline = normalized_scientific_config(config)
     changed_execution = with_runtime(
         config,
         source_root="/different/source",
@@ -102,8 +110,8 @@ def test_execution_knobs_do_not_change_neural_semantic_identity() -> None:
         num_workers=24,
         pin_memory_policy="disabled",
     )
-    assert changed_execution.config_semantic_sha256 == baseline
     assert changed_execution.runtime.seed == 2026
     assert changed_execution.runtime.device == "cpu"
     assert changed_execution.runtime.num_workers == 24
     assert changed_execution.runtime.pin_memory_policy == "disabled"
+    assert normalized_scientific_config(changed_execution) == baseline

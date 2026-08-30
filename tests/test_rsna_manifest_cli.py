@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pyarrow as pa
 from rsna_manifest_test_support import write_sources as _write_sources
 
 from beyondcxr.data.rsna_artifacts import (
@@ -42,11 +41,9 @@ def test_cli_success_and_failure_exit_codes(tmp_path: Path) -> None:
         {"split_name": "test", "ratio": 0.15},
     ]
     assert split["split_recipe_id"].startswith("split-recipe-")
-    assert split["split_assignment_id"].startswith("split-assignment-")
     assert set(split) == {
         "split_source",
         "split_recipe_id",
-        "split_assignment_id",
         "algorithm_version",
         "patient_grouping_rule",
         "patient_target_consistency_rule",
@@ -62,9 +59,4 @@ def test_cli_success_and_failure_exit_codes(tmp_path: Path) -> None:
     }
     assert metadata["qualification"]["counts"]["source_inventory"] == 2
     assert SOURCE_INVENTORY_FILENAME in metadata["artifacts"]
-    assert metadata["provenance"]["logical_arrow_runtime"]["pyarrow_version"] == pa.__version__
-    assert (
-        "cross-version stability is not claimed"
-        in metadata["provenance"]["logical_arrow_runtime"]["stability_scope"]
-    )
     assert main(["--source-root", str(tmp_path / "missing")]) == 1

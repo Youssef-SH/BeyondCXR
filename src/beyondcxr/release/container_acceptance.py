@@ -18,10 +18,17 @@ from beyondcxr.serving.predictor import serving_model_info
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--authority", type=Path, required=True)
-    parser.add_argument("--package-root", type=Path, required=True)
+    parser.add_argument("--deployment-provenance", type=Path, required=True)
+    parser.add_argument("--result-binding", type=Path, required=True)
+    parser.add_argument("--release-archive", type=Path, required=True)
     args = parser.parse_args(argv)
     expected_model_info = serving_model_info(
-        validate_serving_authority(args.authority, package_root=args.package_root)
+        validate_serving_authority(
+            args.authority,
+            deployment_provenance=args.deployment_provenance,
+            result_binding=args.result_binding,
+            release_archive=args.release_archive,
+        )
     )
     process = subprocess.Popen(
         [
@@ -30,8 +37,12 @@ def main(argv: list[str] | None = None) -> int:
             "beyondcxr.serving.cli",
             "--authority",
             str(args.authority),
-            "--package-root",
-            str(args.package_root),
+            "--deployment-provenance",
+            str(args.deployment_provenance),
+            "--result-binding",
+            str(args.result_binding),
+            "--release-archive",
+            str(args.release_archive),
             "--host",
             "127.0.0.1",
             "--port",

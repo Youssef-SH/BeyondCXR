@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.rsna_artifacts import build_rsna_artifacts, write_bundle
+from beyondcxr.data.rsna_artifacts import build_and_write
 from beyondcxr.data.rsna_splitting import SplitConfig
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
@@ -69,9 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_ratio=args.test_ratio,
         )
         with timed_phase(_LOGGER, "manifest_construction"):
-            result = build_rsna_artifacts(args.source_root, split_config)
-        with timed_phase(_LOGGER, "bundle_publication"):
-            written = write_bundle(result, args.output_directory)
+            written = build_and_write(args.source_root, args.output_directory, split_config)
     except (ManifestBuildError, OSError) as exc:
         print(f"RSNA manifest build failed: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -82,15 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "bundle_id": written.paths.bundle_id,
                 "bundle_directory": str(written.paths.bundle_directory),
                 "current_marker": str(written.paths.current_path),
-                "sample_count": result.samples.num_rows,
-                "label_count": result.labels.num_rows,
-                "annotation_count": result.annotations.num_rows,
-                "split_count": result.splits.num_rows,
-                "split_recipe_id": result.metadata["membership"]["split"]["split_recipe_id"],
-                "split_assignment_id": result.metadata["membership"]["split"][
-                    "split_assignment_id"
-                ],
-                "logical_arrow_sha256": dict(written.logical_arrow_sha256),
+                "sample_count": written.sample_count,
+                "label_count": written.label_count,
+                "annotation_count": written.annotation_count,
+                "split_count": written.split_count,
+                "split_recipe_id": written.split_recipe_id,
+                "logical_table_sha256": dict(written.logical_table_sha256),
             },
             indent=2,
         )

@@ -24,14 +24,15 @@ from beyondcxr.data.rsna_artifacts import (
     SOURCE_INVENTORY_FILENAME,
     SPLITS_FILENAME,
     validate_bundle_directory,
-    validate_bundle_reference,
 )
 from beyondcxr.data.rsna_cxr_cache import (
     CXR_CACHE_FRAME_COLUMNS,
     CxrCacheIdentity,
-    ValidatedCxrCache,
+    PreparedCxrCache,
     build_cxr_cache,
     preprocessing_identity,
+    scope_cxr_cache,
+    validate_cxr_source_availability,
 )
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from beyondcxr.evaluation.metrics import validated_binary_targets
@@ -68,8 +69,7 @@ class FusionSample(ImageSample):
 class SourceInventoryIdentity:
     """Exact bundle source-inventory identity used by a cache-backed consumer."""
 
-    source_inventory_arrow_sha256: str
-    source_inventory_file_sha256: str
+    source_inventory_semantic_sha256: str
 
 
 @dataclass(frozen=True)
@@ -79,7 +79,6 @@ class CxrRunData:
     train: pd.DataFrame
     validation: pd.DataFrame
     lineage: DatasetLineage
-    bundle_manifest_sha256: str
     source_inventory: SourceInventoryIdentity
 
 
@@ -89,17 +88,6 @@ class CxrTestData:
 
     test: pd.DataFrame
     lineage: DatasetLineage
-    bundle_manifest_sha256: str
-    source_inventory: SourceInventoryIdentity
-
-
-@dataclass(frozen=True)
-class ImageCacheData:
-    """Source-inventory-bound rows for one complete deterministic image cache."""
-
-    frame: pd.DataFrame
-    lineage: DatasetLineage
-    bundle_manifest_sha256: str
     source_inventory: SourceInventoryIdentity
 
 
@@ -110,7 +98,6 @@ class FusionRunData:
     train: pd.DataFrame
     validation: pd.DataFrame
     lineage: DatasetLineage
-    bundle_manifest_sha256: str
     source_inventory: SourceInventoryIdentity
 
 
@@ -120,7 +107,6 @@ class FusionTestData:
 
     test: pd.DataFrame
     lineage: DatasetLineage
-    bundle_manifest_sha256: str
     source_inventory: SourceInventoryIdentity
 
 
@@ -142,11 +128,13 @@ class RsnaCachedImageDataset(Dataset[ImageSample]):
         self,
         frame: pd.DataFrame,
         *,
-        cache: ValidatedCxrCache,
+        cache: PreparedCxrCache,
         expected_cache_identity: CxrCacheIdentity,
         partition: str,
         transform: StandardCxrTransform,
         training_seed: int,
+        held_out_authorization: object | None = None,
+        package_id: str | None = None,
     ) -> None:
         if tuple(frame.columns) != _IMAGE_FRAME_COLUMNS or frame.empty:
             raise ManifestBuildError("RSNA cached image frame has an invalid contract")
@@ -163,11 +151,7 @@ class RsnaCachedImageDataset(Dataset[ImageSample]):
                 or target not in {0, 1}
             ):
                 raise ManifestBuildError(f"Invalid binary target for sample {sample_id!r}")
-            if (
-                row.split_name != partition
-                or sample_id not in cache.sample_rows
-                or cache.sample_partitions[sample_id] != partition
-            ):
+            if row.split_name != partition:
                 raise ManifestBuildError(
                     "RSNA cached image frame does not match its partition/cache"
                 )
@@ -178,8 +162,15 @@ class RsnaCachedImageDataset(Dataset[ImageSample]):
         _validate_training_seed(training_seed)
         if cache.identity != expected_cache_identity:
             raise ManifestBuildError("CXR cache identity does not match the consuming experiment")
+        scoped_cache = scope_cxr_cache(
+            cache,
+            sample_ids=sample_ids,
+            partition=partition,
+            held_out_authorization=held_out_authorization,
+            package_id=package_id,
+        )
         self._rows = tuple(rows)
-        self._cache = cache
+        self._cache = scoped_cache
         self._transform = transform
         self._training_seed = training_seed
 
@@ -216,11 +207,13 @@ class RsnaCachedFusionDataset(Dataset[FusionSample]):
         structured: np.ndarray,
         *,
         structured_sample_ids: tuple[str, ...],
-        cache: ValidatedCxrCache,
+        cache: PreparedCxrCache,
         expected_cache_identity: CxrCacheIdentity,
         partition: str,
         transform: StandardCxrTransform,
         training_seed: int,
+        held_out_authorization: object | None = None,
+        package_id: str | None = None,
     ) -> None:
         if tuple(frame.columns) != _FUSION_FRAME_COLUMNS:
             raise ManifestBuildError("RSNA cached fusion frame has an invalid contract")
@@ -246,6 +239,8 @@ class RsnaCachedFusionDataset(Dataset[FusionSample]):
             partition=partition,
             transform=transform,
             training_seed=training_seed,
+            held_out_authorization=held_out_authorization,
+            package_id=package_id,
         )
 
     def __len__(self) -> int:
@@ -279,39 +274,29 @@ class RsnaDataset:
     def load_test(
         self, config: ExperimentConfig, *, authorization: object, package_id: str
     ) -> tuple[DatasetPartition, DatasetLineage]:
-        """Load the test partition from the same pinned bundle."""
-        _authorize_test_access(authorization, package_id)
-        bundle, metadata = _load_pinned_bundle(config)
-        frame = _task_frame(bundle, config.task.task_id, partitions=("test",))
+        """Load package-bound test rows only after reauthenticating live held-out authority."""
+        frame, metadata = _held_out_task_frame(
+            config,
+            config.task.task_id,
+            authorization=authorization,
+            package_id=package_id,
+        )
         test = _partition(frame, "test")
         return test, _lineage(config, metadata)
 
     def load_cxr_train_validation(self, config: ExperimentConfig) -> CxrRunData:
         """Load train and validation rows bound to the pinned source inventory."""
-        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
+        bundle, metadata = _load_pinned_bundle(config)
         frame = _task_frame(
             bundle,
             config.task.task_id,
             partitions=("train", "validation"),
             feature_columns=("image_path",),
         )
-        manifest_sha256 = _required_manifest_sha256(bundle)
         return CxrRunData(
             train=_image_partition(frame, "train"),
             validation=_image_partition(frame, "validation"),
             lineage=_lineage(config, metadata),
-            bundle_manifest_sha256=manifest_sha256,
-            source_inventory=_source_inventory_identity(metadata),
-        )
-
-    def load_image_cache(self, config: ExperimentConfig) -> ImageCacheData:
-        """Load every inventory-bound image row required by the shared cache."""
-        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
-        frame = _image_cache_frame(bundle)
-        return ImageCacheData(
-            frame=frame,
-            lineage=_lineage(config, metadata),
-            bundle_manifest_sha256=_required_manifest_sha256(bundle),
             source_inventory=_source_inventory_identity(metadata),
         )
 
@@ -319,34 +304,26 @@ class RsnaDataset:
         self,
         config: ExperimentConfig,
         *,
-        expected_manifest_sha256: str,
         authorization: object,
         package_id: str,
     ) -> CxrTestData:
         """Load test image rows bound to the pinned source inventory."""
-        _authorize_test_access(authorization, package_id)
-        bundle, metadata = _load_pinned_bundle(
+        frame, metadata = _held_out_task_frame(
             config,
-            materialize_all_rows=False,
-            expected_manifest_sha256=expected_manifest_sha256,
-        )
-        frame = _task_frame(
-            bundle,
             config.task.task_id,
-            partitions=("test",),
+            authorization=authorization,
+            package_id=package_id,
             feature_columns=("image_path",),
         )
-        manifest_sha256 = _required_manifest_sha256(bundle)
         return CxrTestData(
             test=_image_partition(frame, "test"),
             lineage=_lineage(config, metadata),
-            bundle_manifest_sha256=manifest_sha256,
             source_inventory=_source_inventory_identity(metadata),
         )
 
     def load_fusion_train_validation(self, config: ExperimentConfig) -> FusionRunData:
         """Load aligned train and validation rows bound to the source inventory."""
-        bundle, metadata = _load_pinned_bundle(config, materialize_all_rows=False)
+        bundle, metadata = _load_pinned_bundle(config)
         frame = _task_frame(
             bundle,
             config.task.task_id,
@@ -357,7 +334,6 @@ class RsnaDataset:
             train=_fusion_partition(frame, "train"),
             validation=_fusion_partition(frame, "validation"),
             lineage=_lineage(config, metadata),
-            bundle_manifest_sha256=_required_manifest_sha256(bundle),
             source_inventory=_source_inventory_identity(metadata),
         )
 
@@ -365,27 +341,20 @@ class RsnaDataset:
         self,
         config: ExperimentConfig,
         *,
-        expected_manifest_sha256: str,
         authorization: object,
         package_id: str,
     ) -> FusionTestData:
         """Load aligned test fusion rows bound to the source inventory."""
-        _authorize_test_access(authorization, package_id)
-        bundle, metadata = _load_pinned_bundle(
+        frame, metadata = _held_out_task_frame(
             config,
-            materialize_all_rows=False,
-            expected_manifest_sha256=expected_manifest_sha256,
-        )
-        frame = _task_frame(
-            bundle,
             config.task.task_id,
-            partitions=("test",),
+            authorization=authorization,
+            package_id=package_id,
             feature_columns=("image_path", *SOURCE_FEATURES),
         )
         return FusionTestData(
             test=_fusion_partition(frame, "test"),
             lineage=_lineage(config, metadata),
-            bundle_manifest_sha256=_required_manifest_sha256(bundle),
             source_inventory=_source_inventory_identity(metadata),
         )
 
@@ -393,22 +362,16 @@ class RsnaDataset:
         self,
         config: ExperimentConfig,
         *,
-        expected_manifest_sha256: str,
         authorization: object,
         package_id: str,
     ) -> LocalizationTestData:
         """Load cache-backed test images and validated positive-box geometry."""
         images = self.load_cxr_test(
             config,
-            expected_manifest_sha256=expected_manifest_sha256,
             authorization=authorization,
             package_id=package_id,
         )
-        bundle, _ = _load_pinned_bundle(
-            config,
-            materialize_all_rows=False,
-            expected_manifest_sha256=expected_manifest_sha256,
-        )
+        bundle, _ = _load_pinned_bundle(config)
         sample_ids = images.test["sample_id"].astype(str).tolist()
         dimensions = pq.read_table(
             bundle.samples_path,
@@ -433,12 +396,36 @@ class RsnaDataset:
         return LocalizationTestData(images, dimensions, annotations)
 
 
-def _authorize_test_access(authorization: object, package_id: str) -> None:
-    from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
+def _authorize_test_access(
+    config: ExperimentConfig, authorization: object, package_id: str
+) -> None:
+    from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
 
-    if not isinstance(authorization, ValidatedRsnaPackageFreeze):
-        raise PermissionError("RSNA held-out access requires a validated package freeze")
-    authorization.require(package_id)
+    capability = require_validated_rsna_held_out(authorization)
+    capability.require(package_id)
+    execution = capability.current_execution.execution.manifest
+    configured_bundle = (
+        config.runtime.manifest_directory
+        / config.dataset.dataset_id
+        / BUNDLES_DIRECTORY
+        / config.dataset.bundle_id
+    ).resolve()
+    if (
+        execution.get("dataset")
+        != {
+            "dataset_id": config.dataset.dataset_id,
+            "bundle_id": config.dataset.bundle_id,
+        }
+        or execution.get("task")
+        != {
+            "task_id": config.task.task_id,
+            "label_policy_version": config.task.label_policy_version,
+        }
+        or configured_bundle != capability.freeze.bundle_directory.resolve()
+    ):
+        raise ManifestBuildError(
+            "RSNA held-out configuration differs from the authorized package authority"
+        )
 
 
 def prepare_rsna_cxr_cache(
@@ -447,158 +434,11 @@ def prepare_rsna_cxr_cache(
     transform: StandardCxrTransform,
     *,
     cache_root: str | Path = "data/cache/rsna",
-) -> ValidatedCxrCache:
+) -> PreparedCxrCache:
     """Build or validate the one cache pinned by an RSNA dataset configuration."""
-    data = dataset.load_image_cache(config)
-    identity = CxrCacheIdentity(
-        bundle_id=data.lineage.bundle_id,
-        bundle_manifest_sha256=data.bundle_manifest_sha256,
-        source_inventory_file_sha256=data.source_inventory.source_inventory_file_sha256,
-        source_inventory_arrow_sha256=data.source_inventory.source_inventory_arrow_sha256,
-        preprocessing_sha256=preprocessing_identity(transform),
-    )
-    if config.runtime.source_root is None:
-        raise ValueError("RSNA image cache requires a runtime source root")
-    return build_cxr_cache(
-        data.frame,
-        dataset_root=config.runtime.source_root,
-        cache_root=cache_root,
-        identity=identity,
-        transform=transform,
-    )
-
-
-def expected_rsna_cxr_cache_identity(
-    *,
-    lineage: DatasetLineage,
-    bundle_manifest_sha256: str,
-    source_inventory: SourceInventoryIdentity,
-    transform: StandardCxrTransform,
-) -> CxrCacheIdentity:
-    """Return the exact cache identity expected by one RSNA consumer."""
-    return CxrCacheIdentity(
-        bundle_id=lineage.bundle_id,
-        bundle_manifest_sha256=bundle_manifest_sha256,
-        source_inventory_file_sha256=source_inventory.source_inventory_file_sha256,
-        source_inventory_arrow_sha256=source_inventory.source_inventory_arrow_sha256,
-        preprocessing_sha256=preprocessing_identity(transform),
-    )
-
-
-@dataclass(frozen=True)
-class _PinnedBundlePaths:
-    samples_path: Path
-    labels_path: Path
-    splits_path: Path
-    source_inventory_path: Path
-    metadata_path: Path
-    manifest_sha256: str | None = None
-
-
-def _load_pinned_bundle(
-    config: ExperimentConfig,
-    *,
-    materialize_all_rows: bool = True,
-    expected_manifest_sha256: str | None = None,
-) -> tuple[_PinnedBundlePaths, dict[str, object]]:
-    dataset_root = config.runtime.manifest_directory / config.dataset.dataset_id
-    bundle_directory = dataset_root / BUNDLES_DIRECTORY / config.dataset.bundle_id
-    if (
-        expected_manifest_sha256 is not None
-        and expected_manifest_sha256 != config.dataset.bundle_manifest_sha256
-    ):
-        raise ManifestBuildError("Expected RSNA manifest SHA differs from configured integrity")
-    validated = validate_bundle_reference(
-        bundle_directory,
-        expected_bundle_id=config.dataset.bundle_id,
-        expected_manifest_sha256=config.dataset.bundle_manifest_sha256,
-    )
-    metadata = dict(validated.manifest)
-    _validate_configured_witnesses(config, metadata)
-    if materialize_all_rows:
-        metadata = validate_bundle_directory(
-            bundle_directory,
-            expected_bundle_id=config.dataset.bundle_id,
-        )
-        _validate_configured_witnesses(config, metadata)
-    return (
-        _PinnedBundlePaths(
-            bundle_directory / SAMPLES_FILENAME,
-            bundle_directory / LABELS_FILENAME,
-            bundle_directory / SPLITS_FILENAME,
-            bundle_directory / SOURCE_INVENTORY_FILENAME,
-            bundle_directory / METADATA_FILENAME,
-            validated.manifest_sha256,
-        ),
-        metadata,
-    )
-
-
-def _validate_configured_witnesses(
-    config: ExperimentConfig,
-    metadata: dict[str, object],
-) -> None:
-    membership = metadata.get("membership")
-    split = membership.get("split") if isinstance(membership, dict) else None
-    tasks = metadata.get("tasks")
-    task = tasks.get(config.task.task_id) if isinstance(tasks, dict) else None
-    if not isinstance(split, dict) or split.get("split_assignment_id") != (
-        config.dataset.split_assignment_id
-    ):
-        raise ManifestBuildError("Configured RSNA split assignment does not match bundle")
-    if not isinstance(task, dict):
-        raise ManifestBuildError("Configured RSNA task is absent from bundle")
-    if task.get("label_policy_version") != config.task.label_policy_version:
-        raise ManifestBuildError("Configured RSNA label policy does not match bundle")
-
-
-def _required_manifest_sha256(bundle: _PinnedBundlePaths) -> str:
-    if bundle.manifest_sha256 is None:
-        raise ManifestBuildError("Image bundle validation did not return manifest byte identity")
-    return bundle.manifest_sha256
-
-
-def _task_frame(
-    bundle: _PinnedBundlePaths,
-    task_id: str,
-    *,
-    partitions: tuple[str, ...],
-    feature_columns: tuple[str, ...] = SOURCE_FEATURES,
-) -> pd.DataFrame:
-    assignments = pq.read_table(
-        bundle.splits_path,
-        columns=["sample_id", "split_name"],
-        filters=[("split_name", "in", list(partitions))],
-    ).to_pandas()
-    selected_ids = assignments["sample_id"].astype(str).tolist()
-    sample_columns = ["sample_id", "patient_id", *feature_columns]
-    samples = pq.read_table(
-        bundle.samples_path,
-        columns=sample_columns,
-        filters=[("sample_id", "in", selected_ids)],
-    ).to_pandas()
-    target = pq.read_table(
-        bundle.labels_path,
-        columns=["sample_id", "label_value"],
-        filters=[
-            ("task_id", "=", task_id),
-            ("sample_id", "in", selected_ids),
-        ],
-    ).to_pandas()
-    if target.empty:
-        raise ManifestBuildError(f"Bundle does not contain configured task {task_id!r}")
-    return (
-        samples.merge(assignments, on="sample_id", validate="one_to_one")
-        .merge(
-            target.rename(columns={"label_value": "target"}), on="sample_id", validate="one_to_one"
-        )
-        .sort_values("sample_id", kind="stable")
-        .reset_index(drop=True)
-    )
-
-
-def _image_cache_frame(bundle: _PinnedBundlePaths) -> pd.DataFrame:
-    """Load deterministic image source rows without opening task labels."""
+    if not isinstance(dataset, RsnaDataset):
+        raise TypeError("RSNA cache preparation requires the concrete dataset adapter")
+    bundle, metadata = _load_pinned_bundle(config)
     assignments = pq.read_table(
         bundle.splits_path,
         columns=["sample_id", "split_name"],
@@ -611,6 +451,191 @@ def _image_cache_frame(bundle: _PinnedBundlePaths) -> pd.DataFrame:
         bundle.source_inventory_path,
         columns=["sample_id", "relative_path", "byte_size", "sha256"],
     ).to_pandas()
+    frame = _validate_complete_cache_source_frame(samples, assignments, inventory)
+    lineage = _lineage(config, metadata)
+    source_inventory = _source_inventory_identity(metadata)
+    identity = CxrCacheIdentity(
+        bundle_id=lineage.bundle_id,
+        source_inventory_semantic_sha256=source_inventory.source_inventory_semantic_sha256,
+        preprocessing_sha256=preprocessing_identity(transform),
+    )
+    if config.runtime.source_root is None:
+        raise ValueError("RSNA image cache requires a runtime source root")
+    return build_cxr_cache(
+        frame,
+        dataset_root=config.runtime.source_root,
+        cache_root=cache_root,
+        identity=identity,
+        transform=transform,
+    )
+
+
+def validate_rsna_cache_source_availability(config: ExperimentConfig) -> None:
+    """Validate complete cache source availability without returning held-out membership."""
+    bundle, _ = _load_pinned_bundle(config)
+    if config.runtime.source_root is None:
+        raise ValueError("RSNA image cache requires a runtime source root")
+    assignments = pq.read_table(
+        bundle.splits_path,
+        columns=["sample_id", "split_name"],
+    ).to_pandas()
+    samples = pq.read_table(
+        bundle.samples_path,
+        columns=["sample_id", "patient_id", "image_path"],
+    ).to_pandas()
+    inventory = pq.read_table(
+        bundle.source_inventory_path,
+        columns=["sample_id", "relative_path", "byte_size", "sha256"],
+    ).to_pandas()
+    validate_cxr_source_availability(
+        _validate_complete_cache_source_frame(samples, assignments, inventory),
+        dataset_root=config.runtime.source_root,
+    )
+
+
+def expected_rsna_cxr_cache_identity(
+    *,
+    lineage: DatasetLineage,
+    source_inventory: SourceInventoryIdentity,
+    transform: StandardCxrTransform,
+) -> CxrCacheIdentity:
+    """Return the exact cache identity expected by one RSNA consumer."""
+    return CxrCacheIdentity(
+        bundle_id=lineage.bundle_id,
+        source_inventory_semantic_sha256=source_inventory.source_inventory_semantic_sha256,
+        preprocessing_sha256=preprocessing_identity(transform),
+    )
+
+
+@dataclass(frozen=True)
+class _PinnedBundlePaths:
+    samples_path: Path
+    labels_path: Path
+    splits_path: Path
+    source_inventory_path: Path
+    metadata_path: Path
+
+
+def _load_pinned_bundle(
+    config: ExperimentConfig,
+) -> tuple[_PinnedBundlePaths, dict[str, object]]:
+    if config.dataset.bundle_id is None:
+        raise ManifestBuildError("RSNA data access requires an explicit bundle identity")
+    dataset_root = config.runtime.manifest_directory / config.dataset.dataset_id
+    bundle_directory = dataset_root / BUNDLES_DIRECTORY / config.dataset.bundle_id
+    metadata = validate_bundle_directory(
+        bundle_directory,
+        expected_bundle_id=config.dataset.bundle_id,
+    )
+    _validate_configured_witnesses(config, metadata)
+    return (
+        _PinnedBundlePaths(
+            bundle_directory / SAMPLES_FILENAME,
+            bundle_directory / LABELS_FILENAME,
+            bundle_directory / SPLITS_FILENAME,
+            bundle_directory / SOURCE_INVENTORY_FILENAME,
+            bundle_directory / METADATA_FILENAME,
+        ),
+        metadata,
+    )
+
+
+def _validate_configured_witnesses(
+    config: ExperimentConfig,
+    metadata: dict[str, object],
+) -> None:
+    tasks = metadata.get("tasks")
+    task = tasks.get(config.task.task_id) if isinstance(tasks, dict) else None
+    if not isinstance(task, dict):
+        raise ManifestBuildError("Configured RSNA task is absent from bundle")
+    if task.get("label_policy_version") != config.task.label_policy_version:
+        raise ManifestBuildError("Configured RSNA label policy does not match bundle")
+
+
+def _task_frame(
+    bundle: _PinnedBundlePaths,
+    task_id: str,
+    *,
+    partitions: tuple[str, ...],
+    feature_columns: tuple[str, ...] = SOURCE_FEATURES,
+) -> pd.DataFrame:
+    if not partitions or any(value not in {"train", "validation"} for value in partitions):
+        raise PermissionError("Generic RSNA task access is limited to development partitions")
+    assignments = pq.read_table(
+        bundle.splits_path,
+        columns=["sample_id", "split_name"],
+        filters=[("split_name", "in", list(partitions))],
+    ).to_pandas()
+    selected_ids = assignments["sample_id"].astype(str).tolist()
+    samples = pq.read_table(
+        bundle.samples_path,
+        columns=["sample_id", "patient_id", *feature_columns],
+        filters=[("sample_id", "in", selected_ids)],
+    ).to_pandas()
+    target = pq.read_table(
+        bundle.labels_path,
+        columns=["sample_id", "label_value"],
+        filters=[("task_id", "=", task_id), ("sample_id", "in", selected_ids)],
+    ).to_pandas()
+    return _merge_task_tables(assignments, samples, target, task_id=task_id)
+
+
+def _held_out_task_frame(
+    config: ExperimentConfig,
+    task_id: str,
+    *,
+    authorization: object,
+    package_id: str,
+    feature_columns: tuple[str, ...] = SOURCE_FEATURES,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Authorize and materialize exact package-bound test rows in one operation."""
+    _authorize_test_access(config, authorization, package_id)
+    bundle, metadata = _load_pinned_bundle(config)
+    assignments = pq.read_table(
+        bundle.splits_path,
+        columns=["sample_id", "split_name"],
+        filters=[("split_name", "in", ["test"])],
+    ).to_pandas()
+    selected_ids = assignments["sample_id"].astype(str).tolist()
+    samples = pq.read_table(
+        bundle.samples_path,
+        columns=["sample_id", "patient_id", *feature_columns],
+        filters=[("sample_id", "in", selected_ids)],
+    ).to_pandas()
+    target = pq.read_table(
+        bundle.labels_path,
+        columns=["sample_id", "label_value"],
+        filters=[("task_id", "=", task_id), ("sample_id", "in", selected_ids)],
+    ).to_pandas()
+    return _merge_task_tables(assignments, samples, target, task_id=task_id), metadata
+
+
+def _merge_task_tables(
+    assignments: pd.DataFrame,
+    samples: pd.DataFrame,
+    target: pd.DataFrame,
+    *,
+    task_id: str,
+) -> pd.DataFrame:
+    """Align caller-local task tables without performing source access."""
+    if target.empty:
+        raise ManifestBuildError(f"Bundle does not contain configured task {task_id!r}")
+    return (
+        samples.merge(assignments, on="sample_id", validate="one_to_one")
+        .merge(
+            target.rename(columns={"label_value": "target"}), on="sample_id", validate="one_to_one"
+        )
+        .sort_values("sample_id", kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def _validate_complete_cache_source_frame(
+    samples: pd.DataFrame,
+    assignments: pd.DataFrame,
+    inventory: pd.DataFrame,
+) -> pd.DataFrame:
+    """Validate builder-local complete source inputs without reading task labels."""
     frame = (
         samples.merge(assignments, on="sample_id", validate="one_to_one")
         .merge(inventory, on="sample_id", validate="one_to_one")
@@ -678,13 +703,11 @@ def _source_inventory_identity(metadata: dict[str, object]) -> SourceInventoryId
     declared = hashes.get(SOURCE_INVENTORY_FILENAME) if isinstance(hashes, dict) else None
     if not isinstance(declared, dict):
         raise ManifestBuildError("Bundle metadata is missing source-inventory identity")
-    arrow_hash = declared.get("logical_arrow_sha256")
-    file_hash = declared.get("physical_file_sha256")
-    if not _is_sha256(arrow_hash) or not _is_sha256(file_hash):
+    semantic_hash = declared.get("semantic_sha256")
+    if not _is_sha256(semantic_hash):
         raise ManifestBuildError("Bundle metadata source-inventory hashes are invalid")
     return SourceInventoryIdentity(
-        source_inventory_arrow_sha256=arrow_hash,
-        source_inventory_file_sha256=file_hash,
+        source_inventory_semantic_sha256=semantic_hash,
     )
 
 
@@ -692,11 +715,9 @@ def _lineage(
     config: ExperimentConfig,
     metadata: dict[str, object],
 ) -> DatasetLineage:
-    split = metadata["membership"]["split"]
     tasks = metadata["tasks"]
     return DatasetLineage(
         bundle_id=config.dataset.bundle_id,
-        split_assignment_id=str(split["split_assignment_id"]),
         label_policy_version=str(tasks[config.task.task_id]["label_policy_version"]),
         task_id=config.task.task_id,
     )

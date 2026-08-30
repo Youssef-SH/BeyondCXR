@@ -8,21 +8,31 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import beyondcxr.training.rsna_campaign_control as campaign_control
-from beyondcxr.training.config import ExperimentConfig, require_runtime_seed
+from beyondcxr.training.config import (
+    ExperimentConfig,
+    normalized_scientific_config,
+    require_runtime_seed,
+)
 from beyondcxr.training.device import (
     full_precision_neural_runtime_policy,
     neural_inference_runtime_policy,
     resolve_device,
 )
 from beyondcxr.training.rsna_campaign_control import (
+    _CURRENT_EXECUTION_GUARD,
     _EXECUTION_GUARD,
-    _PACKAGE_FREEZE_GUARD,
-    FrozenTrainingPackage,
+    _FREEZE_GUARD,
+    _HELD_OUT_GUARD,
+    FrozenScientificPackage,
+    ValidatedCurrentRsnaExecution,
     ValidatedRsnaExecution,
-    ValidatedRsnaPackageFreeze,
+    ValidatedRsnaFreeze,
+    ValidatedRsnaHeldOutCapability,
 )
 
 
@@ -32,14 +42,16 @@ def authorize_rsna_package(
     *,
     monkeypatch: pytest.MonkeyPatch,
     model_path: Path | None = None,
-    report_path: Path | None = None,
-) -> ValidatedRsnaPackageFreeze:
+    held_out_sample_ids: Sequence[str] | None = None,
+    held_out_targets: Sequence[int] | None = None,
+) -> ValidatedRsnaHeldOutCapability:
     """Return a one-member capability matching a component-test package/config pair."""
     return authorize_rsna_packages(
         ((config, package_id),),
         monkeypatch=monkeypatch,
         model_path=model_path,
-        report_path=report_path,
+        held_out_sample_ids=held_out_sample_ids,
+        held_out_targets=held_out_targets,
     )
 
 
@@ -59,8 +71,9 @@ def authorize_rsna_packages(
     *,
     monkeypatch: pytest.MonkeyPatch,
     model_path: Path | None = None,
-    report_path: Path | None = None,
-) -> ValidatedRsnaPackageFreeze:
+    held_out_sample_ids: Sequence[str] | None = None,
+    held_out_targets: Sequence[int] | None = None,
+) -> ValidatedRsnaHeldOutCapability:
     """Return a fabricated bounded capability for component-test package/config pairs."""
     values = tuple(members)
     if not values:
@@ -71,12 +84,20 @@ def authorize_rsna_packages(
         execution_id="rsna-execution-" + "0" * 64,
         directory=Path("unused-control"),
         manifest={
+            "dataset": {
+                "dataset_id": reference.dataset.dataset_id,
+                "bundle_id": reference.dataset.bundle_id,
+            },
+            "task": {
+                "task_id": reference.task.task_id,
+                "label_policy_version": reference.task.label_policy_version,
+            },
             "configs": [
                 {
                     "family_id": config.family.family_id,
                     "seed": require_runtime_seed(config),
-                    "config_source_sha256": config.config_source_sha256,
-                    "config_semantic_sha256": config.config_semantic_sha256,
+                    "config_path": f"configs/{config.family.family_id}.yaml",
+                    "normalized_config": normalized_scientific_config(config),
                 }
                 for config, _ in values
             ],
@@ -85,31 +106,88 @@ def authorize_rsna_packages(
         },
         _guard=_EXECUTION_GUARD,
     )
+    model_root = reference.runtime.model_directory.resolve()
     packages = tuple(
-        FrozenTrainingPackage(
-            run_id=f"component-test-run-{index}",
+        FrozenScientificPackage(
             model_package_id=package_id,
-            model_path=model_path or Path("unused-model"),
-            artifact_directory=report_path or Path("unused-report"),
-            report_sha256="0" * 64,
+            model_path=model_path or model_root / "packages" / package_id,
         )
-        for index, (_, package_id) in enumerate(values)
+        for _, package_id in values
     )
-    model_root = Path("unused-model-root").resolve()
-    report_root = Path("unused-report-root").resolve()
-    bundle_directory = Path("unused-bundle").resolve()
-    capability = ValidatedRsnaPackageFreeze(
-        execution,
+    bundle_directory = (
+        reference.runtime.manifest_directory / "rsna" / "bundles" / reference.dataset.bundle_id
+    ).resolve()
+    if held_out_sample_ids is not None or held_out_targets is not None:
+        if held_out_sample_ids is None or held_out_targets is None:
+            raise ValueError("Synthetic held-out IDs and targets must be supplied together")
+        if len(held_out_sample_ids) != len(held_out_targets):
+            raise ValueError("Synthetic held-out IDs and targets differ in length")
+        bundle_directory.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            pa.table(
+                {
+                    "sample_id": tuple(held_out_sample_ids),
+                    "split_name": ("test",) * len(held_out_sample_ids),
+                }
+            ),
+            bundle_directory / "splits.parquet",
+        )
+        pq.write_table(
+            pa.table(
+                {
+                    "sample_id": tuple(held_out_sample_ids),
+                    "task_id": (reference.task.task_id,) * len(held_out_sample_ids),
+                    "label_value": tuple(int(value) for value in held_out_targets),
+                }
+            ),
+            bundle_directory / "labels.parquet",
+        )
+    freeze = ValidatedRsnaFreeze(
+        "rsna-freeze-" + "f" * 64,
+        Path("unused-freeze"),
         packages,
         model_root,
-        report_root,
         bundle_directory,
-        _PACKAGE_FREEZE_GUARD,
+        _FREEZE_GUARD,
     )
-    monkeypatch.setattr(campaign_control, "_reauthenticate_execution", lambda value: value)
     monkeypatch.setattr(
         campaign_control,
-        "validate_package_freeze",
-        lambda execution, *, model_root, report_root, bundle_directory: capability,
+        "validate_freeze",
+        lambda directory, *, model_root, bundle_directory: freeze,
+    )
+
+    def validate_component_execution(
+        directory: str | Path, *, expected_execution_id: str | None = None
+    ) -> ValidatedRsnaExecution:
+        if expected_execution_id not in {None, execution.execution_id}:
+            raise ValueError("Component-test execution identity differs")
+        return execution
+
+    monkeypatch.setattr(
+        campaign_control,
+        "validate_execution",
+        validate_component_execution,
+    )
+    monkeypatch.setattr(
+        campaign_control,
+        "validate_rsna_execution_freeze_science",
+        lambda execution, freeze: None,
+    )
+    current = ValidatedCurrentRsnaExecution(
+        execution,
+        None,  # type: ignore[arg-type]
+        _CURRENT_EXECUTION_GUARD,
+    )
+    capability = ValidatedRsnaHeldOutCapability(freeze, current, _HELD_OUT_GUARD)
+
+    def require_component_capability(value: object) -> ValidatedRsnaHeldOutCapability:
+        if value is not capability:
+            raise PermissionError("Component test requires its bounded fabricated capability")
+        return capability
+
+    monkeypatch.setattr(
+        campaign_control,
+        "require_validated_rsna_held_out",
+        require_component_capability,
     )
     return capability

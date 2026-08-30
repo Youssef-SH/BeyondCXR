@@ -14,7 +14,6 @@ from beyondcxr.models.symile_tabular import symile_tabular_logits
 from beyondcxr.training.device import (
     ResolvedDevice,
     neural_inference_runtime_policy,
-    resolve_device,
 )
 from beyondcxr.training.neural import (
     build_evaluation_loader,
@@ -22,9 +21,13 @@ from beyondcxr.training.neural import (
     deterministic_inference,
 )
 from beyondcxr.training.symile_campaign_control import (
+    ValidatedHeldOutCapability,
     ValidatedPretestFreeze,
-    ValidatedTestOpenRecord,
+    ValidatedSymileExecution,
+    ValidatedTestOpenEvidence,
     materialize_official_test,
+    require_validated_held_out_capability,
+    require_validated_test_open_evidence,
     validated_pretest_freeze_manifest,
 )
 from beyondcxr.training.symile_families import (
@@ -52,7 +55,8 @@ from beyondcxr.training.symile_test_data import (
 from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
-    publish_prediction_evidence,
+    _publish_held_out_prediction_evidence,
+    authorize_symile_held_out_prediction_publication,
     validate_prediction_evidence,
 )
 from beyondcxr.utils.publication import is_publication_staging_directory
@@ -60,8 +64,7 @@ from beyondcxr.utils.publication import is_publication_staging_directory
 
 def publish_frozen_test_predictions(
     *,
-    capability: ValidatedPretestFreeze,
-    test_open_record: ValidatedTestOpenRecord,
+    capability: ValidatedHeldOutCapability,
     final_packages: Sequence[ValidatedFinalPackage],
     source_root: str | Path,
     manifest_root: str | Path,
@@ -69,16 +72,16 @@ def publish_frozen_test_predictions(
     runtime: ResolvedDevice,
 ) -> tuple[tuple[ValidatedPredictionEvidence, ...], FrozenSymileTestData]:
     """Validate all fourteen packages before the accessor may materialize test state."""
-    packages = _validated_package_membership(capability, final_packages)
+    packages = _validated_package_membership(capability.freeze, final_packages)
     _validate_neural_inference_runtime(capability, runtime)
     configure_neural_determinism()
 
     def evaluate() -> tuple[tuple[ValidatedPredictionEvidence, ...], FrozenSymileTestData]:
         data = FrozenSymileTestData(
             capability,
-            test_open_record,
             load_final_package_config(packages[0]),
             manifest_root=manifest_root,
+            source_root=source_root,
         )
         projection = data.evaluation_projection()
         expected = {package.package_id for package in packages}
@@ -90,7 +93,6 @@ def publish_frozen_test_predictions(
         )
         predictions = _infer_all(
             capability,
-            test_open_record,
             packages,
             data,
             source_root,
@@ -100,40 +102,15 @@ def publish_frozen_test_predictions(
         )
         return predictions, data
 
-    return materialize_official_test(capability, test_open_record, evaluate)
-
-
-def resolve_held_out_neural_runtime(
-    packages: Sequence[ValidatedFinalPackage], device: str
-) -> ResolvedDevice:
-    if len(packages) != FINAL_PACKAGE_COUNT:
-        raise ManifestBuildError("Neural runtime resolution requires fourteen final packages")
-    validated = tuple(validate_final_package(package.directory) for package in packages)
-    if len({package.package_id for package in validated}) != FINAL_PACKAGE_COUNT:
-        raise ManifestBuildError("Final package membership contains duplicates")
-    neural_configs = [
-        config
-        for package in validated
-        if (config := load_final_package_config(package)).family_id not in FINAL_TABULAR_FAMILIES
-    ]
-    mixed_precision = {config.mixed_precision for config in neural_configs}
-    if len(mixed_precision) != 1:
-        raise ManifestBuildError("Final neural packages disagree on mixed-precision policy")
-    return resolve_device(
-        device,
-        mixed_precision=mixed_precision.pop(),
-        pin_memory_policy="auto",
-    )
+    return materialize_official_test(capability, evaluate)
 
 
 def _validate_neural_inference_runtime(
-    capability: ValidatedPretestFreeze, runtime: ResolvedDevice
+    capability: ValidatedHeldOutCapability, runtime: ResolvedDevice
 ) -> None:
-    frozen = validated_pretest_freeze_manifest(capability)["held_out_policy"][
-        "neural_inference_runtime"
-    ]
+    frozen = capability.execution.manifest["neural_runtime"]
     if neural_inference_runtime_policy(runtime) != frozen:
-        raise ManifestBuildError("Neural inference runtime differs from the pre-test freeze")
+        raise ManifestBuildError("Neural inference runtime differs from the formal execution")
 
 
 def _validated_package_membership(
@@ -147,7 +124,11 @@ def _validated_package_membership(
         raise ManifestBuildError("Final package membership contains duplicates")
     frozen = validated_pretest_freeze_manifest(capability)["final_packages"]
     observed = [
-        {"package_id": package.package_id, "manifest_sha256": package.manifest_sha256}
+        {
+            "package_id": package.package_id,
+            "family_id": package.manifest["input"]["family"]["family_id"],
+            "seed": package.manifest["seed_policy"],
+        }
         for package in validated
     ]
     if observed != frozen:
@@ -156,8 +137,7 @@ def _validated_package_membership(
 
 
 def _infer_all(
-    capability: ValidatedPretestFreeze,
-    record: ValidatedTestOpenRecord,
+    capability: ValidatedHeldOutCapability,
     packages: Sequence[ValidatedFinalPackage],
     data: FrozenSymileTestData,
     source_root: str | Path,
@@ -168,7 +148,7 @@ def _infer_all(
     results = dict(existing)
     pending = [package for package in packages if package.package_id not in results]
     cxr_store = (
-        FrozenSymileTestCxrStore(capability, record, data.bundle, source_root)
+        FrozenSymileTestCxrStore(capability, data.bundle, source_root)
         if any("cxr" in load_final_package_config(package).modalities for package in pending)
         else None
     )
@@ -191,11 +171,10 @@ def _infer_all(
                 None if transformer is None else transformer.transform(test_laboratory_frame(data))
             )
             if family == SYMILE_ECG_GATED_FAMILY and ecg_store is None:
-                ecg_store = FrozenSymileTestEcgStore(capability, record, data.bundle, source_root)
+                ecg_store = FrozenSymileTestEcgStore(capability, data.bundle, source_root)
             dataset = FrozenSymileNeuralTestDataset(
                 capability,
-                record,
-                data.frame,
+                data,
                 cxr_store=cxr_store,
                 transform=_evaluation_transform(config),
                 labs=labs,
@@ -208,7 +187,7 @@ def _infer_all(
                 input_keys=_input_keys(family),
             ).logits
         results[package.package_id] = _publish(
-            package.package_id, data, logits, private_root, capability.freeze_id
+            package.package_id, data, logits, private_root, capability
         )
     if len(results) != FINAL_PACKAGE_COUNT:
         raise ManifestBuildError("Test inference did not produce fourteen prediction objects")
@@ -218,10 +197,11 @@ def _infer_all(
 def validate_existing_test_predictions(
     private_root: str | Path,
     *,
-    capability: ValidatedPretestFreeze,
+    capability: ValidatedHeldOutCapability,
     expected_packages: set[str],
     projection: HeldOutEvaluationProjection,
 ) -> dict[str, ValidatedPredictionEvidence]:
+    capability = require_validated_held_out_capability(capability)
     root = Path(private_root) / "predictions" / "symile" / "test"
     if not root.exists():
         return {}
@@ -232,9 +212,10 @@ def validate_existing_test_predictions(
         if is_publication_staging_directory(directory):
             continue
         evidence = validate_prediction_evidence(directory)
+        _validate_live_publication_authority(evidence, capability)
         validate_prediction_against_test_projection(
             evidence,
-            capability=capability,
+            capability=capability.freeze,
             projection=projection,
             expected_package_ids=tuple(expected_packages),
         )
@@ -250,23 +231,76 @@ def _publish(
     data: FrozenSymileTestData,
     logits: np.ndarray,
     private_root: str | Path,
-    freeze_id: str,
+    capability: ValidatedHeldOutCapability,
 ) -> ValidatedPredictionEvidence:
-    return publish_prediction_evidence(
+    capability = require_validated_held_out_capability(capability)
+    frozen_packages = {
+        str(item["package_id"])
+        for item in validated_pretest_freeze_manifest(capability.freeze)["final_packages"]
+    }
+    if package_id not in frozen_packages:
+        raise ManifestBuildError("Test prediction package is not a frozen final package")
+    projection = data.evaluation_projection()
+    publication_authority = authorize_symile_held_out_prediction_publication(
+        capability,
+        model_package_id=package_id,
+        projection=projection,
+    )
+    evidence = _publish_held_out_prediction_evidence(
+        publication_authority=publication_authority,
         private_root=private_root,
         dataset_id="symile",
         model_package_id=package_id,
         task_id=TASK_ID,
         bundle_id=data.bundle.bundle_id,
-        split_assignment_id=data.split_assignment_id,
         scope="test",
         sample_ids=data.frame["sample_id"].astype(str).tolist(),
         targets=data.frame["target"].to_numpy(dtype=np.int8),
         logits=logits,
         label_policy_version=LABEL_POLICY_VERSION,
         inference_policy=SYMILE_TEST_INFERENCE_POLICY,
-        authorized_by_pretest_freeze_id=freeze_id,
+        authorized_by_freeze_id=capability.freeze.freeze_id,
     )
+    _validate_live_publication_authority(evidence, capability)
+    validate_prediction_against_test_projection(
+        evidence,
+        capability=capability.freeze,
+        projection=projection,
+        expected_package_ids=tuple(sorted(frozen_packages)),
+    )
+    return evidence
+
+
+def _validate_live_publication_authority(
+    evidence: ValidatedPredictionEvidence,
+    capability: ValidatedHeldOutCapability,
+) -> None:
+    authority = require_validated_held_out_capability(capability)
+    expected = {
+        "authority_kind": "symile-opened-campaign-v1",
+        "execution_id": authority.execution.execution_id,
+    }
+    if evidence.manifest.get("held_out_publication") != expected:
+        raise ManifestBuildError("Test prediction lacks its official-opening authority")
+
+
+def validate_restored_test_prediction_publication(
+    evidence: ValidatedPredictionEvidence,
+    *,
+    freeze: ValidatedPretestFreeze,
+    execution: ValidatedSymileExecution,
+    opening: ValidatedTestOpenEvidence,
+) -> None:
+    """Bind restored prediction publication to preserved historical opening evidence."""
+    historical_opening = require_validated_test_open_evidence(opening, freeze=freeze)
+    if historical_opening.execution_id != execution.execution_id:
+        raise ManifestBuildError("Restored prediction opening differs from its execution")
+    expected = {
+        "authority_kind": "symile-opened-campaign-v1",
+        "execution_id": execution.execution_id,
+    }
+    if evidence.manifest.get("held_out_publication") != expected:
+        raise ManifestBuildError("Restored prediction lacks its historical opening authority")
 
 
 def _evaluation_transform(config):

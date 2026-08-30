@@ -1,633 +1,414 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import statistics
-import tempfile
-import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from rsna_preservation_test_support import build_real_rsna_campaign_closure
 
+import beyondcxr.training.rsna_preservation as rsna_preservation
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.training.preservation import (
-    EXPORT_MANIFEST_FILENAME,
     PreservationMember,
     export_and_verify,
     restore_and_validate_export,
 )
-from beyondcxr.training.rsna_campaign import _validate_outputs
-from beyondcxr.training.rsna_compare import (
-    COMPARISON_COLUMNS,
-    COMPARISON_POLICY_VERSION,
-    COMPARISON_PREFIX,
-)
-from beyondcxr.training.rsna_localize import _markdown as localization_markdown
-from beyondcxr.training.rsna_localize import _report_document as localization_report_document
 from beyondcxr.training.rsna_preservation import (
+    campaign_export_members,
     validate_restored_rsna_campaign,
 )
-from beyondcxr.training.rsna_training_report import (
-    REQUIRED_REPORT_FILENAMES,
-    _write_evaluation_report,
-)
-from beyondcxr.utils.package_identity import canonical_scientific_id
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
 
 
-def _directory(path: Path, filename: str = "manifest.json") -> Path:
-    path.mkdir(parents=True)
-    (path / filename).write_text("{}\n", encoding="utf-8")
-    return path
+@pytest.mark.integration
+def test_recursive_preservation_revalidates_bundle_evidence(tmp_path: Path) -> None:
+    from rsna_manifest_test_support import write_sources
+
+    from beyondcxr.data.rsna_artifacts import build_and_write, validate_bundle_directory
+
+    bundle = build_and_write(write_sources(tmp_path / "raw"), tmp_path / "manifests")
+    relative = Path("data/manifests/rsna/bundles") / bundle.paths.bundle_id
+    members = (PreservationMember(bundle.paths.bundle_directory, relative),)
+
+    def validate(root: Path) -> None:
+        validate_bundle_directory(root / relative)
+
+    arguments = dict(members=members, backup_root=tmp_path / "backup", export_name="synthetic-rsna")
+    export_and_verify(**arguments, export_root=tmp_path / "export", restoration_validator=validate)
+    labels = pq.read_table(bundle.paths.labels_path).to_pylist()
+    labels[0]["label_value"] = 1 - labels[0]["label_value"]
+    pq.write_table(pa.Table.from_pylist(labels), bundle.paths.labels_path)
+    arguments["backup_root"] = tmp_path / "altered-backup"
+    altered = export_and_verify(**arguments, export_root=tmp_path / "altered-export")
+    with pytest.raises((ValueError, ManifestBuildError)):
+        restore_and_validate_export(altered, restoration_validator=validate)
 
 
-@pytest.fixture(scope="module")
-def real_rsna_archive(tmp_path_factory: pytest.TempPathFactory):
-    root = tmp_path_factory.mktemp("real-rsna-preservation")
-    closure = build_real_rsna_campaign_closure(root / "workspace")
-    unrelated = _directory(root / "workspace/reports/rsna/campaigns/unrelated")
-    validations = []
+class _BoundedFreeze:
+    def __init__(
+        self,
+        *,
+        directory: Path,
+        model_root: Path,
+        bundle_directory: Path,
+        packages: tuple[object, ...],
+    ) -> None:
+        self.freeze_id = "rsna-freeze-" + "f" * 64
+        self.directory = directory
+        self.model_root = model_root
+        self.bundle_directory = bundle_directory
+        self.packages = packages
 
-    def validate(restored: Path):
-        validations.append(restored)
-        assert not (restored / "reports/rsna/campaigns/unrelated").exists()
-        assert not (restored / "mlflow.db").exists()
-        assert not (restored / "mlartifacts").exists()
-        assert not (restored / "data/manifests/rsna/CURRENT").exists()
-        assert not (restored / "raw").exists()
-        return validate_restored_rsna_campaign(restored)
+    def __iter__(self):
+        return iter(self.packages)
 
-    archive = export_and_verify(
-        members=closure.members,
-        export_root=root / "export",
-        backup_root=root / "backup",
-        export_name="rsna-real-closure",
-        restoration_validator=validate,
+
+def _marker(directory: Path, name: str = "manifest.json", content: bytes = b"{}\n") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(content)
+    return directory
+
+
+def _bounded_closure(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[PreservationMember, ...]:
+    bundle_id = "bundle-" + "a" * 64
+    execution_id = "rsna-execution-" + "b" * 64
+    package_ids = ("model-package-" + "c" * 64, "model-package-" + "d" * 64)
+    evaluation_ids = ("evaluation-" + "e" * 64, "evaluation-" + "1" * 64)
+    prediction_ids = ("prediction-" + "2" * 64, "prediction-" + "3" * 64)
+    families = dict(zip(package_ids, ("cxr_densenet", "cxr_metadata_concat"), strict=True))
+
+    bundle = _marker(root / "data/manifests/rsna/bundles" / bundle_id)
+    sample_ids = ["rsna:positive", "rsna:negative", "rsna:training-positive"]
+    pq.write_table(
+        pa.table({"sample_id": sample_ids, "split_name": ["test", "test", "train"]}),
+        bundle / "splits.parquet",
     )
-    return closure, archive, validations, unrelated
-
-
-def test_rsna_export_restores_and_recursively_validates_the_real_scientific_closure(
-    real_rsna_archive,
-) -> None:
-    closure, archive, validations, unrelated = real_rsna_archive
-    assert len(validations) == 2
-    assert archive.is_file()
-    assert unrelated.is_dir()
-    assert tuple((spec.family_id, spec.seed) for spec in closure.plan.runs) == (
-        ("metadata_logistic", 42),
-        ("metadata_lightgbm", 42),
-        ("cxr_densenet", 17),
-        ("cxr_densenet", 42),
-        ("cxr_densenet", 2026),
-        ("cxr_metadata_concat", 17),
-        ("cxr_metadata_concat", 42),
-        ("cxr_metadata_concat", 2026),
-    )
-
-
-def test_completed_scientific_closure_does_not_require_or_create_mlflow(
-    real_rsna_archive,
-) -> None:
-    closure, _, _, _ = real_rsna_archive
-    database = closure.plan.roots.tracking_database
-    assert not database.exists()
-    _validate_outputs(
-        closure.training_results,
-        closure.evaluations,
-        closure.audit_directory,
-        closure.summaries[0].directory,
-        closure.summaries[1].directory,
-        closure.localization,
-        closure.comparison,
-        closure.campaign_log,
-        roots=closure.plan.roots,
-    )
-    assert not database.exists()
-
-
-@pytest.mark.parametrize(
-    "tamper",
-    (
-        "package-report-lineage",
-        "training-metric",
-        "training-markdown",
-        "training-plot",
-        "comparison-membership",
-    ),
-)
-def test_rsna_restoration_rejects_archive_valid_scientific_tampering(
-    tmp_path: Path,
-    real_rsna_archive,
-    tamper: str,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-    plot_selected = False
-
-    def mutate(path: str, content: bytes) -> bytes | None:
-        nonlocal plot_selected
-        if tamper == "package-report-lineage" and path.endswith("/metrics.json"):
-            document = json.loads(content)
-            if document.get("training_package", {}).get("family_id") != "metadata_logistic":
-                return None
-            document["training_package"]["model_package_id"] = "model-package-" + "0" * 64
-            return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
-        if tamper == "training-metric" and path.endswith("/metrics.json"):
-            document = json.loads(content)
-            if document.get("training_package", {}).get("family_id") != "metadata_logistic":
-                return None
-            document["probability_metrics"]["brier_score"] = 0.999
-            return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
-        if (
-            tamper == "training-markdown"
-            and path.endswith("/evaluation_report.md")
-            and content.startswith(b"# metadata_logistic validation evaluation")
-        ):
-            return content + b"tampered report\n"
-        if tamper == "training-plot" and path.endswith("/roc_curve.png") and not plot_selected:
-            plot_selected = True
-            return content + b"tampered plot"
-        if tamper == "comparison-membership" and path.endswith("/manifest.json"):
-            document = json.loads(content)
-            if "comparison_schema_version" not in document:
-                return None
-            document["evaluation_ids"].reverse()
-            return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
-        return None
-
-    corrupted = _rewrite_archive_with_valid_hashes(archive, tmp_path / f"{tamper}.zip", mutate)
-    restore_and_validate_export(corrupted)
-    with pytest.raises((ManifestBuildError, ValueError)):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-@pytest.mark.parametrize(
-    ("relative_path", "content"),
-    (("junk.json", b"{}\n"), ("evaluations/unexpected-package.json", b"{}\n")),
-)
-def test_rsna_restoration_rejects_extra_execution_control_members(
-    tmp_path: Path,
-    real_rsna_archive,
-    relative_path: str,
-    content: bytes,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-    corrupted = _add_archive_member_with_valid_hashes(
-        archive,
-        tmp_path / (relative_path.replace("/", "-") + ".zip"),
-        restore_prefix="private/control/rsna/executions/",
-        relative_path=relative_path,
-        content=content,
-    )
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ManifestBuildError, match="membership"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_coherent_duplicate_comparison_membership(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-    corrupted = _rewrite_comparison_with_duplicate(
-        archive,
-        tmp_path / "duplicate-comparison-membership.zip",
-    )
-
-    restore_and_validate_export(corrupted)
-    with pytest.raises((ManifestBuildError, ValueError)):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_coherent_report_freeze_and_archive_rewrite(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-
-    def mutate(manifest, contents):
-        report_member = next(
-            member
-            for member in manifest["members"]
-            if member["restore_relative"].startswith("reports/rsna/runs/")
-            and json.loads(contents[f"{member['archive_identity']}/metrics.json"])[
-                "training_package"
-            ]["family_id"]
-            == "metadata_logistic"
-        )
-        identity = report_member["archive_identity"]
-        metrics_name = f"{identity}/metrics.json"
-        document = json.loads(contents[metrics_name])
-        document["probability_metrics"]["brier_score"] = 0.5
-        contents[metrics_name] = (
-            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        ).encode()
-        with tempfile.TemporaryDirectory() as temporary:
-            rendered = Path(temporary) / "evaluation_report.md"
-            _write_evaluation_report(rendered, "metadata_logistic", document)
-            contents[f"{identity}/evaluation_report.md"] = rendered.read_bytes()
-        report_digest = hashlib.sha256()
-        files = {item["path"] for item in report_member["files"]}
-        assert files == set(REQUIRED_REPORT_FILENAMES)
-        for filename in sorted(files):
-            name = filename.encode()
-            content = contents[f"{identity}/{filename}"]
-            report_digest.update(len(name).to_bytes(4, "big"))
-            report_digest.update(name)
-            report_digest.update(len(content).to_bytes(8, "big"))
-            report_digest.update(content)
-        control_member = next(
-            member
-            for member in manifest["members"]
-            if member["restore_relative"].startswith("private/control/rsna/executions/")
-        )
-        freeze_name = f"{control_member['archive_identity']}/package-freeze.json"
-        freeze = json.loads(contents[freeze_name])
-        report_relative = report_member["restore_relative"].removeprefix("reports/")
-        frozen_report = next(
-            item for item in freeze["packages"] if item["report_relative"] == report_relative
-        )
-        frozen_report["report_sha256"] = report_digest.hexdigest()
-        contents[freeze_name] = (
-            json.dumps(freeze, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
-
-    corrupted = _rewrite_archive_members_with_valid_hashes(
-        archive, tmp_path / "coherent-report-rewrite.zip", mutate
-    )
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ValueError, match="scientific claims differ from validation evidence"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_coherent_localization_summary_rewrite(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-
-    def mutate(manifest, contents):
-        member = next(
-            item
-            for item in manifest["members"]
-            if item["restore_relative"].startswith("reports/rsna/localization/")
-        )
-        identity = member["archive_identity"]
-        summary_name = f"{identity}/summary.json"
-        document = json.loads(contents[summary_name])
-        document["members"][0]["pointing_game_accuracy"] = 0.25
-        document["aggregates"] = localization_report_document(
-            document["report_id"], document["model_package_ids"], document["members"]
-        )["aggregates"]
-        contents[summary_name] = (
-            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        ).encode()
-        contents[f"{identity}/summary.md"] = localization_markdown(document).encode()
-
-    corrupted = _rewrite_archive_members_with_valid_hashes(
-        archive, tmp_path / "coherent-localization-rewrite.zip", mutate
-    )
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ValueError, match="differ from localization evidence"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_coherent_localization_cohort_omission(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-
-    def mutate(manifest, contents):
-        private_member = next(
-            item
-            for item in manifest["members"]
-            if item["restore_relative"].startswith("private/localization/")
-        )
-        evidence_name = f"{private_member['archive_identity']}/localization-evidence.json"
-        evidence = json.loads(contents[evidence_name])
-        for member in evidence["members"]:
-            member["cases"].pop()
-        contents[evidence_name] = (
-            json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
-
-        public_member = next(
-            item
-            for item in manifest["members"]
-            if item["restore_relative"].startswith("reports/rsna/localization/")
-        )
-        identity = public_member["archive_identity"]
-        summary_name = f"{identity}/summary.json"
-        document = json.loads(contents[summary_name])
-        document["members"] = [
+    pq.write_table(
+        pa.table(
             {
-                "seed": member["seed"],
-                "positive_test_sample_count": len(member["cases"]),
-                "localization_evaluated_count": len(member["cases"]),
-                "zero_heatmap_count": sum(case["zero_heatmap"] for case in member["cases"]),
-                "pointing_game_accuracy": statistics.fmean(
-                    case["pointing_game"] for case in member["cases"]
-                ),
-                "mean_activation_energy_inside_union": statistics.fmean(
-                    case["activation_energy_inside_union"] for case in member["cases"]
-                ),
-                "qualitative_strata_present": member["qualitative_strata_present"],
+                "sample_id": sample_ids,
+                "task_id": ["pneumonia"] * 3,
+                "label_value": pa.array([1, 0, 1], type=pa.int8()),
             }
-            for member in evidence["members"]
-        ]
-        document["aggregates"] = localization_report_document(
-            document["report_id"], document["model_package_ids"], document["members"]
-        )["aggregates"]
-        contents[summary_name] = (
-            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        ).encode()
-        contents[f"{identity}/summary.md"] = localization_markdown(document).encode()
-
-    corrupted = _rewrite_archive_members_with_valid_hashes(
-        archive, tmp_path / "coherent-localization-cohort-omission.zip", mutate
-    )
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ValueError, match="canonical positive held-out cohort"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_substituted_localization_case_id(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-
-    def mutate(manifest, contents):
-        private_member = next(
-            item
-            for item in manifest["members"]
-            if item["restore_relative"].startswith("private/localization/")
-        )
-        evidence_name = f"{private_member['archive_identity']}/localization-evidence.json"
-        evidence = json.loads(contents[evidence_name])
-        evidence["members"][0]["cases"][0]["sample_id"] = "rsna:" + "-".join(
-            ("00000000", "0000", "4000", "8000", "000000000000")
-        )
-        contents[evidence_name] = (
-            json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
-
-    corrupted = _rewrite_archive_members_with_valid_hashes(
-        archive, tmp_path / "substituted-localization-case-id.zip", mutate
-    )
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ValueError, match="canonical positive held-out cohort"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
-
-
-def test_rsna_restoration_rejects_valid_external_preservation_member(
-    tmp_path: Path,
-    real_rsna_archive,
-) -> None:
-    _, archive, _, _ = real_rsna_archive
-    corrupted = _add_external_archive_member_with_valid_hashes(
-        archive,
-        tmp_path / "external-member.zip",
-        restore_relative="private/unrelated",
-        relative_path="state.json",
-        content=b"{}\n",
+        ),
+        bundle / "labels.parquet",
     )
 
-    restore_and_validate_export(corrupted)
-    with pytest.raises(ManifestBuildError, match="outside its exact closure"):
-        restore_and_validate_export(
-            corrupted,
-            restoration_validator=validate_restored_rsna_campaign,
-        )
+    execution_directory = _marker(root / "private/control/rsna/executions" / execution_id)
+    evaluation_control = root / "private/control/rsna/evaluations" / execution_id
+    for package_id in package_ids:
+        _marker(evaluation_control, f"{package_id}.json")
+    active = root / "private/control/rsna/active-execution.json"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.write_bytes(canonical_json_bytes({"schema_version": 1, "execution_id": execution_id}))
+    freeze_directory = _marker(root / "private/control/rsna/freezes" / ("rsna-freeze-" + "f" * 64))
 
-
-@pytest.mark.parametrize(
-    "member_index",
-    range(9),
-    ids=(
-        "bundle",
-        "freeze",
-        "package-report",
-        "evaluation-prediction",
-        "seed-summary",
-        "localization",
-        "comparison",
-        "audit",
-        "campaign-log",
-    ),
-)
-def test_rsna_preservation_rejects_corruption_across_closure_families(
-    tmp_path: Path, member_index: int
-) -> None:
-    members = []
-    for index, restore in enumerate(
-        (
-            "data/manifests/rsna/bundles/bundle-test",
-            "private/control/rsna/executions/execution-test",
-            "models/rsna/packages/package-test",
-            "private/predictions/rsna/prediction-test",
-            "reports/rsna/seed-summaries/summary-test",
-            "reports/rsna/localization/localization-test",
-            "reports/rsna/comparisons/comparison-test",
-            "reports/rsna/audit/bundle-test",
-            "reports/rsna/campaigns/campaign-test",
-        )
+    model_root = root / "models/rsna"
+    report_root = root / "reports"
+    private_root = root / "private"
+    packages = []
+    training_results = []
+    evaluations = []
+    for package_id, evaluation_id, prediction_id in zip(
+        package_ids, evaluation_ids, prediction_ids, strict=True
     ):
-        source = tmp_path / "sources" / str(index)
-        _directory(source)
-        members.append(PreservationMember(source, Path(restore)))
-    archive = export_and_verify(
-        members=members,
-        export_root=tmp_path / "outbox",
-        backup_root=tmp_path / "backup",
-        export_name="campaign",
+        package = _marker(model_root / "packages" / package_id)
+        model_path = package / "model.skops"
+        model_path.write_bytes(b"bounded fitted state")
+        run = _marker(report_root / "rsna/runs" / package_id)
+        evaluation = _marker(report_root / "rsna/evaluations" / evaluation_id)
+        prediction = _marker(private_root / "predictions/rsna" / prediction_id)
+        packages.append(SimpleNamespace(model_package_id=package_id, model_path=model_path))
+        training_results.append(
+            SimpleNamespace(
+                model_package_id=package_id,
+                model_path=model_path,
+                artifact_directory=run,
+            )
+        )
+        evaluations.append(
+            SimpleNamespace(
+                model_package_id=package_id,
+                evaluation_id=evaluation_id,
+                prediction_id=prediction_id,
+                artifact_directory=evaluation,
+                private_prediction_directory=prediction,
+            )
+        )
+
+    summaries = tuple(
+        SimpleNamespace(directory=_marker(report_root / "rsna/seed-summaries" / family))
+        for family in ("cxr_densenet", "cxr_metadata_concat")
     )
-    corrupted = tmp_path / "corrupted.zip"
-    target = f"member-{member_index:04d}/manifest.json"
-    with zipfile.ZipFile(archive) as source, zipfile.ZipFile(corrupted, "w") as output:
-        for info in source.infolist():
-            content = source.read(info.filename)
-            output.writestr(info, b"corrupted" if info.filename == target else content)
-    os.chmod(corrupted, 0o600)
-    with pytest.raises(ManifestBuildError, match="hash"):
-        restore_and_validate_export(corrupted)
-
-
-def _rewrite_archive_with_valid_hashes(archive: Path, destination: Path, mutate) -> Path:
-    selected = []
-
-    def apply(manifest, contents):
-        for member in manifest["members"]:
-            for file_document in member["files"]:
-                name = f"{member['archive_identity']}/{file_document['path']}"
-                replacement = mutate(name, contents[name])
-                if replacement is None:
-                    continue
-                selected.append(name)
-                contents[name] = replacement
-
-    result = _rewrite_archive_members_with_valid_hashes(archive, destination, apply)
-    if len(selected) != 1:
-        raise AssertionError(f"Semantic tamper selector matched {len(selected)} archive files")
-    return result
-
-
-def _rewrite_archive_members_with_valid_hashes(archive: Path, destination: Path, mutate) -> Path:
-    with zipfile.ZipFile(archive) as source:
-        infos = source.infolist()
-        contents = {info.filename: source.read(info.filename) for info in infos}
-    manifest = json.loads(contents[EXPORT_MANIFEST_FILENAME])
-    mutate(manifest, contents)
-    for member in manifest["members"]:
-        for file_document in member["files"]:
-            name = f"{member['archive_identity']}/{file_document['path']}"
-            file_document["sha256"] = hashlib.sha256(contents[name]).hexdigest()
-    contents[EXPORT_MANIFEST_FILENAME] = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    ).encode()
-    with zipfile.ZipFile(destination, "w") as output:
-        for info in infos:
-            output.writestr(info, contents[info.filename])
-    os.chmod(destination, 0o600)
-    return destination
-
-
-def _add_archive_member_with_valid_hashes(
-    archive: Path,
-    destination: Path,
-    *,
-    restore_prefix: str,
-    relative_path: str,
-    content: bytes,
-) -> Path:
-    with zipfile.ZipFile(archive) as source:
-        infos = source.infolist()
-        contents = {info.filename: source.read(info.filename) for info in infos}
-    manifest = json.loads(contents[EXPORT_MANIFEST_FILENAME])
-    member = next(
-        item for item in manifest["members"] if item["restore_relative"].startswith(restore_prefix)
+    localization = _marker(report_root / "rsna/localization/bounded-localization")
+    _marker(private_root / "localization/bounded-localization")
+    comparison = SimpleNamespace(
+        directory=_marker(report_root / "rsna/comparisons/comparison"),
+        manifest={"evaluation_ids": list(evaluation_ids)},
     )
-    name = f"{member['archive_identity']}/{relative_path}"
-    member["files"].append({"path": relative_path, "sha256": hashlib.sha256(content).hexdigest()})
-    member["files"].sort(key=lambda item: item["path"])
-    contents[name] = content
-    contents[EXPORT_MANIFEST_FILENAME] = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    ).encode()
-    with zipfile.ZipFile(destination, "w") as output:
-        for info in infos:
-            output.writestr(info, contents[info.filename])
-        output.writestr(name, content)
-    os.chmod(destination, 0o600)
-    return destination
+    audit = _marker(report_root / "rsna/audit" / bundle_id)
+    campaign_log = report_root / "rsna/campaigns/bounded/execution.log"
+    campaign_log.parent.mkdir(parents=True)
+    campaign_log.write_text("event=campaign_ready_for_export\n", encoding="utf-8")
 
+    execution_manifest = {
+        "dataset": {"dataset_id": "rsna", "bundle_id": bundle_id},
+        "task": {
+            "task_id": "pneumonia",
+            "label_policy_version": "rsna-stage-2-target-v1",
+        },
+    }
 
-def _add_external_archive_member_with_valid_hashes(
-    archive: Path,
-    destination: Path,
-    *,
-    restore_relative: str,
-    relative_path: str,
-    content: bytes,
-) -> Path:
-    with zipfile.ZipFile(archive) as source:
-        infos = source.infolist()
-        contents = {info.filename: source.read(info.filename) for info in infos}
-    manifest = json.loads(contents[EXPORT_MANIFEST_FILENAME])
-    identity = f"member-{len(manifest['members']):04d}"
-    manifest["members"].append(
-        {
-            "archive_identity": identity,
-            "restore_relative": restore_relative,
-            "kind": "directory",
-            "files": [{"path": relative_path, "sha256": hashlib.sha256(content).hexdigest()}],
-        }
-    )
-    name = f"{identity}/{relative_path}"
-    contents[name] = content
-    contents[EXPORT_MANIFEST_FILENAME] = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    ).encode()
-    with zipfile.ZipFile(destination, "w") as output:
-        for info in infos:
-            output.writestr(info, contents[info.filename])
-        output.writestr(name, content)
-    os.chmod(destination, 0o600)
-    return destination
+    def execution_for(directory: str | Path, **_: object) -> object:
+        return SimpleNamespace(
+            execution_id=execution_id,
+            directory=Path(directory),
+            manifest=execution_manifest,
+        )
 
+    def freeze_for(
+        directory: str | Path,
+        *,
+        model_root: str | Path,
+        bundle_directory: str | Path,
+    ) -> _BoundedFreeze:
+        return _BoundedFreeze(
+            directory=Path(directory),
+            model_root=Path(model_root),
+            bundle_directory=Path(bundle_directory),
+            packages=tuple(
+                SimpleNamespace(
+                    model_package_id=package_id,
+                    model_path=Path(model_root) / "packages" / package_id / "model.skops",
+                )
+                for package_id in package_ids
+            ),
+        )
 
-def _rewrite_comparison_with_duplicate(archive: Path, destination: Path) -> Path:
-    with zipfile.ZipFile(archive) as source:
-        infos = source.infolist()
-        contents = {info.filename: source.read(info.filename) for info in infos}
-    manifest = json.loads(contents[EXPORT_MANIFEST_FILENAME])
-    comparison_member = next(
-        member
-        for member in manifest["members"]
-        if member["restore_relative"].startswith("reports/rsna/comparisons/comparison-")
-    )
-    identity = comparison_member["archive_identity"]
-    comparison_manifest_name = f"{identity}/manifest.json"
-    comparison_document = json.loads(contents[comparison_manifest_name])
-    duplicate_id = comparison_document["evaluation_ids"][-1]
-    comparison_document["evaluation_ids"].append(duplicate_id)
-    comparison_document["row_count"] = len(comparison_document["evaluation_ids"])
-    comparison_document["comparison_id"] = canonical_scientific_id(
-        COMPARISON_PREFIX,
-        {
-            "comparison_policy_version": COMPARISON_POLICY_VERSION,
-            "evaluation_ids": comparison_document["evaluation_ids"],
-            "columns": list(COMPARISON_COLUMNS),
+    def restored_training(
+        frozen: _BoundedFreeze,
+        *,
+        report_root: Path,
+        **_: object,
+    ) -> tuple[object, ...]:
+        return tuple(
+            SimpleNamespace(
+                model_package_id=item.model_package_id,
+                model_path=item.model_path,
+                artifact_directory=report_root / "rsna/runs" / item.model_package_id,
+            )
+            for item in frozen.packages
+        )
+
+    def restored_evaluation(
+        _execution: object,
+        *,
+        package_id: str,
+        report_root: Path,
+        private_root: Path,
+        **_: object,
+    ) -> object:
+        index = package_ids.index(package_id)
+        return SimpleNamespace(
+            model_package_id=package_id,
+            evaluation_id=evaluation_ids[index],
+            prediction_id=prediction_ids[index],
+            artifact_directory=report_root / "rsna/evaluations" / evaluation_ids[index],
+            private_prediction_directory=(
+                private_root / "predictions/rsna" / prediction_ids[index]
+            ),
+        )
+
+    def summary_for(ids: list[str], *, output_directory: Path, **_: object) -> object:
+        family = families[package_ids[evaluation_ids.index(ids[0])]]
+        return SimpleNamespace(directory=output_directory / "rsna/seed-summaries" / family)
+
+    def audit_for(_manifest_root: Path, output_root: Path, *, bundle_id: str) -> None:
+        _marker(output_root / bundle_id)
+
+    monkeypatch.setattr(rsna_preservation, "validate_execution", execution_for)
+    monkeypatch.setattr(rsna_preservation, "validate_bundle_reference", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rsna_preservation,
+        "validate_bundle_directory",
+        lambda *a, **k: {
+            "tasks": {"pneumonia": {"label_policy_version": "rsna-stage-2-target-v1"}}
         },
     )
-    comparison_member["restore_relative"] = (
-        f"reports/rsna/comparisons/{comparison_document['comparison_id']}"
+    monkeypatch.setattr(rsna_preservation, "validate_freeze", freeze_for)
+    monkeypatch.setattr(rsna_preservation, "validate_execution_closure", lambda *a, **k: None)
+    monkeypatch.setattr(rsna_preservation, "_restored_training_derivatives", restored_training)
+    monkeypatch.setattr(
+        rsna_preservation,
+        "_load_evaluation_record_from_established_context",
+        restored_evaluation,
     )
-    replacements = {
-        comparison_manifest_name: (
-            json.dumps(comparison_document, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        ).encode(),
-        f"{identity}/table.csv": _duplicate_last_line(contents[f"{identity}/table.csv"]),
-        f"{identity}/table.md": _duplicate_last_line(contents[f"{identity}/table.md"]),
-    }
-    for file_document in comparison_member["files"]:
-        name = f"{identity}/{file_document['path']}"
-        if name in replacements:
-            contents[name] = replacements[name]
-            file_document["sha256"] = hashlib.sha256(contents[name]).hexdigest()
-    contents[EXPORT_MANIFEST_FILENAME] = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    ).encode()
-    with zipfile.ZipFile(destination, "w") as output:
-        for info in infos:
-            output.writestr(info, contents[info.filename])
-    os.chmod(destination, 0o600)
-    return destination
+    monkeypatch.setattr(
+        rsna_preservation,
+        "validate_rsna_model_package",
+        lambda _root, package_id: {"family_id": families[package_id]},
+    )
+    monkeypatch.setattr(rsna_preservation, "publish_seed_summary", summary_for)
+    monkeypatch.setattr(
+        rsna_preservation,
+        "validate_localization_report",
+        lambda directory, **kwargs: Path(directory),
+    )
+    monkeypatch.setattr(
+        rsna_preservation,
+        "regenerate_comparison",
+        lambda ids, *, output_directory, **kwargs: SimpleNamespace(
+            directory=Path(output_directory) / "rsna/comparisons/comparison",
+            manifest={"evaluation_ids": list(ids)},
+        ),
+    )
+    monkeypatch.setattr(rsna_preservation, "generate_rsna_audit", audit_for)
+
+    execution = execution_for(execution_directory)
+    frozen = freeze_for(
+        freeze_directory,
+        model_root=model_root,
+        bundle_directory=bundle,
+    )
+    return campaign_export_members(
+        execution=execution,
+        freeze=frozen,
+        training_results=tuple(training_results),
+        evaluations=tuple(evaluations),
+        summaries=summaries,
+        localization=localization,
+        comparison=comparison,
+        audit_directory=audit,
+        campaign_log=campaign_log,
+        private_root=private_root,
+        report_root=report_root,
+    )
 
 
-def _duplicate_last_line(content: bytes) -> bytes:
-    lines = content.splitlines(keepends=True)
-    return b"".join((*lines, lines[-1]))
+def test_training_reports_are_preserved_as_derivatives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    members = _bounded_closure(tmp_path, monkeypatch)
+    reports = [
+        member for member in members if member.restore_relative.is_relative_to("reports/rsna/runs")
+    ]
+    assert len(reports) == 2
+    assert all(member.role == "derivative" for member in reports)
+    packages = [
+        member
+        for member in members
+        if member.restore_relative.is_relative_to("models/rsna/packages")
+    ]
+    assert len(packages) == 2
+    assert all(member.role == "scientific_authority" for member in packages)
+
+
+def _archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    omit_active_receipt: bool = False,
+    mismatch_active_receipt: bool = False,
+    add_foreign_member: bool = False,
+) -> Path:
+    live = tmp_path / "live"
+    members = list(_bounded_closure(live, monkeypatch))
+    if omit_active_receipt:
+        members = [
+            member
+            for member in members
+            if member.restore_relative != Path("private/control/rsna/active-execution.json")
+        ]
+    if mismatch_active_receipt:
+        active = live / "private/control/rsna/active-execution.json"
+        active.write_bytes(
+            canonical_json_bytes(
+                {"schema_version": 1, "execution_id": "rsna-execution-" + "9" * 64}
+            )
+        )
+    if add_foreign_member:
+        foreign = _marker(live / "foreign")
+        members.append(PreservationMember(foreign, Path("foreign")))
+    return export_and_verify(
+        members=tuple(members),
+        export_root=tmp_path / "export",
+        backup_root=tmp_path / "backup",
+        export_name="bounded-rsna-closure",
+    )
+
+
+def test_rsna_restoration_composes_domain_validators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path, monkeypatch)
+
+    restore_and_validate_export(
+        archive,
+        restoration_validator=validate_restored_rsna_campaign,
+    )
+
+
+def test_restoration_passes_bundle_cohort_and_frozen_cxr_members_to_localization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path, monkeypatch)
+    calls = []
+
+    def reject_localization(directory: Path, **kwargs: object) -> Path:
+        calls.append(directory)
+        assert kwargs["expected_positive_sample_ids"] == ("rsna:positive",)
+        assert kwargs["expected_model_package_ids"] == ("model-package-" + "c" * 64,)
+        raise ValueError("Localization evidence rejected")
+
+    monkeypatch.setattr(rsna_preservation, "validate_localization_report", reject_localization)
+    with pytest.raises(ValueError, match="Localization evidence rejected"):
+        restore_and_validate_export(
+            archive,
+            restoration_validator=validate_restored_rsna_campaign,
+        )
+    assert len(calls) == 1
+
+
+def test_real_rsna_restoration_validator_rejects_missing_required_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path, monkeypatch, omit_active_receipt=True)
+
+    with pytest.raises(ManifestBuildError, match="active execution receipt"):
+        restore_and_validate_export(
+            archive,
+            restoration_validator=validate_restored_rsna_campaign,
+        )
+
+
+def test_real_rsna_restoration_validator_rejects_foreign_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path, monkeypatch, add_foreign_member=True)
+
+    with pytest.raises(ManifestBuildError, match="outside its exact closure"):
+        restore_and_validate_export(
+            archive,
+            restoration_validator=validate_restored_rsna_campaign,
+        )
+
+
+def test_real_rsna_restoration_validator_rejects_wrong_active_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _archive(tmp_path, monkeypatch, mismatch_active_receipt=True)
+
+    with pytest.raises(ManifestBuildError, match="active execution receipt is invalid"):
+        restore_and_validate_export(
+            archive,
+            restoration_validator=validate_restored_rsna_campaign,
+        )

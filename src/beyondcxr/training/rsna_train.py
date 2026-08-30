@@ -23,6 +23,7 @@ from beyondcxr.utils.operational_logging import add_logging_argument, configure_
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Experiment YAML file")
+    parser.add_argument("--bundle-id", required=True, help="Validated dataset bundle identity")
     parser.add_argument("--seed", type=int, required=True, help="Execution seed")
     parser.add_argument(
         "--tracking-uri",
@@ -42,7 +43,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
-        config = with_runtime(load_experiment_config(args.config), seed=args.seed)
+        config = with_runtime(
+            load_experiment_config(args.config, bundle_id=args.bundle_id), seed=args.seed
+        )
         if config.family.family_id == "cxr_metadata_concat":
             if not args.source_cxr_package_id:
                 raise ValueError("Fusion training requires --source-cxr-package-id")

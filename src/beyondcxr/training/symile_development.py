@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -21,8 +21,10 @@ from beyondcxr.data.symile_preprocess import (
     LAB_ECDF_POLICY_VERSION,
     LAB_FEATURE_COLUMNS,
     SymileLabEcdfTransformer,
+    load_symile_lab_preprocessor,
 )
 from beyondcxr.data.symile_schemas import OUTER_FOLDS, REPEAT_SEEDS
+from beyondcxr.data.symile_source import DevelopmentReleaseAsset
 from beyondcxr.models.cxr_baseline import (
     CxrBinaryClassifier,
     StandardCxrEncoder,
@@ -48,6 +50,7 @@ from beyondcxr.training.neural import (
     SelectionMetricName,
     build_evaluation_loader,
     build_image_loaders,
+    configure_neural_determinism,
     deterministic_inference,
     fit_two_stage_binary_model,
     seed_neural_runtime,
@@ -63,6 +66,16 @@ from beyondcxr.training.symile_data import (
     materialize_outer_fold,
 )
 from beyondcxr.training.symile_ecg_data import SymileEcgStore, SymileTriModalDataset
+from beyondcxr.training.symile_execution import (
+    ValidatedSymileProspectiveMutation,
+    build_symile_formal_preflight,
+    require_symile_prospective_mutation,
+    require_symile_prospective_path,
+    symile_prospective_mutation,
+    validate_active_symile_execution,
+    validate_current_symile_execution,
+    validate_symile_lifecycle,
+)
 from beyondcxr.training.symile_families import (
     SYMILE_ALL_FUSION_FAMILIES,
     SYMILE_ALL_NEURAL_FAMILIES,
@@ -73,29 +86,37 @@ from beyondcxr.training.symile_statistics import metrics as symile_headline_metr
 from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
+    discover_repository_root,
     environment_provenance,
-    git_revision,
     log_source_config,
     serialize_modalities,
     tracked_run,
-    uv_lock_sha256,
 )
 from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.package_identity import package_scientific_config_payload
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
     build_prediction_table,
     publish_prediction_evidence,
+    validate_prediction_evidence,
 )
+from beyondcxr.utils.provenance import git_revision, uv_lock_sha256
+from beyondcxr.utils.publication import is_publication_staging_directory
+from beyondcxr.utils.skops_io import load_skops
 from beyondcxr.utils.symile_publication import (
+    LAB_PREPROCESSOR_FILENAME,
     NEURAL_MODEL_FILENAME,
+    TABULAR_MODEL_FILENAME,
     ValidatedDevelopmentResult,
     ValidatedFoldPackage,
     load_symile_neural_checkpoint,
     neural_checkpoint_document,
     publish_development_result,
     publish_fold_package,
+    reconstruct_fold_neural_model,
     validate_development_result,
     validate_fold_package,
+    validate_fold_prediction_pair,
 )
 
 
@@ -109,6 +130,7 @@ class SymileFoldExecutionContext:
     loader_execution: LoaderExecutionPolicy | None
     git_commit: str
     dependency_lock_sha256: str
+    python_version: str
     source_cxr_folds: Mapping[tuple[int, int], ValidatedFoldPackage]
     source_cxr_development_id: str | None
     ecg_store: SymileEcgStore | None = None
@@ -125,12 +147,30 @@ class CompletedSymileFold:
 def run_symile_development(
     config: ExperimentConfig,
     *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
     source_cxr_development_id: str | None = None,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     execution: LoaderExecutionPolicy | None = None,
     repository_root: str | Path = ".",
+    development_assets: tuple[DevelopmentReleaseAsset, ...] | None = None,
 ) -> ValidatedDevelopmentResult:
     """Execute exactly 3 x 5 folds and publish one complete family authority."""
+    require_symile_prospective_mutation(prospective_mutation)
+    require_symile_prospective_path(
+        prospective_mutation,
+        config.runtime.model_directory,
+        "Symile development model root",
+    )
+    require_symile_prospective_path(
+        prospective_mutation,
+        config.runtime.report_directory,
+        "Symile development report root",
+    )
+    require_symile_prospective_path(
+        prospective_mutation,
+        config.runtime.private_output_directory,
+        "Symile development private root",
+    )
     family_id = config.family.family_id
     _validate_source_argument(family_id, source_cxr_development_id)
     commit, dirty = git_revision(repository_root)
@@ -154,9 +194,17 @@ def run_symile_development(
             num_workers=config.runtime.num_workers,
             pin_memory=runtime.pin_memory_effective,
         )
-        cxr_store = SymileCxrStore(data.bundle, config.runtime.source_root)
+        cxr_store = SymileCxrStore(
+            data.bundle,
+            config.runtime.source_root,
+            development_assets=development_assets,
+        )
     ecg_store = (
-        SymileEcgStore(data.bundle, config.runtime.source_root)
+        SymileEcgStore(
+            data.bundle,
+            config.runtime.source_root,
+            development_assets=development_assets,
+        )
         if family_id == SYMILE_ECG_GATED_FAMILY and config.runtime.source_root is not None
         else None
     )
@@ -173,12 +221,23 @@ def run_symile_development(
         loader_execution=loader_execution,
         git_commit=commit,
         dependency_lock_sha256=lock_hash,
+        python_version=str(
+            prospective_mutation.lifecycle.current_execution.execution.manifest[
+                "framework_versions"
+            ]["python"]
+        ),
         source_cxr_folds=source_folds,
         source_cxr_development_id=source_cxr_development_id,
         ecg_store=ecg_store,
     )
     completed = [
-        execute_symile_outer_fold(config, context, repeat_seed=seed, outer_fold=fold)
+        execute_symile_outer_fold(
+            config,
+            context,
+            prospective_mutation=prospective_mutation,
+            repeat_seed=seed,
+            outer_fold=fold,
+        )
         for seed in REPEAT_SEEDS
         for fold in OUTER_FOLDS
     ]
@@ -188,9 +247,9 @@ def run_symile_development(
         prediction_root=config.runtime.private_output_directory,
         manifest_root=config.runtime.manifest_directory,
         family=family_id,
-        config_semantic_sha256=config.config_semantic_sha256,
         folds=[item.package for item in completed],
         predictions=[item.prediction for item in completed],
+        prospective_mutation=prospective_mutation,
     )
 
 
@@ -198,13 +257,19 @@ def execute_symile_outer_fold(
     config: ExperimentConfig,
     context: SymileFoldExecutionContext,
     *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
     repeat_seed: int,
     outer_fold: int,
 ) -> CompletedSymileFold:
     """Fit, select, infer once, and publish one immutable outer-fold package."""
+    require_symile_prospective_mutation(prospective_mutation)
+    require_symile_prospective_path(
+        prospective_mutation,
+        config.runtime.model_directory,
+        "Symile fold model root",
+    )
     outer = materialize_outer_fold(context.data, repeat_seed=repeat_seed, outer_fold=outer_fold)
     inner = derive_inner_split(outer)
-    semantic_hash = config.config_semantic_sha256
     source = context.source_cxr_folds.get((repeat_seed, outer_fold))
     if (
         source is not None
@@ -212,6 +277,11 @@ def execute_symile_outer_fold(
     ):
         raise ManifestBuildError("Source CXR fold uses a different inner split")
     source_lineage = _source_cxr_lineage(context.source_cxr_development_id, source)
+    resumed = _resume_outer_fold(
+        config, context, outer, inner, source_lineage, prospective_mutation
+    )
+    if resumed is not None:
+        return resumed
     tags = {
         "run_kind": "training",
         "evaluation_scope": "oof",
@@ -221,14 +291,10 @@ def execute_symile_outer_fold(
         "family_id": config.family.family_id,
         "modalities": serialize_modalities(config.family.modalities),
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "cv_assignment_id": config.dataset.cv_assignment_id,
         "repeat_seed": str(repeat_seed),
         "outer_fold": str(outer_fold),
         "inner_split_id": inner.inner_split_id,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": semantic_hash,
         "git_commit": context.git_commit,
         "git_dirty": "false",
         "dependency_lock_sha256": context.dependency_lock_sha256,
@@ -259,18 +325,23 @@ def execute_symile_outer_fold(
         lineage = _fold_lineage(config, context, fit.get("pretrained_weight"))
         operational = {
             "mlflow_run_id": run_id,
+            "python_version": context.python_version,
             "runtime_provenance": (
                 context.runtime.provenance() if context.runtime is not None else None
             ),
+            "loader_execution": (
+                context.loader_execution.provenance()
+                if context.loader_execution is not None
+                else None
+            ),
         }
         published = publish_fold_package(
+            prospective_mutation=prospective_mutation,
             model_root=config.runtime.model_directory,
             family=config.family.family_id,
             repeat_seed=repeat_seed,
             outer_fold=outer_fold,
             config_bytes=config.source_bytes,
-            config_sha256=config.config_source_sha256,
-            config_semantic_sha256=semantic_hash,
             lineage=lineage,
             inner_split={
                 "inner_split_id": inner.inner_split_id,
@@ -285,12 +356,12 @@ def execute_symile_outer_fold(
             operational=operational,
         )
         prediction = publish_prediction_evidence(
+            prospective_mutation=prospective_mutation,
             private_root=config.runtime.private_output_directory,
             dataset_id="symile",
             model_package_id=published.manifest["fold_package_id"],
             task_id=config.task.task_id,
             bundle_id=config.dataset.bundle_id,
-            split_assignment_id=config.dataset.split_assignment_id,
             scope="outer_fold_oof",
             sample_ids=oof["sample_id"].to_pylist(),
             targets=oof["target"].to_pylist(),
@@ -324,6 +395,121 @@ def execute_symile_outer_fold(
     if published is None or prediction is None:
         raise RuntimeError("Symile fold lifecycle completed without its package/evidence pair")
     return CompletedSymileFold(published, prediction)
+
+
+def _resume_outer_fold(
+    config: ExperimentConfig,
+    context: SymileFoldExecutionContext,
+    outer: SymileOuterFold,
+    inner: SymileInnerSplit,
+    source_lineage: Mapping[str, object] | None,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
+) -> CompletedSymileFold | None:
+    """Resume an exact fitted coordinate, recovering only missing OOF inference."""
+    from beyondcxr.training.symile_campaign_control import validate_fold_execution_provenance
+
+    candidates = []
+    for directory, manifest in _published_fold_manifests(
+        config.runtime.model_directory / "packages"
+    ):
+        if (
+            manifest.get("family_id") == config.family.family_id
+            and manifest.get("repeat_seed") == outer.repeat_seed
+            and manifest.get("outer_fold") == outer.outer_fold
+        ):
+            package = validate_fold_package(directory)
+            manifest = package.manifest
+            expected_lineage = _fold_lineage(
+                config, context, manifest["lineage"]["pretrained_weight"]
+            )
+            if (
+                manifest["config"]["fit_config"] != package_scientific_config_payload(config)
+                or manifest["lineage"] != expected_lineage
+                or manifest["source_cxr"] != source_lineage
+                or manifest["inner_split"]
+                != {
+                    "inner_split_id": inner.inner_split_id,
+                    "inner_seed": inner.inner_seed,
+                    "policy": inner.policy,
+                }
+            ):
+                raise ManifestBuildError("Existing fold conflicts with the prospective campaign")
+            validate_fold_execution_provenance(
+                package, prospective_mutation.lifecycle.current_execution.execution.manifest
+            )
+            candidates.append(package)
+    if len(candidates) > 1:
+        raise ManifestBuildError("Symile fold selection is ambiguous")
+    if not candidates:
+        return None
+    package = candidates[0]
+    package_id = package.manifest["fold_package_id"]
+    authority = outer.holdout.assign(repeat_seed=outer.repeat_seed, outer_fold=outer.outer_fold)
+    predictions = []
+    root = config.runtime.private_output_directory / "predictions/symile/oof"
+    for directory, manifest in _published_fold_manifests(root):
+        if manifest.get("model_package_id") == package_id:
+            evidence = validate_prediction_evidence(directory, expected_model_package_id=package_id)
+            validate_fold_prediction_pair(package, evidence, authority)
+            predictions.append(evidence)
+    if len(predictions) > 1:
+        raise ManifestBuildError("Symile fold prediction selection is ambiguous")
+    if predictions:
+        return CompletedSymileFold(package, predictions[0])
+    if config.family.family_id not in SYMILE_ALL_NEURAL_FAMILIES:
+        model = load_skops(package.directory / TABULAR_MODEL_FILENAME)
+        logits = symile_tabular_logits(model, outer.holdout[list(LAB_FEATURE_COLUMNS)])
+    else:
+        checkpoint = load_symile_neural_checkpoint(package.directory / NEURAL_MODEL_FILENAME)
+        model = reconstruct_fold_neural_model(config, checkpoint)
+        if context.runtime is None or context.cxr_store is None:
+            raise ConfigError("Symile neural fold context is incomplete")
+        model.to(context.runtime.device)
+        labs = None
+        if config.family.family_id in SYMILE_ALL_FUSION_FAMILIES:
+            transformer = load_symile_lab_preprocessor(
+                package.directory / LAB_PREPROCESSOR_FILENAME
+            )
+            labs = transformer.transform(outer.holdout[list(LAB_FEATURE_COLUMNS)])
+        logits = _infer_neural_holdout(config, context, outer, model, labs)
+    evidence = publish_prediction_evidence(
+        prospective_mutation=prospective_mutation,
+        private_root=config.runtime.private_output_directory,
+        dataset_id="symile",
+        model_package_id=package_id,
+        task_id=config.task.task_id,
+        bundle_id=config.dataset.bundle_id,
+        scope="outer_fold_oof",
+        sample_ids=outer.holdout["sample_id"].astype(str).tolist(),
+        targets=outer.holdout["target"].to_numpy(dtype=np.int8),
+        logits=logits,
+        cv_assignment_id=config.dataset.cv_assignment_id,
+        repeat_seed=outer.repeat_seed,
+        outer_fold=outer.outer_fold,
+    )
+    validate_fold_prediction_pair(package, evidence, authority)
+    return CompletedSymileFold(package, evidence)
+
+
+def _published_fold_manifests(root: Path) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Inspect bounded publication coordinates before recursive candidate validation."""
+    if not root.exists() and not root.is_symlink():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise ManifestBuildError("Symile fold publication root is invalid")
+    for directory in root.iterdir():
+        if is_publication_staging_directory(directory):
+            continue
+        path = directory / "manifest.json"
+        if directory.is_symlink() or not directory.is_dir() or path.is_symlink():
+            raise ManifestBuildError("Symile fold publication member is invalid")
+        try:
+            document = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ManifestBuildError("Symile fold publication manifest is unreadable") from exc
+        if not isinstance(document, dict):
+            raise ManifestBuildError("Symile fold publication manifest is invalid")
+        yield directory, document
 
 
 def _fit_outer_fold(
@@ -480,6 +666,55 @@ def _fit_neural_outer_fold(
     )
     if not np.isclose(restored_roc_auc, fit.selected_validation_metric, rtol=0.0, atol=1e-12):
         raise ValueError("Restored Symile checkpoint does not reproduce selected AUROC")
+    logits = _infer_neural_holdout(config, context, outer, model, transformed_holdout)
+    checkpoint = neural_checkpoint_document(
+        fit.selected_state_dict,
+        selected_epoch=fit.selected_epoch,
+        selected_stage=fit.selected_stage,
+        selected_validation_roc_auc=fit.selected_validation_metric,
+    )
+    return {
+        "model": checkpoint,
+        "lab_preprocessor": lab_preprocessor,
+        "training_history": [
+            {
+                "epoch": record.global_epoch,
+                "stage": record.stage,
+                "training_loss": record.training_loss,
+                "validation_metric": record.validation_metric,
+                "encoder_learning_rate": record.encoder_learning_rate,
+                "head_learning_rate": record.head_learning_rate,
+            }
+            for record in fit.history
+        ],
+        "logits": logits,
+        "selection": {
+            "metric": "roc_auc",
+            "selected_epoch": fit.selected_epoch,
+            "selected_stage": fit.selected_stage,
+            "selected_validation_metric": fit.selected_validation_metric,
+            "best_iteration": None,
+        },
+        "pretrained_weight": pretrained,
+    }
+
+
+def _infer_neural_holdout(
+    config: ExperimentConfig,
+    context: SymileFoldExecutionContext,
+    outer: SymileOuterFold,
+    model: torch.nn.Module,
+    transformed_holdout: np.ndarray | None,
+) -> np.ndarray:
+    if config.neural is None or context.runtime is None or context.cxr_store is None:
+        raise ConfigError("Symile neural holdout context is incomplete")
+    configure_neural_determinism()
+    evaluation_transform = _transform(config, training=False)
+    input_keys = (
+        ("image", "structured", "ecg")
+        if config.family.family_id == SYMILE_ECG_GATED_FAMILY
+        else (("image",) if config.family.family_id == "cxr_densenet" else ("image", "structured"))
+    )
     if config.family.family_id == SYMILE_ECG_GATED_FAMILY:
         if context.ecg_store is None or transformed_holdout is None:
             raise ConfigError("Symile ECG holdout context is incomplete")
@@ -512,36 +747,7 @@ def _fit_neural_outer_fold(
     )
     if inference.sample_ids != tuple(outer.holdout["sample_id"].astype(str)):
         raise ManifestBuildError("Symile neural OOF inference order is invalid")
-    checkpoint = neural_checkpoint_document(
-        fit.selected_state_dict,
-        selected_epoch=fit.selected_epoch,
-        selected_stage=fit.selected_stage,
-        selected_validation_roc_auc=fit.selected_validation_metric,
-    )
-    return {
-        "model": checkpoint,
-        "lab_preprocessor": lab_preprocessor,
-        "training_history": [
-            {
-                "epoch": record.global_epoch,
-                "stage": record.stage,
-                "training_loss": record.training_loss,
-                "validation_metric": record.validation_metric,
-                "encoder_learning_rate": record.encoder_learning_rate,
-                "head_learning_rate": record.head_learning_rate,
-            }
-            for record in fit.history
-        ],
-        "logits": inference.logits,
-        "selection": {
-            "metric": "roc_auc",
-            "selected_epoch": fit.selected_epoch,
-            "selected_stage": fit.selected_stage,
-            "selected_validation_metric": fit.selected_validation_metric,
-            "best_iteration": None,
-        },
-        "pretrained_weight": pretrained,
-    }
+    return inference.logits
 
 
 def _build_neural_model(
@@ -603,13 +809,9 @@ def _resolve_source_cxr_folds(
             folds_root / reference["fold_package_id"],
             expected_fold_package_id=reference["fold_package_id"],
         )
-        if package.manifest_sha256 != reference["fold_manifest_sha256"]:
-            raise ManifestBuildError("Source CXR fold manifest hash differs from family authority")
         lineage = package.manifest["lineage"]
         required = {
             "bundle_id": config.dataset.bundle_id,
-            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-            "split_assignment_id": config.dataset.split_assignment_id,
             "cv_assignment_id": config.dataset.cv_assignment_id,
             "task_id": config.task.task_id,
             "encoder_identity": _encoder_identity(config),
@@ -635,7 +837,6 @@ def _source_cxr_lineage(
     return {
         "development_id": development_id,
         "fold_package_id": source.manifest["fold_package_id"],
-        "fold_manifest_sha256": source.manifest_sha256,
     }
 
 
@@ -646,10 +847,7 @@ def _fold_lineage(
 ) -> dict[str, object]:
     return {
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": context.data.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "cv_assignment_id": config.dataset.cv_assignment_id,
-        "cv_manifest_sha256": context.data.cv_reference.manifest_sha256,
         "task_id": config.task.task_id,
         "git_commit": context.git_commit,
         "dependency_lock_sha256": context.dependency_lock_sha256,
@@ -711,6 +909,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--source-cxr-development-id", default=None)
     parser.add_argument("--tracking-uri", default=DEFAULT_TRACKING_URI)
+    parser.add_argument("--backup-root", type=Path, required=True)
     add_logging_argument(parser)
     return parser
 
@@ -719,14 +918,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
+        repository_root = discover_repository_root()
         config = load_symile_development_config(args.config)
         if config.family.family_id not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
             raise ConfigError("The public development command is limited to the six core families")
-        result = run_symile_development(
-            config,
-            source_cxr_development_id=args.source_cxr_development_id,
-            tracking_uri=args.tracking_uri,
+        execution = validate_active_symile_execution(repository_root / "private/control/symile")
+        config = load_symile_development_config(args.config, **execution.manifest["dataset"])
+        current = validate_current_symile_execution(
+            execution,
+            build_symile_formal_preflight(repository_root, **execution.manifest["dataset"]),
         )
+        lifecycle = validate_symile_lifecycle(
+            current,
+            repository_root=repository_root,
+            private_root=repository_root / "private",
+            backup_root=args.backup_root,
+        )
+        with symile_prospective_mutation(lifecycle) as prospective_mutation:
+            result = run_symile_development(
+                config,
+                prospective_mutation=prospective_mutation,
+                source_cxr_development_id=args.source_cxr_development_id,
+                tracking_uri=args.tracking_uri,
+                repository_root=repository_root,
+            )
     except (ConfigError, ManifestBuildError, OSError, RuntimeError, ValueError) as exc:
         print(f"Symile development failed: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -735,7 +950,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "family_id": result.manifest["family_id"],
                 "development_id": result.manifest["development_id"],
-                "development_manifest_sha256": result.manifest_sha256,
                 "report_directory": result.directory.as_posix(),
             },
             indent=2,

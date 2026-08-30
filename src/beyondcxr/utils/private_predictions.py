@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -16,19 +15,19 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
+from beyondcxr.data.hashing import LogicalTableContract, logical_table_sha256, sha256_file
 from beyondcxr.data.symile_schemas import (
     LABEL_POLICY_VERSION,
     OUTER_FOLDS,
     REPEAT_SEEDS,
     TASK_ID,
 )
-from beyondcxr.utils.package_identity import canonical_scientific_id
 from beyondcxr.utils.publication import (
     install_immutable_directory,
     staging_directory,
     validate_path_component,
 )
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 
 PREDICTION_SCHEMA_VERSION = 1
 PREDICTION_PREFIX = "prediction-"
@@ -42,6 +41,13 @@ PREDICTION_SCHEMA = pa.schema(
         pa.field("probability", pa.float64(), nullable=False),
     ]
 )
+_PREDICTION_TABLE_CONTRACT = LogicalTableContract(
+    "private.predictions",
+    1,
+    PREDICTION_SCHEMA,
+    ("sample_id",),
+    ("sample_id",),
+)
 _MANIFEST_FIELDS = {
     "prediction_schema_version",
     "prediction_id",
@@ -49,17 +55,18 @@ _MANIFEST_FIELDS = {
     "model_package_id",
     "task_id",
     "bundle_id",
-    "split_assignment_id",
     "scope",
     "cv_assignment_id",
     "repeat_seed",
     "outer_fold",
-    "logical_arrow_sha256",
+    "prediction_table_sha256",
     "row_count",
     "prediction_file_sha256",
 }
-_TEST_CONTROL_FIELD = "authorized_by_pretest_freeze_id"
+_HELD_OUT_CONTROL_FIELD = "authorized_by_freeze_id"
+_HELD_OUT_PUBLICATION_FIELD = "held_out_publication"
 _SYMILE_TEST_SEMANTIC_FIELDS = {"label_policy_version", "inference_policy"}
+_HELD_OUT_PUBLICATION_GUARD = object()
 SYMILE_TEST_INFERENCE_POLICY = {
     "inference_policy_schema_version": 1,
     "package_scope": "single_package",
@@ -77,7 +84,6 @@ class ValidatedPredictionEvidence:
 
     directory: Path
     manifest: Mapping[str, Any]
-    manifest_sha256: str
     predictions: pa.Table
     created: bool = False
 
@@ -85,6 +91,23 @@ class ValidatedPredictionEvidence:
     def prediction_id(self) -> str:
         """Return the validated semantic prediction identity."""
         return str(self.manifest["prediction_id"])
+
+
+@dataclass(frozen=True)
+class ValidatedHeldOutPublicationAuthority:
+    """Live study authority bound to one package and canonical held-out cohort."""
+
+    dataset_id: str
+    model_package_id: str
+    task_id: str
+    bundle_id: str
+    freeze_id: str
+    sample_ids: tuple[str, ...]
+    targets: tuple[int, ...]
+    publication_record: Mapping[str, object]
+    _authorization: object
+    _projection: object | None
+    _guard: object
 
 
 def build_prediction_table(
@@ -129,7 +152,6 @@ def publish_prediction_evidence(
     model_package_id: str,
     task_id: str,
     bundle_id: str,
-    split_assignment_id: str,
     scope: str,
     sample_ids: Sequence[str],
     targets: Sequence[int] | np.ndarray,
@@ -139,7 +161,66 @@ def publish_prediction_evidence(
     outer_fold: int | None = None,
     label_policy_version: str | None = None,
     inference_policy: Mapping[str, object] | None = None,
-    authorized_by_pretest_freeze_id: str | None = None,
+    authorized_by_freeze_id: str | None = None,
+    prospective_mutation: object | None = None,
+) -> ValidatedPredictionEvidence:
+    """Publish one immutable prediction object under logical scientific identity."""
+    if _is_held_out_prediction(dataset_id, scope):
+        raise PermissionError(
+            "Held-out prediction publication requires a study-specific validated authority"
+        )
+    return _publish_prediction_evidence(
+        private_root=private_root,
+        dataset_id=dataset_id,
+        model_package_id=model_package_id,
+        task_id=task_id,
+        bundle_id=bundle_id,
+        scope=scope,
+        sample_ids=sample_ids,
+        targets=targets,
+        logits=logits,
+        cv_assignment_id=cv_assignment_id,
+        repeat_seed=repeat_seed,
+        outer_fold=outer_fold,
+        label_policy_version=label_policy_version,
+        inference_policy=inference_policy,
+        authorized_by_freeze_id=authorized_by_freeze_id,
+        prospective_mutation=prospective_mutation,
+    )
+
+
+def _publish_held_out_prediction_evidence(
+    *,
+    publication_authority: ValidatedHeldOutPublicationAuthority,
+    **kwargs: Any,
+) -> ValidatedPredictionEvidence:
+    """Publish held-out evidence under reauthenticated package/cohort authority."""
+    _require_held_out_publication_authority(publication_authority, kwargs)
+    return _publish_prediction_evidence(
+        held_out_authority=publication_authority,
+        **kwargs,
+    )
+
+
+def _publish_prediction_evidence(
+    *,
+    private_root: str | Path,
+    dataset_id: str,
+    model_package_id: str,
+    task_id: str,
+    bundle_id: str,
+    scope: str,
+    sample_ids: Sequence[str],
+    targets: Sequence[int] | np.ndarray,
+    logits: Sequence[float] | np.ndarray,
+    cv_assignment_id: str | None = None,
+    repeat_seed: int | None = None,
+    outer_fold: int | None = None,
+    label_policy_version: str | None = None,
+    inference_policy: Mapping[str, object] | None = None,
+    authorized_by_freeze_id: str | None = None,
+    prospective_mutation: object | None = None,
+    held_out_authority: ValidatedHeldOutPublicationAuthority | None = None,
 ) -> ValidatedPredictionEvidence:
     """Publish one immutable prediction object under logical scientific identity."""
     _validate_prediction_coordinate(
@@ -147,30 +228,65 @@ def publish_prediction_evidence(
         model_package_id=model_package_id,
         task_id=task_id,
         bundle_id=bundle_id,
-        split_assignment_id=split_assignment_id,
         scope=scope,
         cv_assignment_id=cv_assignment_id,
         repeat_seed=repeat_seed,
         outer_fold=outer_fold,
         label_policy_version=label_policy_version,
         inference_policy=inference_policy,
-        authorized_by_pretest_freeze_id=authorized_by_pretest_freeze_id,
+        authorized_by_freeze_id=authorized_by_freeze_id,
     )
+    if dataset_id == "symile" and scope == "outer_fold_oof":
+        from beyondcxr.training.symile_execution import (
+            require_symile_prospective_mutation,
+            require_symile_prospective_path,
+        )
+
+        require_symile_prospective_mutation(prospective_mutation)
+        require_symile_prospective_path(
+            prospective_mutation,
+            private_root,
+            "Symile development prediction root",
+        )
+    elif prospective_mutation is not None:
+        raise ValueError("Prospective mutation authority is invalid for this prediction scope")
+    if _is_held_out_prediction(dataset_id, scope):
+        if held_out_authority is None:
+            raise PermissionError("Held-out prediction publication requires live study authority")
+        _require_held_out_publication_authority(
+            held_out_authority,
+            {
+                "dataset_id": dataset_id,
+                "model_package_id": model_package_id,
+                "task_id": task_id,
+                "bundle_id": bundle_id,
+                "scope": scope,
+                "sample_ids": sample_ids,
+                "targets": targets,
+                "authorized_by_freeze_id": authorized_by_freeze_id,
+            },
+        )
+        held_out_publication = dict(held_out_authority.publication_record)
+    elif held_out_authority is not None:
+        raise ValueError("Non-held-out predictions cannot declare held-out publication")
+    else:
+        held_out_publication = None
     table = build_prediction_table(sample_ids, targets, logits)
     _validate_dataset_sample_ids(dataset_id, table["sample_id"].to_pylist())
-    logical_hash = logical_arrow_sha256(table)
+    logical_hash = logical_table_sha256(table, _PREDICTION_TABLE_CONTRACT)
     semantic = {
         "dataset_id": dataset_id,
         "model_package_id": model_package_id,
         "task_id": task_id,
         "bundle_id": bundle_id,
-        "split_assignment_id": split_assignment_id,
         "scope": scope,
         "cv_assignment_id": cv_assignment_id,
         "repeat_seed": repeat_seed,
         "outer_fold": outer_fold,
-        "logical_arrow_sha256": logical_hash,
+        "prediction_table_sha256": logical_hash,
     }
+    if _is_held_out_prediction(dataset_id, scope):
+        semantic[_HELD_OUT_CONTROL_FIELD] = authorized_by_freeze_id
     if dataset_id == "symile" and scope == "test":
         if label_policy_version is None or inference_policy is None:
             raise ValueError("Symile test prediction policy is incomplete")
@@ -180,7 +296,9 @@ def publish_prediction_evidence(
                 "inference_policy": dict(inference_policy),
             }
         )
-    prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
+    prediction_id = canonical_scientific_id(
+        PREDICTION_PREFIX, semantic, domain="prediction", schema_version=1
+    )
     scope_root = Path(private_root) / "predictions" / dataset_id
     if scope == "outer_fold_oof":
         scope_root /= "oof"
@@ -198,10 +316,8 @@ def publish_prediction_evidence(
             "row_count": table.num_rows,
             "prediction_file_sha256": sha256_file(prediction_path),
         }
-        if dataset_id == "symile" and scope == "test":
-            if authorized_by_pretest_freeze_id is None:
-                raise ValueError("Symile test prediction authorization is missing")
-            manifest[_TEST_CONTROL_FIELD] = authorized_by_pretest_freeze_id
+        if held_out_publication is not None:
+            manifest[_HELD_OUT_PUBLICATION_FIELD] = dict(held_out_publication)
         (stage / PREDICTION_MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
@@ -211,8 +327,12 @@ def publish_prediction_evidence(
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    validated = validate_prediction_evidence(destination, expected_prediction_id=prediction_id)
-    if validated.manifest.get(_TEST_CONTROL_FIELD) != authorized_by_pretest_freeze_id:
+    validated = validate_prediction_evidence(
+        destination,
+        expected_prediction_id=prediction_id,
+        expected_authorizing_freeze_id=authorized_by_freeze_id,
+    )
+    if validated.manifest.get(_HELD_OUT_CONTROL_FIELD) != authorized_by_freeze_id:
         raise ValueError("Existing prediction evidence has different control provenance")
     return replace(validated, created=created)
 
@@ -222,6 +342,7 @@ def validate_prediction_evidence(
     *,
     expected_prediction_id: str | None = None,
     expected_model_package_id: str | None = None,
+    expected_authorizing_freeze_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedPredictionEvidence:
     """Validate physical integrity and canonical logical prediction identity."""
@@ -254,14 +375,13 @@ def validate_prediction_evidence(
         model_package_id=manifest["model_package_id"],
         task_id=manifest["task_id"],
         bundle_id=manifest["bundle_id"],
-        split_assignment_id=manifest["split_assignment_id"],
         scope=manifest["scope"],
         cv_assignment_id=manifest["cv_assignment_id"],
         repeat_seed=manifest["repeat_seed"],
         outer_fold=manifest["outer_fold"],
         label_policy_version=manifest.get("label_policy_version"),
         inference_policy=manifest.get("inference_policy"),
-        authorized_by_pretest_freeze_id=manifest.get(_TEST_CONTROL_FIELD),
+        authorized_by_freeze_id=manifest.get(_HELD_OUT_CONTROL_FIELD),
     )
     prediction_path = root / PREDICTIONS_FILENAME
     if sha256_file(prediction_path) != manifest["prediction_file_sha256"]:
@@ -274,7 +394,8 @@ def validate_prediction_evidence(
         raise ValueError("Prediction row count is invalid")
     if (
         table.num_rows != row_count
-        or logical_arrow_sha256(table) != manifest["logical_arrow_sha256"]
+        or logical_table_sha256(table, _PREDICTION_TABLE_CONTRACT)
+        != manifest["prediction_table_sha256"]
     ):
         raise ValueError("Prediction logical content differs from its manifest")
     semantic = {
@@ -288,9 +409,16 @@ def validate_prediction_evidence(
             "prediction_file_sha256",
         }
     }
+    if _is_held_out_prediction(manifest["dataset_id"], manifest["scope"]):
+        semantic[_HELD_OUT_CONTROL_FIELD] = manifest[_HELD_OUT_CONTROL_FIELD]
+        _validate_held_out_publication_record(
+            manifest["dataset_id"], manifest.get(_HELD_OUT_PUBLICATION_FIELD)
+        )
     if manifest["dataset_id"] == "symile" and manifest["scope"] == "test":
         semantic.update({key: manifest[key] for key in _SYMILE_TEST_SEMANTIC_FIELDS})
-    prediction_id = canonical_scientific_id(PREDICTION_PREFIX, semantic)
+    prediction_id = canonical_scientific_id(
+        PREDICTION_PREFIX, semantic, domain="prediction", schema_version=1
+    )
     if manifest["prediction_id"] != prediction_id:
         raise ValueError("Prediction identity differs from logical content")
     if expected_prediction_id is not None and prediction_id != expected_prediction_id:
@@ -300,12 +428,16 @@ def validate_prediction_evidence(
         and manifest["model_package_id"] != expected_model_package_id
     ):
         raise ValueError("Prediction evidence is bound to a different model package")
+    if (
+        expected_authorizing_freeze_id is not None
+        and manifest.get(_HELD_OUT_CONTROL_FIELD) != expected_authorizing_freeze_id
+    ):
+        raise ValueError("Prediction evidence is bound to a different scientific freeze")
     if enforce_directory_name and root.name != prediction_id:
         raise ValueError("Prediction directory differs from its semantic identity")
     return ValidatedPredictionEvidence(
         root,
         manifest,
-        hashlib.sha256(manifest_bytes).hexdigest(),
         table,
     )
 
@@ -358,18 +490,16 @@ def _validate_prediction_coordinate(
     model_package_id: object,
     task_id: object,
     bundle_id: object,
-    split_assignment_id: object,
     scope: object,
     cv_assignment_id: object,
     repeat_seed: object,
     outer_fold: object,
     label_policy_version: object,
     inference_policy: object,
-    authorized_by_pretest_freeze_id: object,
+    authorized_by_freeze_id: object,
 ) -> None:
     validate_path_component(task_id, "prediction task_id")
     _require_identity(bundle_id, ("bundle-",), "bundle")
-    _require_identity(split_assignment_id, ("split-assignment-",), "split assignment")
     if dataset_id == "rsna":
         if task_id != "pneumonia":
             raise ValueError("RSNA prediction task is invalid")
@@ -382,10 +512,10 @@ def _validate_prediction_coordinate(
                 outer_fold,
                 label_policy_version,
                 inference_policy,
-                authorized_by_pretest_freeze_id,
             )
         ):
             raise ValueError("Held-out prediction coordinate is invalid")
+        _require_identity(authorized_by_freeze_id, ("rsna-freeze-",), "RSNA scientific freeze")
         return
     if dataset_id != "symile":
         raise ValueError("Prediction dataset_id is unsupported")
@@ -398,7 +528,7 @@ def _validate_prediction_coordinate(
             for value in (
                 label_policy_version,
                 inference_policy,
-                authorized_by_pretest_freeze_id,
+                authorized_by_freeze_id,
             )
         ):
             raise ValueError("OOF predictions cannot declare test authorization")
@@ -415,7 +545,7 @@ def _validate_prediction_coordinate(
         return
     if scope == "test":
         _require_identity(model_package_id, ("final-package-",), "model package")
-        _require_identity(authorized_by_pretest_freeze_id, ("pretest-freeze-",), "pretest freeze")
+        _require_identity(authorized_by_freeze_id, ("pretest-freeze-",), "pretest freeze")
         inference_schema_version = (
             inference_policy.get("inference_policy_schema_version")
             if isinstance(inference_policy, Mapping)
@@ -437,9 +567,170 @@ def _validate_prediction_coordinate(
 
 def _manifest_fields(manifest: Mapping[str, object]) -> set[str]:
     fields = set(_MANIFEST_FIELDS)
+    if _is_held_out_prediction(manifest.get("dataset_id"), manifest.get("scope")):
+        fields.add(_HELD_OUT_CONTROL_FIELD)
+        fields.add(_HELD_OUT_PUBLICATION_FIELD)
     if manifest.get("dataset_id") == "symile" and manifest.get("scope") == "test":
-        fields.update(_SYMILE_TEST_SEMANTIC_FIELDS | {_TEST_CONTROL_FIELD})
+        fields.update(_SYMILE_TEST_SEMANTIC_FIELDS)
     return fields
+
+
+def _is_held_out_prediction(dataset_id: object, scope: object) -> bool:
+    return dataset_id in {"rsna", "symile"} and scope == "test"
+
+
+def _validate_held_out_publication_record(dataset_id: object, value: object) -> None:
+    if dataset_id == "rsna":
+        expected = {"authority_kind", "execution_id"}
+        prefix = "rsna-execution-"
+        kind = "rsna-frozen-campaign-v1"
+    elif dataset_id == "symile":
+        expected = {"authority_kind", "execution_id"}
+        prefix = "symile-execution-"
+        kind = "symile-opened-campaign-v1"
+    else:
+        raise ValueError("Held-out publication dataset is invalid")
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected
+        or value.get("authority_kind") != kind
+        or not isinstance(value.get("execution_id"), str)
+        or not str(value["execution_id"]).startswith(prefix)
+        or len(str(value["execution_id"])) != len(prefix) + 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in str(value["execution_id"])[len(prefix) :]
+        )
+    ):
+        raise ValueError("Held-out publication authority is invalid")
+
+
+def authorize_rsna_held_out_prediction_publication(
+    authorization: object,
+    *,
+    model_package_id: str,
+) -> ValidatedHeldOutPublicationAuthority:
+    """Bind current RSNA execution/freeze authority to its canonical test cohort."""
+    from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
+    from beyondcxr.training.rsna_evaluation_result import validate_rsna_model_package
+    from beyondcxr.training.rsna_validation_evidence import _derive_canonical_held_out_cohort
+
+    capability = require_validated_rsna_held_out(authorization)
+    capability.require(model_package_id)
+    package = validate_rsna_model_package(capability.freeze.model_root, model_package_id)
+    cohort = _derive_canonical_held_out_cohort(capability.freeze.bundle_directory, package)
+    return ValidatedHeldOutPublicationAuthority(
+        dataset_id="rsna",
+        model_package_id=model_package_id,
+        task_id=str(package["task_id"]),
+        bundle_id=str(package["bundle_id"]),
+        freeze_id=capability.freeze.freeze_id,
+        sample_ids=cohort.sample_ids,
+        targets=cohort.targets,
+        publication_record={
+            "authority_kind": "rsna-frozen-campaign-v1",
+            "execution_id": capability.current_execution.execution.execution_id,
+        },
+        _authorization=authorization,
+        _projection=None,
+        _guard=_HELD_OUT_PUBLICATION_GUARD,
+    )
+
+
+def authorize_symile_held_out_prediction_publication(
+    authorization: object,
+    *,
+    model_package_id: str,
+    projection: object,
+) -> ValidatedHeldOutPublicationAuthority:
+    """Bind current Symile opening authority to one final package and test projection."""
+    from beyondcxr.training.symile_campaign_control import (
+        require_validated_held_out_capability,
+        validated_pretest_freeze_manifest,
+    )
+    from beyondcxr.training.symile_test_data import require_held_out_evaluation_projection
+
+    capability = require_validated_held_out_capability(authorization)
+    held_out = require_held_out_evaluation_projection(projection, freeze=capability.freeze)
+    frozen_packages = {
+        str(item["package_id"])
+        for item in validated_pretest_freeze_manifest(capability.freeze)["final_packages"]
+    }
+    if model_package_id not in frozen_packages:
+        raise PermissionError("Symile held-out publication package is not frozen")
+    targets = held_out.prediction_targets()
+    return ValidatedHeldOutPublicationAuthority(
+        dataset_id="symile",
+        model_package_id=model_package_id,
+        task_id=held_out.task_id,
+        bundle_id=held_out.bundle_id,
+        freeze_id=capability.freeze.freeze_id,
+        sample_ids=tuple(targets["sample_id"].astype(str)),
+        targets=tuple(int(value) for value in targets["target"]),
+        publication_record={
+            "authority_kind": "symile-opened-campaign-v1",
+            "execution_id": capability.execution.execution_id,
+        },
+        _authorization=authorization,
+        _projection=projection,
+        _guard=_HELD_OUT_PUBLICATION_GUARD,
+    )
+
+
+def _require_held_out_publication_authority(
+    authority: object,
+    values: Mapping[str, object],
+) -> ValidatedHeldOutPublicationAuthority:
+    if (
+        not isinstance(authority, ValidatedHeldOutPublicationAuthority)
+        or authority._guard is not _HELD_OUT_PUBLICATION_GUARD
+    ):
+        raise PermissionError("Held-out prediction publication authority is invalid")
+    expected = _reauthenticate_held_out_publication_authority(authority)
+    if (
+        authority.dataset_id != expected.dataset_id
+        or authority.model_package_id != expected.model_package_id
+        or authority.task_id != expected.task_id
+        or authority.bundle_id != expected.bundle_id
+        or authority.freeze_id != expected.freeze_id
+        or authority.sample_ids != expected.sample_ids
+        or authority.targets != expected.targets
+        or dict(authority.publication_record) != dict(expected.publication_record)
+    ):
+        raise PermissionError("Held-out prediction publication authority is stale or forged")
+    sample_ids = tuple(str(value) for value in values.get("sample_ids", ()))
+    targets = tuple(int(value) for value in np.asarray(values.get("targets", ())).reshape(-1))
+    if (
+        values.get("scope") != "test"
+        or values.get("dataset_id") != authority.dataset_id
+        or values.get("model_package_id") != authority.model_package_id
+        or values.get("task_id") != authority.task_id
+        or values.get("bundle_id") != authority.bundle_id
+        or values.get("authorized_by_freeze_id") != authority.freeze_id
+        or sample_ids != authority.sample_ids
+        or targets != authority.targets
+    ):
+        raise PermissionError("Held-out prediction publication differs from live authority")
+    _validate_held_out_publication_record(authority.dataset_id, authority.publication_record)
+    return authority
+
+
+def _reauthenticate_held_out_publication_authority(
+    authority: ValidatedHeldOutPublicationAuthority,
+) -> ValidatedHeldOutPublicationAuthority:
+    """Re-derive a publication lease from its current study lifecycle authority."""
+    if authority.dataset_id == "rsna":
+        return authorize_rsna_held_out_prediction_publication(
+            authority._authorization,
+            model_package_id=authority.model_package_id,
+        )
+    if authority.dataset_id == "symile" and authority._projection is not None:
+        return authorize_symile_held_out_prediction_publication(
+            authority._authorization,
+            model_package_id=authority.model_package_id,
+            projection=authority._projection,
+        )
+    raise PermissionError("Held-out prediction publication authority is invalid")
 
 
 def _validate_dataset_sample_ids(dataset_id: str, sample_ids: Sequence[str]) -> None:

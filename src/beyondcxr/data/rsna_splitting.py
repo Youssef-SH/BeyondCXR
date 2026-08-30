@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ import pyarrow as pa
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.rsna_schemas import PNEUMONIA_TASK_ID, RSNA_SPLIT_SCHEMA, require_exact_schema
 from beyondcxr.data.rsna_validation import pneumonia_targets
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 
 SPLIT_NAMES = ("train", "validation", "test")
 SPLIT_ALGORITHM = "patient-stratified-sha256"
@@ -71,34 +71,9 @@ class SplitConfig:
     def recipe_id(self) -> str:
         """Return the SHA-256 identity of the complete split policy."""
         self.validate()
-        return _identity("split-recipe", self.recipe_payload)
-
-
-def split_assignment_id(assignments: dict[str, str]) -> str:
-    """Fingerprint canonical sample-to-split assignments."""
-    payload = [[sample_id, assignments[sample_id]] for sample_id in sorted(assignments)]
-    return _identity("split-assignment", payload)
-
-
-def create_patient_stratified_splits(
-    samples: pa.Table,
-    labels: pa.Table,
-    config: SplitConfig | None = None,
-) -> pa.Table:
-    """Assign every sample to a deterministic patient-level stratified split."""
-    resolved = config or SplitConfig()
-    resolved.validate()
-    assignments = _create_assignments(samples, labels, resolved)
-    records = [
-        {
-            "sample_id": sample_id,
-            "split_name": assignments[sample_id],
-        }
-        for sample_id in sorted(assignments)
-    ]
-    splits = pa.Table.from_pylist(records, schema=RSNA_SPLIT_SCHEMA)
-    validate_split_table(splits, samples, labels, config=resolved)
-    return splits
+        return canonical_scientific_id(
+            "split-recipe-", self.recipe_payload, domain="split-recipe", schema_version=1
+        )
 
 
 def validate_split_table(
@@ -128,8 +103,7 @@ def validate_split_table(
         )
     assignments = {row["sample_id"]: row["split_name"] for row in split_rows}
     if config is not None:
-        config.validate()
-        expected_assignments = _create_assignments(samples, labels, config)
+        expected_assignments = _canonical_split_assignments(samples, labels, config)
         if assignments != expected_assignments:
             raise ManifestBuildError("Split rows do not match the declared split recipe")
 
@@ -162,36 +136,17 @@ def validate_split_table(
                 raise ManifestBuildError(f"Split {split_name!r} must contain both target classes")
 
 
-def split_summary(splits: pa.Table, samples: pa.Table, labels: pa.Table) -> list[dict[str, object]]:
-    """Return aggregate sample, patient, and target counts for each split."""
-    assignments = {row["sample_id"]: row["split_name"] for row in splits.to_pylist()}
-    targets = pneumonia_targets(labels)
-    patients: dict[str, set[str]] = defaultdict(set)
-    counts: Counter[tuple[str, int]] = Counter()
-    for row in samples.to_pylist():
-        split_name = assignments[row["sample_id"]]
-        patients[split_name].add(row["patient_id"])
-        counts[(split_name, targets[row["sample_id"]])] += 1
-    return [
-        {
-            "split_name": name,
-            "sample_count": counts[(name, 0)] + counts[(name, 1)],
-            "patient_count": len(patients[name]),
-            "negative_count": counts[(name, 0)],
-            "positive_count": counts[(name, 1)],
-        }
-        for name in SPLIT_NAMES
-    ]
-
-
-def _create_assignments(samples: pa.Table, labels: pa.Table, config: SplitConfig) -> dict[str, str]:
-    sample_rows = samples.to_pylist()
-    if not sample_rows:
-        raise ManifestBuildError("Cannot split an empty sample table")
+def _canonical_split_assignments(
+    samples: pa.Table,
+    labels: pa.Table,
+    config: SplitConfig,
+) -> dict[str, str]:
+    """Return deterministic sample assignments for the canonical patient-level recipe."""
+    config.validate()
     targets = pneumonia_targets(labels)
     patient_samples: dict[str, list[str]] = defaultdict(list)
     patient_targets: dict[str, set[int]] = defaultdict(set)
-    for row in sample_rows:
+    for row in samples.to_pylist():
         sample_id = row["sample_id"]
         if sample_id not in targets:
             raise ManifestBuildError(f"Sample {sample_id!r} has no pneumonia target")
@@ -252,10 +207,3 @@ def _allocate_counts(total: int, ratios: tuple[float, float, float]) -> tuple[in
             )
             counts[index] += 1
     return counts[0], counts[1], counts[2]
-
-
-def _identity(prefix: str, payload: Any) -> str:
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"{prefix}-{digest}"

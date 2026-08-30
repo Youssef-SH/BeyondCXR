@@ -9,9 +9,10 @@ from symile_campaign_test_support import (
     _synthetic_final_family_authorities,
     _synthetic_final_packages,
 )
+from symile_lifecycle_test_support import prospective_symile_mutation
 
 import beyondcxr.training.symile_campaign_control as campaign_control
-import beyondcxr.training.symile_ecg_extension_result as extension_result
+import beyondcxr.training.symile_development_decision as development_decision
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
@@ -23,7 +24,6 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     template = _freeze(tmp_path / "template")
-    core_id = "analysis-" + "a" * 64
     family_ids = {
         family: "development-" + f"{index + 1:064x}"
         for index, family in enumerate(
@@ -38,7 +38,6 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
         )
     }
     ecg_id = "development-" + "e" * 64
-    core = {"analysis_id": core_id, "family_development_ids": family_ids}
     all_development_ids = {**family_ids, "cxr_labs_ecg_gated": ecg_id}
     final_family_authorities = _synthetic_final_family_authorities(all_development_ids, template)
     ecg = ValidatedDevelopmentResult(
@@ -47,16 +46,14 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
             "development_id": ecg_id,
             "family_id": "cxr_labs_ecg_gated",
             "final_training_budget": 3,
-            "scientific_context": {"fit_config": {"family": {"family_id": "cxr_labs_ecg_gated"}}},
+            "scientific_context": {
+                "fit_config": {"family": {"family_id": "cxr_labs_ecg_gated"}},
+                "bundle_id": template.manifest["bundle_id"],
+                "cv_assignment_id": "cv-assignment-" + "c" * 64,
+                "task_id": "pneumonia_strict",
+            },
         },
-        "f" * 64,
     )
-
-    def validate_analysis(directory: Path, **kwargs: object) -> dict[str, object]:
-        expected = kwargs.get("expected_analysis_id")
-        if expected is not None and (expected != core_id or Path(directory).name != core_id):
-            raise ManifestBuildError("invalid core development analysis")
-        return core
 
     def validate_development(directory: Path, **kwargs: object) -> ValidatedDevelopmentResult:
         del kwargs
@@ -71,30 +68,33 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
                     "development_id": identity,
                     "family_id": family,
                     "final_training_budget": None if family == "labs_logistic" else 3,
-                    "scientific_context": {"fit_config": {"family": {"family_id": family}}},
+                    "scientific_context": {
+                        "fit_config": {"family": {"family_id": family}},
+                        "bundle_id": template.manifest["bundle_id"],
+                        "cv_assignment_id": "cv-assignment-" + "c" * 64,
+                        "task_id": "pneumonia_strict",
+                    },
                 },
-                "a" * 64,
             )
         raise ManifestBuildError("invalid development authority")
 
-    monkeypatch.setattr(extension_result, "validate_analysis_result", validate_analysis)
-    monkeypatch.setattr(extension_result, "validate_development_result", validate_development)
+    monkeypatch.setattr(development_decision, "validate_development_result", validate_development)
     monkeypatch.setattr(
-        extension_result,
+        development_decision,
         "final_input_projection_from_development",
         lambda fit_config: final_family_authorities[fit_config["family"]["family_id"]][
             "final_input"
         ],
     )
     monkeypatch.setattr(
-        extension_result,
+        development_decision,
         "_development_pretrained_identity",
         lambda development, family, model_root: final_family_authorities[family][
             "pretrained_scientific_identity"
         ],
     )
     monkeypatch.setattr(
-        extension_result,
+        development_decision,
         "validated_development_repeat_oof",
         lambda development, prediction_root: _repeat_oof(
             [-2.0, 1.0, -1.0, 2.0]
@@ -103,24 +103,23 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
         ),
     )
     report_root = tmp_path / "reports"
-    subgroup_id = extension_result.publish_focused_subgroup_derivative(
-        report_root=report_root, summary={"policy": {}, "strata": {}}
-    )
-    monkeypatch.setattr(
-        extension_result,
-        "_expected_focused_subgroup_derivative",
-        lambda **kwargs: subgroup_id,
-    )
-    development = extension_result.publish_ecg_extension_result(
-        report_root=report_root,
-        core_analysis_directory=tmp_path / "core-analysis",
-        ecg_development=ecg,
-        focused_subgroup_derivative=subgroup_id,
-    )
+    family_developments = {
+        family: validate_development(report_root / "development/families" / development_id)
+        for family, development_id in all_development_ids.items()
+    }
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        development = development_decision.publish_development_decision(
+            prospective_mutation=mutation,
+            report_root=report_root,
+            family_developments=family_developments,
+            model_root=tmp_path / "models/symile/development",
+            prediction_root=tmp_path / "private",
+            manifest_root=tmp_path / "data/manifests",
+        )
     packages = _synthetic_final_packages(
         tmp_path / "packages",
         template,
-        family_authorities=dict(development.manifest["final_family_authorities"]),
+        family_authorities=dict(development.manifest["selected_family_authorities"]),
     )
     package_by_path = {package.directory: package for package in packages}
     monkeypatch.setattr(
@@ -128,50 +127,51 @@ def test_complete_synthetic_pretest_authority_lifecycle_stops_before_test_open(
         "validate_final_package",
         lambda directory, **kwargs: package_by_path[Path(directory)],
     )
-    freeze = campaign_control.publish_pretest_freeze(
-        control_root=tmp_path / "control",
-        bundle=template.manifest["bundle"],
-        task=template.manifest["task"],
-        ecg_extension_result=development,
-        final_packages=packages,
-        neural_inference_runtime=template.manifest["held_out_policy"]["neural_inference_runtime"],
-        science_git_commit=template.manifest["science_git_commit"],
-        dependency_lock_sha256=template.manifest["dependency_lock_sha256"],
-    )
+    control_root = tmp_path / "private/control/symile"
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        freeze = campaign_control.publish_pretest_freeze(
+            prospective_mutation=mutation,
+            control_root=control_root,
+            bundle_id=template.manifest["bundle_id"],
+            cv_assignment_id=template.manifest["cv_assignment_id"],
+            task=template.manifest["task"],
+            development_decision=development,
+            final_packages=packages,
+        )
     restored = campaign_control.validate_pretest_freeze(
         freeze.directory,
-        ecg_extension_result=development,
+        development_decision=development,
         final_packages=packages,
     )
     assert restored.freeze_id == freeze.freeze_id
     assert len(restored.manifest["final_packages"]) == 14
-    assert not (tmp_path / "control" / "test-open.json").exists()
+    assert not (control_root / "test-open.json").exists()
+    assert not (
+        tmp_path.parent / f"{tmp_path.name}-prospective-backup" / "control/symile/test-open.json"
+    ).exists()
 
     def assert_freeze_rejects(index: int, manifest: dict[str, object], message: str) -> None:
         altered = ValidatedFinalPackage(
             packages[index].directory,
             manifest,
-            "9" * 64,
         )
         candidate = (*packages[:index], altered, *packages[index + 1 :])
         package_by_path[altered.directory] = altered
-        with pytest.raises(ManifestBuildError, match=message):
-            campaign_control.publish_pretest_freeze(
-                control_root=tmp_path / f"rejected-{index}",
-                bundle=template.manifest["bundle"],
-                task=template.manifest["task"],
-                ecg_extension_result=development,
-                final_packages=candidate,
-                neural_inference_runtime=template.manifest["held_out_policy"][
-                    "neural_inference_runtime"
-                ],
-                science_git_commit=template.manifest["science_git_commit"],
-                dependency_lock_sha256=template.manifest["dependency_lock_sha256"],
-            )
+        with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+            with pytest.raises(ManifestBuildError, match=message):
+                campaign_control.publish_pretest_freeze(
+                    prospective_mutation=mutation,
+                    control_root=control_root,
+                    bundle_id=template.manifest["bundle_id"],
+                    cv_assignment_id=template.manifest["cv_assignment_id"],
+                    task=template.manifest["task"],
+                    development_decision=development,
+                    final_packages=candidate,
+                )
         with pytest.raises(ManifestBuildError, match=message):
             campaign_control.validate_pretest_freeze(
                 freeze.directory,
-                ecg_extension_result=development,
+                development_decision=development,
                 final_packages=candidate,
             )
         package_by_path[altered.directory] = packages[index]

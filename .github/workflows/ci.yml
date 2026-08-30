@@ -36,7 +36,7 @@ jobs:
         run: uv run pytest
 
       - name: Check public release surfaces
-        run: make release-check
+        run: uv run python -m beyondcxr.release.cli check --root .
 
       - name: Build package
         run: uv build

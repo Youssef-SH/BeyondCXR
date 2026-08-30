@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -227,12 +225,10 @@ _NEURAL_FAMILIES = frozenset({"cxr_densenet", "cxr_metadata_concat", *SYMILE_ALL
 
 @dataclass(frozen=True)
 class DatasetConfig:
-    """Immutable scientific dataset and integrity witnesses."""
+    """Immutable scientific dataset authority coordinates."""
 
     dataset_id: str
-    bundle_id: str
-    bundle_manifest_sha256: str
-    split_assignment_id: str
+    bundle_id: str | None
     cv_assignment_id: str | None
 
 
@@ -334,12 +330,12 @@ class ExperimentConfig:
     runtime: RuntimeConfig
     source_path: Path
     source_bytes: bytes
-    config_source_sha256: str
-    config_semantic_sha256: str
 
 
-def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    """Load one strict canonical schema-version-1 experiment YAML."""
+def load_experiment_config(
+    path: str | Path, *, bundle_id: str | None = None, cv_assignment_id: str | None = None
+) -> ExperimentConfig:
+    """Parse scientific YAML and bind explicitly supplied bundle and CV coordinates."""
     source = Path(path)
     source_bytes, root = _read_yaml(source)
     _keys(
@@ -351,7 +347,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     version = _integer(root["config_schema_version"], "config_schema_version")
     if version != 1:
         raise ConfigError(f"Unsupported config_schema_version: {version}")
-    dataset = _dataset_config(root["dataset"])
+    dataset = _dataset_config(root["dataset"], bundle_id, cv_assignment_id)
     task = _task_config(root["task"], dataset.dataset_id)
     family = _family_config(root["family"], dataset.dataset_id)
     preprocessing = _preprocessing_config(root.get("preprocessing", {}), dataset, family)
@@ -360,7 +356,6 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     _validate_section_applicability(dataset, family, training, evaluation)
     runtime = _default_runtime(dataset.dataset_id)
     neural = _neural_config(training) if family.family_id in _NEURAL_FAMILIES else None
-    semantic = _semantic_payload(dataset, task, family, preprocessing, training, evaluation)
     return ExperimentConfig(
         version,
         dataset,
@@ -373,14 +368,14 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         runtime,
         source,
         source_bytes,
-        hashlib.sha256(source_bytes).hexdigest(),
-        _canonical_sha256(semantic),
     )
 
 
-def load_symile_development_config(path: str | Path) -> ExperimentConfig:
+def load_symile_development_config(
+    path: str | Path, *, bundle_id: str | None = None, cv_assignment_id: str | None = None
+) -> ExperimentConfig:
     """Load a canonical Symile development-family configuration."""
-    config = load_experiment_config(path)
+    config = load_experiment_config(path, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id)
     if config.dataset.dataset_id != "symile":
         raise ConfigError("Symile development requires dataset_id='symile'")
     return config
@@ -400,7 +395,7 @@ def with_runtime(
     num_workers: int | None = None,
     pin_memory_policy: str | None = None,
 ) -> ExperimentConfig:
-    """Attach operational destinations and a seed without changing config identity."""
+    """Attach runtime settings without changing normalized scientific configuration."""
     if seed is not None and (
         isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**31 - 1
     ):
@@ -456,35 +451,50 @@ def require_runtime_seed(config: ExperimentConfig) -> int:
     return config.runtime.seed
 
 
-def _dataset_config(value: object) -> DatasetConfig:
-    data = _mapping(value, "dataset")
-    _keys(
-        data,
-        required={
-            "dataset_id",
-            "bundle_id",
-            "bundle_manifest_sha256",
-            "split_assignment_id",
+def normalized_scientific_config(config: ExperimentConfig) -> dict[str, object]:
+    """Project fully validated scientific values without operational coordinates."""
+    return {
+        "config_schema_version": config.config_schema_version,
+        "dataset": {
+            "dataset_id": config.dataset.dataset_id,
+            "bundle_id": config.dataset.bundle_id,
+            "cv_assignment_id": config.dataset.cv_assignment_id,
         },
-        optional={"cv_assignment_id"},
-        context="dataset",
-    )
+        "task": {
+            "task_id": config.task.task_id,
+            "label_policy_version": config.task.label_policy_version,
+        },
+        "family": {
+            "family_id": config.family.family_id,
+            "modalities": list(config.family.modalities),
+            "parameters": dict(config.family.parameters),
+        },
+        "preprocessing": dict(config.preprocessing),
+        "training": {
+            "selection_metric": config.training.selection_metric,
+            "parameters": dict(config.training.parameters),
+            "loader": dict(config.training.loader),
+            "augmentation": dict(config.training.augmentation),
+        },
+        "evaluation": (None if config.evaluation is None else dict(config.evaluation.parameters)),
+    }
+
+
+def _dataset_config(
+    value: object, bundle_id: str | None, cv_assignment_id: str | None
+) -> DatasetConfig:
+    data = _mapping(value, "dataset")
+    _keys(data, required={"dataset_id"}, context="dataset")
     dataset_id = _choice(data["dataset_id"], {"rsna", "symile"}, "dataset.dataset_id")
-    bundle_id = _text(data["bundle_id"], "dataset.bundle_id")
-    if not valid_bundle_id(bundle_id):
-        raise ConfigError("dataset.bundle_id is invalid")
-    manifest_sha = _sha256(data["bundle_manifest_sha256"], "dataset.bundle_manifest_sha256")
-    split_id = _identity(
-        data["split_assignment_id"], "split-assignment-", "dataset.split_assignment_id"
-    )
-    cv_id = None
-    if "cv_assignment_id" in data:
-        cv_id = _identity(data["cv_assignment_id"], "cv-assignment-", "dataset.cv_assignment_id")
-    if dataset_id == "symile" and cv_id is None:
-        raise ConfigError("Symile configs require dataset.cv_assignment_id")
-    if dataset_id == "rsna" and cv_id is not None:
-        raise ConfigError("RSNA configs do not accept dataset.cv_assignment_id")
-    return DatasetConfig(dataset_id, bundle_id, manifest_sha, split_id, cv_id)
+    if bundle_id is not None and not valid_bundle_id(bundle_id):
+        raise ConfigError("Dataset bundle identity is invalid")
+    if cv_assignment_id is not None:
+        _identity(cv_assignment_id, "cv-assignment-", "dataset CV identity")
+    if dataset_id == "rsna" and cv_assignment_id is not None:
+        raise ConfigError("RSNA does not accept a CV identity")
+    if dataset_id == "symile" and (bundle_id is None) != (cv_assignment_id is None):
+        raise ConfigError("Symile requires bundle and CV identities together")
+    return DatasetConfig(dataset_id, bundle_id, cv_assignment_id)
 
 
 def _task_config(value: object, dataset_id: str) -> TaskConfig:
@@ -890,38 +900,6 @@ def _default_runtime(dataset_id: str) -> RuntimeConfig:
     )
 
 
-def _semantic_payload(
-    dataset: DatasetConfig,
-    task: TaskConfig,
-    family: FamilyConfig,
-    preprocessing: MappingProxyType[str, Any],
-    training: TrainingConfig,
-    evaluation: EvaluationConfig | None,
-) -> dict[str, Any]:
-    return {
-        "dataset": {
-            "dataset_id": dataset.dataset_id,
-            "bundle_id": dataset.bundle_id,
-            "split_assignment_id": dataset.split_assignment_id,
-            "cv_assignment_id": dataset.cv_assignment_id,
-        },
-        "task": {"task_id": task.task_id, "label_policy_version": task.label_policy_version},
-        "family": {
-            "family_id": family.family_id,
-            "modalities": list(family.modalities),
-            "parameters": dict(family.parameters),
-        },
-        "preprocessing": dict(preprocessing),
-        "training": {
-            "selection_metric": training.selection_metric,
-            "parameters": dict(training.parameters),
-            "loader": dict(training.loader),
-            "augmentation": dict(training.augmentation),
-        },
-        "evaluation": dict(evaluation.parameters) if evaluation is not None else None,
-    }
-
-
 def _read_yaml(source: Path) -> tuple[bytes, dict[str, Any]]:
     try:
         source_bytes = source.read_bytes()
@@ -1000,9 +978,3 @@ def _identity(value: object, prefix: str, context: str) -> str:
         raise ConfigError(f"{context} has an invalid prefix")
     _sha256(text.removeprefix(prefix), context)
     return text
-
-
-def _canonical_sha256(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    ).hexdigest()

@@ -9,7 +9,7 @@ import mlflow
 import numpy as np
 
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
-from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
+from beyondcxr.data.rsna_cxr_cache import PreparedCxrCache
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES, transform_rsna_metadata
 from beyondcxr.models.fusion_concat import (
     RsnaConcatFusionModel,
@@ -24,7 +24,7 @@ from beyondcxr.training.config import (
 from beyondcxr.training.device import ResolvedDevice
 from beyondcxr.training.execution import LoaderExecutionPolicy, one_shot_loader_policy
 from beyondcxr.training.neural import build_evaluation_loader, deterministic_inference
-from beyondcxr.training.rsna_campaign_control import ValidatedRsnaPackageFreeze
+from beyondcxr.training.rsna_campaign_control import ValidatedRsnaHeldOutCapability
 from beyondcxr.training.rsna_datasets import (
     RsnaCachedFusionDataset,
     RsnaDataset,
@@ -34,6 +34,7 @@ from beyondcxr.training.rsna_datasets import (
 from beyondcxr.training.rsna_evaluation_result import (
     CompletedRsnaEvaluation,
     publish_rsna_evaluation,
+    publish_rsna_prediction_evidence,
     validate_rsna_model_package,
     validated_rsna_evaluation_policy,
 )
@@ -49,7 +50,6 @@ from beyondcxr.utils.mlflow_utils import (
     tracked_run,
 )
 from beyondcxr.utils.operational_logging import get_operational_logger, log_event, timed_phase
-from beyondcxr.utils.private_predictions import publish_prediction_evidence
 from beyondcxr.utils.rsna_neural_publication import (
     load_validated_neural_checkpoint,
     strict_load_checkpoint,
@@ -61,11 +61,11 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_fusion_model_package(
     model_package_id: str,
     *,
-    authorization: ValidatedRsnaPackageFreeze,
+    authorization: ValidatedRsnaHeldOutCapability,
     evaluation_config: ExperimentConfig,
     runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
-    cache: ValidatedCxrCache | None = None,
+    cache: PreparedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
     private_output_directory: str | Path | None = None,
     model_directory: str | Path = "models/rsna",
@@ -94,14 +94,10 @@ def evaluate_fusion_model_package(
         "evaluation_scope": "test",
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": manifest["bundle_id"],
-        "bundle_manifest_sha256": manifest["bundle_manifest_sha256"],
-        "split_assignment_id": manifest["split_assignment_id"],
         "task_id": manifest["task_id"],
         "family_id": manifest["family_id"],
         "modalities": serialize_modalities(manifest["modalities"]),
         "seed": str(manifest["training_policy"]["seed"]),
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "source_package_id": manifest["source_package_id"],
         "git_commit": manifest["source_provenance"]["git_commit"],
         "dependency_lock_sha256": manifest["source_provenance"]["dependency_lock_sha256"],
@@ -143,7 +139,6 @@ def evaluate_fusion_model_package(
         ):
             data = dataset.load_fusion_test(
                 config,
-                expected_manifest_sha256=str(manifest["bundle_manifest_sha256"]),
                 authorization=authorization,
                 package_id=model_package_id,
             )
@@ -176,7 +171,6 @@ def evaluate_fusion_model_package(
         )
         expected_cache_identity = expected_rsna_cxr_cache_identity(
             lineage=data.lineage,
-            bundle_manifest_sha256=data.bundle_manifest_sha256,
             source_inventory=data.source_inventory,
             transform=transform,
         )
@@ -193,6 +187,8 @@ def evaluate_fusion_model_package(
             partition="test",
             transform=transform,
             training_seed=require_runtime_seed(config),
+            held_out_authorization=authorization,
+            package_id=model_package_id,
         )
         loader_execution = execution or one_shot_loader_policy(
             pin_memory=runtime.pin_memory_effective
@@ -210,14 +206,10 @@ def evaluate_fusion_model_package(
             runtime=runtime,
             input_keys=("image", "structured"),
         )
-        evidence = publish_prediction_evidence(
+        evidence = publish_rsna_prediction_evidence(
+            authorization=authorization,
             private_root=config.runtime.private_output_directory,
-            dataset_id="rsna",
             model_package_id=model_package_id,
-            task_id=manifest["task_id"],
-            bundle_id=manifest["bundle_id"],
-            split_assignment_id=manifest["split_assignment_id"],
-            scope="test",
             sample_ids=inference.sample_ids,
             targets=inference.targets,
             logits=inference.logits,
@@ -227,6 +219,7 @@ def evaluate_fusion_model_package(
             model_root=config.runtime.model_directory,
             private_root=config.runtime.private_output_directory,
             evidence=evidence,
+            authorization=authorization,
             evaluation_policy=policy,
             forbidden_source_values=(*inference.sample_ids, *inference.patient_ids),
         )
@@ -240,7 +233,6 @@ def evaluate_fusion_model_package(
         )
         mlflow.log_params(
             {
-                "bundle_manifest_sha256": data.bundle_manifest_sha256,
                 "evaluation_cxr_cache_id": resolved_cache.identity.cache_id,
                 **{
                     f"evaluation_runtime_{key}": value
@@ -276,8 +268,6 @@ def evaluate_fusion_model_package(
 def _verify_test_lineage(data, manifest) -> None:
     if (
         data.lineage.bundle_id != manifest["bundle_id"]
-        or data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
-        or data.lineage.split_assignment_id != manifest["split_assignment_id"]
         or data.lineage.task_id != manifest["task_id"]
         or data.lineage.label_policy_version != manifest["label_policy_version"]
     ):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -12,6 +11,7 @@ from beyondcxr.training.config import (
     FAMILY_MODALITIES,
     ConfigError,
     load_experiment_config,
+    normalized_scientific_config,
     require_runtime_seed,
     with_runtime,
 )
@@ -51,16 +51,15 @@ def test_supported_configs_load_as_immutable_typed_values() -> None:
     configs = tuple(load_experiment_config(Path("configs") / name) for name in CONFIG_FILENAMES)
     assert all(config.config_schema_version == 1 for config in configs)
     assert configs[0].dataset.dataset_id == "rsna"
-    assert configs[0].dataset.bundle_id.startswith("bundle-")
+    assert all(config.dataset.bundle_id is None for config in configs)
+    assert all(config.dataset.cv_assignment_id is None for config in configs)
     assert configs[0].family.family_id == "metadata_logistic"
     assert configs[0].family.modalities == ("metadata",)
     assert configs[1].training.parameters["early_stopping_rounds"] == 50
     assert configs[1].evaluation is not None
     assert configs[1].evaluation.calibration_bins == 15
-    expected_source = hashlib.sha256(
-        Path("configs/rsna_metadata_logistic.yaml").read_bytes()
-    ).hexdigest()
-    assert configs[0].config_source_sha256 == expected_source
+    assert configs[0].source_path == Path("configs/rsna_metadata_logistic.yaml")
+    assert configs[0].source_bytes == configs[0].source_path.read_bytes()
     with pytest.raises(FrozenInstanceError):
         configs[0].config_schema_version = 0  # type: ignore[misc]
     with pytest.raises(TypeError):
@@ -110,8 +109,7 @@ def test_runtime_seed_is_explicit_and_identity_neutral() -> None:
     assert require_runtime_seed(seeded) == 17
     assert seeded.runtime.source_root == Path("/tmp/source")
     assert seeded.runtime.device == "cpu"
-    assert seeded.config_semantic_sha256 == config.config_semantic_sha256
-    assert seeded.config_source_sha256 == config.config_source_sha256
+    assert normalized_scientific_config(seeded) == normalized_scientific_config(config)
     for device in ("auto", "cpu", "cuda"):
         assert with_runtime(config, device=device).runtime.device == device
     with pytest.raises(ConfigError):
@@ -151,7 +149,7 @@ def test_selection_metric_is_canonical_for_all_families() -> None:
     } == expected
 
 
-def test_source_hash_changes_but_semantic_hash_survives_equivalent_yaml(tmp_path: Path) -> None:
+def test_yaml_representation_does_not_change_normalized_science(tmp_path: Path) -> None:
     source = Path("configs/rsna_metadata_logistic.yaml")
     original = load_experiment_config(source)
     document = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -161,18 +159,8 @@ def test_source_hash_changes_but_semantic_hash_survives_equivalent_yaml(tmp_path
         encoding="utf-8",
     )
     loaded = load_experiment_config(equivalent)
-    assert loaded.config_source_sha256 != original.config_source_sha256
-    assert loaded.config_semantic_sha256 == original.config_semantic_sha256
-
-
-def test_semantic_config_identity_is_stable_across_manifest_witnesses(tmp_path: Path) -> None:
-    original = load_experiment_config("configs/rsna_metadata_logistic.yaml")
-    document = _document()
-    document["dataset"]["bundle_manifest_sha256"] = "0" * 64  # type: ignore[index]
-    changed = load_experiment_config(_write(tmp_path, document))
-    assert changed.dataset.bundle_manifest_sha256 == "0" * 64
-    assert changed.config_source_sha256 != original.config_source_sha256
-    assert changed.config_semantic_sha256 == original.config_semantic_sha256
+    assert loaded.source_bytes != original.source_bytes
+    assert normalized_scientific_config(loaded) == normalized_scientific_config(original)
 
 
 def test_structurally_valid_alternate_scientific_value_is_representable(tmp_path: Path) -> None:
@@ -181,7 +169,7 @@ def test_structurally_valid_alternate_scientific_value_is_representable(tmp_path
     document["training"]["parameters"]["C"] = 0.5  # type: ignore[index]
     changed = load_experiment_config(_write(tmp_path, document))
     assert changed.training.parameters["C"] == 0.5
-    assert changed.config_semantic_sha256 != original.config_semantic_sha256
+    assert normalized_scientific_config(changed) != normalized_scientific_config(original)
 
 
 def test_logistic_policy_matches_frozen_contract() -> None:
@@ -225,17 +213,18 @@ def test_equivalent_numeric_config_representations_share_semantic_identity(
     float_form["evaluation"]["sensitivity_target"] = 1.0  # type: ignore[index]
     float_config = load_experiment_config(_write(tmp_path, float_form))
 
-    assert integer_config.config_semantic_sha256 == float_config.config_semantic_sha256
+    assert normalized_scientific_config(integer_config) == normalized_scientific_config(
+        float_config
+    )
     assert isinstance(integer_config.training.parameters["C"], float)
     assert math.copysign(1.0, float_config.training.parameters["l1_ratio"]) == 1.0
 
     different = _document()
     different["training"]["parameters"]["C"] = 0.5  # type: ignore[index]
     different["evaluation"]["sensitivity_target"] = 1.0  # type: ignore[index]
-    assert (
-        load_experiment_config(_write(tmp_path, different)).config_semantic_sha256
-        != integer_config.config_semantic_sha256
-    )
+    assert normalized_scientific_config(
+        load_experiment_config(_write(tmp_path, different))
+    ) != normalized_scientific_config(integer_config)
 
 
 def test_invalid_config_fails_before_execution(tmp_path: Path) -> None:
@@ -269,7 +258,7 @@ def test_evaluation_calibration_bins_reject_out_of_range_or_mistyped_values(
 _MISSING_SCHEMA_VERSION = object()
 
 
-@pytest.mark.parametrize("version", [True, 1.0, "1", None, 0, _MISSING_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [True, 1.0, 2, _MISSING_SCHEMA_VERSION])
 def test_only_integer_config_schema_version_one_is_supported(
     tmp_path: Path, version: object
 ) -> None:
@@ -287,18 +276,18 @@ def test_unknown_top_level_and_nested_fields_are_rejected(tmp_path: Path) -> Non
     document["unexpected"] = True
     with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
-    document = _document()
-    document["task"]["unexpected"] = True  # type: ignore[index]
-    with pytest.raises(ConfigError):
-        load_experiment_config(_write(tmp_path, document))
+    for section in ("task", "dataset"):
+        document = _document()
+        document[section]["unexpected"] = True  # type: ignore[index]
+        with pytest.raises(ConfigError, match="unknown fields"):
+            load_experiment_config(_write(tmp_path, document))
 
 
 @pytest.mark.parametrize("bundle_id", ["../escape", "a/b", ".", "bundle-not-a-sha256"])
 def test_bundle_id_requires_canonical_bundle_identity(tmp_path: Path, bundle_id: str) -> None:
     document = _document()
-    document["dataset"]["bundle_id"] = bundle_id  # type: ignore[index]
     with pytest.raises(ConfigError):
-        load_experiment_config(_write(tmp_path, document))
+        load_experiment_config(_write(tmp_path, document), bundle_id=bundle_id)
 
 
 def test_duplicate_yaml_keys_are_rejected(tmp_path: Path) -> None:
@@ -317,3 +306,40 @@ def test_model_randomness_controls_are_rejected_in_yaml(tmp_path: Path, seed_key
     document["family"]["parameters"][seed_key] = 7  # type: ignore[index]
     with pytest.raises(ConfigError):
         load_experiment_config(_write(tmp_path, document))
+
+
+@pytest.mark.parametrize("field", ["bundle_id", "cv_assignment_id"])
+def test_reviewed_yaml_rejects_generated_authority_coordinates(tmp_path: Path, field: str) -> None:
+    document = _document("symile_labs_logistic.yaml")
+    document["dataset"][field] = "not-a-reviewed-policy"
+    with pytest.raises(ConfigError, match="unknown fields"):
+        load_experiment_config(_write(tmp_path, document))
+
+
+def test_same_reviewed_policy_binds_explicit_builder_coordinates() -> None:
+    path = Path("configs/symile_labs_logistic.yaml")
+    first = load_experiment_config(
+        path, bundle_id="bundle-" + "a" * 64, cv_assignment_id="cv-assignment-" + "b" * 64
+    )
+    second = load_experiment_config(
+        path, bundle_id="bundle-" + "c" * 64, cv_assignment_id="cv-assignment-" + "d" * 64
+    )
+    assert first.source_bytes == second.source_bytes == path.read_bytes()
+    assert first.dataset.bundle_id == "bundle-" + "a" * 64
+    assert second.dataset.bundle_id == "bundle-" + "c" * 64
+    assert first.dataset.cv_assignment_id == "cv-assignment-" + "b" * 64
+    assert second.dataset.cv_assignment_id == "cv-assignment-" + "d" * 64
+    assert normalized_scientific_config(first) != normalized_scientific_config(second)
+
+
+def test_unbound_symile_config_cannot_resolve_current(monkeypatch: pytest.MonkeyPatch) -> None:
+    from beyondcxr.data.errors import ManifestBuildError
+    from beyondcxr.training import symile_data
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unbound scientific access reached a dataset resolver")
+
+    monkeypatch.setattr(symile_data, "resolve_symile_bundle", forbidden)
+    config = load_experiment_config("configs/symile_labs_logistic.yaml")
+    with pytest.raises(ManifestBuildError, match="explicit bundle and CV identities"):
+        symile_data.load_symile_development_cohort(config)

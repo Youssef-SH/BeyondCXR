@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
-from beyondcxr.data.rsna_artifacts import BuildResult, build_rsna_artifacts
+from beyondcxr.data.rsna_artifacts import (
+    _BuildState as BuildResult,
+)
+from beyondcxr.data.rsna_artifacts import (
+    _write_bundle,
+    build_and_write,
+)
+from beyondcxr.data.rsna_splitting import SplitConfig
 
 
 def write_header(
@@ -123,6 +132,34 @@ def write_sources(
 def tables(tmp_path: Path) -> tuple[Path, BuildResult]:
     root = write_sources(tmp_path / "extracted")
     return root, build_rsna_artifacts(root)
+
+
+def build_rsna_artifacts(
+    root: Path,
+    split_config: SplitConfig | None = None,
+    *,
+    output_directory: Path | None = None,
+) -> BuildResult:
+    """Materialize bundle tables only inside the test suite."""
+    written = build_and_write(
+        root,
+        output_directory or root.parent / "test-manifests",
+        split_config,
+    )
+    paths = written.paths
+    return BuildResult(
+        pq.read_table(paths.samples_path),
+        pq.read_table(paths.labels_path),
+        pq.read_table(paths.annotations_path),
+        pq.read_table(paths.splits_path),
+        pq.read_table(paths.source_inventory_path),
+        json.loads(paths.metadata_path.read_bytes()),
+    )
+
+
+def write_bundle(result: BuildResult, output_directory: Path):
+    """Publish deliberately manipulated test tables through the internal writer."""
+    return _write_bundle(result, output_directory)
 
 
 def replace_table_row(table: pa.Table, row_index: int, **changes: object) -> pa.Table:

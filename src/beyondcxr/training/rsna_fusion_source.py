@@ -43,7 +43,9 @@ def resolve_source_cxr_package(
     )
     package_directory = fusion_config.runtime.model_directory / "packages" / source_package_id
     source_config = with_runtime(
-        load_experiment_config(package_directory / CONFIG_FILENAME),
+        load_experiment_config(
+            package_directory / CONFIG_FILENAME, bundle_id=manifest["bundle_id"]
+        ),
         seed=int(manifest["training_policy"]["seed"]),
     )
     _validate_source_contract(source_config, manifest, fusion_config, source_package_id)
@@ -75,7 +77,6 @@ def _validate_source_contract(
         "model_package_id": source_package_id,
         "dataset_id": fusion_config.dataset.dataset_id,
         "bundle_id": fusion_config.dataset.bundle_id,
-        "split_assignment_id": fusion_config.dataset.split_assignment_id,
         "task_id": fusion_config.task.task_id,
         "label_policy_version": fusion_config.task.label_policy_version,
         "family_id": "cxr_densenet",

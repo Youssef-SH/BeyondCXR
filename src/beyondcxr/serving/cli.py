@@ -13,7 +13,9 @@ from beyondcxr.serving.api import create_app
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--authority", type=Path, required=True)
-    parser.add_argument("--package-root", type=Path, required=True)
+    parser.add_argument("--deployment-provenance", type=Path, required=True)
+    parser.add_argument("--result-binding", type=Path, required=True)
+    parser.add_argument("--release-archive", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -26,7 +28,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--port must be between 1 and 65535")
     application = create_app(
         authority_path=args.authority,
-        package_root=args.package_root,
+        deployment_provenance=args.deployment_provenance,
+        result_binding=args.result_binding,
+        release_archive=args.release_archive,
         device=args.device,
     )
     uvicorn.run(

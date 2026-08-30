@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -24,13 +23,13 @@ from beyondcxr.training.rsna_training_report import (
     validate_report_set,
     write_run_reports,
 )
-from beyondcxr.utils.package_identity import (
-    canonical_scientific_id,
-    package_scientific_config_payload,
-)
+from beyondcxr.utils.package_identity import package_scientific_config_payload
 from beyondcxr.utils.privacy import validate_public_reports
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
+    _publish_held_out_prediction_evidence,
+    authorize_rsna_held_out_prediction_publication,
+    build_prediction_table,
     validate_prediction_evidence,
 )
 from beyondcxr.utils.publication import (
@@ -48,6 +47,7 @@ from beyondcxr.utils.rsna_model_publication import (
 from beyondcxr.utils.rsna_neural_publication import (
     validate_published_neural_model,
 )
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_PREFIX = "evaluation-"
@@ -63,10 +63,8 @@ _FIELDS = {
     "seed",
     "model_package_id",
     "prediction_id",
-    "prediction_manifest_sha256",
     "task_id",
     "bundle_id",
-    "split_assignment_id",
     "scope",
     "evaluation_policy",
     "thresholds",
@@ -93,8 +91,95 @@ class ValidatedEvaluationResult:
 
     directory: Path
     manifest: Mapping[str, Any]
-    manifest_sha256: str
     created: bool = False
+
+
+def publish_rsna_prediction_evidence(
+    *,
+    authorization: object,
+    private_root: str | Path,
+    model_package_id: str,
+    sample_ids: Sequence[str],
+    targets: Sequence[int] | np.ndarray,
+    logits: Sequence[float] | np.ndarray,
+) -> ValidatedPredictionEvidence:
+    """Publish exact canonical RSNA held-out predictions under live authority."""
+    publication_authority = authorize_rsna_held_out_prediction_publication(
+        authorization, model_package_id=model_package_id
+    )
+    candidate = build_prediction_table(sample_ids, targets, logits)
+    if (
+        tuple(candidate["sample_id"].to_pylist()) != publication_authority.sample_ids
+        or tuple(candidate["target"].to_pylist()) != publication_authority.targets
+    ):
+        raise ValueError("RSNA prediction differs from the canonical held-out cohort")
+    evidence = _publish_held_out_prediction_evidence(
+        publication_authority=publication_authority,
+        private_root=private_root,
+        dataset_id="rsna",
+        model_package_id=model_package_id,
+        task_id=publication_authority.task_id,
+        bundle_id=publication_authority.bundle_id,
+        scope="test",
+        sample_ids=sample_ids,
+        targets=targets,
+        logits=logits,
+        authorized_by_freeze_id=publication_authority.freeze_id,
+    )
+    from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
+
+    capability = require_validated_rsna_held_out(authorization)
+    return validate_rsna_held_out_prediction(
+        evidence,
+        freeze=capability.freeze,
+        execution=capability.current_execution.execution,
+    )
+
+
+def validate_rsna_held_out_prediction(
+    evidence: ValidatedPredictionEvidence,
+    *,
+    freeze: object,
+    execution: object,
+) -> ValidatedPredictionEvidence:
+    """Validate prediction lineage and exact bundle-derived held-out membership."""
+    from beyondcxr.training.rsna_campaign_control import (
+        require_validated_execution,
+        require_validated_freeze,
+        validate_rsna_execution_freeze_science,
+    )
+
+    historical = require_validated_execution(execution)
+    scientific = require_validated_freeze(freeze)
+    validate_rsna_execution_freeze_science(historical, scientific)
+    validated = validate_prediction_evidence(
+        evidence.directory,
+        expected_prediction_id=evidence.prediction_id,
+        expected_model_package_id=str(evidence.manifest["model_package_id"]),
+        expected_authorizing_freeze_id=scientific.freeze_id,
+    )
+    scientific.require(str(validated.manifest["model_package_id"]))
+    package = validate_rsna_model_package(
+        scientific.model_root, validated.manifest["model_package_id"]
+    )
+    publication = validated.manifest["held_out_publication"]
+    if publication != {
+        "authority_kind": "rsna-frozen-campaign-v1",
+        "execution_id": historical.execution_id,
+    }:
+        raise ValueError("RSNA prediction publication authority is invalid")
+    from beyondcxr.training.rsna_validation_evidence import _derive_canonical_held_out_cohort
+
+    cohort = _derive_canonical_held_out_cohort(
+        scientific.bundle_directory,
+        package,
+    )
+    if (
+        tuple(validated.predictions["sample_id"].to_pylist()) != cohort.sample_ids
+        or tuple(validated.predictions["target"].to_pylist()) != cohort.targets
+    ):
+        raise ValueError("RSNA prediction differs from the canonical held-out cohort")
+    return validated
 
 
 def derive_evaluation_claims(
@@ -136,10 +221,48 @@ def publish_rsna_evaluation(
     private_root: str | Path,
     model_root: str | Path,
     evidence: ValidatedPredictionEvidence,
+    authorization: object,
     evaluation_policy: Mapping[str, Any],
     forbidden_source_values: Sequence[str],
 ) -> ValidatedEvaluationResult:
     """Publish one evidence-and-policy-identified held-out evaluation."""
+    from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
+
+    capability = require_validated_rsna_held_out(authorization)
+    evidence = validate_rsna_held_out_prediction(
+        evidence,
+        freeze=capability.freeze,
+        execution=capability.current_execution.execution,
+    )
+    return _publish_rsna_evaluation(
+        report_root=report_root,
+        private_root=private_root,
+        model_root=model_root,
+        evidence=evidence,
+        freeze=capability.freeze,
+        execution=capability.current_execution.execution,
+        evaluation_policy=evaluation_policy,
+        forbidden_source_values=forbidden_source_values,
+    )
+
+
+def _publish_rsna_evaluation(
+    *,
+    report_root: str | Path,
+    private_root: str | Path,
+    model_root: str | Path,
+    evidence: ValidatedPredictionEvidence,
+    freeze: object,
+    execution: object,
+    evaluation_policy: Mapping[str, Any],
+    forbidden_source_values: Sequence[str],
+) -> ValidatedEvaluationResult:
+    """Publish from an already validated historical held-out relationship."""
+    evidence = validate_rsna_held_out_prediction(
+        evidence,
+        freeze=freeze,
+        execution=execution,
+    )
     package = validate_rsna_model_package(model_root, evidence.manifest["model_package_id"])
     frozen_threshold_contract = validated_threshold_contract(
         package["threshold_contract"], positive_class=package["positive_class"]
@@ -157,7 +280,6 @@ def publish_rsna_evaluation(
         "prediction_id": evidence.manifest["prediction_id"],
         "task_id": evidence.manifest["task_id"],
         "bundle_id": evidence.manifest["bundle_id"],
-        "split_assignment_id": evidence.manifest["split_assignment_id"],
         "scope": evidence.manifest["scope"],
         "evaluation_policy": policy,
         "thresholds": {key: float(value) for key, value in thresholds.items()},
@@ -171,12 +293,13 @@ def publish_rsna_evaluation(
         thresholds=frozen_thresholds,
     )
     semantic["thresholds"] = frozen_thresholds
-    evaluation_id = canonical_scientific_id(EVALUATION_PREFIX, semantic)
+    evaluation_id = canonical_scientific_id(
+        EVALUATION_PREFIX, semantic, domain="evaluation", schema_version=1
+    )
     document = {
         "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
         **semantic,
         "evaluation_id": evaluation_id,
-        "prediction_manifest_sha256": evidence.manifest_sha256,
         "claims": claims,
     }
     destination = Path(report_root) / "rsna" / "evaluations" / evaluation_id
@@ -204,6 +327,8 @@ def publish_rsna_evaluation(
             stage,
             private_root=private_root,
             model_root=model_root,
+            freeze=freeze,
+            execution=execution,
             enforce_directory_name=False,
         )
         created = install_immutable_directory(
@@ -213,6 +338,8 @@ def publish_rsna_evaluation(
                 path,
                 private_root=private_root,
                 model_root=model_root,
+                freeze=freeze,
+                execution=execution,
                 **kwargs,
             ),
         )
@@ -225,6 +352,8 @@ def publish_rsna_evaluation(
             private_root=private_root,
             model_root=model_root,
             expected_evaluation_id=evaluation_id,
+            freeze=freeze,
+            execution=execution,
         ),
         created=created,
     )
@@ -235,6 +364,8 @@ def validate_rsna_evaluation(
     *,
     private_root: str | Path,
     model_root: str | Path,
+    freeze: object,
+    execution: object,
     expected_evaluation_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedEvaluationResult:
@@ -273,13 +404,15 @@ def validate_rsna_evaluation(
     _require_identity(document["evaluation_id"], EVALUATION_PREFIX, "evaluation")
     _require_identity(prediction_id, "prediction-", "prediction")
     _require_identity(document["model_package_id"], "model-package-", "model package")
-    evidence = validate_prediction_evidence(
-        Path(private_root) / "predictions" / "rsna" / prediction_id,
-        expected_prediction_id=prediction_id,
-        expected_model_package_id=document["model_package_id"],
+    evidence = validate_rsna_held_out_prediction(
+        validate_prediction_evidence(
+            Path(private_root) / "predictions" / "rsna" / prediction_id,
+            expected_prediction_id=prediction_id,
+            expected_model_package_id=document["model_package_id"],
+        ),
+        freeze=freeze,
+        execution=execution,
     )
-    if evidence.manifest_sha256 != document["prediction_manifest_sha256"]:
-        raise ValueError("Evaluation prediction-manifest integrity witness differs")
     package = validate_rsna_model_package(model_root, document["model_package_id"])
     policy = _validate_evaluation_policy(document["evaluation_policy"])
     thresholds = _validated_thresholds(document["thresholds"])
@@ -293,7 +426,6 @@ def validate_rsna_evaluation(
         "prediction_id": evidence.prediction_id,
         "task_id": package["task_id"],
         "bundle_id": package["bundle_id"],
-        "split_assignment_id": package["split_assignment_id"],
         "scope": "test",
     }
     if any(document[field] != value for field, value in expected_lineage.items()):
@@ -305,11 +437,12 @@ def validate_rsna_evaluation(
         not in {
             "evaluation_schema_version",
             "evaluation_id",
-            "prediction_manifest_sha256",
             "claims",
         }
     }
-    evaluation_id = canonical_scientific_id(EVALUATION_PREFIX, semantic)
+    evaluation_id = canonical_scientific_id(
+        EVALUATION_PREFIX, semantic, domain="evaluation", schema_version=1
+    )
     if document["evaluation_id"] != evaluation_id:
         raise ValueError("Evaluation identity differs from evidence and policy")
     if expected_evaluation_id is not None and evaluation_id != expected_evaluation_id:
@@ -344,7 +477,6 @@ def validate_rsna_evaluation(
     return ValidatedEvaluationResult(
         root,
         document,
-        hashlib.sha256(manifest_bytes).hexdigest(),
     )
 
 
@@ -371,8 +503,6 @@ def validated_rsna_evaluation_policy(
     expected = {
         "dataset_id": evaluation_config.dataset.dataset_id,
         "bundle_id": evaluation_config.dataset.bundle_id,
-        "bundle_manifest_sha256": evaluation_config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": evaluation_config.dataset.split_assignment_id,
         "task_id": evaluation_config.task.task_id,
         "label_policy_version": evaluation_config.task.label_policy_version,
         "family_id": evaluation_config.family.family_id,
@@ -413,7 +543,6 @@ def _validate_package_evidence(
         "model_package_id": package["model_package_id"],
         "task_id": package["task_id"],
         "bundle_id": package["bundle_id"],
-        "split_assignment_id": package["split_assignment_id"],
         "scope": "test",
     }
     if any(manifest.get(field) != value for field, value in expected.items()):

@@ -10,15 +10,20 @@ import stat
 import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.utils.publication import is_publication_staging_directory, validate_path_component
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
 
 PRESERVATION_MANIFEST_SCHEMA_VERSION = 1
 EXPORT_MANIFEST_FILENAME = "export-manifest.json"
+PreservationRole = Literal["scientific_authority", "operational_evidence", "derivative"]
+_RESTORATION_CONTEXT_GUARD = object()
+_ACTIVE_RESTORATION_ROOTS: dict[Path, str] = {}
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,36 @@ class PreservationMember:
 
     path: Path
     restore_relative: Path
+    role: PreservationRole = "scientific_authority"
+
+
+@dataclass(frozen=True)
+class ValidatedRestorationContext:
+    """One authenticated, temporary restoration rooted in a verified archive."""
+
+    root: Path
+    archive_sha256: str
+    _guard: object
+
+
+def require_restoration_context(value: object) -> ValidatedRestorationContext:
+    if (
+        not isinstance(value, ValidatedRestorationContext)
+        or value._guard is not _RESTORATION_CONTEXT_GUARD
+        or _ACTIVE_RESTORATION_ROOTS.get(value.root) != value.archive_sha256
+        or value.root.is_symlink()
+        or not value.root.is_dir()
+    ):
+        raise PermissionError("Historical validation requires authenticated restoration context")
+    return value
+
+
+def _validated_restoration_context(restored_root: str | Path) -> ValidatedRestorationContext:
+    root = Path(restored_root).resolve()
+    archive_sha256 = _ACTIVE_RESTORATION_ROOTS.get(root)
+    if archive_sha256 is None or root.is_symlink() or not root.is_dir():
+        raise PermissionError("Historical validation requires authenticated restoration context")
+    return ValidatedRestorationContext(root, archive_sha256, _RESTORATION_CONTEXT_GUARD)
 
 
 @dataclass(frozen=True)
@@ -35,6 +70,7 @@ class _ValidatedManifestMember:
     restore_relative: PurePosixPath
     kind: str
     files: tuple[tuple[PurePosixPath, str], ...]
+    role: PreservationRole
 
 
 def validate_exact_restored_closure(
@@ -98,48 +134,150 @@ def export_and_verify(
         export_root=export_root,
         backup_root=backup_root,
     )
+    export_directory = Path(export_root)
+    archive = export_directory / f"{export_name}.zip"
+    checksum = archive.with_suffix(".zip.sha256")
+    backup_directory = Path(backup_root)
+    backup = backup_directory / archive.name
+    completed_paths = (archive, checksum, backup)
+    if any(path.exists() or path.is_symlink() for path in completed_paths):
+        _validate_private_file(archive)
+        digest = _file_sha256(archive)
+        expected_checksum = f"{digest}  {archive.name}\n".encode()
+        for existing in (checksum, backup):
+            if existing.exists() or existing.is_symlink():
+                _validate_private_file(existing)
+                if (existing == checksum and existing.read_bytes() != expected_checksum) or (
+                    existing == backup and _file_sha256(existing) != digest
+                ):
+                    raise ManifestBuildError("Preservation export conflicts with existing state")
+        if not checksum.exists() or not backup.exists():
+            restore_and_validate_export(archive, restoration_validator=restoration_validator)
+            _write_or_validate(checksum, expected_checksum)
+            backup_directory.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{backup.name}.", suffix=".tmp", dir=backup_directory
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as destination, archive.open("rb") as source:
+                    shutil.copyfileobj(source, destination)
+                _install_or_validate(temporary, backup)
+            finally:
+                temporary.unlink(missing_ok=True)
+        validate_completed_preservation(
+            archive,
+            backup_root=backup_directory,
+            restoration_validator=restoration_validator,
+        )
+        return archive
+
     document, entries = _build_export_manifest(values)
     encoded_manifest = _canonical_json_bytes(document)
-    export_directory = Path(export_root)
-    export_directory.mkdir(parents=True, exist_ok=True)
-    archive = export_directory / f"{export_name}.zip"
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{archive.name}.", suffix=".tmp", dir=export_directory
+    absent_directories = tuple(
+        sorted(
+            {
+                candidate
+                for directory in (export_directory, backup_directory)
+                for candidate in (directory, *directory.parents)
+                if not candidate.exists() and not candidate.is_symlink()
+            },
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
     )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
+    created: list[Path] = []
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as output:
-            _write_zip_bytes(output, EXPORT_MANIFEST_FILENAME, encoded_manifest)
-            for name, path in entries:
-                info = _zip_file_info(name)
-                with path.open("rb") as source, output.open(info, "w") as destination:
-                    shutil.copyfileobj(source, destination)
-        digest = _file_sha256(temporary)
-        _validate_private_file(temporary, expected_sha256=digest)
-        restore_and_validate_export(temporary, restoration_validator=restoration_validator)
-        _install_or_validate(temporary, archive)
-    finally:
-        temporary.unlink(missing_ok=True)
-    _validate_private_file(archive, expected_sha256=digest)
-    checksum = archive.with_suffix(".zip.sha256")
-    _write_or_validate(checksum, f"{digest}  {archive.name}\n".encode())
-    backup_directory = Path(backup_root)
-    backup_directory.mkdir(parents=True, exist_ok=True)
-    backup = backup_directory / archive.name
-    descriptor, backup_temporary_name = tempfile.mkstemp(
-        prefix=f".{backup.name}.", suffix=".tmp", dir=backup_directory
-    )
-    backup_temporary = Path(backup_temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as destination, archive.open("rb") as source:
-            shutil.copyfileobj(source, destination)
-        _install_or_validate(backup_temporary, backup)
-    finally:
-        backup_temporary.unlink(missing_ok=True)
+        export_directory.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{archive.name}.", suffix=".tmp", dir=export_directory
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as output:
+                _write_zip_bytes(output, EXPORT_MANIFEST_FILENAME, encoded_manifest)
+                for name, path in entries:
+                    info = _zip_file_info(name)
+                    with path.open("rb") as source, output.open(info, "w") as destination:
+                        shutil.copyfileobj(source, destination)
+            digest = _file_sha256(temporary)
+            _validate_private_file(temporary, expected_sha256=digest)
+            restore_and_validate_export(temporary, restoration_validator=restoration_validator)
+            if _install_or_validate(temporary, archive):
+                created.append(archive)
+        finally:
+            temporary.unlink(missing_ok=True)
+        _validate_private_file(archive, expected_sha256=digest)
+        if _write_or_validate(checksum, f"{digest}  {archive.name}\n".encode()):
+            created.append(checksum)
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        descriptor, backup_temporary_name = tempfile.mkstemp(
+            prefix=f".{backup.name}.", suffix=".tmp", dir=backup_directory
+        )
+        backup_temporary = Path(backup_temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as destination, archive.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+            if _install_or_validate(backup_temporary, backup):
+                created.append(backup)
+        finally:
+            backup_temporary.unlink(missing_ok=True)
+        _validate_private_file(backup, expected_sha256=digest)
+        # Scientific restoration was certified from the temporary archive above. This final
+        # validation joins the installed archive, sidecar, and byte-identical backup without
+        # repeating the potentially expensive scientific validator.
+        validate_completed_preservation(archive, backup_root=backup_directory)
+        return archive
+    except BaseException:
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for directory in absent_directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
+
+
+def validate_preservation_archive[RestorationResult](
+    archive: str | Path,
+    *,
+    restoration_validator: Callable[[Path], RestorationResult] | None = None,
+) -> RestorationResult | None:
+    """Authenticate one canonical archive and sidecar, then restore and validate it."""
+    source = Path(archive)
+    validate_archive_checksum(source)
+    return restore_and_validate_export(source, restoration_validator=restoration_validator)
+
+
+def validate_archive_checksum(source: Path) -> None:
+    """Authenticate the canonical archive and its checksum sidecar before extraction."""
+    _validate_private_file(source)
+    digest = _file_sha256(source)
+    checksum = source.with_suffix(".zip.sha256")
+    _validate_private_file(checksum)
+    expected = f"{digest}  {source.name}\n".encode()
+    if checksum.read_bytes() != expected:
+        raise ManifestBuildError("Preservation archive checksum is invalid")
+
+
+def validate_completed_preservation(
+    archive: str | Path,
+    *,
+    backup_root: str | Path,
+    restoration_validator: Callable[[Path], object] | None = None,
+) -> Path:
+    """Validate one completed canonical archive, its exact backup, and restored science."""
+    source = Path(archive)
+    validate_preservation_archive(source, restoration_validator=restoration_validator)
+    digest = _file_sha256(source)
+    backup = Path(backup_root) / source.name
     _validate_private_file(backup, expected_sha256=digest)
-    restore_and_validate_export(backup, restoration_validator=restoration_validator)
-    return archive
+    return source
 
 
 def _resolved_preservation_path(value: str | Path) -> Path:
@@ -176,9 +314,19 @@ def restore_and_validate_export[RestorationResult](
     *,
     restoration_validator: Callable[[Path], RestorationResult] | None = None,
 ) -> RestorationResult | None:
-    """Restore a campaign using only its archive-owned V1 manifest and validate it."""
+    """Restore a campaign using only its archive-owned manifest and validate it."""
+    with restored_export(archive) as root:
+        if restoration_validator is not None:
+            return restoration_validator(root)
+    return None
+
+
+@contextmanager
+def restored_export(archive: str | Path):
+    """Own one authenticated extraction and revoke its context on exit."""
     source = Path(archive)
     _validate_private_file(source)
+    archive_sha256 = _file_sha256(source)
     with zipfile.ZipFile(source) as input_archive:
         members = _read_and_validate_archive(input_archive)
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -203,9 +351,12 @@ def restore_and_validate_export[RestorationResult](
                         target,
                         expected_hash,
                     )
-            if restoration_validator is not None:
-                return restoration_validator(restored_root)
-    return None
+            resolved = restored_root.resolve()
+            _ACTIVE_RESTORATION_ROOTS[resolved] = archive_sha256
+            try:
+                yield restored_root
+            finally:
+                _ACTIVE_RESTORATION_ROOTS.pop(resolved, None)
 
 
 def _build_export_manifest(
@@ -230,6 +381,11 @@ def _build_export_manifest(
         if any(path.is_symlink() for path in descendants):
             raise ManifestBuildError("Preservation export source contains a symlink")
         files = [root] if kind == "file" else [path for path in descendants if path.is_file()]
+        files.sort(
+            key=lambda path: (
+                Path(root.name) if kind == "file" else path.relative_to(root)
+            ).as_posix()
+        )
         if not files:
             raise ManifestBuildError("Preservation export authority directory is empty")
         file_documents = []
@@ -244,6 +400,7 @@ def _build_export_manifest(
                 "archive_identity": identity,
                 "restore_relative": restore.as_posix(),
                 "kind": kind,
+                "role": member.role,
                 "files": file_documents,
             }
         )
@@ -271,23 +428,27 @@ def _read_and_validate_archive(
         raise ManifestBuildError("Preservation manifest is unreadable") from exc
     if raw != _canonical_json_bytes(document):
         raise ManifestBuildError("Preservation manifest serialization is invalid")
-    members = _validate_export_manifest(document)
-    expected_names = {EXPORT_MANIFEST_FILENAME}
-    for member in members:
+    declared_members = _validate_export_manifest(document)
+    expected_names = [EXPORT_MANIFEST_FILENAME]
+    for member in declared_members:
         for relative, expected_hash in member.files:
             name = f"{member.archive_identity}/{relative.as_posix()}"
-            expected_names.add(name)
+            expected_names.append(name)
             try:
                 observed_hash = _zip_member_sha256(archive, name)
-            except KeyError as exc:
+            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
                 raise ManifestBuildError(
                     "Preservation archive has missing or unexpected members"
                 ) from exc
             if observed_hash != expected_hash:
                 raise ManifestBuildError("Preservation archived file hash is invalid")
-    if set(names) != expected_names:
+    if set(names) != set(expected_names):
         raise ManifestBuildError("Preservation archive has missing or unexpected members")
-    return members
+    if names != expected_names:
+        raise ManifestBuildError("Preservation archive members are not canonically ordered")
+    if any(not _zip_info_is_canonical(info) for info in infos):
+        raise ManifestBuildError("Preservation archive member metadata is not canonical")
+    return declared_members
 
 
 def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMember, ...]:
@@ -313,6 +474,7 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             "archive_identity",
             "restore_relative",
             "kind",
+            "role",
             "files",
         }:
             raise ManifestBuildError("Preservation member contract is invalid")
@@ -330,8 +492,14 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             raise ManifestBuildError("Preservation restore targets collide")
         restore_targets.append(restore)
         kind = item["kind"]
+        role = item["role"]
         files = item["files"]
-        if kind not in {"file", "directory"} or not isinstance(files, list) or not files:
+        if (
+            kind not in {"file", "directory"}
+            or role not in {"scientific_authority", "operational_evidence", "derivative"}
+            or not isinstance(files, list)
+            or not files
+        ):
             raise ManifestBuildError("Preservation member kind or files are invalid")
         validated_files: list[tuple[PurePosixPath, str]] = []
         for file_item in files:
@@ -359,7 +527,9 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             path.as_posix() for path, _ in validated_files
         ):
             raise ManifestBuildError("Preservation archived files are not canonically ordered")
-        values.append(_ValidatedManifestMember(identity, restore, kind, tuple(validated_files)))
+        values.append(
+            _ValidatedManifestMember(identity, restore, kind, tuple(validated_files), role)
+        )
     return tuple(values)
 
 
@@ -403,12 +573,22 @@ def _write_zip_bytes(archive: zipfile.ZipFile, name: str, content: bytes) -> Non
     archive.writestr(_zip_file_info(name), content)
 
 
+def _zip_info_is_canonical(info: zipfile.ZipInfo) -> bool:
+    expected = _zip_file_info(info.filename)
+    return (
+        info.date_time == expected.date_time
+        and info.create_system == expected.create_system
+        and info.external_attr == expected.external_attr
+        and info.compress_type == expected.compress_type
+    )
+
+
 def _zip_entry_is_symlink(info: zipfile.ZipInfo) -> bool:
     mode = info.external_attr >> 16
     return info.create_system == 3 and stat.S_ISLNK(mode)
 
 
-def _install_or_validate(temporary: Path, destination: Path) -> None:
+def _install_or_validate(temporary: Path, destination: Path) -> bool:
     try:
         os.link(temporary, destination)
     except FileExistsError:
@@ -419,6 +599,8 @@ def _install_or_validate(temporary: Path, destination: Path) -> None:
             or _file_sha256(temporary) != _file_sha256(destination)
         ):
             raise ManifestBuildError("Preservation export conflicts with existing state") from None
+        return False
+    return True
 
 
 def _validate_private_file(path: Path, *, expected_sha256: str | None = None) -> None:
@@ -430,7 +612,8 @@ def _validate_private_file(path: Path, *, expected_sha256: str | None = None) ->
         raise ManifestBuildError("Preserved archive hash is invalid")
 
 
-def _write_or_validate(path: Path, content: bytes) -> None:
+def _write_or_validate(path: Path, content: bytes) -> bool:
+    created = False
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -440,19 +623,18 @@ def _write_or_validate(path: Path, content: bytes) -> None:
         try:
             with os.fdopen(descriptor, "wb") as output:
                 output.write(content)
-            _install_or_validate(temporary, path)
+            created = _install_or_validate(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
     if path.is_symlink() or not path.is_file() or path.read_bytes() != content:
         raise ManifestBuildError("Preservation checksum conflicts with existing state")
     _validate_private_file(path)
+    return created
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
     try:
-        return (
-            json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
+        return canonical_json_bytes(value)
     except (TypeError, ValueError) as exc:
         raise ManifestBuildError("Preservation manifest is not serializable") from exc
 

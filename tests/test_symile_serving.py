@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import AsyncIterator
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import httpx
 import numpy as np
@@ -11,13 +11,15 @@ import pandas as pd
 import pytest
 import torch
 from PIL import Image
-from symile_campaign_test_support import _freeze
+from symile_campaign_test_support import _freeze, _synthetic_held_out_capability
 
 import beyondcxr.serving.cli as serving_cli
+import beyondcxr.serving.predictor as serving_predictor
+import beyondcxr.training.symile_test_data as symile_test_data
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
 from beyondcxr.serving.api import MAX_REQUEST_BODY_BYTES, create_app
 from beyondcxr.serving.authority import LAB_KEYS, RESEARCH_WARNING, SERVING_SPATIAL_POLICY
-from beyondcxr.serving.predictor import mean_logit_probability
+from beyondcxr.serving.predictor import SymileServingPredictor, mean_logit_probability
 from beyondcxr.serving.preprocessing import (
     SERVING_CANONICAL_SIZE,
     ServingInputError,
@@ -28,7 +30,6 @@ from beyondcxr.serving.preprocessing import (
     validate_view_position,
     validated_serving_input,
 )
-from beyondcxr.training.symile_campaign_control import create_or_validate_test_open_record
 from beyondcxr.training.symile_test_data import FrozenSymileNeuralTestDataset
 
 
@@ -44,6 +45,25 @@ def _labs(*, missing: str | None = None) -> str:
     return json.dumps(
         {key: None if key == missing else float(index) for index, key in enumerate(LAB_KEYS)}
     )
+
+
+def test_model_info_uses_immutable_startup_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predictor = object.__new__(SymileServingPredictor)
+    predictor._model_info = MappingProxyType(
+        {"serving_authority_id": "serving-authority-" + "a" * 64, "seeds": (17, 42, 2026)}
+    )
+    monkeypatch.setattr(
+        serving_predictor,
+        "serving_model_info",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("filesystem revalidation")),
+    )
+
+    observed = predictor.model_info()
+    observed["seeds"].append(999)
+
+    assert predictor.model_info()["seeds"] == [17, 42, 2026]
 
 
 _SPATIAL_CASES = (
@@ -124,23 +144,38 @@ def test_pathological_spatial_resize_is_rejected_before_allocation(
         serving_canonical_image(np.zeros(shape, dtype=np.uint8))
 
 
-def test_canonical_image_exactly_matches_frozen_evaluation_path(tmp_path) -> None:
+def test_canonical_image_exactly_matches_frozen_evaluation_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     decoded = decode_jpeg_once(_jpeg(rows=361, columns=479))
     canonical = serving_canonical_image(decoded)
     transform = StandardCxrTransform(training=False)
     freeze = _freeze(tmp_path / "synthetic-freeze")
-    record = create_or_validate_test_open_record(
-        control_root=tmp_path / "synthetic-control",
-        capability=freeze,
+    capability = _synthetic_held_out_capability(tmp_path / "capability", freeze)
+    monkeypatch.setattr(symile_test_data, "materialize_official_test", lambda *args: None)
+    monkeypatch.setattr(symile_test_data, "STRICT_PNEUMONIA_TEST_ADMISSIONS", 2)
+    monkeypatch.setattr(
+        symile_test_data, "validated_pretest_freeze_manifest", lambda value: value.manifest
     )
     frame = pd.DataFrame(
-        {"sample_id": ["synthetic-sample"], "subject_id": [1], "source_row": [0], "target": [0]}
+        {
+            "sample_id": ["synthetic-0", "synthetic-1"],
+            "subject_id": [1, 2],
+            "source_row": [0, 1],
+            "target": [0, 1],
+        }
     )
-    store = SimpleNamespace(canonical_image=lambda row: canonical)
+    data = object.__new__(symile_test_data.FrozenSymileTestData)
+    data._bundle = SimpleNamespace(bundle_id=str(freeze.manifest["bundle_id"]))
+    data._canonical_frame = frame
+    data._capability = freeze
+    store = object.__new__(symile_test_data.FrozenSymileTestCxrStore)
+    store._freeze = freeze
+    store._bundle_id = str(freeze.manifest["bundle_id"])
+    store.canonical_image = lambda row: canonical
     reference_dataset = FrozenSymileNeuralTestDataset(
-        freeze,
-        record,
-        frame,
+        capability,
+        data,
         cxr_store=store,
         transform=transform,
     )
@@ -150,6 +185,68 @@ def test_canonical_image_exactly_matches_frozen_evaluation_path(tmp_path) -> Non
     assert reference.shape == serving.shape == (1, 224, 224)
     assert reference.is_contiguous() and serving.is_contiguous()
     assert torch.equal(reference, serving)
+
+
+def test_neural_test_dataset_rejects_foreign_modality_composition(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    freeze = _freeze(tmp_path / "freeze")
+    capability = _synthetic_held_out_capability(tmp_path / "capability", freeze)
+    monkeypatch.setattr(symile_test_data, "materialize_official_test", lambda *args: None)
+    monkeypatch.setattr(symile_test_data, "STRICT_PNEUMONIA_TEST_ADMISSIONS", 2)
+    monkeypatch.setattr(
+        symile_test_data, "validated_pretest_freeze_manifest", lambda value: value.manifest
+    )
+    data = object.__new__(symile_test_data.FrozenSymileTestData)
+    data._bundle = SimpleNamespace(bundle_id=str(freeze.manifest["bundle_id"]))
+    data._canonical_frame = pd.DataFrame(
+        {
+            "sample_id": ["sample-0", "sample-1"],
+            "subject_id": [1, 2],
+            "source_row": [0, 1],
+            "target": [0, 1],
+        }
+    )
+    data._capability = freeze
+
+    def store(store_type, *, bundle_id: str):
+        value = object.__new__(store_type)
+        value._freeze = freeze
+        value._bundle_id = bundle_id
+        return value
+
+    authorized = str(freeze.manifest["bundle_id"])
+    foreign = "bundle-" + "f" * 64
+    cxr = store(symile_test_data.FrozenSymileTestCxrStore, bundle_id=authorized)
+    ecg = store(symile_test_data.FrozenSymileTestEcgStore, bundle_id=authorized)
+    transform = StandardCxrTransform(training=False)
+    assert (
+        len(
+            FrozenSymileNeuralTestDataset(
+                capability,
+                data,
+                cxr_store=cxr,
+                ecg_store=ecg,
+                transform=transform,
+            )
+        )
+        == 2
+    )
+    with pytest.raises(PermissionError, match="another campaign"):
+        FrozenSymileNeuralTestDataset(
+            capability,
+            data,
+            cxr_store=store(symile_test_data.FrozenSymileTestCxrStore, bundle_id=foreign),
+            transform=transform,
+        )
+    with pytest.raises(PermissionError, match="another campaign"):
+        FrozenSymileNeuralTestDataset(
+            capability,
+            data,
+            cxr_store=cxr,
+            ecg_store=store(symile_test_data.FrozenSymileTestEcgStore, bundle_id=foreign),
+            transform=transform,
+        )
 
 
 @pytest.mark.parametrize("media", ["image/png", "application/dicom", "application/octet-stream"])
@@ -276,8 +373,12 @@ def test_cli_disables_uvicorn_access_log(monkeypatch: pytest.MonkeyPatch) -> Non
         [
             "--authority",
             "/synthetic/authority",
-            "--package-root",
-            "/synthetic/packages",
+            "--deployment-provenance",
+            "/synthetic/deployment.json",
+            "--result-binding",
+            "/synthetic/binding.json",
+            "--release-archive",
+            "/synthetic/release.zip",
             "--device",
             "cpu",
             "--host",
@@ -334,7 +435,9 @@ async def client(monkeypatch: pytest.MonkeyPatch):
     )
     application = create_app(
         authority_path="/explicitly-synthetic/authority",
-        package_root="/explicitly-synthetic/packages",
+        deployment_provenance="/explicitly-synthetic/deployment.json",
+        result_binding="/explicitly-synthetic/binding.json",
+        release_archive="/explicitly-synthetic/release.zip",
     )
     transport = httpx.ASGITransport(app=application)
     async with application.router.lifespan_context(application):
@@ -366,7 +469,7 @@ async def test_health_endpoint(client: httpx.AsyncClient) -> None:
 @pytest.mark.anyio
 async def test_service_startup_fails_closed_without_authority() -> None:
     application = create_app()
-    with pytest.raises(RuntimeError, match="authority and package root"):
+    with pytest.raises(RuntimeError, match="deployment provenance"):
         async with application.router.lifespan_context(application):
             pass
 

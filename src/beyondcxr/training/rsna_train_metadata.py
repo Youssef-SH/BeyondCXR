@@ -51,14 +51,13 @@ from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
     environment_provenance,
-    git_revision,
     log_source_config,
     serialize_modalities,
     tracked_run,
-    uv_lock_sha256,
 )
 from beyondcxr.utils.operational_logging import get_operational_logger, log_event, timed_phase
 from beyondcxr.utils.privacy import validate_public_reports
+from beyondcxr.utils.provenance import git_revision, uv_lock_sha256
 from beyondcxr.utils.publication import publish_directory, staging_directory
 from beyondcxr.utils.rsna_model_publication import publish_model_package, threshold_contract
 from beyondcxr.utils.skops_io import load_skops, save_skops
@@ -106,13 +105,9 @@ def train_metadata_experiment(
         "family_id": config.family.family_id,
         "modalities": serialize_modalities(config.family.modalities),
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
         "git_commit": commit,
         "dependency_lock_sha256": lock_hash,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "run_complete": "false",
     }
     base_parameters = {
@@ -141,8 +136,6 @@ def train_metadata_experiment(
             validation_count=len(dataset.validation.targets),
             **context,
         )
-        if dataset.lineage.split_assignment_id != config.dataset.split_assignment_id:
-            raise ValueError("Loaded split assignment differs from the configuration")
         with timed_phase(_LOGGER, "model_fitting", **context):
             model_fit = get_model(config.family.family_id).fit(
                 config,
@@ -250,12 +243,9 @@ def train_metadata_experiment(
                 ),
                 manifest={
                     "bundle_id": dataset.lineage.bundle_id,
-                    "split_assignment_id": dataset.lineage.split_assignment_id,
                     "task_id": dataset.lineage.task_id,
                     "positive_class": 1,
                     "family_id": config.family.family_id,
-                    "config_source_sha256": config.config_source_sha256,
-                    "config_semantic_sha256": config.config_semantic_sha256,
                     "seed": seed,
                     "git_commit": commit,
                     "git_dirty": dirty,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 from dataclasses import dataclass, replace
@@ -47,6 +46,7 @@ from beyondcxr.training.rsna_datasets import (
 from beyondcxr.training.rsna_evaluate import evaluate_model_package
 from beyondcxr.training.rsna_interfaces import DatasetLineage
 from beyondcxr.training.rsna_train_cxr import train_cxr_experiment
+from beyondcxr.training.rsna_validation_evidence import CanonicalHeldOutCohort
 from beyondcxr.utils.mlflow_utils import configure_mlflow
 from beyondcxr.utils.operational_logging import configure_logging
 from beyondcxr.utils.package_identity import package_scientific_config_payload
@@ -69,11 +69,14 @@ from beyondcxr.utils.rsna_neural_publication import (
 _SYNTHETIC_BUNDLE_ID = "bundle-" + "a" * 64
 
 
+pytestmark = pytest.mark.integration
+
+
 def test_neural_evaluation_reestablishes_deterministic_backend_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = with_runtime(
-        load_experiment_config("configs/rsna_cxr_densenet.yaml"),
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
         seed=42,
         device="cpu",
     )
@@ -121,12 +124,13 @@ def test_neural_evaluation_reestablishes_deterministic_backend_before_dispatch(
         torch.backends.cudnn.benchmark = prior[2]
 
 
-def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, object]:
+def _manifest(checkpoint: dict[str, object]) -> dict[str, object]:
     config_path = Path("configs/rsna_cxr_densenet.yaml")
-    config = with_runtime(load_experiment_config(config_path), seed=42)
+    config = with_runtime(
+        load_experiment_config(config_path, bundle_id=_SYNTHETIC_BUNDLE_ID), seed=42
+    )
     neural = config.neural
     assert neural is not None
-    digest = hashlib.sha256(config_bytes).hexdigest()
     transform_kwargs = {
         "image_size": 224,
         "rotation_degrees": neural.rotation_degrees,
@@ -142,11 +146,7 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
         "task_id": "pneumonia",
         "positive_class": 1,
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "label_policy_version": config.task.label_policy_version,
-        "config_source_sha256": digest,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
             "git_commit": "commit",
             "git_dirty": False,
@@ -211,14 +211,13 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
             "selected_stage": checkpoint["selected_stage"],
             "validation_average_precision": checkpoint["validation_average_precision"],
         },
-        "thresholds": {"youden_j": 0.5, "target_sensitivity": 0.3},
+        "thresholds": {"youden_j": 0.7, "target_sensitivity": 0.7},
         "threshold_contract": threshold_contract(sensitivity_target=0.9),
         "source_authentication": {
             "policy_version": SOURCE_AUTHENTICATION_POLICY_VERSION,
             "partitions": ["train", "validation", "test"],
             "file_count": 3,
-            "source_inventory_arrow_sha256": "4" * 64,
-            "source_inventory_file_sha256": "5" * 64,
+            "source_inventory_semantic_sha256": "4" * 64,
         },
         "runtime_provenance": {
             **_runtime().provenance(),
@@ -232,7 +231,7 @@ def _manifest(config_bytes: bytes, checkpoint: dict[str, object]) -> dict[str, o
     }
 
 
-def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path) -> None:
+def test_safe_neural_checkpoint_and_immutable_package(tmp_path: Path) -> None:
     model = _TinyImageModel()
     checkpoint = checkpoint_document(
         model.state_dict(),
@@ -256,7 +255,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
             selected_stage="fine_tune",
             selected_validation_average_precision=0.75,
         ),
-        manifest=_manifest(config_bytes, checkpoint),
+        manifest=_manifest(checkpoint),
     )
 
     metadata = validate_neural_package_metadata(published.package_directory)
@@ -281,7 +280,7 @@ def test_safe_neural_checkpoint_and_immutable_three_file_package(tmp_path: Path)
         checkpoint_path=alternate_checkpoint,
         source_config_bytes=config_bytes,
         validation_evidence_path=published.package_directory / "validation-evidence.json",
-        manifest=_manifest(config_bytes, checkpoint),
+        manifest=_manifest(checkpoint),
     )
     assert repeated.model_package_id == published.model_package_id
     assert published.created is True
@@ -323,7 +322,7 @@ def test_neural_manifest_rejects_nested_contract_tampering(tmp_path: Path, mutat
             selected_stage="warmup",
             selected_validation_average_precision=0.5,
         ),
-        manifest=_manifest(config_bytes, checkpoint),
+        manifest=_manifest(checkpoint),
     )
     document = json.loads(published.manifest_path.read_text(encoding="utf-8"))
     mutation(document)
@@ -359,7 +358,7 @@ def test_neural_manifest_requires_integer_schema_version_one(tmp_path: Path, val
             selected_stage="warmup",
             selected_validation_average_precision=0.5,
         ),
-        manifest=_manifest(config_bytes, checkpoint),
+        manifest=_manifest(checkpoint),
     )
     document = json.loads(published.manifest_path.read_text(encoding="utf-8"))
     if value is _MISSING_SCHEMA_VERSION:
@@ -433,7 +432,7 @@ def test_strict_checkpoint_loading_rejects_parameter_mismatch(mutation: str) -> 
         strict_load_checkpoint(_TinyImageModel(), document)
 
 
-def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
+def test_safe_loader_rejects_whole_module_and_package_identity_binds_science(
     tmp_path: Path,
 ) -> None:
     unsafe = tmp_path / "unsafe.pt"
@@ -461,7 +460,7 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
             selected_stage="warmup",
             selected_validation_average_precision=0.6,
         ),
-        manifest=_manifest(config_bytes, checkpoint),
+        manifest=_manifest(checkpoint),
     )
     identity = json.loads(published.manifest_path.read_text(encoding="utf-8"))
     baseline = neural_model_package_id(identity)
@@ -471,18 +470,20 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
     changed_config_path.write_text(
         yaml.safe_dump(config_document, sort_keys=False), encoding="utf-8"
     )
-    original_config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
-    changed_config = load_experiment_config(changed_config_path)
-    assert changed_config.config_semantic_sha256 != original_config.config_semantic_sha256
+    original_config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
+    changed_config = load_experiment_config(changed_config_path, bundle_id="bundle-" + "a" * 64)
     assert package_scientific_config_payload(changed_config) == package_scientific_config_payload(
         original_config
     )
-    evaluation_changed = json.loads(json.dumps(identity))
-    evaluation_changed["config_semantic_sha256"] = changed_config.config_semantic_sha256
+    evaluation_changed = {
+        **identity,
+        "fit_config": package_scientific_config_payload(changed_config),
+    }
     assert neural_model_package_id(evaluation_changed) == baseline
     mutations = (
         lambda value: value.update({"bundle_id": "bundle-changed"}),
-        lambda value: value.update({"split_assignment_id": "split-changed"}),
         lambda value: value.update({"task_id": "changed-task"}),
         lambda value: value.update({"label_policy_version": "changed-label-policy"}),
         lambda value: value["training_policy"].update({"seed": 17}),
@@ -511,9 +512,6 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         assert neural_model_package_id(changed) != baseline
     for mutation in (
         lambda value: value.update({"checkpoint_sha256": "e" * 64}),
-        lambda value: value.update({"config_source_sha256": "e" * 64}),
-        lambda value: value.update({"config_semantic_sha256": "e" * 64}),
-        lambda value: value.update({"bundle_manifest_sha256": "8" * 64}),
         lambda value: value["model_identity"]["pretrained_weight"].update(
             {"cache_filename": "alternate-cache-name.pt"}
         ),
@@ -526,11 +524,47 @@ def test_safe_loader_rejects_whole_module_and_package_identity_binds_provenance(
         assert neural_model_package_id(changed) == baseline
 
 
+def test_neural_package_rejects_resealed_threshold(tmp_path: Path) -> None:
+    config_bytes = Path("configs/rsna_cxr_densenet.yaml").read_bytes()
+    checkpoint = checkpoint_document(
+        {"weight": torch.tensor([1.0])},
+        selected_epoch=1,
+        selected_stage="warmup",
+        validation_average_precision=0.6,
+    )
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    save_neural_checkpoint(checkpoint, checkpoint_path)
+    published = publish_neural_model_package(
+        model_root=tmp_path / "models",
+        checkpoint_path=checkpoint_path,
+        source_config_bytes=config_bytes,
+        validation_evidence_path=write_synthetic_validation_evidence(
+            tmp_path / "validation-evidence.json",
+            config_bytes,
+            seed=42,
+            selected_epoch=1,
+            selected_stage="warmup",
+            selected_validation_average_precision=0.6,
+        ),
+        manifest=_manifest(checkpoint),
+    )
+    document = json.loads(published.manifest_path.read_bytes())
+    document["thresholds"]["target_sensitivity"] = 0.5
+    document["model_package_id"] = neural_model_package_id(document)
+    destination = published.package_directory.with_name(document["model_package_id"])
+    published.package_directory.rename(destination)
+    (destination / "manifest.json").write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="thresholds differ from validation evidence"):
+        validate_published_neural_model(destination)
+
+
 def test_dataset_loading_failure_precedes_model_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_runtime(
-        load_experiment_config("configs/rsna_cxr_densenet.yaml"),
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
         seed=42,
         source_root=tmp_path / "raw",
         model_directory=tmp_path / "models" / "rsna",
@@ -583,9 +617,6 @@ def _synthetic_cxr_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> _SyntheticCxrLifecycle:
     document = yaml.safe_load(Path("configs/rsna_cxr_densenet.yaml").read_text(encoding="utf-8"))
-    document["dataset"]["bundle_id"] = _SYNTHETIC_BUNDLE_ID
-    document["dataset"]["bundle_manifest_sha256"] = "e" * 64
-    document["dataset"]["split_assignment_id"] = "split-assignment-" + "6" * 64
     document["training"]["loader"].update({"batch_size": 2})
     document["training"]["parameters"].update(
         {
@@ -598,7 +629,7 @@ def _synthetic_cxr_lifecycle(
     config_path = tmp_path / "cxr.yaml"
     config_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     config = with_runtime(
-        load_experiment_config(config_path),
+        load_experiment_config(config_path, bundle_id=_SYNTHETIC_BUNDLE_ID),
         seed=42,
         source_root=tmp_path / "raw",
         manifest_directory=tmp_path / "manifests",
@@ -611,7 +642,6 @@ def _synthetic_cxr_lifecycle(
     )
     lineage = DatasetLineage(
         bundle_id=_SYNTHETIC_BUNDLE_ID,
-        split_assignment_id=config.dataset.split_assignment_id,
         label_policy_version=config.task.label_policy_version,
         task_id=config.task.task_id,
     )
@@ -628,8 +658,7 @@ def _synthetic_cxr_lifecycle(
         )
 
     source_inventory = SourceInventoryIdentity(
-        source_inventory_arrow_sha256="a" * 64,
-        source_inventory_file_sha256="b" * 64,
+        source_inventory_semantic_sha256="a" * 64,
     )
 
     class Adapter:
@@ -641,20 +670,15 @@ def _synthetic_cxr_lifecycle(
                 train=frame("train"),
                 validation=frame("validation"),
                 lineage=lineage,
-                bundle_manifest_sha256=config.dataset.bundle_manifest_sha256,
                 source_inventory=source_inventory,
             )
 
-        def load_cxr_test(
-            self, dataset_config, *, expected_manifest_sha256, authorization, package_id
-        ):
+        def load_cxr_test(self, dataset_config, *, authorization, package_id):
             authorization.require(package_id)
-            assert expected_manifest_sha256 == config.dataset.bundle_manifest_sha256
             self.test_calls += 1
             return CxrTestData(
                 test=frame("test"),
                 lineage=lineage,
-                bundle_manifest_sha256=config.dataset.bundle_manifest_sha256,
                 source_inventory=source_inventory,
             )
 
@@ -672,6 +696,15 @@ def _synthetic_cxr_lifecycle(
             return self.build(model_config)
 
     adapter = Adapter()
+    test_frame = frame("test")
+    cohort = CanonicalHeldOutCohort(
+        tuple(f"rsna:sample-{index}" for index in range(len(test_frame))),
+        tuple(int(value) for value in test_frame["target"]),
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_validation_evidence._derive_canonical_held_out_cohort",
+        lambda *args, **kwargs: cohort,
+    )
     weight = PretrainedWeightIdentity(
         declared_name="densenet121-res224-chex",
         stable_identifier="https://example.invalid/weights.pt",
@@ -694,9 +727,7 @@ def _synthetic_cxr_lifecycle(
             transform = args[2]
             identity = CxrCacheIdentity(
                 bundle_id=_SYNTHETIC_BUNDLE_ID,
-                bundle_manifest_sha256="e" * 64,
-                source_inventory_file_sha256="b" * 64,
-                source_inventory_arrow_sha256="a" * 64,
+                source_inventory_semantic_sha256="a" * 64,
                 preprocessing_sha256=preprocessing_identity(transform),
             )
             return SimpleNamespace(
@@ -705,8 +736,7 @@ def _synthetic_cxr_lifecycle(
                     policy_version=SOURCE_AUTHENTICATION_POLICY_VERSION,
                     partitions=("train", "validation", "test"),
                     file_count=12,
-                    source_inventory_arrow_sha256="a" * 64,
-                    source_inventory_file_sha256="b" * 64,
+                    source_inventory_semantic_sha256="a" * 64,
                 ),
             )
 
@@ -822,7 +852,6 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
     assert package_manifest["model_package_schema_version"] == 1
     assert package_manifest["family_id"] == "cxr_densenet"
     assert package_manifest["modalities"] == ["cxr"]
-    assert package_manifest["bundle_manifest_sha256"] == "e" * 64
     assert package_manifest["runtime_provenance"]["loader_execution"] == {
         "lifecycle": "reused",
         "num_workers": 0,
@@ -830,13 +859,17 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
     }
     recorded_training = configure_mlflow(tracking_uri=setup.tracking_uri).get_run(training.run_id)
     assert recorded_training.data.tags["run_complete"] == "true"
-    assert recorded_training.data.tags["bundle_manifest_sha256"] == "e" * 64
 
+    authorization = authorize_rsna_package(
+        setup.config,
+        training.model_package_id,
+        monkeypatch=monkeypatch,
+        held_out_sample_ids=tuple(f"rsna:sample-{index}" for index in range(4)),
+        held_out_targets=(0, 1, 0, 1),
+    )
     evaluation = evaluate_model_package(
         training.model_package_id,
-        authorization=authorize_rsna_package(
-            setup.config, training.model_package_id, monkeypatch=monkeypatch
-        ),
+        authorization=authorization,
         evaluation_config=setup.config,
         runtime=rsna_test_runtime(setup.config),
         tracking_uri=setup.tracking_uri,
@@ -862,8 +895,6 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
     assert client.list_artifacts(evaluation.mlflow_run_id) == []
     assert evaluation_run.data.tags["run_complete"] == "true"
     assert evaluation_run.data.tags["package_id"] == training.model_package_id
-    assert evaluation_run.data.tags["bundle_manifest_sha256"] == "e" * 64
-    assert evaluation_run.data.params["bundle_manifest_sha256"] == "e" * 64
     assert evaluation_run.data.params["evaluation_runtime_resolved_device"] == "cpu"
     assert evaluation_run.data.params["evaluation_loader_num_workers"] == "0"
     assert evaluation_run.data.params["evaluation_cxr_cache_id"].startswith("cache-")
@@ -873,6 +904,8 @@ def test_synthetic_cxr_training_package_and_separate_evaluation(
         output_directory=setup.config.runtime.report_directory,
         private_directory=setup.config.runtime.private_output_directory,
         model_directory=setup.config.runtime.model_directory,
+        freeze=authorization.freeze,
+        execution=authorization.current_execution.execution,
     )
     comparison = pd.read_csv(comparison_result.csv_path)
     assert comparison_result.row_count == 1
@@ -989,23 +1022,6 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     assert setup.adapter.test_calls == 0
     manifest_path.write_bytes(original_manifest)
 
-    config_archive = training.model_path.parent / "resolved_config.yaml"
-    original_config = config_archive.read_bytes()
-    config_archive.write_bytes(original_config + b"\n# tampered\n")
-    with pytest.raises(ValueError):
-        evaluate_model_package(
-            training.model_package_id,
-            authorization=authorize_rsna_package(
-                setup.config, training.model_package_id, monkeypatch=monkeypatch
-            ),
-            evaluation_config=setup.config,
-            runtime=rsna_test_runtime(setup.config),
-            tracking_uri=setup.tracking_uri,
-            model_directory=setup.config.runtime.model_directory,
-        )
-    assert setup.adapter.test_calls == 0
-    config_archive.write_bytes(original_config)
-
     original_checkpoint = training.model_path.read_bytes()
     training.model_path.write_bytes(original_checkpoint + b"tampered")
     with pytest.raises(ValueError):
@@ -1031,7 +1047,11 @@ def test_cxr_evaluation_rejects_package_and_source_lineage_before_test_access(
     evaluation = evaluate_model_package(
         training.model_package_id,
         authorization=authorize_rsna_package(
-            setup.config, training.model_package_id, monkeypatch=monkeypatch
+            setup.config,
+            training.model_package_id,
+            monkeypatch=monkeypatch,
+            held_out_sample_ids=tuple(f"rsna:sample-{index}" for index in range(4)),
+            held_out_targets=(0, 1, 0, 1),
         ),
         evaluation_config=setup.config,
         runtime=rsna_test_runtime(setup.config),
@@ -1060,7 +1080,11 @@ def test_cxr_publication_failures_remain_incomplete(
         evaluate_model_package(
             training.model_package_id,
             authorization=authorize_rsna_package(
-                setup.config, training.model_package_id, monkeypatch=monkeypatch
+                setup.config,
+                training.model_package_id,
+                monkeypatch=monkeypatch,
+                held_out_sample_ids=tuple(f"rsna:sample-{index}" for index in range(4)),
+                held_out_targets=(0, 1, 0, 1),
             ),
             evaluation_config=setup.config,
             runtime=rsna_test_runtime(setup.config),
