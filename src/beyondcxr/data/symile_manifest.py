@@ -12,7 +12,7 @@ from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.symile_source import publish_symile_source_bundle
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
-    configure_logging,
+    cli_operation,
     get_operational_logger,
     timed_phase,
 )
@@ -40,13 +40,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        with timed_phase(_LOGGER, "source_qualification_and_bundle_publication"):
-            paths, sample_count = publish_symile_source_bundle(
-                args.source_root,
-                output_directory=args.output_directory,
-            )
+        with cli_operation("symile_manifest_cli", level=args.log_level):
+            with timed_phase(_LOGGER, "source_qualification_and_bundle_publication"):
+                paths, sample_count = publish_symile_source_bundle(
+                    args.source_root,
+                    output_directory=args.output_directory,
+                )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
         print(f"Symile manifest build failed: {type(exc).__name__}", file=sys.stderr)
         return 1

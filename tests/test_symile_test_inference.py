@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import zipfile
 from dataclasses import replace
@@ -331,17 +332,33 @@ def test_partial_prediction_resume_infers_only_missing_packages(
         )
         runtime = cpu_runtime()
         test_inference._validate_neural_inference_runtime(capability, runtime)
-    resumed = test_inference._infer_all(
-        capability,
-        packages,
-        data,
-        tmp_path / "source",
-        tmp_path / "private",
-        runtime,
-        existing,
-    )
+    from beyondcxr.utils.operational_logging import configured_logging, parse_operational_record
+
+    stream = io.StringIO()
+    with configured_logging(stream=stream, context={}):
+        resumed = test_inference._infer_all(
+            capability,
+            packages,
+            data,
+            tmp_path / "source",
+            tmp_path / "private",
+            runtime,
+            existing,
+        )
     assert resumed == predictions
     assert inferred == [package.package_id for package in packages[5:]]
+    records = [parse_operational_record(line) for line in stream.getvalue().splitlines()]
+    member_records = [record for record in records if record.get("phase") == "held_out_member"]
+    assert len(member_records) == 2 * len(packages[5:])
+    assert {record["package_id"] for record in member_records} == {
+        package.package_id for package in packages[5:]
+    }
+    assert all(
+        {"family_id", "seed", "elapsed_s"} <= record.keys() for record in member_records[1::2]
+    )
+    assert "sample_id" not in stream.getvalue()
+    assert "patient_id" not in stream.getvalue()
+    assert str(tmp_path) not in stream.getvalue()
 
 
 @pytest.mark.parametrize(

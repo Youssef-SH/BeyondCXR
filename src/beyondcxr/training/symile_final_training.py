@@ -284,6 +284,7 @@ def fit_final_neural_member(
         stage1_epochs=int(plan.stage1_epochs or 0),
         stage2_epochs=int(plan.stage2_epochs or 0),
         fine_tune_scope=str(config.training.parameters["fine_tune_scope"]),
+        operational_fields={"family_id": config.family.family_id, "seed": member_seed},
     )
     publication_operational = {
         **operational,

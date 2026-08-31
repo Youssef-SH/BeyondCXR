@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.rsna_source import RsnaPaths, discover_dicoms, load_source_samples
+from beyondcxr.utils.operational_logging import observed_operation
 from beyondcxr.utils.publication import install_immutable_directory, staging_directory
 
 RSNA_KAGGLE_COMPETITION = "rsna-pneumonia-detection-challenge"
@@ -25,6 +26,7 @@ _MAX_ARCHIVE_MEMBERS = 40_000
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES = 20 * 1024**3
 
 
+@observed_operation("ensure_rsna_source")
 def ensure_rsna_source(
     source_root: str | Path,
     *,
@@ -83,6 +85,7 @@ def ensure_rsna_source(
     return destination
 
 
+@observed_operation("download_with_kaggle")
 def _download_with_kaggle(command: Sequence[str], _directory: Path) -> None:
     try:
         subprocess.run(list(command), check=True, capture_output=True)
@@ -96,6 +99,7 @@ def _download_with_kaggle(command: Sequence[str], _directory: Path) -> None:
         ) from exc
 
 
+@observed_operation("extract_release")
 def _extract_release(archive: Path, destination: Path) -> None:
     try:
         with zipfile.ZipFile(archive) as handle:
@@ -150,6 +154,7 @@ def _is_expected_release_member(member: zipfile.ZipInfo, path: PurePosixPath) ->
     return len(path.parts) == 1 and not member.is_dir()
 
 
+@observed_operation("validate_rsna_source")
 def _validate_rsna_source(
     source_root: str | Path,
     *,

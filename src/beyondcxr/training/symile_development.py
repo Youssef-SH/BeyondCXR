@@ -92,7 +92,12 @@ from beyondcxr.utils.mlflow_utils import (
     serialize_modalities,
     tracked_run,
 )
-from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.operational_logging import (
+    add_logging_argument,
+    cli_operation,
+    get_operational_logger,
+    log_event,
+)
 from beyondcxr.utils.package_identity import package_scientific_config_payload
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
@@ -650,6 +655,37 @@ def _fit_neural_outer_fold(
         runtime=context.runtime,
         pos_weight=float(config.training.parameters["pos_weight"]),
         selection_metric=cast(SelectionMetricName, config.training.selection_metric),
+        epoch_started_callback=lambda stage, epoch, stage_epoch: log_event(
+            get_operational_logger(__name__),
+            "epoch_started",
+            family_id=config.family.family_id,
+            repeat_seed=outer.repeat_seed,
+            outer_fold=outer.outer_fold,
+            stage=stage,
+            global_epoch=epoch,
+            stage_epoch=stage_epoch,
+        ),
+        throughput_callback=lambda record, throughput: log_event(
+            get_operational_logger(__name__),
+            "epoch_completed",
+            family_id=config.family.family_id,
+            repeat_seed=outer.repeat_seed,
+            outer_fold=outer.outer_fold,
+            stage=record.stage,
+            global_epoch=record.global_epoch,
+            stage_epoch=record.stage_epoch,
+            selection_metric=config.training.selection_metric,
+            training_loss=record.training_loss,
+            validation_metric=record.validation_metric,
+            selected_best=record.selected_best,
+            no_improvement_count=record.no_improvement_count,
+            training_elapsed_s=throughput.training_elapsed_s,
+            validation_elapsed_s=throughput.validation_elapsed_s,
+            training_batches_per_second=throughput.training_batches_per_second,
+            validation_batches_per_second=throughput.validation_batches_per_second,
+            training_samples_per_second=throughput.training_samples_per_second,
+            validation_samples_per_second=throughput.validation_samples_per_second,
+        ),
         fine_tune_scope=cast(FineTuneScope, config.training.parameters["fine_tune_scope"]),
     )
     incompatible = model.load_state_dict(fit.selected_state_dict, strict=True)
@@ -916,32 +952,34 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        repository_root = discover_repository_root()
-        config = load_symile_development_config(args.config)
-        if config.family.family_id not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
-            raise ConfigError("The public development command is limited to the six core families")
-        execution = validate_active_symile_execution(repository_root / "private/control/symile")
-        config = load_symile_development_config(args.config, **execution.manifest["dataset"])
-        current = validate_current_symile_execution(
-            execution,
-            build_symile_formal_preflight(repository_root, **execution.manifest["dataset"]),
-        )
-        lifecycle = validate_symile_lifecycle(
-            current,
-            repository_root=repository_root,
-            private_root=repository_root / "private",
-            backup_root=args.backup_root,
-        )
-        with symile_prospective_mutation(lifecycle) as prospective_mutation:
-            result = run_symile_development(
-                config,
-                prospective_mutation=prospective_mutation,
-                source_cxr_development_id=args.source_cxr_development_id,
-                tracking_uri=args.tracking_uri,
-                repository_root=repository_root,
+        with cli_operation("symile_development_cli", level=args.log_level):
+            repository_root = discover_repository_root()
+            config = load_symile_development_config(args.config)
+            if config.family.family_id not in SYMILE_CORE_DEVELOPMENT_FAMILIES:
+                raise ConfigError(
+                    "The public development command is limited to the six core families"
+                )
+            execution = validate_active_symile_execution(repository_root / "private/control/symile")
+            config = load_symile_development_config(args.config, **execution.manifest["dataset"])
+            current = validate_current_symile_execution(
+                execution,
+                build_symile_formal_preflight(repository_root, **execution.manifest["dataset"]),
             )
+            lifecycle = validate_symile_lifecycle(
+                current,
+                repository_root=repository_root,
+                private_root=repository_root / "private",
+                backup_root=args.backup_root,
+            )
+            with symile_prospective_mutation(lifecycle) as prospective_mutation:
+                result = run_symile_development(
+                    config,
+                    prospective_mutation=prospective_mutation,
+                    source_cxr_development_id=args.source_cxr_development_id,
+                    tracking_uri=args.tracking_uri,
+                    repository_root=repository_root,
+                )
     except (ConfigError, ManifestBuildError, OSError, RuntimeError, ValueError) as exc:
         print(f"Symile development failed: {type(exc).__name__}", file=sys.stderr)
         return 1

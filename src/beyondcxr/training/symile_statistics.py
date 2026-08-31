@@ -12,6 +12,7 @@ from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_s
 from beyondcxr.data.symile_schemas import REPEAT_SEEDS
 from beyondcxr.evaluation.metrics import calibration_coefficients
 from beyondcxr.training.symile_families import FINAL_NEURAL_MEMBER_SEEDS
+from beyondcxr.utils.operational_logging import CountProgress, get_operational_logger
 
 METRIC_POLICY = {
     "primary_comparison": {"candidate": "cxr_labs_gated", "comparator": "cxr_densenet"},
@@ -180,6 +181,14 @@ def cluster_bootstrap_effect(
     rng = np.random.default_rng(seed)
     accepted: list[float] = []
     attempts = 0
+    progress = CountProgress(
+        get_operational_logger(__name__),
+        "bootstrap_progress",
+        total=resamples,
+        unit="resamples",
+        count_interval=500,
+        fields={"metric_name": metric},
+    )
     while len(accepted) < resamples and attempts < maximum_attempts:
         attempts += 1
         draw = rng.choice(subjects, len(subjects), replace=True)
@@ -191,6 +200,7 @@ def cluster_bootstrap_effect(
         left = _metric(sampled["target"], sampled[candidate], metric)
         right = _metric(sampled["target"], sampled[comparator], metric)
         accepted.append(left - right)
+        progress.update(len(accepted))
     if len(accepted) != resamples:
         raise ValueError("Bootstrap could not obtain the required accepted draws")
     values = np.asarray(accepted)

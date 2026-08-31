@@ -13,7 +13,7 @@ from beyondcxr.data.rsna_artifacts import build_and_write
 from beyondcxr.data.rsna_splitting import SplitConfig
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
-    configure_logging,
+    cli_operation,
     get_operational_logger,
     timed_phase,
 )
@@ -60,16 +60,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        split_config = SplitConfig(
-            seed=args.split_seed,
-            train_ratio=args.train_ratio,
-            validation_ratio=args.validation_ratio,
-            test_ratio=args.test_ratio,
-        )
-        with timed_phase(_LOGGER, "manifest_construction"):
-            written = build_and_write(args.source_root, args.output_directory, split_config)
+        with cli_operation("rsna_manifest_cli", level=args.log_level):
+            split_config = SplitConfig(
+                seed=args.split_seed,
+                train_ratio=args.train_ratio,
+                validation_ratio=args.validation_ratio,
+                test_ratio=args.test_ratio,
+            )
+            with timed_phase(_LOGGER, "manifest_construction"):
+                written = build_and_write(args.source_root, args.output_directory, split_config)
     except (ManifestBuildError, OSError) as exc:
         print(f"RSNA manifest build failed: {type(exc).__name__}", file=sys.stderr)
         return 1

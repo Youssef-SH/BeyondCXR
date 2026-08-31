@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -327,11 +328,47 @@ def test_neural_fold_delivers_inner_partitions_to_shared_training_loaders(
                 observed.extend(batch["sample_id"])
             assert sorted(observed) == sorted(outer.training.iloc[indices]["sample_id"])
         assert set(kwargs["input_keys"]) == expected_keys - {"target", "sample_id", "patient_id"}
+        # Exercise the supplied operational callbacks; the trainer deliberately swallows
+        # callback failures, so call them here to catch attribute/signature drift.
+        from beyondcxr.training.neural import EpochThroughput, TrainingEpochRecord
+
+        kwargs["epoch_started_callback"]("warmup", 1, 1)
+        kwargs["throughput_callback"](
+            TrainingEpochRecord(1, 1, "warmup", 0.25, 0.75, True, None, 0.1, None, 0),
+            EpochThroughput(1, 2, 3, 4, 5, 6),
+        )
         raise TrainingReached
 
     monkeypatch.setattr(symile_development, "fit_two_stage_binary_model", train)
-    with pytest.raises(TrainingReached):
+    from beyondcxr.utils.operational_logging import configured_logging, parse_operational_record
+
+    stream = io.StringIO()
+    with configured_logging(stream=stream, context={}), pytest.raises(TrainingReached):
         symile_development._fit_neural_outer_fold(config, context, outer, inner, None)
+    records = [parse_operational_record(line) for line in stream.getvalue().splitlines()]
+    started = next(record for record in records if record["event"] == "epoch_started")
+    completed = next(record for record in records if record["event"] == "epoch_completed")
+    for record in (started, completed):
+        assert record["family_id"] == family
+        assert record["repeat_seed"] == "42"
+        assert record["outer_fold"] == "2"
+        assert record["stage"] == "warmup"
+        assert record["global_epoch"] == record["stage_epoch"] == "1"
+    for field in (
+        "training_loss",
+        "selection_metric",
+        "validation_metric",
+        "selected_best",
+        "no_improvement_count",
+        "training_elapsed_s",
+        "validation_elapsed_s",
+        "training_batches_per_second",
+        "validation_batches_per_second",
+        "training_samples_per_second",
+        "validation_samples_per_second",
+    ):
+        assert field in completed
+    assert completed["selection_metric"] == config.training.selection_metric
 
 
 def test_neural_holdout_establishes_backend_policy_without_training(
