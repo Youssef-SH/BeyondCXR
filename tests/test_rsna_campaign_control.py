@@ -327,16 +327,27 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
     assert materialized is False
     (report / "evaluation_report.md").write_bytes(report_bytes)
     held_out = authorize_rsna_held_out(plan=plan, execution=execution, freeze=frozen)
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
-        lambda **kwargs: plan,
-    )
+    calls = []
+
+    def preflight(*, backup_root, bundle_id, source_root="data/raw/rsna/extracted"):
+        assert bundle_id == plan.authority.bundle_id
+        assert backup_root == plan.roots.backup_root
+        assert source_root == plan.roots.source_root
+        calls.append(bundle_id)
+        return plan
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign._preflight_rsna_campaign", preflight)
     assert require_validated_rsna_held_out(held_out).freeze == frozen
+    assert calls == [plan.authority.bundle_id]
 
     with monkeypatch.context() as drift:
+
+        def drifted_preflight(*, backup_root, bundle_id, source_root="data/raw/rsna/extracted"):
+            preflight(backup_root=backup_root, bundle_id=bundle_id, source_root=source_root)
+            return replace(plan, git_commit="9" * 40)
+
         drift.setattr(
-            "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
-            lambda **kwargs: replace(plan, git_commit="9" * 40),
+            "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", drifted_preflight
         )
         with pytest.raises(ManifestBuildError, match="Current environment differs"):
             require_validated_rsna_held_out(held_out)

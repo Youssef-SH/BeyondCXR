@@ -18,11 +18,13 @@ from beyondcxr.data.rsna_artifacts import (
 )
 from beyondcxr.data.rsna_audit import generate_rsna_audit
 from beyondcxr.data.rsna_schemas import PNEUMONIA_LABEL_POLICY_VERSION, PNEUMONIA_TASK_ID
+from beyondcxr.training.campaign_observability import campaign_log_members
 from beyondcxr.training.preservation import (
     PreservationMember,
     PreservationRole,
     _validated_restoration_context,
     validate_exact_restored_closure,
+    validate_preservation_members,
 )
 from beyondcxr.training.rsna_campaign_control import (
     ValidatedRsnaExecution,
@@ -67,11 +69,10 @@ def campaign_export_members(
     localization: Path,
     comparison: ComparisonResult,
     audit_directory: Path,
-    campaign_log: Path,
     private_root: Path,
     report_root: Path,
 ) -> tuple[PreservationMember, ...]:
-    """Return the exact non-overlapping authority closure for one RSNA campaign."""
+    """Prepare the RSNA closure and derivatives before attaching attempt evidence."""
     validate_execution_closure(execution, freeze)
     bundle_directory = freeze.bundle_directory
     members: list[PreservationMember] = []
@@ -82,9 +83,6 @@ def campaign_export_members(
         *,
         role: PreservationRole = "scientific_authority",
     ) -> None:
-        resolved = path.resolve()
-        if resolved in {member.path.resolve() for member in members}:
-            raise ManifestBuildError("RSNA preservation closure contains a duplicate source")
         members.append(PreservationMember(path, restore_relative, role))
 
     add(
@@ -186,11 +184,7 @@ def campaign_export_members(
     if audit_directory.resolve() != regenerated_audit.resolve():
         raise ManifestBuildError("RSNA audit derivative uses an unexpected coordinate")
     add(regenerated_audit, Path("reports/rsna/audit") / bundle_id, role="derivative")
-    add(
-        campaign_log,
-        Path("reports/rsna/campaigns") / campaign_log.parent.name / "execution.log",
-        role="operational_evidence",
-    )
+    validate_preservation_members(members)
     return tuple(members)
 
 
@@ -339,11 +333,7 @@ def validate_restored_rsna_campaign(restored_root: Path) -> None:
         bundle_id=bundle_id,
     )
     audit = report_root / "rsna/audit" / bundle_id
-    logs = tuple((report_root / "rsna/campaigns").glob("*/execution.log"))
-    if len(logs) != 1 or logs[0].is_symlink() or not logs[0].is_file():
-        raise ManifestBuildError("Restored RSNA campaign log is invalid")
-    if "event=campaign_ready_for_export" not in logs[0].read_text(encoding="utf-8"):
-        raise ManifestBuildError("Restored RSNA campaign log is incomplete")
+    campaign_log = report_root / "rsna/campaigns/export/execution.log"
     validate_exact_restored_closure(
         restored_root,
         campaign_export_members(
@@ -355,10 +345,10 @@ def validate_restored_rsna_campaign(restored_root: Path) -> None:
             localization=localization,
             comparison=comparison,
             audit_directory=audit,
-            campaign_log=logs[0],
             private_root=private_root,
             report_root=report_root,
-        ),
+        )
+        + campaign_log_members(campaign_log, study="rsna", execution_id=execution.execution_id),
     )
 
 

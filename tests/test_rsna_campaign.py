@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -31,6 +32,7 @@ from beyondcxr.training.rsna_formal import (
     RsnaFormalRoots,
     ValidatedRsnaPlan,
 )
+from beyondcxr.training.rsna_localize import generate_localization_report
 
 _PACKAGE_IDS = {
     name: "model-package-" + character * 64
@@ -137,19 +139,49 @@ def test_formal_preflight_accepts_existing_tracking_database_on_retry(
         lambda: repository_root,
     )
 
+    import shutil
+
+    from beyondcxr.training import operational_validation
+
+    shutil.copytree(Path(__file__).parents[1] / "configs", repository_root / "configs")
+    source = repository_root / "data/raw/rsna/extracted"
+    (source / "stage_2_train_images").mkdir(parents=True)
+    for name in ("stage_2_train_labels.csv", "stage_2_detailed_class_info.csv"):
+        (source / name).write_text("synthetic")
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign.git_revision", lambda root: ("f" * 40, False)
+    )
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.uv_lock_sha256", lambda path: "0" * 64)
+    for name in (
+        "validate_bundle_reference",
+        "validate_bundle_directory",
+        "validate_rsna_cache_source_availability",
+    ):
+        monkeypatch.setattr("beyondcxr.training.rsna_campaign." + name, lambda *a, **kw: None)
+    observed = []
+
+    def volume(path):
+        observed.append(path)
+        return 1, 25 * 1024**3
+
+    monkeypatch.setattr(operational_validation, "_storage_volume", volume)
+
     class DestinationValidationPassed(Exception):
         pass
 
-    def stop_after_destination_validation(root: Path) -> tuple[str, bool]:
-        assert root == repository_root
+    def stop_before_runtime(config):
         raise DestinationValidationPassed
 
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.git_revision",
-        stop_after_destination_validation,
+        "beyondcxr.training.rsna_campaign._required_cuda_runtime", stop_before_runtime
     )
-
     with pytest.raises(DestinationValidationPassed):
+        _preflight_rsna_campaign(backup_root=backup_root, bundle_id="bundle-" + "a" * 64)
+    assert observed == [repository_root, repository_root / "outbox", backup_root]
+    monkeypatch.setattr(
+        operational_validation, "_storage_volume", lambda path: (1, 25 * 1024**3 - 1)
+    )
+    with pytest.raises(OSError, match="insufficient"):
         _preflight_rsna_campaign(backup_root=backup_root, bundle_id="bundle-" + "a" * 64)
 
 
@@ -355,7 +387,7 @@ def test_campaign_consumes_preflight_authority_and_freezes_before_test(
     localization = tmp_path / "reports/rsna/localization/localization-test"
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.generate_localization_report",
-        lambda *args, **kwargs: localization,
+        create_autospec(generate_localization_report, return_value=localization),
     )
     comparison = ComparisonResult(
         tmp_path / "reports/rsna/comparisons/comparison",
@@ -387,10 +419,19 @@ def test_campaign_consumes_preflight_authority_and_freezes_before_test(
         "beyondcxr.training.rsna_campaign._validate_outputs",
         lambda *args, **kwargs: events.append(("outputs_validated", None)),
     )
+    from beyondcxr.data.rsna_audit import generate_rsna_audit
+
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign.campaign_export_members",
-        lambda **kwargs: (SimpleNamespace(),),
+        "beyondcxr.data.rsna_audit._generate_rsna_audit", lambda *args, **kwargs: {}
     )
+
+    def prepare_export(**kwargs):
+        # Keep the production audit wrapper at the preparation boundary; scientific
+        # closure projection is exercised by the preservation composition tests.
+        generate_rsna_audit()
+        return ()
+
+    monkeypatch.setattr("beyondcxr.training.rsna_campaign.campaign_export_members", prepare_export)
 
     def export(**kwargs):
         path = tmp_path / "outbox/campaign.zip"
@@ -438,7 +479,8 @@ def test_campaign_resume_reuses_frozen_packages_and_evaluations(
         for name, package_id in _PACKAGE_IDS.items()
     )
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: preflight
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda *, backup_root, bundle_id, source_root="data/raw/rsna/extracted": preflight,
     )
     execution = SimpleNamespace(execution_id="execution", directory=execution_directory)
     monkeypatch.setattr(
@@ -495,7 +537,7 @@ def test_campaign_resume_reuses_frozen_packages_and_evaluations(
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.generate_localization_report",
-        lambda *args, **kwargs: tmp_path / "localization",
+        create_autospec(generate_localization_report, return_value=tmp_path / "localization"),
     )
 
     def compare(
@@ -731,7 +773,8 @@ def test_training_failure_cannot_cross_scientific_freeze_or_heldout_boundary(
     heldout_calls = []
     freeze_calls = []
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: plan
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda *, backup_root, bundle_id, source_root="data/raw/rsna/extracted": plan,
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.publish_or_validate_execution", lambda value: execution
@@ -781,7 +824,8 @@ def test_source_authentication_failure_prevents_all_training(
     )
     training_calls = []
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign", lambda **kwargs: plan
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda *, backup_root, bundle_id, source_root="data/raw/rsna/extracted": plan,
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.publish_or_validate_execution", lambda value: execution

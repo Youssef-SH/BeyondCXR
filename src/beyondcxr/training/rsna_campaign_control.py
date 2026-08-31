@@ -489,6 +489,7 @@ def require_current_rsna_execution(value: object) -> ValidatedCurrentRsnaExecuti
     from beyondcxr.training.rsna_campaign import _preflight_rsna_campaign
 
     fresh_plan = _preflight_rsna_campaign(
+        bundle_id=value.plan.authority.bundle_id,
         backup_root=value.plan.roots.backup_root,
         source_root=value.plan.roots.source_root,
     )

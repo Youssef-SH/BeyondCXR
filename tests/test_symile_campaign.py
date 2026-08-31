@@ -28,6 +28,7 @@ from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.release.binding import validate_result_binding
 from beyondcxr.release.inputs import derive_result_binding
 from beyondcxr.serving.predictor import SymileServingPredictor
+from beyondcxr.training.campaign_observability import campaign_session
 from beyondcxr.training.config import load_symile_development_config, with_runtime
 from beyondcxr.training.preservation import (
     PreservationMember,
@@ -39,6 +40,7 @@ from beyondcxr.training.symile_campaign_control import (
     GlobalResultIntegrity,
 )
 from beyondcxr.training.symile_families import DEVELOPMENT_FAMILY_ORDER
+from beyondcxr.utils.operational_logging import get_operational_logger, log_event
 from beyondcxr.utils.semantic_identity import canonical_json_bytes, canonical_scientific_id
 from beyondcxr.utils.symile_publication import ValidatedDevelopmentResult
 
@@ -202,6 +204,15 @@ def bounded_restored_symile_consumers(tmp_path_factory: pytest.TempPathFactory):
         final_packages=(),
         test_data=object(),
     )
+    with campaign_session(
+        repository_root=root, report_root=root / "attempts", study="symile", operation="test"
+    ) as session:
+        session.bind_execution(capability.execution.execution_id)
+        log_event(get_operational_logger("fixture"), "campaign_ready_for_export")
+        snapshot = report_root / "campaigns/export"
+        snapshot.mkdir(parents=True)
+        for name in ("execution.log", "session.json"):
+            shutil.copyfile(session.log_path.with_name(name), snapshot / name)
     archive = export_and_verify(
         members=[
             PreservationMember(manifest_root.parent, Path("data")),
@@ -751,23 +762,68 @@ def test_storage_readiness_rejects_low_space_before_campaign_work(
     assert not (repository / "models").exists()
 
 
-def test_storage_readiness_accounts_for_distinct_and_shared_filesystems(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.parametrize("devices", [(1, 1, 1), (1, 1, 2), (1, 2, 3)])
+def test_storage_readiness_accounts_for_export_and_restoration(tmp_path, monkeypatch, devices):
+    from contextlib import contextmanager
+
+    from beyondcxr.training import operational_validation, preservation
+
     monkeypatch.undo()
     repository = tmp_path / "repository"
-    backup = tmp_path / "external/backup"
+    repository.mkdir()
+    export = repository / "outbox"
+    backup = tmp_path / "backup"
+    roots = (repository, export, backup)
     gib = 1024**3
-    monkeypatch.setattr(
-        symile_campaign,
-        "_storage_volume",
-        lambda path: (1, 32 * gib) if path == repository else (2, 8 * gib),
-    )
-    symile_campaign._validate_symile_storage_readiness(repository, backup)
+    reserves = (32 * gib, 16 * gib, 8 * gib)
+    required = {}
+    for device, reserve in zip(devices, reserves, strict=True):
+        required[device] = required.get(device, 0) + reserve
+    available = dict(required)
+    queried = []
 
-    monkeypatch.setattr(symile_campaign, "_storage_volume", lambda path: (1, 39 * gib))
-    with pytest.raises(OSError, match="40 GiB"):
-        symile_campaign._validate_symile_storage_readiness(repository, backup)
+    def volume(path):
+        queried.append(path)
+        device = devices[roots.index(path)]
+        return device, available[device]
+
+    monkeypatch.setattr(operational_validation, "_storage_volume", volume)
+    for device in required:
+        available[device] -= 1
+        with pytest.raises(OSError, match="insufficient"):
+            symile_campaign._validate_symile_storage_readiness(repository, backup)
+        available[device] += 1
+    queried.clear()
+    symile_campaign._validate_symile_storage_readiness(repository, backup)
+    assert queried == list(roots)
+    assert not export.exists() and not backup.exists()
+
+    original_restore = preservation.restored_export
+    restored_paths = []
+
+    @contextmanager
+    def restore(archive, *, scratch_root=None):
+        assert scratch_root == export
+        with original_restore(archive, scratch_root=scratch_root) as root:
+            assert root.is_relative_to(export)
+            restored_paths.append(root)
+            yield root
+
+    monkeypatch.setattr(preservation, "restored_export", restore)
+    source = repository / "synthetic"
+    source.write_bytes(b"synthetic closure")
+    arguments = dict(
+        members=(PreservationMember(source, Path("synthetic")),),
+        export_root=export,
+        backup_root=backup,
+        export_name="synthetic",
+    )
+    archive = export_and_verify(**arguments)
+    original_bytes = archive.read_bytes()
+    export_and_verify(**arguments)
+    assert archive.read_bytes() == original_bytes
+    assert len(restored_paths) == 3  # Initial certification, transport validation, retry.
+    assert all(not path.exists() for path in restored_paths)
 
 
 def test_final_fit_configures_the_explicit_tracking_uri(
@@ -1385,3 +1441,282 @@ def test_restoration_rejects_freeze_path_before_reading_it(
     monkeypatch.setattr(Path, "read_bytes", bounded_read)
     with pytest.raises(ValueError, match="safe path component"):
         symile_campaign.validate_restored_campaign(root)
+
+
+@pytest.mark.parametrize("operation", ["development", "test"])
+def test_public_symile_attempts_have_durable_failure_logs_without_opening(
+    tmp_path, monkeypatch, capsys, operation
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    shutil.copytree(Path(__file__).parents[1] / "configs", repository / "configs")
+    monkeypatch.chdir(repository)
+    monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository)
+    execution = SimpleNamespace(
+        manifest={
+            "dataset": {
+                "bundle_id": "bundle-" + "a" * 64,
+                "cv_assignment_id": "cv-assignment-" + "b" * 64,
+            }
+        }
+    )
+    monkeypatch.setattr(symile_campaign, "validate_active_symile_execution", lambda root: execution)
+    failure = RuntimeError("private preflight detail")
+
+    def reject(*args, **kwargs):
+        raise failure
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("logging must not open test or begin science")
+
+    monkeypatch.setattr(symile_campaign, "build_symile_formal_preflight", reject)
+    monkeypatch.setattr(symile_campaign, "open_official_test", forbidden)
+    monkeypatch.setattr(symile_campaign, "run_symile_development", forbidden)
+    monkeypatch.setattr(symile_campaign, "publish_or_validate_symile_execution", forbidden)
+    for _ in range(2):
+        with pytest.raises(RuntimeError) as caught:
+            if operation == "development":
+                symile_campaign.run_symile_campaign(
+                    **execution.manifest["dataset"],
+                    source_root=tmp_path / "source",
+                    backup_root=tmp_path / "backup",
+                )
+            else:
+                symile_campaign.resume_symile_test_phase(
+                    source_root=tmp_path / "source",
+                    backup_root=tmp_path / "backup",
+                )
+        assert caught.value is failure
+    logs = tuple((repository / "reports/symile/campaigns").glob("*/execution.log"))
+    assert len(logs) == 2
+    for path in logs:
+        content = path.read_text()
+        assert content.count("event=campaign_started") == 1
+        assert content.count("event=campaign_failed") == 1
+        assert f"operation={operation}" in content
+        assert f"phase={operation}_preflight" in content
+        assert "private preflight detail" not in content
+        assert "campaign_succeeded" not in content
+    assert not (repository / "private").exists()
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "event=campaign_failed" in output.err
+
+
+def test_frozen_development_resume_creates_only_new_operational_attempt(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    shutil.copytree(Path(__file__).parents[1] / "configs", repository / "configs")
+    monkeypatch.setattr(symile_campaign, "discover_repository_root", lambda: repository)
+    dataset = {"bundle_id": "bundle-" + "a" * 64, "cv_assignment_id": "cv-assignment-" + "b" * 64}
+    execution = SimpleNamespace(execution_id="symile-execution-" + "c" * 64)
+    freeze = SimpleNamespace(freeze_id="pretest-freeze-" + "d" * 64)
+    monkeypatch.setattr(
+        symile_campaign, "build_symile_formal_preflight", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        symile_campaign, "_resolve_unique_pretest_state", lambda **kwargs: (freeze, None, ())
+    )
+    monkeypatch.setattr(symile_campaign, "validate_active_symile_execution", lambda root: execution)
+    monkeypatch.setattr(
+        symile_campaign,
+        "validate_current_symile_execution",
+        lambda *args: SimpleNamespace(execution=execution),
+    )
+    monkeypatch.setattr(
+        symile_campaign, "validate_symile_lifecycle", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        symile_campaign, "symile_prospective_mutation", lambda lifecycle: nullcontext()
+    )
+    monkeypatch.setattr(symile_campaign, "validate_symile_frozen_campaign", lambda **kwargs: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("frozen resume must not publish science or open test")
+
+    for name in (
+        "publish_or_validate_symile_execution",
+        "publish_pretest_freeze",
+        "run_symile_development",
+        "open_official_test",
+    ):
+        monkeypatch.setattr(symile_campaign, name, forbidden)
+    results = [
+        symile_campaign.run_symile_campaign(
+            **dataset, source_root=tmp_path / "source", backup_root=tmp_path / "backup"
+        )
+        for _ in range(2)
+    ]
+    assert (
+        results[0]
+        == results[1]
+        == {
+            "status": "pretest_ready",
+            "execution_id": execution.execution_id,
+            "freeze_id": freeze.freeze_id,
+        }
+    )
+    logs = tuple((repository / "reports/symile/campaigns").glob("*/execution.log"))
+    assert len(logs) == 2
+    assert all("event=campaign_succeeded" in path.read_text() for path in logs)
+
+
+def test_test_continuation_observes_opening_failure_without_authorizing_it(tmp_path, monkeypatch):
+    frozen = SimpleNamespace(
+        lifecycle=SimpleNamespace(
+            private_root=tmp_path / "private", backup_root=tmp_path / "backup"
+        )
+    )
+    monkeypatch.setattr(symile_campaign, "require_symile_frozen_campaign", lambda value: value)
+    rejected = PermissionError("synthetic opening denied")
+
+    def reject(*, frozen_campaign):
+        assert frozen_campaign is frozen
+        raise rejected
+
+    monkeypatch.setattr(symile_campaign, "open_official_test", reject)
+    with pytest.raises(PermissionError) as caught:
+        with campaign_session(
+            repository_root=tmp_path,
+            report_root=tmp_path / "reports/symile",
+            study="symile",
+            operation="test",
+        ) as session:
+            symile_campaign.complete_symile_test_phase(
+                session=session,
+                frozen_campaign=frozen,
+                development_decision=None,
+                packages=(),
+                source_root=tmp_path / "source",
+                manifest_root=tmp_path / "manifests",
+                model_root=tmp_path / "models",
+                report_root=tmp_path / "reports/symile",
+                private_root=tmp_path / "private",
+                export_root=tmp_path / "outbox",
+                backup_root=tmp_path / "backup",
+                runtime=None,
+            )
+    assert caught.value is rejected
+    content = session.log_path.read_text()
+    assert "phase=test_opening" in content
+    assert "phase=held_out_predictions" not in content
+    assert not (tmp_path / "private").exists()
+
+
+@pytest.mark.parametrize("failure", [None, "analysis", "subgroups", "archive"])
+def test_test_phase_archive_snapshots_complete_log_chronology(tmp_path, monkeypatch, failure):
+    from contextlib import nullcontext
+
+    from beyondcxr.utils.operational_logging import parse_operational_record
+
+    logger = get_operational_logger("fixture")
+    execution = SimpleNamespace(execution_id="symile-execution-" + "a" * 64)
+    decision = SimpleNamespace(decision_id="decision")
+    freeze = SimpleNamespace(freeze_id="freeze", development_decision=decision, final_packages=())
+    capability = SimpleNamespace(
+        freeze=freeze,
+        execution=execution,
+        opening=SimpleNamespace(path=tmp_path / "opening"),
+        frozen_campaign=SimpleNamespace(developments=()),
+        _operation=object(),
+    )
+    global_result = SimpleNamespace(result_id="result", matches_integrity=lambda value: True)
+    monkeypatch.setattr(
+        symile_campaign, "publish_frozen_test_predictions", lambda **kwargs: ((), object())
+    )
+    monkeypatch.setattr(symile_campaign, "publish_global_result", lambda **kwargs: global_result)
+    monkeypatch.setattr(
+        symile_campaign, "publish_error_review", lambda **kwargs: tmp_path / "review"
+    )
+    monkeypatch.setattr(symile_campaign, "require_certified_global_result", lambda value: value)
+    monkeypatch.setattr(
+        symile_campaign, "require_validated_held_out_capability", lambda value: value
+    )
+    monkeypatch.setattr(symile_campaign, "validate_global_result_integrity", lambda *a, **kw: None)
+    monkeypatch.setattr(symile_campaign, "validate_error_review", lambda *a, **kw: None)
+
+    prepared = []
+
+    def prepare(name):
+        # Preserve the publisher side effects inside the real closure-preparation call.
+        log_event(logger, "derivative_preparation", artifact=name)
+        if failure == name:
+            raise OSError("synthetic preparation failure")
+        path = tmp_path / name
+        path.write_text("synthetic derivative")
+        prepared.append(name)
+        return path
+
+    monkeypatch.setattr(
+        symile_campaign, "publish_operation_analysis", lambda *a, **kw: prepare("analysis")
+    )
+    monkeypatch.setattr(
+        symile_campaign, "publish_operation_subgroups", lambda *a, **kw: prepare("subgroups")
+    )
+
+    def project(**kwargs):
+        assert prepared == ["analysis", "subgroups"]
+        assert kwargs["analysis_path"].is_file() and kwargs["subgroup_path"].is_file()
+        return tuple(
+            PreservationMember(tmp_path / name, Path(name), "derivative") for name in prepared
+        )
+
+    monkeypatch.setattr(symile_campaign, "_project_campaign_export_members", project)
+
+    def restored_log(root):
+        return (root / "reports/symile/campaigns/export/execution.log").read_text()
+
+    monkeypatch.setattr(symile_campaign, "validate_restored_campaign", restored_log)
+    if failure == "archive":
+
+        def fail_export(**kwargs):
+            raise OSError("synthetic archive failure")
+
+        monkeypatch.setattr(symile_campaign, "export_and_verify", fail_export)
+
+    with pytest.raises(OSError) if failure else nullcontext():
+        with campaign_session(
+            repository_root=tmp_path,
+            report_root=tmp_path / "reports/symile",
+            study="symile",
+            operation="test",
+        ) as session:
+            session.bind_execution(execution.execution_id)
+            result = symile_campaign._complete_opened_campaign(
+                session=session,
+                capability=capability,
+                development_decision=decision,
+                packages=(),
+                source_root=tmp_path / "source",
+                manifest_root=tmp_path / "manifests",
+                model_root=tmp_path / "models",
+                report_root=tmp_path / "reports/symile",
+                private_root=tmp_path / "private",
+                export_root=tmp_path / "outbox",
+                backup_root=tmp_path / "backup",
+                runtime=None,
+            )
+    local = session.log_path.read_text()
+    events = [parse_operational_record(line)["event"] for line in local.splitlines()]
+    if failure:
+        assert events[-1] == "campaign_failed"
+        assert "archive_created" not in events and "campaign_succeeded" not in events
+        if failure != "archive":
+            assert "campaign_ready_for_export" not in events
+            assert not (tmp_path / "outbox").exists()
+    else:
+        archived = restore_and_validate_export(result["export"], restoration_validator=restored_log)
+        archived_events = [
+            parse_operational_record(line)["event"] for line in archived.splitlines()
+        ]
+        assert archived_events[-3:] == [
+            "derivative_preparation",
+            "derivative_preparation",
+            "campaign_ready_for_export",
+        ]
+        assert (
+            "archive_created" not in archived_events and "campaign_succeeded" not in archived_events
+        )
+        assert events[-2:] == ["archive_created", "campaign_succeeded"]
