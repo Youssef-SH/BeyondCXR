@@ -8,6 +8,7 @@ __pycache__/
 # Environment
 .venv/
 .env
+.beyondcxr.local.toml
 .env.*
 /dist/
 

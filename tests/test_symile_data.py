@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import symile_data_test_support as source_fixtures
 from symile_data_test_support import (
     _published_synthetic_release,
     _refresh_checksums,
@@ -17,26 +20,27 @@ from symile_data_test_support import (
 )
 
 import beyondcxr.data.symile_artifacts as symile_artifacts
+import beyondcxr.data.symile_source as symile_source
+import beyondcxr.training.symile_test_data as symile_test_data
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import logical_arrow_sha256
+from beyondcxr.data.hashing import LogicalTableContract, logical_table_sha256
 from beyondcxr.data.symile_artifacts import (
     LABS_FILENAME,
     METADATA_FILENAME,
     SAMPLES_FILENAME,
     authenticate_source_asset,
-    build_symile_artifacts,
     bundle_identity_payload,
-    official_split_assignment_id,
+    read_symile_labs,
     read_symile_samples,
     resolve_symile_bundle,
     semantic_bundle_id,
     strict_pneumonia_rows,
     validate_symile_bundle,
     validate_symile_bundle_reference,
-    write_symile_bundle,
 )
 from beyondcxr.data.symile_audit import REPORT_FILENAMES, generate_symile_audit
 from beyondcxr.data.symile_cv import (
+    _CV_TABLE_CONTRACT,
     CV_ASSIGNMENTS_FILENAME,
     _cv_identity_payload,
     cv_assignment_id,
@@ -48,6 +52,7 @@ from beyondcxr.data.symile_cv import (
 from beyondcxr.data.symile_manifest import main as symile_manifest_main
 from beyondcxr.data.symile_schemas import (
     CV_SCHEMA,
+    DEVELOPMENT_SPLITS,
     LAB_ITEM_IDS,
     LAB_NAMES,
     LAB_SCHEMA,
@@ -56,10 +61,19 @@ from beyondcxr.data.symile_schemas import (
 from beyondcxr.data.symile_source import (
     EXPECTED_RELEASE_ASSETS,
     parse_sha256sums,
-    qualify_symile_source,
-    select_test_queries,
+    publish_symile_source_bundle,
     strict_pneumonia_target,
 )
+from beyondcxr.training.config import load_symile_development_config, with_runtime
+from beyondcxr.training.symile_data import load_symile_development_cohort
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
+
+
+def _replace_parquet_value(path: Path, column: str, value: object, *, row_index: int = 0) -> None:
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    rows[row_index][column] = value
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path)
 
 
 def test_exact_symile_schemas_and_lab_order() -> None:
@@ -98,14 +112,28 @@ def test_strict_endpoint_derivation(state: object, target: int | None) -> None:
     assert strict_pneumonia_target(state) == target
 
 
-def test_positive_self_query_selector_retains_original_rows() -> None:
-    frame = pd.DataFrame(
-        {"hadm_id": [10, 11, 12], "label_hadm_id": [10, 10, 12], "label": [1, 0, 1]},
-        index=[4, 7, 9],
+def test_source_bundle_preserves_positive_query_source_positions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    split_rows = source_fixtures._split_rows
+
+    def reversed_retrieval_rows(
+        admissions: list[tuple[int, int]], *, retrieval: bool = False
+    ) -> pd.DataFrame:
+        frame = split_rows(admissions, retrieval=retrieval)
+        return frame.iloc[::-1].reset_index(drop=True) if retrieval else frame
+
+    monkeypatch.setattr(source_fixtures, "_split_rows", reversed_retrieval_rows)
+    source_root = _synthetic_release(tmp_path)
+    bundle, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=tmp_path / "manifests",
+        enforce_production_counts=False,
     )
-    selected = select_test_queries(frame)
-    assert selected.index.tolist() == [4, 9]
-    assert selected["hadm_id"].tolist() == [10, 12]
+    selected = source_fixtures._materialized_synthetic_test(bundle, monkeypatch).source_samples
+    assert dict(zip(selected["hadm_id"], selected["source_row"], strict=True)) == {
+        830_000 + index: 99 - index for index in range(10)
+    }
 
 
 def _identity_metadata() -> dict[str, object]:
@@ -129,7 +157,6 @@ def _identity_metadata() -> dict[str, object]:
                 "test": "positive self-query rows of test.csv",
             },
             "test_selector": "label == 1 and label_hadm_id == hadm_id",
-            "split_assignment_id": "split-assignment-" + "0" * 64,
         },
         "source": {
             "release": "1.0.0",
@@ -185,8 +212,6 @@ def _identity_metadata() -> dict[str, object]:
             },
         },
         "qualification": {"diagnostic": "ignored"},
-        "generation": {"timestamp": "ignored"},
-        "artifacts": {"physical_file_sha256": "ignored"},
     }
 
 
@@ -201,14 +226,10 @@ def test_semantic_bundle_identity_includes_only_meaning_and_logical_content() ->
     metadata = _identity_metadata()
     logical = {SAMPLES_FILENAME: "b" * 64, LABS_FILENAME: "c" * 64}
     identity = semantic_bundle_id(metadata, logical)
-    for change in ("diagnostics", "generation", "physical", "checksum_manifest"):
+    for change in ("diagnostics", "checksum_manifest"):
         changed = deepcopy(metadata)
         if change == "diagnostics":
             changed["qualification"] = {"diagnostic": "changed"}
-        elif change == "generation":
-            changed["generation"] = {"timestamp": "different"}
-        elif change == "physical":
-            changed["artifacts"] = {"physical_file_sha256": "different encoding"}
         else:
             changed["source"]["checksum_manifest_sha256"] = "d" * 64
         assert semantic_bundle_id(changed, logical) == identity
@@ -217,9 +238,6 @@ def test_semantic_bundle_identity_includes_only_meaning_and_logical_content() ->
     task_changed = deepcopy(metadata)
     task_changed["tasks"]["pneumonia_strict"]["positive"] = "different"
     changes.append((task_changed, logical))
-    split_changed = deepcopy(metadata)
-    split_changed["membership"]["split_assignment_id"] = "split-assignment-" + "1" * 64
-    changes.append((split_changed, logical))
     source_changed = deepcopy(metadata)
     source_changed["source"]["source_assets"][0]["expected_sha256"] = "e" * 64
     changes.append((source_changed, logical))
@@ -241,8 +259,9 @@ def test_semantic_bundle_identity_is_independent_of_parquet_encoding(tmp_path: P
     pq.write_table(table, first, compression="zstd")
     pq.write_table(table, second, compression=None)
     assert first.read_bytes() != second.read_bytes()
-    first_hash = logical_arrow_sha256(pq.read_table(first))
-    second_hash = logical_arrow_sha256(pq.read_table(second))
+    contract = LogicalTableContract("test.values", 1, table.schema, ("value",), ("value",))
+    first_hash = logical_table_sha256(pq.read_table(first), contract)
+    second_hash = logical_table_sha256(pq.read_table(second), contract)
     assert first_hash == second_hash
     metadata = _identity_metadata()
     assert semantic_bundle_id(
@@ -251,28 +270,17 @@ def test_semantic_bundle_identity_is_independent_of_parquet_encoding(tmp_path: P
 
 
 def test_semantic_bundle_identity_is_independent_of_source_root_location(tmp_path: Path) -> None:
-    first_source = qualify_symile_source(
-        _synthetic_release(tmp_path / "first"), enforce_production_counts=False
+    first, _ = publish_symile_source_bundle(
+        _synthetic_release(tmp_path / "first"),
+        output_directory=tmp_path / "first-manifests",
+        enforce_production_counts=False,
     )
-    second_source = qualify_symile_source(
-        _synthetic_release(tmp_path / "second"), enforce_production_counts=False
+    second, _ = publish_symile_source_bundle(
+        _synthetic_release(tmp_path / "second"),
+        output_directory=tmp_path / "second-manifests",
+        enforce_production_counts=False,
     )
-
-    first = build_symile_artifacts(first_source)
-    second = build_symile_artifacts(second_source)
-    assert semantic_bundle_id(
-        first.metadata,
-        {
-            SAMPLES_FILENAME: logical_arrow_sha256(first.samples),
-            LABS_FILENAME: logical_arrow_sha256(first.labs),
-        },
-    ) == semantic_bundle_id(
-        second.metadata,
-        {
-            SAMPLES_FILENAME: logical_arrow_sha256(second.samples),
-            LABS_FILENAME: logical_arrow_sha256(second.labs),
-        },
-    )
+    assert first.bundle_id == second.bundle_id
 
 
 def test_symile_semantic_payload_uses_abstract_roles_and_canonical_source_assets() -> None:
@@ -288,24 +296,30 @@ def test_symile_semantic_payload_uses_abstract_roles_and_canonical_source_assets
 
 def test_synthetic_source_bundle_audit_and_access_workflow(tmp_path: Path) -> None:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    assert source.evidence["reconciliation"]["excluded_admissions"] == 2
-    assert source.evidence["reconciliation"]["train_subject_exclusions"] == 1
-    assert source.evidence["reconciliation"]["validation_subject_exclusions"] == 1
-    result = build_symile_artifacts(source)
     manifest_root = tmp_path / "manifests"
-    paths = write_symile_bundle(result, manifest_root)
+    paths, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=manifest_root,
+        enforce_production_counts=False,
+    )
+    assert not hasattr(paths, "samples")
+    assert not hasattr(paths, "labs")
+    metadata = json.loads(paths.metadata_path.read_text(encoding="utf-8"))
+    reconciliation = metadata["qualification"]["membership_counts"]
+    assert reconciliation == {"train_admissions": 12, "validation_admissions": 10}
 
     assert {path.name for path in paths.bundle_directory.iterdir()} == {
         SAMPLES_FILENAME,
         LABS_FILENAME,
         METADATA_FILENAME,
+        "symile_mimic_data.csv",
+        "test.csv",
     }
     validate_symile_bundle(paths.bundle_directory, expected_bundle_id=paths.bundle_id)
     reference = validate_symile_bundle_reference(
         paths.bundle_directory, expected_bundle_id=paths.bundle_id
     )
-    assert len(reference.manifest_sha256) == 64
+    assert reference.manifest["bundle"]["bundle_id"] == paths.bundle_id
     assert resolve_symile_bundle(manifest_root).bundle_id == paths.bundle_id
     assert (
         resolve_symile_bundle(manifest_root, bundle_id=paths.bundle_id).bundle_id == paths.bundle_id
@@ -315,13 +329,21 @@ def test_synthetic_source_bundle_audit_and_access_workflow(tmp_path: Path) -> No
     assert "target" not in samples
     assert set(strict_pneumonia_rows(samples)["target"]) == {0, 1}
     with pytest.raises(ManifestBuildError):
-        read_symile_samples(paths, sample_ids=[samples.iloc[0]["sample_id"], "symile:missing"])
+        read_symile_samples(
+            paths,
+            official_splits=DEVELOPMENT_SPLITS,
+            sample_ids=[samples.iloc[0]["sample_id"], "symile:missing"],
+        )
     assert (
         authenticate_source_asset(paths, source_root, official_split="train", modality="cxr").name
         == "cxr_train.npy"
     )
 
-    second = write_symile_bundle(result, manifest_root)
+    second, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=manifest_root,
+        enforce_production_counts=False,
+    )
     assert second.bundle_id == paths.bundle_id
     audit = generate_symile_audit(
         manifest_root,
@@ -330,7 +352,13 @@ def test_synthetic_source_bundle_audit_and_access_workflow(tmp_path: Path) -> No
     )
     audit_directory = Path(audit["report_directory"])
     assert {path.name for path in audit_directory.iterdir()} == set(REPORT_FILENAMES)
-    assert "symile:" not in (audit_directory / "symile_audit.md").read_text(encoding="utf-8")
+    audit_text = (audit_directory / "symile_audit.md").read_text(encoding="utf-8")
+    assert "symile:" not in audit_text
+    assert "| test |" not in audit_text
+    missingness = pd.read_csv(audit_directory / "laboratory_missingness.csv")
+    assert set(missingness["scope"]) == {"train", "validation", "development"}
+    metadata = json.loads(paths.metadata_path.read_text(encoding="utf-8"))
+    assert "strict_pneumonia_counts" not in metadata["qualification"]
     default_audit = generate_symile_audit(manifest_root, tmp_path / "default-reports")
     assert default_audit["bundle_id"] == paths.bundle_id
 
@@ -340,14 +368,12 @@ def test_manifest_validator_rejects_changed_fixed_declaration(tmp_path: Path) ->
     manifest = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
     manifest["modalities"]["common_locator"] = ["source_row", "official_split"]
     logical_hashes = {
-        filename: manifest["artifacts"][filename]["logical_arrow_sha256"]
+        filename: manifest["artifacts"][filename]["semantic_sha256"]
         for filename in (SAMPLES_FILENAME, LABS_FILENAME)
     }
     changed_bundle_id = semantic_bundle_id(manifest, logical_hashes)
     manifest["bundle"]["bundle_id"] = changed_bundle_id
-    bundle.metadata_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    bundle.metadata_path.write_bytes(canonical_json_bytes(manifest))
 
     with pytest.raises(ManifestBuildError):
         validate_symile_bundle_reference(
@@ -357,14 +383,152 @@ def test_manifest_validator_rejects_changed_fixed_declaration(tmp_path: Path) ->
         )
 
 
+def test_development_loading_rejects_logically_corrupted_bundle(tmp_path: Path) -> None:
+    _, bundle = _published_synthetic_release(tmp_path)
+    samples = pq.read_table(bundle.samples_path).to_pylist()
+    _replace_parquet_value(
+        bundle.samples_path,
+        "age_years",
+        int(samples[0]["age_years"]) + 1,
+    )
+    baseline = load_symile_development_config(
+        "configs/symile_labs_logistic.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
+    config = with_runtime(
+        replace(baseline, dataset=replace(baseline.dataset, bundle_id=bundle.bundle_id)),
+        manifest_directory=tmp_path / "manifests",
+    )
+
+    with pytest.raises(ManifestBuildError, match="Logical table hash mismatch"):
+        load_symile_development_cohort(config, enforce_production_counts=False)
+
+
+@pytest.mark.parametrize("corruption", [None, "transport", "alignment", "laboratory", "cxr", "ecg"])
+def test_authorized_held_out_source_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str | None
+) -> None:
+    root = _synthetic_release(tmp_path)
+    if corruption in {"alignment", "laboratory"}:
+        frame = pd.read_csv(root / "test.csv")
+        column = "subject_id" if corruption == "alignment" else LAB_ITEM_IDS[1]
+        frame.loc[0, column] += 1
+        frame.to_csv(root / "test.csv", index=False)
+    if corruption in {"cxr", "ecg"}:
+        path = root / "data_npy/test" / f"{corruption}_test.npy"
+        array = np.load(path)
+        array[0] = np.nan
+        np.save(path, array)
+    source_fixtures._refresh_checksums(root)
+    bundle, _ = publish_symile_source_bundle(
+        root, output_directory=tmp_path / "manifests", enforce_production_counts=False
+    )
+    if corruption == "transport":
+        with (bundle.bundle_directory / "test.csv").open("ab") as stream:
+            stream.write(b"corrupt")
+
+    def qualify():
+        data = source_fixtures._materialized_synthetic_test(bundle, monkeypatch)
+        capability = SimpleNamespace(freeze=data._capability)
+        # Synthetic dimensions replace only the production shape requirement.
+        for modality in ("cxr", "ecg"):
+            validator = getattr(symile_source, f"_validate_{modality}")
+            monkeypatch.setattr(
+                symile_source,
+                f"_validate_{modality}",
+                lambda *args, exact_contract, validate=validator: validate(
+                    *args, exact_contract=False
+                ),
+            )
+        monkeypatch.setattr(
+            symile_test_data, "require_validated_held_out_capability", lambda value: value
+        )
+        symile_test_data._qualify_held_out_source(capability, data, root)
+        assert data.source_reconciliation["excluded_admissions"] == 2
+        assert len(data.source_samples) == 10
+
+    if corruption is None:
+        qualify()
+    else:
+        with pytest.raises(
+            ManifestBuildError,
+            match="hash mismatch|alignment|laboratory values|non-finite|ECG tensor values",
+        ):
+            qualify()
+
+
+def test_low_level_held_out_materialization_requires_opening_authority(tmp_path: Path) -> None:
+    _, bundle = _published_synthetic_release(tmp_path)
+    unauthorized = object()
+    freeze = object()
+    with pytest.raises(PermissionError, match="validated opening authority"):
+        symile_test_data._read_test_source(unauthorized, freeze, bundle)
+    with pytest.raises(PermissionError, match="validated opening authority"):
+        symile_test_data._strict_test_pneumonia_rows(unauthorized, freeze, pd.DataFrame())
+    for modality in ("cxr", "ecg"):
+        with pytest.raises(PermissionError, match="capability"):
+            symile_test_data._authenticate_test_source_asset(
+                unauthorized,
+                freeze,
+                bundle,
+                tmp_path,
+                modality=modality,
+            )
+
+
+def test_low_level_artifact_access_rejects_official_test_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root, bundle = _published_synthetic_release(tmp_path)
+    test_rows = source_fixtures._materialized_synthetic_test(bundle, monkeypatch).source_samples
+    test_id = str(test_rows.iloc[0]["sample_id"])
+    development = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
+    development_ids = development["sample_id"].astype(str).tolist()[:2]
+
+    assert len(read_symile_labs(bundle, sample_ids=development_ids)) == 2
+    assert not strict_pneumonia_rows(development).empty
+    for modality in ("cxr", "ecg"):
+        assert authenticate_source_asset(
+            bundle,
+            source_root,
+            official_split="train",
+            modality=modality,
+        ).is_file()
+
+    with pytest.raises(PermissionError, match="development splits"):
+        read_symile_samples(bundle, official_splits=("test",))
+    with pytest.raises(PermissionError, match="development samples"):
+        read_symile_labs(bundle, sample_ids=[test_id])
+    with pytest.raises(PermissionError, match="development rows"):
+        strict_pneumonia_rows(test_rows)
+    for modality in ("cxr", "ecg"):
+        with pytest.raises(PermissionError, match="development splits"):
+            authenticate_source_asset(
+                bundle,
+                source_root,
+                official_split="test",
+                modality=modality,
+            )
+
+
 def test_manifest_cli_reports_complete_immutable_lineage(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    monkeypatch.setattr("beyondcxr.data.symile_manifest.qualify_symile_source", lambda _: source)
+
+    def publish_for_test(source: Path, *, output_directory: Path):
+        return publish_symile_source_bundle(
+            source,
+            output_directory=output_directory,
+            enforce_production_counts=False,
+        )
+
+    monkeypatch.setattr(
+        "beyondcxr.data.symile_manifest.publish_symile_source_bundle", publish_for_test
+    )
     assert (
         symile_manifest_main(
             [
@@ -378,8 +542,7 @@ def test_manifest_cli_reports_complete_immutable_lineage(
     )
     output = json.loads(capsys.readouterr().out)
     assert output["bundle_id"].startswith("bundle-")
-    assert len(output["bundle_manifest_sha256"]) == 64
-    assert output["split_assignment_id"].startswith("split-assignment-")
+    assert set(output) >= {"bundle_id", "bundle_directory"}
 
 
 @pytest.mark.parametrize("identifier_column", ["sample_id", "subject_id", "hadm_id"])
@@ -390,7 +553,7 @@ def test_symile_audit_rejects_patient_or_admission_identifiers(
 ) -> None:
     source_root, bundle = _published_synthetic_release(tmp_path)
     del source_root
-    samples = read_symile_samples(bundle)
+    samples = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
     leaked_value = str(samples.iloc[0][identifier_column])
     monkeypatch.setattr(
         "beyondcxr.data.symile_audit._audit_markdown",
@@ -409,14 +572,22 @@ def test_source_qualification_and_bundle_validation_reject_tampering(tmp_path: P
     source_root = _synthetic_release(tmp_path)
     (source_root / "LICENSE.txt").write_bytes(b"tampered")
     with pytest.raises(ManifestBuildError):
-        qualify_symile_source(source_root, enforce_production_counts=False)
+        publish_symile_source_bundle(
+            source_root,
+            output_directory=tmp_path / "tampered-manifests",
+            enforce_production_counts=False,
+        )
 
     source_root = _synthetic_release(tmp_path / "header")
     cxr_path = source_root / "data_npy/train/cxr_train.npy"
     np.save(cxr_path, np.load(cxr_path, allow_pickle=False).astype(np.float64))
     _refresh_checksums(source_root)
     with pytest.raises(ManifestBuildError):
-        qualify_symile_source(source_root, enforce_production_counts=False)
+        publish_symile_source_bundle(
+            source_root,
+            output_directory=tmp_path / "header-manifests",
+            enforce_production_counts=False,
+        )
 
     source_root = _synthetic_release(tmp_path / "second")
     mask_path = source_root / "data_npy/train/labs_missingness_train.npy"
@@ -425,11 +596,18 @@ def test_source_qualification_and_bundle_validation_reject_tampering(tmp_path: P
     np.save(mask_path, mask)
     _refresh_checksums(source_root)
     with pytest.raises(ManifestBuildError):
-        qualify_symile_source(source_root, enforce_production_counts=False)
+        publish_symile_source_bundle(
+            source_root,
+            output_directory=tmp_path / "second-manifests",
+            enforce_production_counts=False,
+        )
 
     source_root = _synthetic_release(tmp_path / "third")
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    paths = write_symile_bundle(build_symile_artifacts(source), tmp_path / "manifests")
+    paths, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=tmp_path / "manifests",
+        enforce_production_counts=False,
+    )
     with paths.samples_path.open("ab") as stream:
         stream.write(b"tamper")
     with pytest.raises(ManifestBuildError):
@@ -498,10 +676,12 @@ def test_failed_bundle_publication_preserves_current(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    result = build_symile_artifacts(source)
     manifest_root = tmp_path / "manifests"
-    paths = write_symile_bundle(result, manifest_root)
+    paths, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=manifest_root,
+        enforce_production_counts=False,
+    )
     previous = paths.current_path.read_text(encoding="utf-8")
 
     def fail_validation(*args: object, **kwargs: object) -> None:
@@ -509,20 +689,64 @@ def test_failed_bundle_publication_preserves_current(
 
     monkeypatch.setattr(symile_artifacts, "validate_symile_bundle", fail_validation)
     with pytest.raises(ManifestBuildError):
-        write_symile_bundle(result, manifest_root)
+        publish_symile_source_bundle(
+            source_root,
+            output_directory=manifest_root,
+            enforce_production_counts=False,
+        )
     assert paths.current_path.read_text(encoding="utf-8") == previous
     assert not list(paths.bundle_directory.parent.glob(".*-staging-*"))
 
 
+@pytest.mark.parametrize("artifact", ["bundle", "cv"])
+def test_symile_publication_preserves_concurrent_empty_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    import beyondcxr.utils.publication as publication
+
+    source_root = _synthetic_release(tmp_path)
+    manifest_root = tmp_path / "manifests"
+    if artifact == "cv":
+        bundle, _ = publish_symile_source_bundle(
+            source_root, output_directory=manifest_root, enforce_production_counts=False
+        )
+    rename = publication.rename_directory_no_replace
+    destinations = []
+
+    def create_competing_directory(source: Path, destination: Path) -> None:
+        destination.mkdir()
+        destinations.append(destination)
+        rename(source, destination)
+
+    monkeypatch.setattr(publication, "rename_directory_no_replace", create_competing_directory)
+    with pytest.raises(ManifestBuildError):
+        if artifact == "cv":
+            publish_symile_cv(bundle, manifest_directory=manifest_root)
+        else:
+            publish_symile_source_bundle(
+                source_root, output_directory=manifest_root, enforce_production_counts=False
+            )
+    assert len(destinations) == 1
+    assert list(destinations[0].iterdir()) == []
+    if artifact == "bundle":
+        assert not (manifest_root / "symile/CURRENT").exists()
+
+
 def test_cv_is_deterministic_grouped_and_bundle_bound(tmp_path: Path) -> None:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
     manifest_root = tmp_path / "manifests"
-    bundle = write_symile_bundle(build_symile_artifacts(source), manifest_root)
-    samples = read_symile_samples(bundle)
+    bundle, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=manifest_root,
+        enforce_production_counts=False,
+    )
+    samples = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
     first = generate_cv_assignments(samples)
     second = generate_cv_assignments(samples)
     assert first.equals(second)
+    assert logical_table_sha256(first, _CV_TABLE_CONTRACT) == logical_table_sha256(
+        second, _CV_TABLE_CONTRACT
+    )
     assignment_id, directory = publish_symile_cv(bundle, manifest_directory=manifest_root)
     manifest = validate_symile_cv(
         directory,
@@ -545,14 +769,8 @@ def test_cv_is_deterministic_grouped_and_bundle_bound(tmp_path: Path) -> None:
     for seed in (17, 42, 2026):
         assert grouped.loc[grouped["repeat_seed"] == seed, "outer_fold"].nunique() == 1
     assert manifest["bundle_id"] == bundle.bundle_id
+    assert manifest["schema_version"] == 1
     assert not (manifest_root / "symile" / "cv" / "CURRENT").exists()
-
-
-def test_split_assignment_identity_is_order_independent() -> None:
-    frame = pd.DataFrame(
-        {"sample_id": ["symile:2", "symile:1"], "official_split": ["test", "train"]}
-    )
-    assert official_split_assignment_id(frame) == official_split_assignment_id(frame.iloc[::-1])
 
 
 def test_cv_identity_changes_with_bundle_or_logical_assignment() -> None:
@@ -575,9 +793,7 @@ def test_cv_validation_rejects_incorrect_declared_row_count(tmp_path: Path) -> N
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["artifact"]["row_count"] += 1
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
 
     with pytest.raises(ManifestBuildError):
         validate_symile_cv(
@@ -607,6 +823,24 @@ def test_cv_reference_validation_does_not_load_bundle_samples(
     assert reference.manifest["task_id"] == "pneumonia_strict"
 
 
+def test_cv_manifest_requires_exact_schema_version_one(tmp_path: Path) -> None:
+    _, bundle = _published_synthetic_release(tmp_path)
+    assignment_id, directory = publish_symile_cv(bundle, manifest_directory=tmp_path / "manifests")
+    manifest_path = directory / "manifest.json"
+    original = json.loads(manifest_path.read_bytes())
+    for version in (True, 2, "1", None):
+        manifest = {**original, "schema_version": version}
+        if version is None:
+            del manifest["schema_version"]
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+        with pytest.raises(ManifestBuildError, match="schema version|field set"):
+            validate_symile_cv_reference(
+                directory,
+                bundle_id=bundle.bundle_id,
+                expected_assignment_id=assignment_id,
+            )
+
+
 @pytest.mark.parametrize(
     ("value", "observed"),
     [(None, True), (1.0, False)],
@@ -615,12 +849,17 @@ def test_laboratory_validator_rejects_inconsistent_observedness(
     tmp_path: Path, value: float | None, observed: bool
 ) -> None:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    result = build_symile_artifacts(source)
-    rows = result.labs.to_pylist()
+    paths, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=tmp_path / "manifests",
+        enforce_production_counts=False,
+    )
+    samples = pq.read_table(paths.samples_path)
+    labs = pq.read_table(paths.labs_path)
+    rows = labs.to_pylist()
     rows[0]["lab_50802_value"] = value
     rows[0]["lab_50802_observed"] = observed
     invalid_labs = pa.Table.from_pylist(rows, schema=LAB_SCHEMA)
 
     with pytest.raises(ManifestBuildError):
-        symile_artifacts._validate_tables(result.samples, invalid_labs)
+        symile_artifacts._validate_tables(samples, invalid_labs)

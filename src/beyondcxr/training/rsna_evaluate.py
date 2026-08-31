@@ -1,4 +1,4 @@
-"""Evaluate one package authorized by the complete formal RSNA package freeze."""
+"""Evaluate RSNA packages under a scientific freeze joined to current execution."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import mlflow
 
-from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
+from beyondcxr.data.rsna_cxr_cache import PreparedCxrCache
 from beyondcxr.data.rsna_metadata_preprocess import validate_metadata_pipeline
 from beyondcxr.evaluation.latency import (
     LATENCY_MEASURED_CALLS,
@@ -16,6 +16,7 @@ from beyondcxr.evaluation.latency import (
 from beyondcxr.evaluation.probabilities import canonical_binary_raw_scores
 from beyondcxr.training.config import (
     ExperimentConfig,
+    normalized_scientific_config,
     require_runtime_seed,
     with_runtime,
 )
@@ -23,11 +24,12 @@ from beyondcxr.training.device import ResolvedDevice, neural_inference_runtime_p
 from beyondcxr.training.execution import LoaderExecutionPolicy
 from beyondcxr.training.neural import configure_neural_determinism
 from beyondcxr.training.rsna_campaign_control import (
-    ValidatedRsnaPackageFreeze,
+    ValidatedRsnaHeldOutCapability,
 )
 from beyondcxr.training.rsna_evaluation_result import (
     CompletedRsnaEvaluation,
     publish_rsna_evaluation,
+    publish_rsna_prediction_evidence,
     validate_rsna_model_package,
     validated_rsna_evaluation_policy,
 )
@@ -45,7 +47,6 @@ from beyondcxr.utils.operational_logging import (
     log_event,
     timed_phase,
 )
-from beyondcxr.utils.private_predictions import publish_prediction_evidence
 from beyondcxr.utils.rsna_model_publication import (
     MODEL_FILENAME,
     validate_published_model,
@@ -58,25 +59,25 @@ _LOGGER = get_operational_logger(__name__)
 def evaluate_model_package(
     model_package_id: str,
     *,
-    authorization: ValidatedRsnaPackageFreeze,
+    authorization: ValidatedRsnaHeldOutCapability,
     evaluation_config: ExperimentConfig,
     runtime: ResolvedDevice,
     tracking_uri: str = DEFAULT_TRACKING_URI,
     model_directory: str | Path = "models/rsna",
-    cache: ValidatedCxrCache | None = None,
+    cache: PreparedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
     private_output_directory: str | Path | None = None,
     report_directory: str | Path | None = None,
 ) -> CompletedRsnaEvaluation:
-    """Dispatch held-out evaluation only after validating the complete package freeze."""
+    """Authorize package-bound held-out evaluation against the current execution and freeze."""
     frozen = authorization.require(model_package_id)
     position = authorization.packages.index(frozen)
-    configured = authorization.execution.manifest["configs"][position]
+    execution_authority = authorization.current_execution.execution
+    configured = execution_authority.manifest["configs"][position]
     if (
         configured["family_id"] != evaluation_config.family.family_id
         or configured["seed"] != require_runtime_seed(evaluation_config)
-        or configured["config_source_sha256"] != evaluation_config.config_source_sha256
-        or configured["config_semantic_sha256"] != evaluation_config.config_semantic_sha256
+        or configured["normalized_config"] != normalized_scientific_config(evaluation_config)
     ):
         raise ValueError("Held-out evaluation config differs from the frozen formal plan")
     manifest = validate_rsna_model_package(model_directory, model_package_id)
@@ -85,7 +86,7 @@ def evaluate_model_package(
     if evaluation_config.neural is not None:
         if (
             neural_inference_runtime_policy(runtime)
-            != authorization.execution.manifest["training_evaluation_runtime"]
+            != execution_authority.manifest["training_evaluation_runtime"]
         ):
             raise ValueError("Held-out numerical runtime differs from the frozen execution")
         configure_neural_determinism()
@@ -132,7 +133,7 @@ def evaluate_model_package(
 def _evaluate_tabular_package(
     package: Path,
     *,
-    authorization: ValidatedRsnaPackageFreeze,
+    authorization: ValidatedRsnaHeldOutCapability,
     evaluation_config: ExperimentConfig,
     tracking_uri: str,
     private_output_directory: str | Path | None,
@@ -150,11 +151,7 @@ def _evaluate_tabular_package(
     model = validate_metadata_pipeline(load_skops(package / MODEL_FILENAME))
     dataset = get_dataset(config.dataset.dataset_id)
     pinned = dataset.load_lineage(config)
-    if (
-        pinned.bundle_id != manifest["bundle_id"]
-        or pinned.split_assignment_id != manifest["split_assignment_id"]
-        or pinned.task_id != manifest["task_id"]
-    ):
+    if pinned.bundle_id != manifest["bundle_id"] or pinned.task_id != manifest["task_id"]:
         raise ValueError("Pinned bundle lineage differs from the model package")
     configure_mlflow(experiment_name=config.runtime.experiment_name, tracking_uri=tracking_uri)
     tags = {
@@ -162,14 +159,10 @@ def _evaluate_tabular_package(
         "evaluation_scope": "test",
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": manifest["bundle_id"],
-        "bundle_manifest_sha256": manifest["bundle_manifest_sha256"],
-        "split_assignment_id": manifest["split_assignment_id"],
         "task_id": manifest["task_id"],
         "family_id": config.family.family_id,
         "modalities": serialize_modalities(manifest["modalities"]),
         "seed": str(manifest["seed"]),
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "git_commit": manifest["git_commit"],
         "dependency_lock_sha256": manifest["dependency_lock_sha256"],
         "package_kind": "model",
@@ -188,11 +181,7 @@ def _evaluate_tabular_package(
                 authorization=authorization,
                 package_id=str(manifest["model_package_id"]),
             )
-        if (
-            lineage.bundle_id != manifest["bundle_id"]
-            or lineage.split_assignment_id != manifest["split_assignment_id"]
-            or lineage.task_id != manifest["task_id"]
-        ):
+        if lineage.bundle_id != manifest["bundle_id"] or lineage.task_id != manifest["task_id"]:
             raise ValueError("Test bundle lineage differs from the model package")
         logits = canonical_binary_raw_scores(
             model,
@@ -206,14 +195,10 @@ def _evaluate_tabular_package(
             measured_calls=LATENCY_MEASURED_CALLS,
             best_iteration=manifest["best_iteration"],
         )
-        evidence = publish_prediction_evidence(
+        evidence = publish_rsna_prediction_evidence(
+            authorization=authorization,
             private_root=config.runtime.private_output_directory,
-            dataset_id="rsna",
             model_package_id=manifest["model_package_id"],
-            task_id=manifest["task_id"],
-            bundle_id=manifest["bundle_id"],
-            split_assignment_id=manifest["split_assignment_id"],
-            scope="test",
             sample_ids=test.sample_ids,
             targets=test.targets,
             logits=logits,
@@ -223,6 +208,7 @@ def _evaluate_tabular_package(
             model_root=config.runtime.model_directory,
             private_root=config.runtime.private_output_directory,
             evidence=evidence,
+            authorization=authorization,
             evaluation_policy=policy,
             forbidden_source_values=(*test.sample_ids, *test.patient_ids),
         )

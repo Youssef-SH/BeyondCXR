@@ -11,32 +11,24 @@ from typing import Any
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.training.symile_families import (
+    DEVELOPMENT_FAMILY_ORDER,
     FINAL_PACKAGE_COUNT,
-    SYMILE_CORE_DEVELOPMENT_FAMILIES,
 )
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
 
 RESULT_BINDING_SCHEMA_VERSION = 1
-_HEX40 = re.compile(r"[0-9a-f]{40}")
-
-
-@dataclass(frozen=True)
-class ScienceExecutionCoordinates:
-    git_commit: str
 
 
 @dataclass(frozen=True)
 class DataCoordinates:
     bundle_id: str
-    split_assignment_id: str
     cv_assignment_id: str
 
 
 @dataclass(frozen=True)
 class DevelopmentCoordinates:
-    core_analysis_id: str
     family_development_ids: tuple[tuple[str, str], ...]
-    ecg_development_id: str
-    ecg_extension_result_id: str
+    development_decision_id: str
 
 
 @dataclass(frozen=True)
@@ -51,7 +43,6 @@ class HeldOutCoordinates:
 class ResultBinding:
     """Deeply immutable coordinates for one validated scientific evidence chain."""
 
-    science_execution: ScienceExecutionCoordinates
     data: DataCoordinates
     development: DevelopmentCoordinates
     held_out: HeldOutCoordinates
@@ -61,19 +52,17 @@ class ResultBinding:
         document["development"]["family_development_ids"] = dict(
             self.development.family_development_ids
         )
+        document["held_out"]["final_package_ids"] = list(self.held_out.final_package_ids)
+        document["held_out"]["prediction_ids"] = list(self.held_out.prediction_ids)
         return {
             "result_binding_schema_version": RESULT_BINDING_SCHEMA_VERSION,
-            "science_execution": document["science_execution"],
             "data": document["data"],
             "development": document["development"],
             "held_out": document["held_out"],
         }
 
     def canonical_bytes(self) -> bytes:
-        return (
-            json.dumps(self.to_document(), sort_keys=True, separators=(",", ":"), allow_nan=False)
-            + "\n"
-        ).encode()
+        return canonical_json_bytes(self.to_document())
 
 
 def load_result_binding(path: str | Path) -> ResultBinding:
@@ -98,7 +87,6 @@ def validate_result_binding(document: object) -> ResultBinding:
         document,
         {
             "result_binding_schema_version",
-            "science_execution",
             "data",
             "development",
             "held_out",
@@ -107,34 +95,24 @@ def validate_result_binding(document: object) -> ResultBinding:
     version = top["result_binding_schema_version"]
     if type(version) is not int or version != RESULT_BINDING_SCHEMA_VERSION:
         raise ManifestBuildError("Result binding contract is invalid")
-    science = _mapping(top["science_execution"], {"git_commit"})
-    if not _fullmatch(_HEX40, science["git_commit"]):
-        raise ManifestBuildError("Result binding Git provenance is invalid")
     data = _mapping(
         top["data"],
-        {"bundle_id", "split_assignment_id", "cv_assignment_id"},
+        {"bundle_id", "cv_assignment_id"},
     )
-    _prefixed(data["bundle_id"], "bundle-")
-    _prefixed(data["split_assignment_id"], "split-assignment-")
-    _prefixed(data["cv_assignment_id"], "cv-assignment-")
+    _identity_value(data["bundle_id"], "bundle-")
+    _identity_value(data["cv_assignment_id"], "cv-assignment-")
     development = _mapping(
         top["development"],
         {
-            "core_analysis_id",
             "family_development_ids",
-            "ecg_development_id",
-            "ecg_extension_result_id",
+            "development_decision_id",
         },
     )
-    _prefixed(development["core_analysis_id"], "analysis-")
-    _prefixed(development["ecg_development_id"], "development-")
-    _prefixed(development["ecg_extension_result_id"], "ecg-extension-result-")
-    families = _mapping(
-        development["family_development_ids"], set(SYMILE_CORE_DEVELOPMENT_FAMILIES)
-    )
+    _identity_value(development["development_decision_id"], "development-decision-")
+    families = _mapping(development["family_development_ids"], set(DEVELOPMENT_FAMILY_ORDER))
     ordered_families = tuple(
         (family, _identity_value(families[family], "development-"))
-        for family in SYMILE_CORE_DEVELOPMENT_FAMILIES
+        for family in DEVELOPMENT_FAMILY_ORDER
     )
     if len({identity for _, identity in ordered_families}) != len(ordered_families):
         raise ManifestBuildError("Result binding development identities are duplicated")
@@ -142,21 +120,17 @@ def validate_result_binding(document: object) -> ResultBinding:
         top["held_out"],
         {"pretest_freeze_id", "final_package_ids", "prediction_ids", "global_result_id"},
     )
-    _prefixed(held["pretest_freeze_id"], "pretest-freeze-")
-    _prefixed(held["global_result_id"], "global-result-")
+    _identity_value(held["pretest_freeze_id"], "pretest-freeze-")
+    _identity_value(held["global_result_id"], "global-result-")
     packages = _identities(held["final_package_ids"], "final-package-", FINAL_PACKAGE_COUNT)
     predictions = _identities(held["prediction_ids"], "prediction-", FINAL_PACKAGE_COUNT)
     if len(set(packages)) != len(packages) or len(set(predictions)) != len(predictions):
         raise ManifestBuildError("Result binding held-out identities are duplicated")
-    _reject_path_values(top)
     return ResultBinding(
-        science_execution=ScienceExecutionCoordinates(**science),
         data=DataCoordinates(**data),
         development=DevelopmentCoordinates(
-            core_analysis_id=development["core_analysis_id"],
             family_development_ids=ordered_families,
-            ecg_development_id=development["ecg_development_id"],
-            ecg_extension_result_id=development["ecg_extension_result_id"],
+            development_decision_id=development["development_decision_id"],
         ),
         held_out=HeldOutCoordinates(
             pretest_freeze_id=held["pretest_freeze_id"],
@@ -173,10 +147,6 @@ def _mapping(value: object, fields: set[str]) -> dict[str, Any]:
     return dict(value)
 
 
-def _prefixed(value: object, prefix: str) -> None:
-    _identity_value(value, prefix)
-
-
 def _identity_value(value: object, prefix: str) -> str:
     if (
         not isinstance(value, str)
@@ -186,24 +156,7 @@ def _identity_value(value: object, prefix: str) -> str:
     return value
 
 
-def _fullmatch(pattern: re.Pattern[str], value: object) -> bool:
-    return isinstance(value, str) and pattern.fullmatch(value) is not None
-
-
 def _identities(value: object, prefix: str, count: int) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, Sequence) or len(value) != count:
         raise ManifestBuildError("Result binding ordered membership is invalid")
     return tuple(_identity_value(identity, prefix) for identity in value)
-
-
-def _reject_path_values(value: object) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if "path" in str(key).lower() or "root" in str(key).lower():
-                raise ManifestBuildError("Operational paths do not belong in result binding")
-            _reject_path_values(item)
-    elif isinstance(value, Sequence) and not isinstance(value, str):
-        for item in value:
-            _reject_path_values(item)
-    elif isinstance(value, str) and (value.startswith(("/", "~", "file:")) or "\\" in value):
-        raise ManifestBuildError("Result binding contains a filesystem path")

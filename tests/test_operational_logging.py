@@ -7,6 +7,8 @@ import logging
 import math
 import shlex
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,39 +23,146 @@ from beyondcxr.utils.operational_logging import (
 
 
 @pytest.mark.parametrize(
-    ("module_name", "operation", "arguments"),
+    ("module_name", "operation", "evaluation_ids", "result"),
     [
-        ("data.rsna_manifest", "build_rsna_artifacts", []),
-        ("data.symile_manifest", "qualify_symile_source", []),
-        ("data.rsna_audit", "generate_rsna_audit", []),
-        ("data.symile_audit", "generate_symile_audit", []),
-        ("data.symile_cv", "resolve_symile_bundle", []),
-        ("training.rsna_train", "load_experiment_config", ["--config", "unused", "--seed", "42"]),
-        ("training.rsna_compare", "regenerate_comparison", ["--evaluation-ids", "unused"]),
+        (
+            "training.rsna_compare",
+            "regenerate_comparison",
+            ["evaluation-a"],
+            SimpleNamespace(
+                row_count=1,
+                csv_path=Path("comparison.csv"),
+                markdown_path=Path("comparison.md"),
+            ),
+        ),
         (
             "training.rsna_seed_summary",
             "publish_seed_summary",
-            ["--evaluation-ids", "a", "b", "c"],
+            ["evaluation-a", "evaluation-b", "evaluation-c"],
+            SimpleNamespace(directory=Path("seed-summary")),
+        ),
+    ],
+)
+def test_rsna_report_clis_forward_explicit_authority_directories(
+    module_name: str,
+    operation: str,
+    evaluation_ids: list[str],
+    result: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module(f"beyondcxr.{module_name}")
+    execution = object()
+    freeze = object()
+    observed: dict[str, object] = {}
+
+    def validate_execution(path: Path) -> object:
+        observed["execution_directory"] = path
+        return execution
+
+    def validate_freeze(path: Path, **kwargs: object) -> object:
+        observed["freeze_directory"] = path
+        observed.update(kwargs)
+        return freeze
+
+    def run(ids: list[str], **kwargs: object) -> SimpleNamespace:
+        observed["evaluation_ids"] = ids
+        observed.update(kwargs)
+        return result
+
+    monkeypatch.setattr(module, "validate_execution", validate_execution)
+    monkeypatch.setattr(module, "validate_freeze", validate_freeze)
+    monkeypatch.setattr(module, operation, run)
+
+    arguments = [
+        "--evaluation-ids",
+        *evaluation_ids,
+        "--execution-directory",
+        "explicit/execution",
+        "--freeze-directory",
+        "explicit/freeze",
+        "--bundle-directory",
+        "explicit/bundle",
+    ]
+    assert module.main(arguments) == 0
+    assert observed["execution_directory"] == Path("explicit/execution")
+    assert observed["freeze_directory"] == Path("explicit/freeze")
+    assert observed["bundle_directory"] == Path("explicit/bundle")
+    assert observed["execution"] is execution
+    assert observed["freeze"] is freeze
+    assert observed["evaluation_ids"] == evaluation_ids
+
+
+@pytest.mark.parametrize(
+    ("module_name", "operation", "arguments"),
+    [
+        ("data.rsna_manifest", "build_and_write", []),
+        ("data.symile_manifest", "publish_symile_source_bundle", []),
+        ("data.rsna_audit", "generate_rsna_audit", []),
+        ("data.symile_audit", "generate_symile_audit", []),
+        ("data.symile_cv", "resolve_symile_bundle", []),
+        (
+            "training.rsna_train",
+            "load_experiment_config",
+            ["--config", "unused", "--seed", "42", "--bundle-id", "bundle-" + "a" * 64],
+        ),
+        (
+            "training.rsna_compare",
+            "regenerate_comparison",
+            [
+                "--evaluation-ids",
+                "unused",
+                "--execution-directory",
+                "execution",
+                "--freeze-directory",
+                "freeze",
+                "--bundle-directory",
+                "bundle",
+            ],
+        ),
+        (
+            "training.rsna_seed_summary",
+            "publish_seed_summary",
+            [
+                "--evaluation-ids",
+                "a",
+                "b",
+                "c",
+                "--execution-directory",
+                "execution",
+                "--freeze-directory",
+                "freeze",
+                "--bundle-directory",
+                "bundle",
+            ],
         ),
         (
             "training.rsna_campaign",
             "execute_rsna_campaign",
-            ["--backup-root", "unused-backup"],
+            ["--backup-root", "unused-backup", "--bundle-id", "bundle-" + "a" * 64],
         ),
         (
             "training.symile_development",
             "load_symile_development_config",
-            ["--config", "unused"],
+            ["--config", "unused", "--backup-root", "unused-backup"],
         ),
         (
-            "training.symile_analysis",
+            "training.symile_development_reports",
             "analyze_symile_development",
             ["--development-ids", "a", "b", "c", "d", "e", "f"],
         ),
         (
             "training.symile_campaign",
             "run_symile_campaign",
-            ["--source-root", "unused", "--backup-root", "unused-backup"],
+            [
+                "--source-root",
+                "unused",
+                "--backup-root",
+                "unused-backup",
+                "--bundle-id",
+                "bundle-" + "a" * 64,
+                "--cv-assignment-id",
+                "cv-assignment-" + "b" * 64,
+            ],
         ),
         ("release.cli", "check_repository", ["check", "--root", "unused"]),
     ],
@@ -66,6 +175,9 @@ def test_cli_failure_does_not_echo_private_exception_text(
     def fail(*args, **kwargs):
         raise OSError("synthetic-patient-secret /private/source/secret.dcm token=demo")
 
+    if module_name in {"training.rsna_compare", "training.rsna_seed_summary"}:
+        monkeypatch.setattr(module, "validate_execution", lambda *args, **kwargs: object())
+        monkeypatch.setattr(module, "validate_freeze", lambda *args, **kwargs: object())
     monkeypatch.setattr(module, operation, fail)
     assert (module.main() if arguments is None else module.main(arguments)) == 1
     captured = capsys.readouterr()
@@ -81,7 +193,16 @@ def test_cli_failure_does_not_echo_private_exception_text(
         (
             "training.symile_campaign",
             "run_symile_campaign",
-            ["--source-root", "unused", "--backup-root", "unused-backup"],
+            [
+                "--source-root",
+                "unused",
+                "--backup-root",
+                "unused-backup",
+                "--bundle-id",
+                "bundle-" + "a" * 64,
+                "--cv-assignment-id",
+                "cv-assignment-" + "b" * 64,
+            ],
         ),
         ("release.cli", "check_repository", ["check", "--root", "unused"]),
     ],
@@ -128,7 +249,19 @@ def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsy
     monkeypatch.setattr("beyondcxr.training.rsna_train.train_metadata_experiment", fake_train)
 
     for _ in range(2):
-        assert train_main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
+        assert (
+            train_main(
+                [
+                    "--config",
+                    "configs/rsna_metadata_logistic.yaml",
+                    "--seed",
+                    "42",
+                    "--bundle-id",
+                    "bundle-" + "a" * 64,
+                ]
+            )
+            == 0
+        )
         captured = capsys.readouterr()
         assert json.loads(captured.out)["mlflow_run_id"] == "run-test"
         assert "event=test_progress" not in captured.out

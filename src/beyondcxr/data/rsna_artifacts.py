@@ -2,25 +2,21 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
-import platform
 import shutil
 import tempfile
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pydicom
 
 from beyondcxr.data.bundle_contract import (
     BUNDLE_MANIFEST_SCHEMA_VERSION,
@@ -33,7 +29,7 @@ from beyondcxr.data.bundle_contract import (
     validate_common_bundle_envelope,
 )
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
+from beyondcxr.data.hashing import LogicalTableContract, logical_table_sha256, sha256_file
 from beyondcxr.data.rsna_dicom import AuditAccumulator, read_dicom_metadata
 from beyondcxr.data.rsna_schemas import (
     DATASET_ID,
@@ -74,8 +70,7 @@ from beyondcxr.data.rsna_splitting import (
     SPLIT_SOURCE,
     STRATIFICATION_TARGET,
     SplitConfig,
-    create_patient_stratified_splits,
-    split_assignment_id,
+    _canonical_split_assignments,
     validate_split_table,
 )
 from beyondcxr.data.rsna_validation import (
@@ -84,7 +79,8 @@ from beyondcxr.data.rsna_validation import (
     validate_sample_table,
 )
 from beyondcxr.utils.operational_logging import CountProgress, get_operational_logger
-from beyondcxr.utils.publication import update_current_marker
+from beyondcxr.utils.publication import install_immutable_directory, update_current_marker
+from beyondcxr.utils.semantic_identity import canonical_json_bytes, semantic_sha256
 
 DATASET_VERSION = "rsna-pneumonia-detection-challenge-stage-2"
 _LOGGER = get_operational_logger(__name__)
@@ -106,7 +102,6 @@ _SPLIT_METADATA_FIELDS = frozenset(
     {
         "split_source",
         "split_recipe_id",
-        "split_assignment_id",
         "algorithm_version",
         "patient_grouping_rule",
         "patient_target_consistency_rule",
@@ -165,7 +160,7 @@ class SourceInventoryRecord:
 
 
 @dataclass(frozen=True)
-class BuildResult:
+class _BuildState:
     samples: pa.Table
     labels: pa.Table
     annotations: pa.Table
@@ -190,21 +185,27 @@ class BundlePaths:
 @dataclass(frozen=True)
 class WriteResult:
     paths: BundlePaths
-    logical_arrow_sha256: Mapping[str, str]
+    logical_table_sha256: Mapping[str, str]
+    sample_count: int
+    label_count: int
+    annotation_count: int
+    split_count: int
+    split_recipe_id: str
 
 
 @dataclass(frozen=True)
 class ValidatedBundleReference:
-    """Validated bundle manifest and its exact serialized-byte identity."""
+    """Structurally inspected envelope; logical table values are not rehashed."""
 
     manifest: Mapping[str, Any]
-    manifest_sha256: str
 
 
-def build_rsna_artifacts(
-    dataset_root: str | Path, split_config: SplitConfig | None = None
-) -> BuildResult:
-    """Construct validated, deterministic in-memory RSNA artifacts."""
+def build_and_write(
+    dataset_root: str | Path,
+    output_directory: str | Path,
+    split_config: SplitConfig | None = None,
+) -> WriteResult:
+    """Publish a validated RSNA bundle and return its paths and aggregate counts."""
     paths = RsnaPaths.from_root(dataset_root)
     paths.validate()
     source_samples = load_source_samples(paths)
@@ -307,21 +308,29 @@ def build_rsna_artifacts(
     if len(audit.sop_instance_uids) != samples.num_rows:
         raise ManifestBuildError("Every RSNA sample must have one unique SOP Instance UID")
     resolved_split_config = split_config or SplitConfig()
-    splits = create_patient_stratified_splits(samples, labels, resolved_split_config)
+    assignments = _canonical_split_assignments(samples, labels, resolved_split_config)
+    splits = pa.Table.from_pylist(
+        [
+            {"sample_id": sample_id, "split_name": split_name}
+            for sample_id, split_name in assignments.items()
+        ],
+        schema=RSNA_SPLIT_SCHEMA,
+    ).sort_by([("sample_id", "ascending")])
+    validate_split_table(splits, samples, labels, config=resolved_split_config)
     metadata = _build_aggregate_metadata(
         paths,
         samples,
         labels,
         annotations,
-        splits,
         source_inventory,
         audit,
         resolved_split_config,
     )
-    return BuildResult(samples, labels, annotations, splits, source_inventory, metadata)
+    state = _BuildState(samples, labels, annotations, splits, source_inventory, metadata)
+    return _write_bundle(state, output_directory)
 
 
-def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResult:
+def _write_bundle(result: _BuildState, output_directory: str | Path) -> WriteResult:
     """Publish an immutable bundle and atomically update its CURRENT marker."""
     output_root = Path(output_directory)
     dataset_bundle_root = output_root / DATASET_ID
@@ -330,11 +339,8 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
     current_path = dataset_bundle_root / CURRENT_FILENAME
 
     logical_hashes = {
-        SAMPLES_FILENAME: logical_arrow_sha256(result.samples),
-        LABELS_FILENAME: logical_arrow_sha256(result.labels),
-        ANNOTATIONS_FILENAME: logical_arrow_sha256(result.annotations),
-        SPLITS_FILENAME: logical_arrow_sha256(result.splits),
-        SOURCE_INVENTORY_FILENAME: logical_arrow_sha256(result.source_inventory),
+        filename: logical_table_sha256(getattr(result, role), contract)
+        for role, filename, contract in _artifact_contracts()
     }
     stage_directory = Path(tempfile.mkdtemp(prefix=".staging-", dir=bundles_root))
 
@@ -353,36 +359,27 @@ def write_bundle(result: BuildResult, output_directory: str | Path) -> WriteResu
         final_directory = bundles_root / bundle_id
         staged_paths = _bundle_paths(bundle_id, stage_directory, current_path)
         metadata = _finalize_metadata(result.metadata, bundle_id, staged_paths, logical_hashes)
-        staged_paths.metadata_path.write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        validate_bundle_directory(
+        staged_paths.metadata_path.write_bytes(canonical_json_bytes(metadata))
+        install_immutable_directory(
             stage_directory,
-            expected_bundle_id=bundle_id,
-            enforce_directory_name=False,
+            final_directory,
+            partial(validate_bundle_directory, expected_bundle_id=bundle_id),
         )
-
-        if final_directory.exists():
-            validate_bundle_directory(final_directory, expected_bundle_id=bundle_id)
-            shutil.rmtree(stage_directory)
-        else:
-            os.replace(stage_directory, final_directory)
         final_paths = _bundle_paths(bundle_id, final_directory, current_path)
         update_current_marker(current_path, bundle_id)
     finally:
         if stage_directory.exists():
             shutil.rmtree(stage_directory)
 
-    return WriteResult(final_paths, logical_hashes)
-
-
-def build_and_write(
-    dataset_root: str | Path,
-    output_directory: str | Path,
-    split_config: SplitConfig | None = None,
-) -> WriteResult:
-    """Construct RSNA artifacts and publish the resulting bundle."""
-    return write_bundle(build_rsna_artifacts(dataset_root, split_config), output_directory)
+    return WriteResult(
+        final_paths,
+        logical_hashes,
+        result.samples.num_rows,
+        result.labels.num_rows,
+        result.annotations.num_rows,
+        result.splits.num_rows,
+        str(result.metadata["membership"]["split"]["split_recipe_id"]),
+    )
 
 
 def resolve_bundle(
@@ -410,7 +407,7 @@ def validate_bundle_directory(
     expected_bundle_id: str | None = None,
     enforce_directory_name: bool = True,
 ) -> dict[str, Any]:
-    """Require complete metadata plus matching physical and logical hashes for a bundle."""
+    """Validate logical content, semantic identity, and cross-table bundle contracts."""
     validated = validate_bundle_reference(
         bundle_directory,
         expected_bundle_id=expected_bundle_id,
@@ -419,6 +416,7 @@ def validate_bundle_directory(
     metadata = dict(validated.manifest)
     directory = Path(bundle_directory)
     expected_files = _artifact_schemas()
+    contracts = {filename: contract for _, filename, contract in _artifact_contracts()}
     bundle_id = metadata.get("bundle", {}).get("bundle_id")
     split_config = _validate_manifest_contract(metadata)
     hashes = metadata.get("artifacts", {})
@@ -427,10 +425,10 @@ def validate_bundle_directory(
         path = directory / filename
         declared = hashes.get(filename)
         table = pq.read_table(path)
-        actual_arrow_hash = logical_arrow_sha256(table)
+        actual_arrow_hash = logical_table_sha256(table, contracts[filename])
         actual_arrow_hashes[filename] = actual_arrow_hash
-        if actual_arrow_hash != declared.get("logical_arrow_sha256"):
-            raise ManifestBuildError(f"Logical Arrow hash mismatch for {filename}")
+        if actual_arrow_hash != declared.get("semantic_sha256"):
+            raise ManifestBuildError(f"Logical table hash mismatch for {filename}")
         if table.num_rows != declared.get("row_count"):
             raise ManifestBuildError(f"Row count mismatch for {filename}")
     try:
@@ -451,11 +449,8 @@ def validate_bundle_directory(
     if not isinstance(split_metadata, dict):
         raise ManifestBuildError("Bundle metadata is missing split lineage")
     validate_split_table(splits, samples, labels, config=split_config)
-    assignments = {row["sample_id"]: row["split_name"] for row in splits.to_pylist()}
     if split_metadata.get("split_recipe_id") != split_config.recipe_id:
         raise ManifestBuildError("Split metadata recipe does not match its policy")
-    if split_metadata.get("split_assignment_id") != split_assignment_id(assignments):
-        raise ManifestBuildError("Split assignment identity does not match the split artifact")
     _validate_source_inventory(source_inventory, samples)
     _validate_metadata_counts(metadata, samples, labels, annotations, source_inventory)
     return metadata
@@ -465,10 +460,9 @@ def validate_bundle_reference(
     bundle_directory: str | Path,
     *,
     expected_bundle_id: str | None = None,
-    expected_manifest_sha256: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedBundleReference:
-    """Validate a bundle reference and return its manifest and exact byte hash."""
+    """Inspect files, schemas, and declarations without validating logical table values."""
     directory = Path(bundle_directory)
     expected_files = _artifact_schemas()
     _require_exact_regular_entries(directory, {METADATA_FILENAME, *expected_files})
@@ -477,16 +471,12 @@ def validate_bundle_reference(
         metadata_bytes = metadata_path.read_bytes()
     except OSError as exc:
         raise ManifestBuildError(f"Bundle metadata is unreadable: {metadata_path}") from exc
-    observed_manifest_sha256 = hashlib.sha256(metadata_bytes).hexdigest()
-    if expected_manifest_sha256 is not None:
-        if not _sha256_text(expected_manifest_sha256):
-            raise ManifestBuildError("Expected bundle-manifest SHA-256 is invalid")
-        if observed_manifest_sha256 != expected_manifest_sha256:
-            raise ManifestBuildError("Bundle-manifest SHA-256 does not match expected lineage")
     try:
         metadata = json.loads(metadata_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestBuildError(f"Bundle metadata is unreadable: {metadata_path}") from exc
+    if metadata_bytes != canonical_json_bytes(metadata):
+        raise ManifestBuildError("Bundle manifest serialization is not canonical")
     bundle_id = metadata.get("bundle", {}).get("bundle_id")
     if not valid_bundle_id(bundle_id):
         raise ManifestBuildError("Bundle manifest identity is invalid")
@@ -502,13 +492,14 @@ def validate_bundle_reference(
         declared = hashes.get(filename)
         if not isinstance(declared, dict):
             raise ManifestBuildError(f"Bundle is incomplete: {filename}")
-        if sha256_file(path) != declared.get("physical_file_sha256"):
-            raise ManifestBuildError(f"File hash mismatch for {filename}")
-        if pq.read_schema(path) != schema:
-            raise ManifestBuildError(f"{filename} schema mismatch")
-        if pq.read_metadata(path).num_rows != declared.get("row_count"):
-            raise ManifestBuildError(f"Row count mismatch for {filename}")
-        arrow_hash = declared.get("logical_arrow_sha256")
+        try:
+            if pq.read_schema(path) != schema:
+                raise ManifestBuildError(f"{filename} schema mismatch")
+            if pq.read_metadata(path).num_rows != declared.get("row_count"):
+                raise ManifestBuildError(f"Row count mismatch for {filename}")
+        except (OSError, pa.ArrowException) as exc:
+            raise ManifestBuildError(f"Bundle artifact is unreadable: {filename}") from exc
+        arrow_hash = declared.get("semantic_sha256")
         if not _sha256_text(arrow_hash):
             raise ManifestBuildError(f"Logical Arrow hash declaration is invalid for {filename}")
         declared_arrow_hashes[filename] = arrow_hash
@@ -520,7 +511,7 @@ def validate_bundle_reference(
         raise ManifestBuildError("Bundle ID does not match deterministic bundle content")
     if enforce_directory_name and directory.name != bundle_id:
         raise ManifestBuildError("Bundle directory name does not match manifest identity")
-    return ValidatedBundleReference(metadata, observed_manifest_sha256)
+    return ValidatedBundleReference(metadata)
 
 
 def _require_exact_regular_entries(directory: Path, required_names: set[str]) -> None:
@@ -600,6 +591,58 @@ def _artifact_schemas() -> dict[str, pa.Schema]:
     }
 
 
+def _artifact_contracts() -> tuple[tuple[str, str, LogicalTableContract], ...]:
+    return (
+        (
+            "samples",
+            SAMPLES_FILENAME,
+            LogicalTableContract(
+                "rsna.samples", 1, RSNA_SAMPLE_SCHEMA, ("sample_id",), ("sample_id",)
+            ),
+        ),
+        (
+            "labels",
+            LABELS_FILENAME,
+            LogicalTableContract(
+                "rsna.labels",
+                1,
+                RSNA_LABEL_SCHEMA,
+                ("sample_id", "task_id"),
+                ("sample_id", "task_id"),
+            ),
+        ),
+        (
+            "annotations",
+            ANNOTATIONS_FILENAME,
+            LogicalTableContract(
+                "rsna.annotations",
+                1,
+                RSNA_ANNOTATION_SCHEMA,
+                ("sample_id", "annotation_id"),
+                ("sample_id", "annotation_id"),
+            ),
+        ),
+        (
+            "splits",
+            SPLITS_FILENAME,
+            LogicalTableContract(
+                "rsna.splits", 1, RSNA_SPLIT_SCHEMA, ("sample_id",), ("sample_id",)
+            ),
+        ),
+        (
+            "source_inventory",
+            SOURCE_INVENTORY_FILENAME,
+            LogicalTableContract(
+                "rsna.source-inventory",
+                1,
+                RSNA_SOURCE_INVENTORY_SCHEMA,
+                ("sample_id",),
+                ("sample_id",),
+            ),
+        ),
+    )
+
+
 def _label_records(sample_id: str, target: int, rsna_class: str) -> list[LabelRecord]:
     return [
         LabelRecord(
@@ -670,7 +713,6 @@ def _build_aggregate_metadata(
     samples: pa.Table,
     labels: pa.Table,
     annotations: pa.Table,
-    splits: pa.Table,
     source_inventory: pa.Table,
     audit: AuditAccumulator,
     split_config: SplitConfig,
@@ -679,11 +721,9 @@ def _build_aggregate_metadata(
     pneumonia = Counter(
         str(row["label_value"]) for row in label_rows if row["task_id"] == PNEUMONIA_TASK_ID
     )
-    assignments = {row["sample_id"]: row["split_name"] for row in splits.to_pylist()}
     split = {
         "split_source": SPLIT_SOURCE,
         "split_recipe_id": split_config.recipe_id,
-        "split_assignment_id": split_assignment_id(assignments),
         "algorithm_version": SPLIT_ALGORITHM_VERSION,
         "patient_grouping_rule": PATIENT_GROUPING_RULE,
         "patient_target_consistency_rule": PATIENT_TARGET_CONSISTENCY_RULE,
@@ -727,21 +767,6 @@ def _build_aggregate_metadata(
             "classification": "protected patient-level data",
             "public_reporting": "aggregate only",
         },
-        "provenance": {
-            "tool_versions": {
-                "python": platform.python_version(),
-                "pydicom": pydicom.__version__,
-                "pyarrow": pa.__version__,
-                "pandas": pd.__version__,
-            },
-            "logical_arrow_runtime": {
-                "pyarrow_version": pa.__version__,
-                "stability_scope": (
-                    "Deterministic only for the recorded PyArrow version; cross-version "
-                    "stability is not claimed"
-                ),
-            },
-        },
         "qualification": {
             "counts": {
                 "samples": samples.num_rows,
@@ -782,13 +807,6 @@ def _finalize_metadata(
     paths: BundlePaths,
     logical_hashes: Mapping[str, str],
 ) -> dict[str, Any]:
-    artifact_paths = {
-        SAMPLES_FILENAME: paths.samples_path,
-        LABELS_FILENAME: paths.labels_path,
-        ANNOTATIONS_FILENAME: paths.annotations_path,
-        SPLITS_FILENAME: paths.splits_path,
-        SOURCE_INVENTORY_FILENAME: paths.source_inventory_path,
-    }
     return {
         **base,
         "bundle": {
@@ -797,15 +815,10 @@ def _finalize_metadata(
         },
         "artifacts": {
             filename: {
-                "logical_arrow_sha256": logical_hashes[filename],
-                "physical_file_sha256": sha256_file(path),
-                "row_count": pq.read_metadata(path).num_rows,
+                "semantic_sha256": logical_hashes[filename],
+                "row_count": pq.read_metadata(getattr(paths, f"{role}_path")).num_rows,
             }
-            for filename, path in artifact_paths.items()
-        },
-        "generation": {
-            "timestamp_utc": datetime.now(UTC).isoformat(),
-            "command": "python -m beyondcxr.data.rsna_manifest",
+            for role, filename, _ in _artifact_contracts()
         },
     }
 
@@ -815,9 +828,7 @@ def _bundle_id(
     deterministic_metadata: Mapping[str, Any],
 ) -> str:
     identity = _bundle_identity_payload(arrow_hashes, deterministic_metadata)
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    digest = semantic_sha256("rsna-bundle", 1, identity)
     return f"{BUNDLE_PREFIX}{digest}"
 
 
@@ -834,7 +845,6 @@ def _bundle_identity_payload(
         "membership": {
             "split_source": split["split_source"],
             "split_recipe_id": split["split_recipe_id"],
-            "split_assignment_id": split["split_assignment_id"],
             "algorithm_version": split["algorithm_version"],
             "seed": split["seed"],
             "stratification_target": split["stratification_target"],

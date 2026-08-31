@@ -5,22 +5,29 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lightgbm import LGBMClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
 from beyondcxr.data.hashing import sha256_file
-from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
+from beyondcxr.data.rsna_metadata_preprocess import (
+    metadata_input_contract,
+    validate_metadata_pipeline,
+)
 from beyondcxr.training.config import load_experiment_config, with_runtime
 from beyondcxr.training.rsna_validation_evidence import (
     VALIDATION_EVIDENCE_FILENAME,
-    evidence_semantic_sha256,
     validate_validation_evidence,
+    validation_evidence_id,
 )
 from beyondcxr.utils.package_identity import (
-    canonical_scientific_id,
     fitted_object_state_sha256,
     package_scientific_config_payload,
 )
@@ -28,6 +35,7 @@ from beyondcxr.utils.publication import (
     install_immutable_directory,
     staging_directory,
 )
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops, trusted_types_for_file
 
 MODEL_FILENAME = "model.skops"
@@ -43,8 +51,6 @@ REQUIRED_MANIFEST_FIELDS = frozenset(
         "model_package_id",
         "dataset_id",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "task_id",
         "label_policy_version",
         "positive_class",
@@ -57,12 +63,11 @@ REQUIRED_MANIFEST_FIELDS = frozenset(
         "source_package_id",
         "model_sha256",
         "validation_evidence_sha256",
-        "validation_evidence_semantic_sha256",
-        "config_source_sha256",
-        "config_semantic_sha256",
+        "validation_evidence_id",
         "git_commit",
         "git_dirty",
         "dependency_lock_sha256",
+        "python_version",
         "best_iteration",
         "thresholds",
         "threshold_contract",
@@ -105,24 +110,19 @@ def publish_model_package(
         shutil.copyfile(validation_evidence_path, evidence_path)
         config_path.write_bytes(source_config_bytes)
         trusted_types_for_file(model_path)
-        fitted = load_skops(model_path)
-        config = with_runtime(load_experiment_config(config_path), seed=int(manifest["seed"]))
-        try:
-            preprocessor = fitted.named_steps["preprocess"]
-            estimator = fitted.named_steps["classifier"]
-        except (AttributeError, KeyError, TypeError) as exc:
-            raise ValueError(
-                "RSNA tabular package must contain preprocess and classifier steps"
-            ) from exc
+        config = with_runtime(
+            load_experiment_config(config_path, bundle_id=manifest["bundle_id"]),
+            seed=int(manifest["seed"]),
+        )
+        fitted = _validate_fitted_model(load_skops(model_path), config.family.family_id)
+        preprocessor = fitted.named_steps["preprocess"]
+        estimator = fitted.named_steps["classifier"]
         document = {
             **dict(manifest),
             "model_package_schema_version": MODEL_PACKAGE_SCHEMA_VERSION,
             "dataset_id": config.dataset.dataset_id,
-            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
             "label_policy_version": config.task.label_policy_version,
             "modalities": list(config.family.modalities),
-            "config_source_sha256": sha256_file(config_path),
-            "config_semantic_sha256": config.config_semantic_sha256,
             "fit_config": package_scientific_config_payload(config),
             "preprocessor_state_sha256": fitted_object_state_sha256(preprocessor),
             "model_state_sha256": fitted_object_state_sha256(
@@ -131,9 +131,10 @@ def publish_model_package(
             "source_package_id": None,
             "model_sha256": sha256_file(model_path),
             "validation_evidence_sha256": sha256_file(evidence_path),
-            "validation_evidence_semantic_sha256": evidence_semantic_sha256(
+            "validation_evidence_id": validation_evidence_id(
                 json.loads(evidence_path.read_bytes())
             ),
+            "python_version": platform.python_version(),
         }
         document["model_package_id"] = model_package_id(document)
         destination = packages_root / document["model_package_id"]
@@ -202,7 +203,6 @@ def model_package_id(document: Mapping[str, Any]) -> str:
     payload = {
         "dataset_id": document["dataset_id"],
         "bundle_id": document["bundle_id"],
-        "split_assignment_id": document["split_assignment_id"],
         "task_id": document["task_id"],
         "label_policy_version": document["label_policy_version"],
         "positive_class": document["positive_class"],
@@ -216,9 +216,11 @@ def model_package_id(document: Mapping[str, Any]) -> str:
         "best_iteration": document["best_iteration"],
         "thresholds": document["thresholds"],
         "threshold_contract": document["threshold_contract"],
-        "validation_evidence_semantic_sha256": document["validation_evidence_semantic_sha256"],
+        "validation_evidence_id": document["validation_evidence_id"],
     }
-    return canonical_scientific_id(MODEL_PACKAGE_ID_PREFIX, payload)
+    return canonical_scientific_id(
+        MODEL_PACKAGE_ID_PREFIX, payload, domain="model-package", schema_version=1
+    )
 
 
 def _validate_manifest(
@@ -233,17 +235,16 @@ def _validate_manifest(
         or schema_version != MODEL_PACKAGE_SCHEMA_VERSION
     ):
         raise ValueError("Model package schema version is invalid")
-    config = with_runtime(load_experiment_config(config_path), seed=document["seed"])
+    config = with_runtime(
+        load_experiment_config(config_path, bundle_id=document["bundle_id"]), seed=document["seed"]
+    )
     expected = {
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "task_id": config.task.task_id,
         "label_policy_version": config.task.label_policy_version,
         "family_id": config.family.family_id,
         "modalities": list(config.family.modalities),
-        "config_semantic_sha256": config.config_semantic_sha256,
         "fit_config": package_scientific_config_payload(config),
     }
     if any(document[key] != value for key, value in expected.items()):
@@ -252,22 +253,24 @@ def _validate_manifest(
         raise ValueError("Tabular model package semantic contract is invalid")
     for field in (
         "model_sha256",
-        "config_source_sha256",
-        "config_semantic_sha256",
-        "bundle_manifest_sha256",
         "preprocessor_state_sha256",
         "model_state_sha256",
         "dependency_lock_sha256",
         "validation_evidence_sha256",
-        "validation_evidence_semantic_sha256",
     ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Model manifest {field} must be a lowercase SHA-256")
+    validation_id = document["validation_evidence_id"]
+    if (
+        not isinstance(validation_id, str)
+        or not validation_id.startswith("validation-evidence-")
+        or len(validation_id) != len("validation-evidence-") + 64
+        or any(character not in "0123456789abcdef" for character in validation_id[20:])
+    ):
+        raise ValueError("Model manifest validation evidence identity is invalid")
     if document["model_sha256"] != sha256_file(model_path):
         raise ValueError("Model SHA-256 does not match model bytes")
-    if document["config_source_sha256"] != sha256_file(config_path):
-        raise ValueError("Source config SHA-256 does not match archived config bytes")
-    fitted = load_skops(model_path)
+    fitted = _validate_fitted_model(load_skops(model_path), config.family.family_id)
     if (
         fitted_object_state_sha256(fitted.named_steps["preprocess"])
         != document["preprocessor_state_sha256"]
@@ -281,6 +284,8 @@ def _validate_manifest(
         raise ValueError("Model manifest git_dirty must be Boolean")
     if not isinstance(document["git_commit"], str) or not document["git_commit"]:
         raise ValueError("Model manifest git_commit must be non-empty text")
+    if not isinstance(document["python_version"], str) or not document["python_version"]:
+        raise ValueError("Model manifest python_version must be non-empty text")
     best_iteration = document["best_iteration"]
     if best_iteration is not None and (
         isinstance(best_iteration, bool)
@@ -306,6 +311,18 @@ def _validate_manifest(
         raise ValueError("Model manifest input contract is invalid")
     if document["model_package_id"] != model_package_id(document):
         raise ValueError("Model package ID does not match its semantic payload")
+
+
+def _validate_fitted_model(model: object, family_id: str) -> Pipeline:
+    fitted = validate_metadata_pipeline(model)
+    classifier = fitted.named_steps["classifier"]
+    expected_type = {
+        "metadata_logistic": LogisticRegression,
+        "metadata_lightgbm": LGBMClassifier,
+    }.get(family_id)
+    if expected_type is None or not isinstance(classifier, expected_type):
+        raise ValueError("RSNA tabular classifier differs from its configured family")
+    return fitted
 
 
 def threshold_contract(*, sensitivity_target: float, positive_class: int = 1) -> dict[str, Any]:

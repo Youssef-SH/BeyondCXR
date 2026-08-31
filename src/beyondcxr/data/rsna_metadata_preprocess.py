@@ -149,10 +149,15 @@ def _missing_scalar(value: object) -> bool:
 
 
 def validate_metadata_pipeline(model: object) -> Pipeline:
-    """Validate that a loaded estimator embeds the fitted metadata input pipeline."""
-    if not isinstance(model, Pipeline):
-        raise ValueError("Serialized metadata model must be a scikit-learn pipeline")
-    preprocessor = model.named_steps.get("preprocess")
+    """Validate the exact fitted top-level RSNA metadata inference graph."""
+    if not isinstance(model, Pipeline) or tuple(model.named_steps) != (
+        "preprocess",
+        "classifier",
+    ):
+        raise ValueError(
+            "Serialized metadata model must contain exactly preprocess and classifier steps"
+        )
+    preprocessor = model.named_steps["preprocess"]
     if not isinstance(preprocessor, Pipeline):
         raise ValueError("Serialized metadata model is missing its preprocessing pipeline")
     validate_fitted_rsna_preprocessor(preprocessor)

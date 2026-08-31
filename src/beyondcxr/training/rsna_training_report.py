@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -196,7 +195,9 @@ def validate_training_report(
     _validate_training_metrics(document)
     package_path = Path(package_directory)
     config = with_runtime(
-        load_experiment_config(package_path / "resolved_config.yaml"),
+        load_experiment_config(
+            package_path / "resolved_config.yaml", bundle_id=package["bundle_id"]
+        ),
         seed=seed,
     )
     evidence = validate_validation_evidence(
@@ -266,8 +267,6 @@ def validate_training_report(
                 key: package[key]
                 for key in (
                     "bundle_id",
-                    "bundle_manifest_sha256",
-                    "split_assignment_id",
                     "task_id",
                     "label_policy_version",
                 )
@@ -286,9 +285,12 @@ def validate_training_report(
         if training != expected_training:
             raise ValueError("Training report neural claims differ from the package authority")
     selection = package.get("selection")
-    if isinstance(selection, Mapping) and document["probability_metrics"][
-        "average_precision"
-    ] != selection.get("validation_average_precision"):
+    if isinstance(selection, Mapping) and not math.isclose(
+        document["probability_metrics"]["average_precision"],
+        selection.get("validation_average_precision"),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
         raise ValueError("Training report validation metric differs from the package authority")
     with tempfile.TemporaryDirectory(prefix="beyondcxr-training-report-validation-") as temporary:
         rendered = Path(temporary)
@@ -304,19 +306,100 @@ def validate_training_report(
                 raise ValueError("Training report differs from authoritative evidence rendering")
 
 
-def training_report_sha256(directory: str | Path) -> str:
-    """Return one unambiguous byte witness for the complete bounded report set."""
-    validate_report_set(directory)
-    digest = hashlib.sha256()
-    root = Path(directory)
-    for filename in sorted(REQUIRED_REPORT_FILENAMES):
-        encoded_name = filename.encode()
-        content = (root / filename).read_bytes()
-        digest.update(len(encoded_name).to_bytes(4, "big"))
-        digest.update(encoded_name)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
-    return digest.hexdigest()
+def regenerate_training_report(
+    directory: str | Path,
+    *,
+    run_id: str,
+    model_package_id: str,
+    family_id: str,
+    seed: int,
+    package: Mapping[str, Any],
+    package_directory: str | Path,
+    canonical_validation_cohort: CanonicalValidationCohort,
+) -> Path:
+    """Regenerate one deterministic report solely from immutable package evidence."""
+    package_path = Path(package_directory)
+    config = with_runtime(
+        load_experiment_config(
+            package_path / "resolved_config.yaml", bundle_id=package["bundle_id"]
+        ),
+        seed=seed,
+    )
+    evidence = validate_validation_evidence(
+        package_path / VALIDATION_EVIDENCE_FILENAME,
+        package=package,
+        config=config,
+        expected_cohort=canonical_validation_cohort,
+    )
+    targets = np.asarray(evidence["targets"], dtype=np.int8)
+    probabilities = np.asarray(evidence["probabilities"], dtype=np.float64)
+    thresholds = {
+        "youden_j": youden_j_threshold(targets, probabilities),
+        "target_sensitivity": target_sensitivity_threshold(
+            targets,
+            probabilities,
+            sensitivity=float(evidence["sensitivity_target"]),
+        ),
+    }
+    document = metrics_document(
+        scope="validation",
+        calibration_bins=int(evidence["calibration_bins"]),
+        sensitivity_target=float(evidence["sensitivity_target"]),
+        thresholds=thresholds,
+        probability=evaluate_probabilities(
+            targets,
+            probabilities,
+            calibration_bins=int(evidence["calibration_bins"]),
+        ),
+        youden=evaluate_operating_point(targets, probabilities, threshold=thresholds["youden_j"]),
+        target_sensitivity=evaluate_operating_point(
+            targets, probabilities, threshold=thresholds["target_sensitivity"]
+        ),
+    )
+    document["training_package"] = {
+        "run_id": run_id,
+        "model_package_id": model_package_id,
+        "family_id": family_id,
+        "seed": seed,
+    }
+    if family_id == "cxr_densenet":
+        runtime = package.get("runtime_provenance")
+        if not isinstance(runtime, Mapping):
+            raise ValueError("Training report neural runtime authority is invalid")
+        document["cxr_training"] = {
+            "lineage": {
+                key: package[key] for key in ("bundle_id", "task_id", "label_policy_version")
+            },
+            "source_authentication": package.get("source_authentication"),
+            "model_identity": package.get("model_identity"),
+            "input_contract": package.get("input_contract"),
+            "training_transform_contract": package.get("training_transform_contract"),
+            "evaluation_transform_contract": package.get("evaluation_transform_contract"),
+            "class_weighting": package.get("training_policy", {}).get("class_weight"),
+            "runtime": {field: runtime[field] for field in CXR_REPORT_RUNTIME_FIELDS},
+            "epoch_history": evidence["epoch_history"],
+            "selection": package.get("selection"),
+            "limitations": CXR_REPORT_LIMITATIONS,
+        }
+    destination = Path(directory)
+    write_run_reports(
+        destination,
+        model_name=family_id,
+        targets=targets,
+        probabilities=probabilities,
+        document=document,
+    )
+    validate_training_report(
+        destination,
+        run_id=run_id,
+        model_package_id=model_package_id,
+        family_id=family_id,
+        seed=seed,
+        package=package,
+        package_directory=package_path,
+        canonical_validation_cohort=canonical_validation_cohort,
+    )
+    return destination
 
 
 def _validate_training_metrics(document: Mapping[str, Any]) -> None:

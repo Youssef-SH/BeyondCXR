@@ -4,19 +4,22 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from rsna_manifest_test_support import BuildResult, build_rsna_artifacts, write_bundle
 
-from beyondcxr.data.rsna_artifacts import BuildResult, build_rsna_artifacts, write_bundle
 from beyondcxr.data.rsna_audit import REPORT_FILENAMES, generate_rsna_audit
 from beyondcxr.data.rsna_schemas import PNEUMONIA_TASK_ID
 from beyondcxr.utils.privacy import validate_public_reports
 
 
 @pytest.fixture(scope="session")
-def real_rsna_build() -> BuildResult:
+def real_rsna_build(tmp_path_factory: pytest.TempPathFactory) -> BuildResult:
     root = Path("data/raw/rsna/extracted")
     if not (root / "stage_2_train_images").is_dir():
         pytest.skip("Local RSNA data is not available")
-    return build_rsna_artifacts(root)
+    return build_rsna_artifacts(
+        root,
+        output_directory=tmp_path_factory.mktemp("real-rsna-build") / "manifests",
+    )
 
 
 @pytest.mark.integration

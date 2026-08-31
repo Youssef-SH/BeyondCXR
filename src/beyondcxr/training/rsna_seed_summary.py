@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import shutil
@@ -16,25 +15,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from beyondcxr.training.rsna_campaign_control import validate_execution, validate_freeze
 from beyondcxr.training.rsna_evaluation_result import (
     validate_rsna_evaluation,
     validate_rsna_model_package,
 )
 from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
-from beyondcxr.utils.package_identity import (
-    canonical_scientific_id,
-    pretrained_weight_semantic_identity,
-)
+from beyondcxr.utils.package_identity import pretrained_weight_semantic_identity
 from beyondcxr.utils.privacy import validate_public_reports
 from beyondcxr.utils.publication import (
-    install_immutable_directory,
+    install_regenerable_directory,
     staging_directory,
     validate_path_component,
 )
 
 SEED_SUMMARY_SCHEMA_VERSION = 1
-SEED_SUMMARY_PREFIX = "seed-summary-"
 MANIFEST_FILENAME = "manifest.json"
 SEED_SUMMARY_FILENAMES = frozenset({MANIFEST_FILENAME, "metrics.csv", "summary.md"})
 _PROBABILITY_METRICS = (
@@ -65,12 +61,10 @@ _POLICY = "rsna-arithmetic-mean-and-sample-standard-deviation-v1"
 
 @dataclass(frozen=True)
 class SeedSummaryResult:
-    """One validated reusable three-seed scientific result."""
+    """One validated regenerable view over three seed evaluations."""
 
-    seed_summary_id: str
     directory: Path
     manifest: Mapping[str, Any]
-    manifest_sha256: str
 
 
 def publish_seed_summary(
@@ -79,13 +73,17 @@ def publish_seed_summary(
     output_directory: str | Path = "reports",
     model_directory: str | Path = "models/rsna",
     private_directory: str | Path = "private",
+    freeze: object,
+    execution: object,
 ) -> SeedSummaryResult:
-    """Publish the exact validated three-seed aggregate scientific result."""
+    """Publish the exact regenerable three-seed aggregate view."""
     members = _validated_members(
         evaluation_ids,
         report_root=output_directory,
         model_root=model_directory,
         private_root=private_directory,
+        freeze=freeze,
+        execution=execution,
     )
     context = _scientific_context(members)
     aggregate = _aggregate(members)
@@ -95,20 +93,18 @@ def publish_seed_summary(
         "required_seeds": list(RSNA_NEURAL_SEEDS),
         "policy": _POLICY,
     }
-    summary_id = canonical_scientific_id(SEED_SUMMARY_PREFIX, semantic)
     document = {
         "seed_summary_schema_version": SEED_SUMMARY_SCHEMA_VERSION,
         **semantic,
-        "seed_summary_id": summary_id,
         "members": members,
         "aggregate": aggregate,
     }
-    destination = Path(output_directory) / "rsna" / "seed-summaries" / summary_id
+    destination = Path(output_directory) / "rsna" / "seed-summaries" / str(context["family_id"])
     stage = staging_directory(destination)
     try:
         _write(stage, document)
         validate_public_reports(stage.iterdir(), forbidden_source_values=())
-        install_immutable_directory(
+        install_regenerable_directory(
             stage,
             destination,
             lambda path, **kwargs: validate_seed_summary(
@@ -116,6 +112,8 @@ def publish_seed_summary(
                 report_root=output_directory,
                 model_root=model_directory,
                 private_root=private_directory,
+                freeze=freeze,
+                execution=execution,
                 **kwargs,
             ),
         )
@@ -127,7 +125,8 @@ def publish_seed_summary(
         report_root=output_directory,
         model_root=model_directory,
         private_root=private_directory,
-        expected_seed_summary_id=summary_id,
+        freeze=freeze,
+        execution=execution,
     )
 
 
@@ -137,7 +136,8 @@ def validate_seed_summary(
     report_root: str | Path,
     model_root: str | Path,
     private_root: str | Path,
-    expected_seed_summary_id: str | None = None,
+    freeze: object,
+    execution: object,
     enforce_directory_name: bool = True,
 ) -> SeedSummaryResult:
     """Transitively validate and re-derive a three-seed aggregate result."""
@@ -157,13 +157,11 @@ def validate_seed_summary(
         raise ValueError("Seed summary manifest is unreadable") from exc
     fields = {
         "seed_summary_schema_version",
-        "seed_summary_id",
         "dataset_id",
         "task_id",
         "family_id",
         "modalities",
         "bundle_id",
-        "split_assignment_id",
         "family_scientific_context",
         "evaluation_policy",
         "evaluation_ids",
@@ -188,6 +186,8 @@ def validate_seed_summary(
         report_root=report_root,
         model_root=model_root,
         private_root=private_root,
+        freeze=freeze,
+        execution=execution,
     )
     if document["members"] != members:
         raise ValueError("Seed summary members differ from evaluation authorities")
@@ -197,24 +197,8 @@ def validate_seed_summary(
     aggregate = _aggregate(members)
     if document["aggregate"] != aggregate:
         raise ValueError("Seed summary aggregate differs from re-derived claims")
-    semantic = {
-        key: document[key]
-        for key in fields
-        if key
-        not in {
-            "seed_summary_schema_version",
-            "seed_summary_id",
-            "members",
-            "aggregate",
-        }
-    }
-    summary_id = canonical_scientific_id(SEED_SUMMARY_PREFIX, semantic)
-    if document["seed_summary_id"] != summary_id:
-        raise ValueError("Seed summary identity differs from its scientific claims")
-    if expected_seed_summary_id is not None and summary_id != expected_seed_summary_id:
-        raise ValueError("Seed summary differs from the expected identity")
-    if enforce_directory_name and root.name != summary_id:
-        raise ValueError("Seed summary directory differs from its identity")
+    if enforce_directory_name and root.name != document["family_id"]:
+        raise ValueError("Seed summary directory is not canonical")
     with tempfile.TemporaryDirectory(prefix="beyondcxr-seed-summary-validation-") as workspace:
         temporary = Path(workspace)
         _write(temporary, document)
@@ -222,10 +206,8 @@ def validate_seed_summary(
             if (root / filename).read_bytes() != (temporary / filename).read_bytes():
                 raise ValueError("Seed summary rendering differs from its manifest")
     return SeedSummaryResult(
-        summary_id,
         root,
         document,
-        hashlib.sha256(manifest_bytes).hexdigest(),
     )
 
 
@@ -235,6 +217,8 @@ def _validated_members(
     report_root: str | Path,
     model_root: str | Path,
     private_root: str | Path,
+    freeze: object,
+    execution: object,
 ) -> list[dict[str, Any]]:
     identities = tuple(evaluation_ids)
     if len(identities) != 3 or len(set(identities)) != 3:
@@ -246,6 +230,8 @@ def _validated_members(
             Path(report_root) / "rsna" / "evaluations" / evaluation_id,
             private_root=private_root,
             model_root=model_root,
+            freeze=freeze,
+            execution=execution,
             expected_evaluation_id=evaluation_id,
         )
         package = validate_rsna_model_package(model_root, evaluation.manifest["model_package_id"])
@@ -266,7 +252,6 @@ def _validated_members(
                         "family_id",
                         "modalities",
                         "bundle_id",
-                        "split_assignment_id",
                     )
                 },
                 "family_scientific_context": _package_family_context(
@@ -380,7 +365,7 @@ def _package_family_context(
         or _package_seed(source) != _package_seed(package)
         or any(
             source.get(field) != package.get(field)
-            for field in ("dataset_id", "task_id", "bundle_id", "split_assignment_id")
+            for field in ("dataset_id", "task_id", "bundle_id")
         )
     ):
         raise ValueError("Fusion package source CXR scientific lineage is incompatible")
@@ -476,28 +461,16 @@ def _write(directory: Path, document: Mapping[str, Any]) -> None:
                             f"{value:.12g}",
                         ]
                     )
-    family_context_sha256 = hashlib.sha256(
-        json.dumps(
-            document["family_scientific_context"],
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
     evaluation_policy = document["evaluation_policy"]
     threshold_policy = evaluation_policy["threshold_selection"]
     lines = [
         "# RSNA three-seed evaluation summary",
         "",
-        f"- Summary ID: `{document['seed_summary_id']}`",
         f"- Dataset: `{document['dataset_id']}`",
         f"- Task: `{document['task_id']}`",
         f"- Family: `{document['family_id']}`",
         f"- Modalities: `{json.dumps(document['modalities'], separators=(',', ':'))}`",
         f"- Bundle: `{document['bundle_id']}`",
-        f"- Split assignment: `{document['split_assignment_id']}`",
-        f"- Family scientific context SHA-256: `{family_context_sha256}`",
         f"- Label policy: `{document['family_scientific_context']['label_policy_version']}`",
         f"- Positive class: `{document['family_scientific_context']['positive_class']}`",
         f"- Evaluation policy: `{evaluation_policy['policy_version']}`",
@@ -594,6 +567,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-directory", type=Path, default=Path("reports"))
     parser.add_argument("--model-directory", type=Path, default=Path("models/rsna"))
     parser.add_argument("--private-directory", type=Path, default=Path("private"))
+    parser.add_argument("--execution-directory", type=Path, required=True)
+    parser.add_argument("--freeze-directory", type=Path, required=True)
+    parser.add_argument("--bundle-directory", type=Path, required=True)
     add_logging_argument(parser)
     return parser
 
@@ -602,16 +578,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
+        execution = validate_execution(args.execution_directory)
+        freeze = validate_freeze(
+            args.freeze_directory,
+            model_root=args.model_directory,
+            bundle_directory=args.bundle_directory,
+        )
         result = publish_seed_summary(
             args.evaluation_ids,
             output_directory=args.output_directory,
             model_directory=args.model_directory,
             private_directory=args.private_directory,
+            freeze=freeze,
+            execution=execution,
         )
     except (OSError, ValueError) as exc:
         print(f"Seed summary failed: {type(exc).__name__}", file=sys.stderr)
         return 1
-    print(json.dumps({"seed_summary_id": result.seed_summary_id}, indent=2))
+    print(json.dumps({"report_directory": result.directory.as_posix()}, indent=2))
     return 0
 
 

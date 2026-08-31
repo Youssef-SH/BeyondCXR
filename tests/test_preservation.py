@@ -17,6 +17,8 @@ from beyondcxr.training.preservation import (
     PreservationMember,
     export_and_verify,
     restore_and_validate_export,
+    validate_completed_preservation,
+    validate_preservation_archive,
     validate_preservation_paths,
 )
 
@@ -27,7 +29,7 @@ def _members(tmp_path: Path) -> tuple[PreservationMember, ...]:
     (directory / "manifest.json").write_text('{"schema_version":1}\n', encoding="utf-8")
     (directory / "artifact.bin").write_bytes(b"bounded-streaming-input" * 100)
     single = tmp_path / "test-open.json"
-    single.write_text('{"test_open_schema_version":1}\n', encoding="utf-8")
+    single.write_text('{"schema_version":1}\n', encoding="utf-8")
     return (
         PreservationMember(directory, Path("reports/symile/result")),
         PreservationMember(single, Path("private/control/symile/test-open.json")),
@@ -107,12 +109,38 @@ def test_export_is_self_describing_private_and_byte_deterministic(tmp_path: Path
         assert manifest["members"][1]["kind"] == "file"
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
     assert export_and_verify(**arguments).read_bytes() == before
-    assert restorations == 4
+    assert restorations == 2
 
     os.chmod(backup, 0o644)
     with pytest.raises(ManifestBuildError, match="permissions are unsafe"):
         export_and_verify(**arguments)
     assert backup.read_bytes() == before
+
+
+def test_export_canonicalizes_nested_files_by_archive_path(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "a").mkdir(parents=True)
+    (source / "a.json").write_text("sibling\n", encoding="utf-8")
+    (source / "a/manifest.json").write_text("nested\n", encoding="utf-8")
+
+    archive_path = export_and_verify(
+        members=[PreservationMember(source, Path("reports/symile/result"))],
+        export_root=tmp_path / "export",
+        backup_root=tmp_path / "backup",
+        export_name="canonical-order",
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        manifest = json.loads(archive.read("export-manifest.json"))
+        assert [item["path"] for item in manifest["members"][0]["files"]] == [
+            "a.json",
+            "a/manifest.json",
+        ]
+        assert archive.namelist() == [
+            "export-manifest.json",
+            "member-0000/a.json",
+            "member-0000/a/manifest.json",
+        ]
 
 
 @pytest.mark.parametrize(
@@ -172,8 +200,56 @@ def test_identical_secure_backup_is_reused_and_symlink_is_rejected(tmp_path: Pat
     }
     (tmp_path / "other-backup").mkdir()
     (tmp_path / "other-backup/campaign.zip").symlink_to(backup)
-    with pytest.raises(ManifestBuildError, match="conflicts with existing state"):
+    with pytest.raises(ManifestBuildError, match="not a regular file"):
         export_and_verify(**other_arguments)
+
+
+def test_completed_export_is_validated_and_reused_without_rebuilding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    expected = archive.read_bytes()
+
+    def reject_rebuild(_members: object) -> None:
+        raise AssertionError("completed preservation must not be rebuilt")
+
+    monkeypatch.setattr(preservation, "_build_export_manifest", reject_rebuild)
+    assert export_and_verify(**arguments).read_bytes() == expected
+
+
+@pytest.mark.parametrize("target", ["archive", "checksum", "backup"])
+def test_completed_export_rejects_conflicting_canonical_state(tmp_path: Path, target: str) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    paths = {
+        "archive": archive,
+        "checksum": archive.with_suffix(".zip.sha256"),
+        "backup": tmp_path / "backup/campaign.zip",
+    }
+    paths[target].write_bytes(b"conflicting completed state")
+    os.chmod(paths[target], 0o600)
+
+    with pytest.raises(ManifestBuildError):
+        export_and_verify(**arguments)
+
+
+def test_completed_preservation_validates_sidecar_backup_and_restored_science(
+    tmp_path: Path,
+) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    observed: list[bytes] = []
+
+    validate_completed_preservation(
+        archive,
+        backup_root=tmp_path / "backup",
+        restoration_validator=lambda root: observed.append(
+            (root / "reports/symile/result/artifact.bin").read_bytes()
+        ),
+    )
+    assert observed == [b"bounded-streaming-input" * 100]
+    assert validate_preservation_archive(archive) is None
 
 
 def test_export_certifies_before_publishing_preservation_files(tmp_path: Path) -> None:
@@ -213,6 +289,7 @@ def _valid_manifest() -> dict[str, object]:
                 "archive_identity": "member-0000",
                 "restore_relative": "reports/symile/result",
                 "kind": "directory",
+                "role": "scientific_authority",
                 "files": [
                     {"path": "manifest.json", "sha256": hashlib.sha256(b"content").hexdigest()}
                 ],
@@ -277,11 +354,7 @@ def test_export_manifest_rejects_hostile_contracts(mutation: str) -> None:
         ("restore", "reports//symile/result"),
         ("restore", "reports/./symile/result"),
         ("restore", "reports/symile/result/"),
-        ("archive", "."),
-        ("archive", "./nested/manifest.json"),
         ("archive", "nested//manifest.json"),
-        ("archive", "nested/./manifest.json"),
-        ("archive", "nested/manifest.json/"),
     ],
 )
 def test_export_manifest_rejects_textually_noncanonical_paths(field: str, value: str) -> None:
@@ -340,12 +413,62 @@ def test_standalone_restore_rejects_hostile_zip_membership(tmp_path: Path, mutat
         restore_and_validate_export(archive)
 
 
+def test_standalone_restore_rejects_noncanonical_zip_member_order(tmp_path: Path) -> None:
+    document = _valid_manifest()
+    archive_path = tmp_path / "reordered.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        preservation._write_zip_bytes(archive, "member-0000/manifest.json", b"content")
+        preservation._write_zip_bytes(
+            archive,
+            "export-manifest.json",
+            preservation._canonical_json_bytes(document),
+        )
+    os.chmod(archive_path, 0o600)
+
+    with pytest.raises(ManifestBuildError, match="not canonically ordered"):
+        restore_and_validate_export(archive_path)
+
+
+def test_standalone_restore_rejects_noncanonical_zip_metadata(tmp_path: Path) -> None:
+    document = _valid_manifest()
+    archive_path = tmp_path / "noncanonical-metadata.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        preservation._write_zip_bytes(
+            archive,
+            "export-manifest.json",
+            preservation._canonical_json_bytes(document),
+        )
+        info = preservation._zip_file_info("member-0000/manifest.json")
+        info.date_time = (1981, 1, 1, 0, 0, 0)
+        archive.writestr(info, b"content")
+    os.chmod(archive_path, 0o600)
+
+    with pytest.raises(ManifestBuildError, match="metadata is not canonical"):
+        restore_and_validate_export(archive_path)
+
+
+@pytest.mark.parametrize("content", [None, b"corrupted derivative"])
+def test_standalone_restore_rejects_missing_or_corrupt_derivative(
+    tmp_path: Path, content: bytes | None
+) -> None:
+    document = _valid_manifest()
+    document["members"][0]["role"] = "derivative"
+    entries = [] if content is None else [("member-0000/manifest.json", content)]
+    archive = tmp_path / "derivative.zip"
+    _write_archive(archive, document, entries)
+
+    with pytest.raises(ManifestBuildError):
+        restore_and_validate_export(archive)
+
+
 def test_standalone_restore_uses_only_backup_manifest_after_sources_are_deleted(
     tmp_path: Path,
 ) -> None:
     arguments = _arguments(tmp_path)
     export_and_verify(**arguments)
     backup = tmp_path / "backup/campaign.zip"
+    renamed = tmp_path / "renamed-valid-campaign.zip"
+    shutil.copy2(backup, renamed)
     for member in arguments["members"]:
         shutil.rmtree(member.path) if member.path.is_dir() else member.path.unlink()
 
@@ -358,8 +481,28 @@ def test_standalone_restore_uses_only_backup_manifest_after_sources_are_deleted(
     observed = restore_and_validate_export(backup, restoration_validator=validate)
     assert observed == {
         "artifact": b"bounded-streaming-input" * 100,
-        "open": b'{"test_open_schema_version":1}\n',
+        "open": b'{"schema_version":1}\n',
     }
+    assert restore_and_validate_export(renamed, restoration_validator=validate) == observed
+
+
+def test_restoration_context_exists_only_inside_authenticated_archive_validation(
+    tmp_path: Path,
+) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    captured = []
+
+    def validate(root: Path) -> None:
+        context = preservation._validated_restoration_context(root)
+        assert preservation.require_restoration_context(context) is context
+        captured.append(context)
+
+    restore_and_validate_export(archive, restoration_validator=validate)
+    with pytest.raises(PermissionError, match="authenticated restoration context"):
+        preservation.require_restoration_context(captured[0])
+    with pytest.raises(PermissionError, match="authenticated restoration context"):
+        preservation._validated_restoration_context(tmp_path)
 
 
 def test_export_cleans_temporary_file_after_archive_install_failure(
@@ -377,3 +520,112 @@ def test_export_cleans_temporary_file_after_archive_install_failure(
     export_root = tmp_path / "export"
     assert not (export_root / "campaign.zip").exists()
     assert not tuple(export_root.glob(".campaign.zip.*.tmp"))
+
+
+def test_late_checksum_failure_rolls_back_and_allows_clean_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path)
+    real_write = preservation._write_or_validate
+
+    def fail_checksum(path: Path, content: bytes) -> bool:
+        del path, content
+        raise OSError("simulated checksum publication failure")
+
+    monkeypatch.setattr(preservation, "_write_or_validate", fail_checksum)
+    with pytest.raises(OSError, match="simulated checksum publication failure"):
+        export_and_verify(**arguments)
+
+    archive = tmp_path / "export/campaign.zip"
+    checksum = archive.with_suffix(".zip.sha256")
+    backup = tmp_path / "backup/campaign.zip"
+    assert not archive.exists()
+    assert not checksum.exists()
+    assert not backup.exists()
+    assert not tuple(tmp_path.rglob(".*.tmp"))
+
+    monkeypatch.setattr(preservation, "_write_or_validate", real_write)
+    published = export_and_verify(**arguments)
+    assert published == archive
+    assert checksum.is_file()
+    assert backup.read_bytes() == archive.read_bytes()
+    assert validate_completed_preservation(archive, backup_root=tmp_path / "backup") == archive
+
+
+def test_terminal_validation_failure_rolls_back_only_attempt_created_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path)
+    export_root = tmp_path / "export"
+    backup_root = tmp_path / "backup"
+    export_root.mkdir()
+    backup_root.mkdir()
+    export_marker = export_root / "pre-existing.txt"
+    backup_marker = backup_root / "pre-existing.txt"
+    export_marker.write_bytes(b"keep export state")
+    backup_marker.write_bytes(b"keep backup state")
+
+    def fail_completed_validation(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise ManifestBuildError("simulated terminal preservation failure")
+
+    monkeypatch.setattr(
+        preservation,
+        "validate_completed_preservation",
+        fail_completed_validation,
+    )
+    with pytest.raises(ManifestBuildError, match="simulated terminal preservation failure"):
+        export_and_verify(**arguments)
+
+    archive = export_root / "campaign.zip"
+    assert not archive.exists()
+    assert not archive.with_suffix(".zip.sha256").exists()
+    assert not (backup_root / "campaign.zip").exists()
+    assert export_marker.read_bytes() == b"keep export state"
+    assert backup_marker.read_bytes() == b"keep backup state"
+    assert not tuple(tmp_path.rglob(".*.tmp"))
+
+
+@pytest.mark.parametrize("missing", [("checksum",), ("backup",), ("checksum", "backup")])
+def test_interrupted_installed_archive_recovers_missing_transport_files(
+    tmp_path: Path, missing: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    expected = archive.read_bytes()
+    paths = {
+        "checksum": archive.with_suffix(".zip.sha256"),
+        "backup": tmp_path / "backup/campaign.zip",
+    }
+    for name in missing:
+        paths[name].unlink()
+
+    def forbid_rebuild(_members: object) -> None:
+        raise AssertionError("Recovery must retain the installed archive")
+
+    monkeypatch.setattr(preservation, "_build_export_manifest", forbid_rebuild)
+    validated = []
+    arguments["restoration_validator"] = lambda root: validated.append(root)
+    assert export_and_verify(**arguments) == archive
+    assert validated
+    assert archive.read_bytes() == expected == paths["backup"].read_bytes()
+    validate_completed_preservation(archive, backup_root=tmp_path / "backup")
+
+
+def test_interrupted_archive_requires_valid_science_before_repair(tmp_path: Path) -> None:
+    arguments = _arguments(tmp_path)
+    archive = export_and_verify(**arguments)
+    checksum = archive.with_suffix(".zip.sha256")
+    backup = tmp_path / "backup/campaign.zip"
+    checksum.unlink()
+    backup.unlink()
+
+    def reject(_root: Path) -> None:
+        raise ManifestBuildError("invalid restored science")
+
+    arguments["restoration_validator"] = reject
+    with pytest.raises(ManifestBuildError, match="invalid restored science"):
+        export_and_verify(**arguments)
+    assert archive.exists()
+    assert not checksum.exists()
+    assert not backup.exists()

@@ -1,10 +1,9 @@
 """Load and normalize DICOM images with selected metadata."""
 
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pydicom
@@ -80,11 +79,6 @@ def read_dicom(
     )
 
     return pixels, record
-
-
-def record_as_dict(record: DicomRecord) -> dict[str, Any]:
-    """Return a dictionary representation of a DICOM record."""
-    return asdict(record)
 
 
 def _optional_string(dataset: FileDataset, attribute: str) -> str | None:

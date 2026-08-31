@@ -63,7 +63,7 @@ select = ["E", "F", "I", "B", "UP"]
 testpaths = ["tests"]
 addopts = "-q -m 'not integration'"
 markers = [
-    "integration: requires local RSNA data and is excluded from ordinary test runs",
+    "integration: bounded optional model, data, localization, or serving lifecycle integration",
 ]
 
 [dependency-groups]

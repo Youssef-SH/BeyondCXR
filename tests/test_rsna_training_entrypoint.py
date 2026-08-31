@@ -23,7 +23,20 @@ def test_training_entrypoint_invokes_runner_from_config(monkeypatch, capsys) -> 
 
     monkeypatch.setattr("beyondcxr.training.rsna_train.train_metadata_experiment", fake_train)
 
-    assert main(["--config", "configs/rsna_metadata_logistic.yaml", "--seed", "42"]) == 0
+    assert (
+        main(
+            [
+                "--config",
+                "configs/rsna_metadata_logistic.yaml",
+                "--seed",
+                "42",
+                "--bundle-id",
+                "bundle-" + "a" * 64,
+            ]
+        )
+        == 0
+    )
+    assert captured["config"].dataset.bundle_id == "bundle-" + "a" * 64
     assert captured["config"].family.family_id == "metadata_logistic"
     assert captured["config"].runtime.seed == 42
     assert captured["tracking_uri"] == "sqlite:///mlflow.db"

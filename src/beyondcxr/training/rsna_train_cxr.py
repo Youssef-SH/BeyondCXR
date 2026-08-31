@@ -16,7 +16,7 @@ import numpy as np
 from torch import nn
 
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
-from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
+from beyondcxr.data.rsna_cxr_cache import PreparedCxrCache
 from beyondcxr.evaluation.metrics import (
     OperatingPointMetrics,
     ProbabilityMetrics,
@@ -68,11 +68,9 @@ from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
     environment_provenance,
-    git_revision,
     log_source_config,
     serialize_modalities,
     tracked_run,
-    uv_lock_sha256,
 )
 from beyondcxr.utils.operational_logging import (
     CountProgress,
@@ -81,6 +79,7 @@ from beyondcxr.utils.operational_logging import (
     timed_phase,
 )
 from beyondcxr.utils.privacy import validate_public_reports
+from beyondcxr.utils.provenance import git_revision, uv_lock_sha256
 from beyondcxr.utils.publication import publish_directory, staging_directory
 from beyondcxr.utils.rsna_model_publication import threshold_contract
 from beyondcxr.utils.rsna_neural_publication import (
@@ -114,7 +113,7 @@ def train_cxr_experiment(
     config: ExperimentConfig,
     *,
     tracking_uri: str = DEFAULT_TRACKING_URI,
-    cache: ValidatedCxrCache | None = None,
+    cache: PreparedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
     runtime: ResolvedDevice | None = None,
 ) -> CxrModelResult:
@@ -141,13 +140,9 @@ def train_cxr_experiment(
         "family_id": family.family_id,
         "modalities": serialize_modalities(family.modalities),
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
         "git_commit": commit,
         "dependency_lock_sha256": lock_hash,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "run_complete": "false",
     }
     initial_parameters = {
@@ -170,8 +165,6 @@ def train_cxr_experiment(
         dataset_adapter = get_dataset(config.dataset.dataset_id)
         with timed_phase(_LOGGER, "dataset_loading", **context):
             cxr_data = dataset_adapter.load_cxr_train_validation(config)
-        if cxr_data.lineage.split_assignment_id != config.dataset.split_assignment_id:
-            raise ValueError("Loaded split assignment differs from the configuration")
         with timed_phase(_LOGGER, "cxr_runtime_preparation", **context):
             seed_neural_runtime(seed)
             train_transform = _transform(config, training=True)
@@ -181,7 +174,6 @@ def train_cxr_experiment(
             )
             expected_cache_identity = expected_rsna_cxr_cache_identity(
                 lineage=cxr_data.lineage,
-                bundle_manifest_sha256=cxr_data.bundle_manifest_sha256,
                 source_inventory=cxr_data.source_inventory,
                 transform=evaluation_transform,
             )
@@ -431,8 +423,6 @@ def train_cxr_experiment(
         document["cxr_training"] = {
             "lineage": {
                 "bundle_id": cxr_data.lineage.bundle_id,
-                "bundle_manifest_sha256": cxr_data.bundle_manifest_sha256,
-                "split_assignment_id": cxr_data.lineage.split_assignment_id,
                 "task_id": cxr_data.lineage.task_id,
                 "label_policy_version": cxr_data.lineage.label_policy_version,
             },
@@ -564,9 +554,8 @@ def train_cxr_experiment(
                     "train_negative_count": negative_count,
                     "pos_weight": pos_weight,
                     "class_weight_policy": CLASS_WEIGHT_POLICY_VERSION,
-                    "source_inventory_file_sha256": authentication["source_inventory_file_sha256"],
-                    "source_inventory_arrow_sha256": authentication[
-                        "source_inventory_arrow_sha256"
+                    "source_inventory_semantic_sha256": authentication[
+                        "source_inventory_semantic_sha256"
                     ],
                     "source_authentication_policy_version": authentication["policy_version"],
                     "selected_epoch": fit.selected_epoch,
@@ -664,11 +653,7 @@ def _manifest(
         "task_id": cxr_data.lineage.task_id,
         "positive_class": 1,
         "bundle_id": cxr_data.lineage.bundle_id,
-        "bundle_manifest_sha256": cxr_data.bundle_manifest_sha256,
-        "split_assignment_id": cxr_data.lineage.split_assignment_id,
         "label_policy_version": cxr_data.lineage.label_policy_version,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
             "git_commit": commit,
             "git_dirty": dirty,

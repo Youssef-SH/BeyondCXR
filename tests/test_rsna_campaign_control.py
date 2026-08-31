@@ -4,29 +4,29 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
-from rsna_preservation_test_support import build_real_rsna_campaign_closure
 
 import beyondcxr.training.rsna_campaign_control as control
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import sha256_file
 from beyondcxr.models.cxr_baseline import PretrainedWeightIdentity
 from beyondcxr.training.config import load_experiment_config, with_runtime
 from beyondcxr.training.device import ResolvedDevice
 from beyondcxr.training.rsna_campaign_control import (
-    FrozenTrainingPackage,
+    FrozenScientificPackage,
     ValidatedRsnaExecution,
+    authorize_rsna_held_out,
     publish_evaluation_record,
     publish_or_validate_execution,
-    publish_or_validate_package_freeze,
-    require_validated_package_freeze,
+    publish_or_validate_freeze,
+    require_validated_freeze,
+    require_validated_rsna_held_out,
+    validate_current_rsna_execution,
     validate_execution,
     validate_execution_closure,
-    validate_package_freeze,
+    validate_freeze,
 )
 from beyondcxr.training.rsna_datasets import RsnaDataset
 from beyondcxr.training.rsna_evaluation_result import CompletedRsnaEvaluation
@@ -40,25 +40,29 @@ from beyondcxr.training.rsna_formal import (
 )
 from beyondcxr.training.rsna_training_report import (
     REQUIRED_REPORT_FILENAMES,
-    training_report_sha256,
-    write_run_reports,
 )
 from beyondcxr.training.rsna_validation_evidence import (
     CanonicalValidationCohort,
-    evidence_semantic_sha256,
 )
-from beyondcxr.utils.rsna_model_publication import model_package_id
+from beyondcxr.utils.package_identity import package_scientific_config_payload
+from beyondcxr.utils.rsna_model_publication import threshold_contract
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
 
 
 def _configs():
     return tuple(
-        with_runtime(load_experiment_config(spec.config_relative), seed=spec.seed)
+        with_runtime(
+            load_experiment_config(spec.config_relative, bundle_id="bundle-" + "a" * 64),
+            seed=spec.seed,
+        )
         for spec in RSNA_FORMAL_RUN_PLAN
     )
 
 
 def _plan(tmp_path: Path) -> ValidatedRsnaPlan:
-    configs = _configs()
+    configs = tuple(
+        with_runtime(config, manifest_directory=tmp_path / "manifests") for config in _configs()
+    )
     first = configs[0]
     roots = RsnaFormalRoots(
         tmp_path,
@@ -95,11 +99,9 @@ def _plan(tmp_path: Path) -> ValidatedRsnaPlan:
         RsnaAuthorityCoordinates(
             "rsna",
             first.dataset.bundle_id,
-            first.dataset.bundle_manifest_sha256,
-            first.dataset.split_assignment_id,
             first.task.task_id,
             first.task.label_policy_version,
-            tmp_path / "bundle",
+            tmp_path / "manifests" / "rsna" / "bundles" / first.dataset.bundle_id,
         ),
         roots,
         RSNA_FORMAL_RUN_PLAN,
@@ -109,41 +111,50 @@ def _plan(tmp_path: Path) -> ValidatedRsnaPlan:
         "0" * 64,
         PretrainedWeightIdentity("densenet121-res224-chex", "url", "weights.bin", 1, "1" * 64),
         runtime,
-        SimpleNamespace(),
-        SimpleNamespace(),
+        SimpleNamespace(
+            provenance=lambda: {
+                "lifecycle": "reused",
+                "num_workers": 2,
+                "pin_memory": True,
+            },
+            prefetch_factor=2,
+        ),
+        SimpleNamespace(
+            provenance=lambda: {
+                "lifecycle": "one_shot",
+                "num_workers": 0,
+                "pin_memory": True,
+            },
+            prefetch_factor=None,
+        ),
         _FORMAL_PLAN_GUARD,
     )
+
+
+def test_completed_fit_resolution_rejects_dangling_package_root(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    execution = publish_or_validate_execution(plan)
+    assert control.resolve_completed_rsna_packages(plan, execution) == (None,) * 8
+    root = plan.roots.model_root / "packages"
+    root.parent.mkdir(parents=True)
+    root.symlink_to(tmp_path / "absent-packages", target_is_directory=True)
+    with pytest.raises(ManifestBuildError, match="package root is invalid"):
+        control.resolve_completed_rsna_packages(plan, execution)
 
 
 def test_execution_control_freezes_the_exact_ordered_package_matrix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def validate_report(
-        directory,
-        *,
-        run_id,
-        model_package_id,
-        family_id,
-        seed,
-        package,
-        package_directory,
-        canonical_validation_cohort,
-    ):
-        del package, package_directory, canonical_validation_cohort
-        document = json.loads((Path(directory) / "metrics.json").read_text(encoding="utf-8"))
-        if document["training_package"] != {
-            "run_id": run_id,
-            "model_package_id": model_package_id,
-            "family_id": family_id,
-            "seed": seed,
-        }:
-            raise ValueError("Training report package binding is invalid")
-
-    monkeypatch.setattr(control, "validate_training_report", validate_report)
+    monkeypatch.setattr(control, "validate_training_report", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         control,
         "load_canonical_validation_cohort",
         lambda *args, **kwargs: CanonicalValidationCohort(("sample",), (0,)),
+    )
+    monkeypatch.setattr(
+        control,
+        "validate_package_validation_cohort",
+        lambda *args, **kwargs: None,
     )
     plan = _plan(tmp_path)
     configs = plan.configs
@@ -177,23 +188,36 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
             encoding="utf-8",
         )
         package_manifests[package_id] = {
+            "dataset_id": config.dataset.dataset_id,
             "bundle_id": config.dataset.bundle_id,
-            "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-            "split_assignment_id": config.dataset.split_assignment_id,
             "task_id": config.task.task_id,
             "label_policy_version": config.task.label_policy_version,
             "family_id": config.family.family_id,
-            "config_source_sha256": config.config_source_sha256,
-            "config_semantic_sha256": config.config_semantic_sha256,
+            "modalities": list(config.family.modalities),
+            "fit_config": package_scientific_config_payload(config),
             "seed": config.runtime.seed,
+            "positive_class": 1,
+            "threshold_contract": threshold_contract(
+                sensitivity_target=config.evaluation.sensitivity_target
+            ),
             **(
                 {
                     "model_identity": {"pretrained_weight": plan.pretrained_weight.as_dict()},
-                    "runtime_provenance": plan.runtime.provenance(),
+                    "runtime_provenance": {
+                        **plan.runtime.provenance(),
+                        "loader_execution": {
+                            **plan.training_execution.provenance(),
+                            "prefetch_factor": plan.training_execution.prefetch_factor,
+                        },
+                    },
                     "source_provenance": {
                         "git_commit": plan.git_commit,
                         "git_dirty": False,
                         "dependency_lock_sha256": plan.dependency_lock_sha256,
+                        "python_version": execution.manifest["framework_versions"]["python"],
+                        "torch_version": execution.manifest["framework_versions"]["torch"],
+                        "torchvision_version": plan.runtime.torchvision_version,
+                        "torchxrayvision_version": plan.runtime.torchxrayvision_version,
                     },
                 }
                 if config.neural is not None
@@ -201,6 +225,7 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
                     "git_commit": plan.git_commit,
                     "git_dirty": False,
                     "dependency_lock_sha256": plan.dependency_lock_sha256,
+                    "python_version": execution.manifest["framework_versions"]["python"],
                 }
             ),
         }
@@ -218,7 +243,52 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
         lambda root, package_id: package_manifests[package_id],
     )
 
-    frozen = publish_or_validate_package_freeze(
+    for index in range(5, 8):
+        package_manifests[results[index].model_package_id]["source_package_id"] = results[
+            index - 3
+        ].model_package_id
+    resolved = control.resolve_completed_rsna_packages(plan, execution)
+    assert tuple(item.model_package_id for item in resolved) == tuple(
+        item.model_package_id for item in results
+    )
+    missing = results[1].model_path.parent
+    unpublished = missing.with_name(f".{missing.name}-staging-interrupted")
+    missing.rename(unpublished)
+    try:
+        partial = control.resolve_completed_rsna_packages(plan, execution)
+        assert partial[1] is None
+        assert partial[:1] + partial[2:] == resolved[:1] + resolved[2:]
+    finally:
+        unpublished.rename(missing)
+    package = package_manifests[results[0].model_package_id]
+    for field, value in (
+        ("fit_config", {}),
+        ("dependency_lock_sha256", "9" * 64),
+    ):
+        with monkeypatch.context() as mutation:
+            mutation.setitem(package, field, value)
+            with pytest.raises(ManifestBuildError, match="differs from the formal plan"):
+                control.resolve_completed_rsna_packages(plan, execution)
+    with monkeypatch.context() as mutation:
+        mutation.setitem(
+            package_manifests[results[5].model_package_id],
+            "source_package_id",
+            results[3].model_package_id,
+        )
+        with pytest.raises(ManifestBuildError, match="conflicting CXR membership"):
+            control.resolve_completed_rsna_packages(plan, execution)
+    duplicate = model_root / "packages" / ("model-package-" + "a" * 64)
+    duplicate.mkdir()
+    (duplicate / "model.skops").write_bytes(b"another fit")
+    package_manifests[duplicate.name] = dict(package)
+    try:
+        with pytest.raises(ManifestBuildError, match="ambiguous"):
+            control.resolve_completed_rsna_packages(plan, execution)
+    finally:
+        shutil.rmtree(duplicate)
+        del package_manifests[duplicate.name]
+
+    frozen = publish_or_validate_freeze(
         plan=plan,
         execution=execution,
         results=results,
@@ -227,14 +297,19 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
     assert tuple(item.model_package_id for item in frozen.packages) == tuple(
         item.model_package_id for item in results
     )
-    assert require_validated_package_freeze(frozen) is frozen
+    assert require_validated_freeze(frozen) is frozen
+    unexpected = frozen.directory / "unexpected.txt"
+    unexpected.write_text("not a freeze member\n", encoding="utf-8")
+    try:
+        with pytest.raises(ManifestBuildError, match="freeze directory membership"):
+            require_validated_freeze(frozen)
+    finally:
+        unexpected.unlink()
 
-    report_bytes = (frozen.packages[0].artifact_directory / "evaluation_report.md").read_bytes()
-    (frozen.packages[0].artifact_directory / "evaluation_report.md").write_bytes(
-        report_bytes + b"tampered"
-    )
-    with pytest.raises(ManifestBuildError, match="training report"):
-        frozen.require(frozen.packages[0].model_package_id)
+    report = results[0].artifact_directory
+    report_bytes = (report / "evaluation_report.md").read_bytes()
+    (report / "evaluation_report.md").write_bytes(report_bytes + b"tampered")
+    assert frozen.require(frozen.packages[0].model_package_id) == frozen.packages[0]
     materialized = False
 
     def load_pinned_bundle(*args, **kwargs):
@@ -243,98 +318,144 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
         raise AssertionError("held-out materialization must not begin")
 
     monkeypatch.setattr("beyondcxr.training.rsna_datasets._load_pinned_bundle", load_pinned_bundle)
-    with pytest.raises(ManifestBuildError, match="training report"):
+    with pytest.raises(PermissionError, match="current-execution capability"):
         RsnaDataset().load_test(
             configs[0],
             authorization=frozen,
             package_id=frozen.packages[0].model_package_id,
         )
     assert materialized is False
-    (frozen.packages[0].artifact_directory / "evaluation_report.md").write_bytes(report_bytes)
+    (report / "evaluation_report.md").write_bytes(report_bytes)
+    held_out = authorize_rsna_held_out(plan=plan, execution=execution, freeze=frozen)
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+        lambda **kwargs: plan,
+    )
+    assert require_validated_rsna_held_out(held_out).freeze == frozen
+
+    with monkeypatch.context() as drift:
+        drift.setattr(
+            "beyondcxr.training.rsna_campaign._preflight_rsna_campaign",
+            lambda **kwargs: replace(plan, git_commit="9" * 40),
+        )
+        with pytest.raises(ManifestBuildError, match="Current environment differs"):
+            require_validated_rsna_held_out(held_out)
+
+    extra_freeze = frozen.directory.parent / ("rsna-freeze-" + "9" * 64)
+    shutil.copytree(frozen.directory, extra_freeze)
+    with pytest.raises(ManifestBuildError, match="current formal execution plan"):
+        require_validated_rsna_held_out(held_out)
+    shutil.rmtree(extra_freeze)
+
+    receipt = plan.roots.control_root / "active-execution.json"
+    receipt_bytes = receipt.read_bytes()
+    receipt.write_bytes(
+        canonical_json_bytes({"schema_version": 1, "execution_id": "rsna-execution-" + "9" * 64})
+    )
+    with pytest.raises(ManifestBuildError, match="active execution receipt"):
+        require_validated_rsna_held_out(held_out)
+    receipt.write_bytes(receipt_bytes)
+
+    freeze_manifest = frozen.directory / "manifest.json"
+    freeze_bytes = freeze_manifest.read_bytes()
+    freeze_manifest.write_bytes(freeze_bytes + b"tampered")
+    with pytest.raises(ManifestBuildError, match="freeze"):
+        require_validated_rsna_held_out(held_out)
+    freeze_manifest.write_bytes(freeze_bytes)
+
+    moved_directory = tmp_path / "unrelated-freezes" / frozen.freeze_id
+    shutil.copytree(frozen.directory, moved_directory)
+    moved_freeze = replace(frozen, directory=moved_directory)
+    assert require_validated_freeze(moved_freeze) == moved_freeze
+    with pytest.raises(ManifestBuildError, match="current formal execution plan"):
+        authorize_rsna_held_out(plan=plan, execution=execution, freeze=moved_freeze)
+    with pytest.raises(AssertionError, match="materialization must not begin"):
+        RsnaDataset().load_test(
+            configs[0],
+            authorization=held_out,
+            package_id=frozen.packages[0].model_package_id,
+        )
 
     package_manifests[frozen.packages[0].model_package_id]["seed"] = 7
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
+    with pytest.raises(ManifestBuildError, match="scientific freeze"):
         frozen.require(frozen.packages[0].model_package_id)
     package_manifests[frozen.packages[0].model_package_id]["seed"] = 42
 
-    forged_member = FrozenTrainingPackage(
-        "run-forged",
+    forged_member = FrozenScientificPackage(
         "model-package-" + "9" * 64,
         frozen.packages[0].model_path,
-        frozen.packages[0].artifact_directory,
-        frozen.packages[0].report_sha256,
     )
-    evaluations = execution.directory / "evaluations"
-    evaluations.mkdir()
+    evaluations = execution.directory.parent.parent / "evaluations" / execution.execution_id
+    evaluations.mkdir(parents=True)
     for member in (*frozen.packages, forged_member):
         (evaluations / f"{member.model_package_id}.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ManifestBuildError, match="canonical authority"):
         validate_execution_closure(
+            execution,
             replace(frozen, packages=(*frozen.packages, forged_member)),
         )
+    (evaluations / f"{forged_member.model_package_id}.json").unlink()
+    validate_execution_closure(execution, frozen)
+    for parent in (execution.directory, evaluations):
+        unexpected = parent / "unexpected.json"
+        unexpected.write_text("{}\n", encoding="utf-8")
+        try:
+            with pytest.raises(ManifestBuildError, match="membership"):
+                validate_execution_closure(execution, frozen)
+        finally:
+            unexpected.unlink()
+    moved_evaluations = tmp_path / "moved-evaluations"
+    evaluations.rename(moved_evaluations)
+    evaluations.symlink_to(moved_evaluations, target_is_directory=True)
+    try:
+        with pytest.raises(ManifestBuildError, match="records directory is invalid"):
+            validate_execution_closure(execution, frozen)
+    finally:
+        evaluations.unlink()
+        moved_evaluations.rename(evaluations)
 
     substituted = replace(
         frozen.packages[0],
         model_package_id="model-package-" + "f" * 64,
     )
     with pytest.raises(ManifestBuildError, match="differs from its canonical authority"):
-        require_validated_package_freeze(
-            replace(frozen, packages=(substituted, *frozen.packages[1:]))
-        )
+        require_validated_freeze(replace(frozen, packages=(substituted, *frozen.packages[1:])))
     with pytest.raises(ManifestBuildError, match="differs from its canonical authority"):
-        require_validated_package_freeze(
+        require_validated_freeze(
             replace(
                 frozen,
                 packages=(frozen.packages[1], frozen.packages[0], *frozen.packages[2:]),
             )
         )
 
-    original_bundle_id = frozen.execution.manifest["dataset"]["bundle_id"]
-    replacement_hash = "0" * 64 if original_bundle_id != "bundle-" + "0" * 64 else "1" * 64
-    frozen.execution.manifest["dataset"]["bundle_id"] = "bundle-" + replacement_hash
-    with pytest.raises(ManifestBuildError, match="execution capability differs"):
-        require_validated_package_freeze(frozen)
-    frozen.execution.manifest["dataset"]["bundle_id"] = original_bundle_id
-
-    freeze_path = execution.directory / "package-freeze.json"
+    freeze_path = frozen.directory / "manifest.json"
     canonical_freeze = freeze_path.read_bytes()
     freeze_document = json.loads(canonical_freeze)
-    freeze_document["packages"][0]["run_id"] = "run-tampered"
+    freeze_document["packages"][0]["family_id"] = "tampered-family"
     freeze_path.write_text(
         json.dumps(freeze_document, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
-        require_validated_package_freeze(frozen)
+    with pytest.raises(ManifestBuildError, match="scientific freeze"):
+        require_validated_freeze(frozen)
     freeze_path.write_bytes(canonical_freeze)
 
     other_plan = replace(plan, git_commit="e" * 40)
-    other_execution = publish_or_validate_execution(other_plan)
-    shutil.copyfile(
-        execution.directory / "package-freeze.json",
-        other_execution.directory / "package-freeze.json",
-    )
-    copied_freeze = json.loads(
-        (other_execution.directory / "package-freeze.json").read_text(encoding="utf-8")
-    )
-    assert copied_freeze["execution_id"] == execution.execution_id
-    assert copied_freeze["execution_id"] != other_execution.execution_id
-    with pytest.raises(ManifestBuildError, match="package freeze contract is invalid"):
-        require_validated_package_freeze(replace(frozen, execution=other_execution))
-    with pytest.raises(ManifestBuildError, match="package freeze contract is invalid"):
-        validate_package_freeze(
-            other_execution,
+    assert other_plan.git_commit != plan.git_commit
+    assert (
+        validate_freeze(
+            frozen.directory,
             model_root=model_root,
-            report_root=report_root,
             bundle_directory=plan.authority.bundle_directory,
-        )
+        ).freeze_id
+        == frozen.freeze_id
+    )
 
     package_manifests[results[2].model_package_id]["seed"] = 42
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
-        validate_package_freeze(
-            execution,
+    with pytest.raises(ManifestBuildError, match="scientific freeze"):
+        validate_freeze(
+            frozen.directory,
             model_root=model_root,
-            report_root=report_root,
             bundle_directory=plan.authority.bundle_directory,
         )
     package_manifests[results[2].model_package_id]["seed"] = 17
@@ -342,192 +463,94 @@ def test_execution_control_freezes_the_exact_ordered_package_matrix(
     report_document = json.loads(report_manifest.read_text(encoding="utf-8"))
     report_document["training_package"]["model_package_id"] = "model-package-wrong"
     report_manifest.write_text(json.dumps(report_document), encoding="utf-8")
-    with pytest.raises(ValueError, match="package binding"):
-        validate_package_freeze(
-            execution,
+    assert (
+        validate_freeze(
+            frozen.directory,
             model_root=model_root,
-            report_root=report_root,
             bundle_directory=plan.authority.bundle_directory,
-        )
-
-    report_document["training_package"]["model_package_id"] = results[2].model_package_id
-    report_manifest.write_text(json.dumps(report_document), encoding="utf-8")
-    package_manifests[results[2].model_package_id]["model_identity"]["pretrained_weight"][
-        "sha256"
-    ] = "2" * 64
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
-        validate_package_freeze(
-            execution,
-            model_root=model_root,
-            report_root=report_root,
-            bundle_directory=plan.authority.bundle_directory,
-        )
-
-    package_manifests[results[2].model_package_id]["model_identity"]["pretrained_weight"][
-        "sha256"
-    ] = plan.pretrained_weight.sha256
-    package_manifests[results[2].model_package_id]["runtime_provenance"]["gpu_device_name"] = (
-        "different GPU"
-    )
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
-        validate_package_freeze(
-            execution,
-            model_root=model_root,
-            report_root=report_root,
-            bundle_directory=plan.authority.bundle_directory,
-        )
-    package_manifests[results[2].model_package_id]["runtime_provenance"]["gpu_device_name"] = (
-        plan.runtime.gpu_device_name
+        ).freeze_id
+        == frozen.freeze_id
     )
 
-    provenance_tampering = (
-        (0, "git_commit", "e" * 40),
-        (2, "dependency_lock_sha256", "e" * 64),
-        (5, "git_dirty", True),
-    )
-    for index, field, replacement in provenance_tampering:
-        manifest = package_manifests[results[index].model_package_id]
-        provenance = manifest if index < 2 else manifest["source_provenance"]
-        original = provenance[field]
-        provenance[field] = replacement
-        with pytest.raises(ManifestBuildError, match="package freeze output"):
-            validate_package_freeze(
-                execution,
-                model_root=model_root,
-                report_root=report_root,
-                bundle_directory=plan.authority.bundle_directory,
-            )
-        provenance[field] = original
-
-    freeze_document = json.loads(freeze_path.read_text(encoding="utf-8"))
     misplaced_validation = report_root / "some-other-place" / results[0].run_id
     shutil.copytree(results[0].artifact_directory, misplaced_validation)
-    freeze_document["packages"][0]["report_relative"] = misplaced_validation.relative_to(
-        report_root
-    ).as_posix()
-    freeze_path.write_text(
-        json.dumps(freeze_document, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ManifestBuildError, match="package freeze output"):
-        validate_package_freeze(
-            execution,
-            model_root=model_root,
-            report_root=report_root,
-            bundle_directory=plan.authority.bundle_directory,
-        )
-    freeze_path.unlink()
-    publish_or_validate_package_freeze(plan=plan, execution=execution, results=results)
-
     misplaced = report_root / "some-other-place" / results[0].run_id
     shutil.rmtree(misplaced_validation)
     results[0].artifact_directory.rename(misplaced)
     misplaced_result = SimpleNamespace(**{**results[0].__dict__, "artifact_directory": misplaced})
-    with pytest.raises(ManifestBuildError, match="report directory"):
-        publish_or_validate_package_freeze(
+    assert (
+        publish_or_validate_freeze(
             plan=plan,
             execution=execution,
             results=(misplaced_result, *results[1:]),
+        ).freeze_id
+        == frozen.freeze_id
+    )
+
+
+def test_scientific_freeze_rejects_unknown_fields(tmp_path: Path) -> None:
+    directory = tmp_path / "rsna-freeze-invalid"
+    directory.mkdir()
+    (directory / "manifest.json").write_bytes(
+        canonical_json_bytes({"schema_version": 1, "operational_path": "/forbidden"})
+    )
+
+    with pytest.raises(ManifestBuildError, match="scientific freeze contract"):
+        validate_freeze(
+            directory,
+            model_root=tmp_path / "models",
+            bundle_directory=tmp_path / "bundle",
         )
 
 
-def test_package_freeze_rejects_coherently_reidentified_noncanonical_validation_cohort(
+def test_rsna_execution_schema_is_v1_and_rejects_wrong_version(tmp_path: Path) -> None:
+    execution = publish_or_validate_execution(_plan(tmp_path))
+
+    assert control.RSNA_EXECUTION_SCHEMA_VERSION == 1
+    assert execution.manifest["rsna_execution_schema_version"] == 1
+    assert "freeze_id" not in execution.manifest
+
+    path = execution.directory / "manifest.json"
+    document = json.loads(path.read_bytes())
+    document["rsna_execution_schema_version"] = 2
+    path.write_bytes(canonical_json_bytes(document))
+
+    with pytest.raises(ManifestBuildError, match="execution control contract"):
+        validate_execution(execution.directory)
+
+
+def test_rsna_execution_identity_changes_with_config_and_pretrained_science(
     tmp_path: Path,
 ) -> None:
-    closure = build_real_rsna_campaign_closure(tmp_path / "campaign")
-    result = closure.training_results[0]
-    old_package_id = result.model_package_id
-    package_directory = result.model_path.parent
-    evidence_path = package_directory / "validation-evidence.json"
-    evidence = json.loads(evidence_path.read_bytes())
-    evidence["sample_ids"][0] = "rsna:" + "-".join(
-        ("00000000", "0000", "4000", "8000", "000000000000")
+    plan = _plan(tmp_path)
+    baseline = control._execution_document(plan)["execution_id"]
+    first = plan.configs[0]
+    changed_config = replace(
+        first,
+        training=replace(
+            first.training,
+            parameters=MappingProxyType(
+                {**first.training.parameters, "max_iter": first.training.parameters["max_iter"] + 1}
+            ),
+        ),
     )
-    evidence_path.write_bytes(
-        (
-            json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
+    config_plan = replace(plan, configs=(changed_config, *plan.configs[1:]))
+    assert control._execution_document(config_plan)["execution_id"] != baseline
+
+    pretrained_plan = replace(
+        plan,
+        pretrained_weight=PretrainedWeightIdentity(
+            plan.pretrained_weight.declared_name,
+            plan.pretrained_weight.stable_identifier,
+            "relocated.bin",
+            plan.pretrained_weight.byte_size,
+            "9" * 64,
+        ),
     )
-
-    manifest_path = package_directory / "manifest.json"
-    manifest = json.loads(manifest_path.read_bytes())
-    manifest["validation_evidence_sha256"] = sha256_file(evidence_path)
-    manifest["validation_evidence_semantic_sha256"] = evidence_semantic_sha256(evidence)
-    manifest["model_package_id"] = model_package_id(manifest)
-    new_package_id = manifest["model_package_id"]
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    renamed_package = package_directory.with_name(new_package_id)
-    package_directory.rename(renamed_package)
-
-    report = result.artifact_directory
-    report_document = json.loads((report / "metrics.json").read_bytes())
-    report_document["training_package"]["model_package_id"] = new_package_id
-    write_run_reports(
-        report,
-        model_name=str(manifest["family_id"]),
-        targets=np.asarray(evidence["targets"], dtype=np.int8),
-        probabilities=np.asarray(evidence["probabilities"], dtype=np.float64),
-        document=report_document,
-    )
-
-    freeze_path = closure.execution.directory / "package-freeze.json"
-    freeze = json.loads(freeze_path.read_bytes())
-    member = next(item for item in freeze["packages"] if item["package_id"] == old_package_id)
-    member.update(
-        {
-            "package_id": new_package_id,
-            "model_relative": f"packages/{new_package_id}/model.skops",
-            "report_sha256": training_report_sha256(report),
-        }
-    )
-    freeze_path.write_bytes(
-        (json.dumps(freeze, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
-    )
-
-    with pytest.raises(ValueError, match="canonical validation cohort"):
-        validate_package_freeze(
-            closure.execution,
-            model_root=closure.plan.roots.model_root,
-            report_root=closure.plan.roots.report_root,
-            bundle_directory=closure.plan.authority.bundle_directory,
-        )
+    assert control._execution_document(pretrained_plan)["execution_id"] != baseline
 
 
-@pytest.mark.parametrize(
-    "model_relative",
-    (
-        "./packages/{package_id}/model.skops",
-        "packages//{package_id}/model.skops",
-        "packages/./{package_id}/model.skops",
-    ),
-)
-def test_package_freeze_rejects_lexically_noncanonical_control_paths(
-    tmp_path: Path, model_relative: str
-) -> None:
-    closure = build_real_rsna_campaign_closure(tmp_path / "campaign")
-    freeze_path = closure.execution.directory / "package-freeze.json"
-    document = json.loads(freeze_path.read_bytes())
-    package_id = document["packages"][0]["package_id"]
-    document["packages"][0]["model_relative"] = model_relative.format(package_id=package_id)
-    freeze_path.write_bytes(
-        (
-            json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
-    )
-
-    with pytest.raises(ManifestBuildError, match="RSNA control path is invalid"):
-        validate_package_freeze(
-            closure.execution,
-            model_root=closure.plan.roots.model_root,
-            report_root=closure.plan.roots.report_root,
-            bundle_directory=closure.plan.authority.bundle_directory,
-        )
-
-
-def test_package_freeze_rejects_a_valid_execution_from_a_different_plan(
+def test_scientific_freeze_rejects_a_valid_execution_from_a_different_plan(
     tmp_path: Path,
 ) -> None:
     plan = _plan(tmp_path)
@@ -535,14 +558,33 @@ def test_package_freeze_rejects_a_valid_execution_from_a_different_plan(
     different_plan = replace(plan, git_commit="e" * 40)
 
     with pytest.raises(ManifestBuildError, match="does not match the validated plan"):
-        publish_or_validate_package_freeze(
+        publish_or_validate_freeze(
             plan=different_plan,
             execution=execution,
             results=(),
         )
 
 
-def test_package_freeze_rejects_forged_and_tampered_executions(tmp_path: Path) -> None:
+def test_incompatible_execution_cannot_adopt_partial_campaign_state(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    publish_or_validate_execution(plan)
+    with pytest.raises(ManifestBuildError, match="active under another execution"):
+        publish_or_validate_execution(replace(plan, git_commit="e" * 40))
+
+
+def test_historical_execution_directory_does_not_select_active_campaign(tmp_path: Path) -> None:
+    plan = _plan(tmp_path / "campaign")
+    active = publish_or_validate_execution(plan)
+    historical_plan = replace(_plan(tmp_path / "history"), git_commit="e" * 40)
+    historical = publish_or_validate_execution(historical_plan)
+    shutil.copytree(
+        historical.directory,
+        active.directory.parent / historical.execution_id,
+    )
+    assert publish_or_validate_execution(plan) == active
+
+
+def test_scientific_freeze_rejects_forged_and_tampered_executions(tmp_path: Path) -> None:
     plan = _plan(tmp_path)
     execution = publish_or_validate_execution(plan)
     forged = ValidatedRsnaExecution(
@@ -552,29 +594,19 @@ def test_package_freeze_rejects_forged_and_tampered_executions(tmp_path: Path) -
         object(),
     )
     with pytest.raises(PermissionError, match="validated execution"):
-        publish_or_validate_package_freeze(plan=plan, execution=forged, results=())
-    with pytest.raises(PermissionError, match="validated execution"):
-        validate_package_freeze(
-            forged,
-            model_root=plan.roots.model_root,
-            report_root=plan.roots.report_root,
-            bundle_directory=plan.authority.bundle_directory,
-        )
+        publish_or_validate_freeze(plan=plan, execution=forged, results=())
 
     tampered = replace(
         execution,
         manifest={**execution.manifest, "git_commit": "e" * 40},
     )
     with pytest.raises(ManifestBuildError, match="canonical authority"):
-        validate_package_freeze(
-            tampered,
-            model_root=plan.roots.model_root,
-            report_root=plan.roots.report_root,
-            bundle_directory=plan.authority.bundle_directory,
-        )
+        validate_current_rsna_execution(plan, tampered)
 
 
-def test_execution_and_evaluation_records_are_append_only(tmp_path: Path) -> None:
+def test_execution_records_are_append_only_and_completion_requires_evaluation_authority(
+    tmp_path: Path,
+) -> None:
     plan = _plan(tmp_path)
     execution = publish_or_validate_execution(plan)
     assert validate_execution(execution.directory) == execution
@@ -585,7 +617,7 @@ def test_execution_and_evaluation_records_are_append_only(tmp_path: Path) -> Non
     with pytest.raises(ManifestBuildError):
         validate_execution(execution.directory)
 
-    # Restore the exact control, then prove a conflicting completion cannot replace the first.
+    # Restore the exact control, then prove a dataclass alone cannot publish completion.
     path.unlink()
     execution = publish_or_validate_execution(plan)
     first = CompletedRsnaEvaluation(
@@ -597,12 +629,16 @@ def test_execution_and_evaluation_records_are_append_only(tmp_path: Path) -> Non
         private_prediction_directory=tmp_path / "prediction",
         average_precision=0.5,
     )
-    publish_evaluation_record(execution, first)
-    conflicting = CompletedRsnaEvaluation(
-        **{**first.__dict__, "evaluation_id": "evaluation-" + "4" * 64}
-    )
-    with pytest.raises(ManifestBuildError, match="differs"):
-        publish_evaluation_record(execution, conflicting)
+    with pytest.raises((OSError, ValueError, PermissionError, ManifestBuildError)):
+        publish_evaluation_record(
+            execution,
+            first,
+            freeze=object(),
+            report_root=tmp_path / "reports",
+            private_root=tmp_path / "private",
+            model_root=tmp_path / "models/rsna",
+        )
+    assert {item.name for item in execution.directory.iterdir()} == {"manifest.json"}
 
 
 def test_execution_control_rejects_a_forged_formal_plan_before_publication(

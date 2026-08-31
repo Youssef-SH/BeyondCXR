@@ -1,13 +1,13 @@
-"""Compact pre-test firewall and global-result authority for the Symile campaign."""
+"""Scientific freeze, held-out authorization, and global-result validation for Symile."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import shutil
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,22 +17,47 @@ from sklearn.calibration import calibration_curve
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.symile_schemas import LABEL_POLICY_VERSION, TASK_ID
-from beyondcxr.training.symile_ecg_extension_result import (
-    ValidatedEcgExtensionResult,
-    require_validated_ecg_extension_result,
+from beyondcxr.training.campaign_lock import campaign_lock
+from beyondcxr.training.preservation import (
+    ValidatedRestorationContext,
+    require_restoration_context,
+)
+from beyondcxr.training.symile_development_decision import (
+    DEVELOPMENT_DECISION_POLICY,
+    ValidatedDevelopmentDecision,
+    require_validated_development_decision,
+    validate_development_decision,
+)
+from beyondcxr.training.symile_execution import (
+    ValidatedCurrentSymileExecution,
+    ValidatedSymileExecution,
+    ValidatedSymileLifecycle,
+    ValidatedSymileProspectiveMutation,
+    prepare_symile_test_open_hierarchy,
+    require_current_symile_execution,
+    require_symile_execution,
+    require_symile_lifecycle,
+    require_symile_prospective_mutation,
+    require_symile_prospective_path,
 )
 from beyondcxr.training.symile_families import (
+    DEVELOPMENT_FAMILY_ORDER,
     FINAL_NEURAL_MEMBER_SEEDS,
     FINAL_PACKAGE_COUNT,
     FINAL_PACKAGE_POLICY,
     FINAL_TABULAR_SEED,
+    NEURAL_MEMBER_REDUCTION,
+    SINGLE_MEMBER_REDUCTION,
     SYMILE_ECG_GATED_FAMILY,
+    final_predictor_reduction_policy,
+    final_predictor_view_policy,
 )
 from beyondcxr.training.symile_final_packages import ValidatedFinalPackage, validate_final_package
 from beyondcxr.training.symile_statistics import (
     BOOTSTRAP_POLICY,
     ERROR_REVIEW_POLICY,
     METRIC_POLICY,
+    SUBGROUP_POLICY,
     cluster_bootstrap_effect,
     deterministic_error_cases,
     final_member_mean_logit_ensemble,
@@ -40,7 +65,8 @@ from beyondcxr.training.symile_statistics import (
     operating_point_metrics,
     raw_probability_metrics,
 )
-from beyondcxr.utils.package_identity import canonical_scientific_id
+from beyondcxr.utils.immutable_json import immutable_json
+from beyondcxr.utils.package_identity import package_scientific_config_from_normalized
 from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
@@ -49,7 +75,16 @@ from beyondcxr.utils.private_predictions import (
 from beyondcxr.utils.publication import (
     install_immutable_directory,
     publish_bytes_no_replace,
+    publish_regenerable_bytes,
     staging_directory,
+)
+from beyondcxr.utils.semantic_identity import (
+    canonical_json_bytes,
+    canonical_scientific_id,
+)
+from beyondcxr.utils.symile_publication import (
+    ValidatedFoldPackage,
+    validate_development_result,
 )
 
 if TYPE_CHECKING:
@@ -60,8 +95,12 @@ if TYPE_CHECKING:
 
 PRETEST_FREEZE_PREFIX = "pretest-freeze-"
 GLOBAL_RESULT_PREFIX = "global-result-"
-_CAPABILITY_GUARD = object()
+_FREEZE_GUARD = object()
+_FROZEN_CAMPAIGN_GUARD = object()
 _TEST_OPEN_GUARD = object()
+_PRESERVED_TEST_OPEN_GUARD = object()
+_HELD_OUT_GUARD = object()
+_GLOBAL_RESULT_CERTIFICATION_GUARD = object()
 GLOBAL_EFFECT_COMPARISONS = (
     ("primary", "cxr_labs_gated", "cxr_densenet"),
     ("concat_vs_cxr", "cxr_labs_concat", "cxr_densenet"),
@@ -75,8 +114,10 @@ RELIABILITY_POLICY = {"bins": 10, "strategy": "uniform", "role": "descriptive"}
 class ValidatedPretestFreeze:
     directory: Path
     manifest: Mapping[str, Any]
-    manifest_sha256: str
+    development_decision: ValidatedDevelopmentDecision
+    final_packages: tuple[ValidatedFinalPackage, ...]
     _guard: object
+    _operation: _HeldOutOperation | None = field(default=None, compare=False, repr=False)
 
     @property
     def freeze_id(self) -> str:
@@ -86,68 +127,237 @@ class ValidatedPretestFreeze:
 @dataclass(frozen=True)
 class ValidatedTestOpenRecord:
     path: Path
+    external_path: Path
     freeze_id: str
-    document_sha256: str
+    execution_id: str
+    document_bytes: bytes
     _guard: object
 
 
 @dataclass(frozen=True)
-class ValidatedGlobalResult:
+class ValidatedTestOpenEvidence:
+    """One preserved historical opening receipt without live-access authority."""
+
+    path: Path
+    restoration: ValidatedRestorationContext
+    freeze_id: str
+    execution_id: str
+    bundle_id: str
+    document_bytes: bytes
+    _guard: object
+
+
+@dataclass(frozen=True)
+class ValidatedSymileFrozenCampaign:
+    """One scientific freeze joined to its current canonical formal lifecycle."""
+
+    freeze: ValidatedPretestFreeze
+    lifecycle: ValidatedSymileLifecycle
+    _guard: object
+    developments: tuple = ()
+
+    @property
+    def current_execution(self) -> ValidatedCurrentSymileExecution:
+        return self.lifecycle.current_execution
+
+
+@dataclass(frozen=True)
+class ValidatedHeldOutCapability:
+    """Matching freeze, execution, and durable opening evidence."""
+
+    frozen_campaign: ValidatedSymileFrozenCampaign
+    opening: ValidatedTestOpenRecord
+    _guard: object
+    _operation: _HeldOutOperation | None = None
+
+    @property
+    def freeze(self) -> ValidatedPretestFreeze:
+        return self.frozen_campaign.freeze
+
+    @property
+    def current_execution(self) -> ValidatedCurrentSymileExecution:
+        return self.frozen_campaign.current_execution
+
+    @property
+    def lifecycle(self) -> ValidatedSymileLifecycle:
+        return self.frozen_campaign.lifecycle
+
+    @property
+    def execution(self) -> ValidatedSymileExecution:
+        return self.current_execution.execution
+
+
+@dataclass
+class _HeldOutOperation:
+    capability: ValidatedHeldOutCapability
+    state: object
+    active: bool = True
+
+
+def _held_out_state(value: ValidatedHeldOutCapability) -> object:
+    freeze = value.freeze
+    return immutable_json(
+        {
+            "freeze": freeze.manifest,
+            "execution": value.execution.manifest,
+            "decision": freeze.development_decision.manifest,
+            "packages": [package.manifest for package in freeze.final_packages],
+            "developments": [
+                {
+                    "authority": item.manifest,
+                    "folds": [fold.manifest for fold in item.folds],
+                    "predictions": [prediction.manifest for prediction in item.predictions],
+                }
+                for item in value.frozen_campaign.developments
+            ],
+        }
+    )
+
+
+@contextmanager
+def held_out_operation(value: ValidatedHeldOutCapability):
+    """Authenticate once while holding the campaign lock; revoke on scope exit.
+
+    Receipt checks remain live at every materialization. Independently opened
+    package and source files retain their own complete boundary validation.
+    """
+    roots = value.lifecycle
+    with campaign_lock(roots.control_root, "Symile", trusted_root=roots.repository_root):
+        validated = require_validated_held_out_capability(value)
+        operation = _HeldOutOperation(validated, _held_out_state(validated))
+        try:
+            freeze = replace(validated.freeze, _operation=operation)
+            joined = replace(validated.frozen_campaign, freeze=freeze)
+            scoped = replace(validated, frozen_campaign=joined, _operation=operation)
+            operation.capability = scoped
+            yield scoped
+        finally:
+            operation.active = False
+
+
+@dataclass(frozen=True)
+class GlobalResultIntegrity:
+    """Integrity and lineage observation without scientific claim certification."""
+
     directory: Path
     manifest: Mapping[str, Any]
+    claims_sha256: str
+    reliability_sha256: str
 
     @property
     def result_id(self) -> str:
         return str(self.manifest["global_result_id"])
 
 
+class CertifiedGlobalResult:
+    """Immutable authority for one exactly attested, scientifically certified result."""
+
+    __slots__ = (
+        "__directory",
+        "__manifest",
+        "__claims_sha256",
+        "__reliability_sha256",
+        "__guard",
+    )
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("CertifiedGlobalResult is created only by scientific validation")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("CertifiedGlobalResult is immutable")
+
+    def __copy__(self) -> CertifiedGlobalResult:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> CertifiedGlobalResult:
+        memo[id(self)] = self
+        return self
+
+    @property
+    def directory(self) -> Path:
+        return self.__directory
+
+    @property
+    def manifest(self) -> Mapping[str, Any]:
+        return self.__manifest
+
+    @property
+    def claims_sha256(self) -> str:
+        return self.__claims_sha256
+
+    @property
+    def reliability_sha256(self) -> str:
+        return self.__reliability_sha256
+
+    @property
+    def result_id(self) -> str:
+        return str(self.manifest["global_result_id"])
+
+    def matches_integrity(self, value: object) -> bool:
+        """Return whether an integrity observation is exactly the certified evidence."""
+        return (
+            isinstance(value, GlobalResultIntegrity)
+            and value.directory == self.directory
+            and immutable_json(value.manifest) == self.manifest
+            and value.claims_sha256 == self.claims_sha256
+            and value.reliability_sha256 == self.reliability_sha256
+        )
+
+
+def require_certified_global_result(value: object) -> CertifiedGlobalResult:
+    """Require scientific certification rather than artifact integrity alone."""
+    if (
+        not isinstance(value, CertifiedGlobalResult)
+        or value._CertifiedGlobalResult__guard is not _GLOBAL_RESULT_CERTIFICATION_GUARD
+    ):
+        raise PermissionError("Global result requires full scientific certification")
+    return value
+
+
 def publish_pretest_freeze(
     *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
     control_root: str | Path,
-    bundle: Mapping[str, str],
+    bundle_id: str,
+    cv_assignment_id: str,
     task: Mapping[str, str],
-    ecg_extension_result: ValidatedEcgExtensionResult,
+    development_decision: ValidatedDevelopmentDecision,
     final_packages: Sequence[ValidatedFinalPackage],
-    neural_inference_runtime: Mapping[str, object],
-    science_git_commit: str,
-    dependency_lock_sha256: str,
 ) -> ValidatedPretestFreeze:
-    development = require_validated_ecg_extension_result(ecg_extension_result)
+    """Validate and publish complete scientific membership under an unopened campaign lock."""
+    require_symile_prospective_mutation(prospective_mutation)
+    require_symile_prospective_path(
+        prospective_mutation,
+        control_root,
+        "Symile freeze control root",
+        relative="private/control/symile",
+    )
+    development = require_validated_development_decision(development_decision)
     packages = _validated_packages(
         final_packages,
-        expected_git_commit=science_git_commit,
-        expected_dependency_lock_sha256=dependency_lock_sha256,
-        final_family_authorities=development.manifest["final_family_authorities"],
+        selected_family_authorities=development.manifest["selected_family_authorities"],
     )
-    semantic = {
-        "bundle": dict(bundle),
-        "task": dict(task),
-        "ecg_extension_result_id": development.result_id,
-        "final_packages": [
-            {"package_id": package.package_id, "manifest_sha256": package.manifest_sha256}
+    document = pretest_freeze_document(
+        bundle_id=bundle_id,
+        cv_assignment_id=cv_assignment_id,
+        task=task,
+        development_decision_id=development.decision_id,
+        package_members=[
+            {
+                "package_id": package.package_id,
+                "family_id": package.manifest["input"]["family"]["family_id"],
+                "seed": package.manifest["seed_policy"],
+            }
             for package in packages
         ],
-        "held_out_policy": {
-            "metric_policy": METRIC_POLICY,
-            "bootstrap": BOOTSTRAP_POLICY,
-            "neural_inference_runtime": dict(neural_inference_runtime),
-        },
-        "primary_thresholds": development.manifest["primary_thresholds"],
-        "science_git_commit": science_git_commit,
-        "dependency_lock_sha256": dependency_lock_sha256,
-    }
-    freeze_id = canonical_scientific_id(PRETEST_FREEZE_PREFIX, semantic)
-    document = {
-        "pretest_freeze_schema_version": 1,
-        "pretest_freeze_id": freeze_id,
-        **semantic,
-    }
+    )
+    freeze_id = document["pretest_freeze_id"]
     destination = Path(control_root) / "freezes" / freeze_id
 
     def validator(path: Path, **kwargs: object) -> ValidatedPretestFreeze:
         return validate_pretest_freeze(
             path,
-            ecg_extension_result=development,
+            development_decision=development,
             final_packages=packages,
             **kwargs,
         )
@@ -156,45 +366,85 @@ def publish_pretest_freeze(
     return validator(destination)
 
 
+def pretest_freeze_document(
+    *,
+    bundle_id: str,
+    cv_assignment_id: str,
+    task: Mapping[str, object],
+    development_decision_id: str,
+    package_members: list[dict[str, object]],
+) -> dict[str, object]:
+    """Construct the sole scientific freeze document from explicit coordinates."""
+    semantic = {
+        "dataset_id": "symile",
+        "bundle_id": bundle_id,
+        "cv_assignment_id": cv_assignment_id,
+        "task": dict(task),
+        "development_decision_id": development_decision_id,
+        "final_packages": package_members,
+        "held_out_policy": {
+            "predictor_views": final_predictor_view_policy(package_members),
+            "inference_policy": SYMILE_TEST_INFERENCE_POLICY,
+            "metric_policy": METRIC_POLICY,
+            "operating_point_policy": DEVELOPMENT_DECISION_POLICY["threshold_derivation"],
+            "subgroup_policy": SUBGROUP_POLICY,
+            "bootstrap": BOOTSTRAP_POLICY,
+            "calibration_policy": {
+                "coefficients": "logit_calibration_slope_and_intercept",
+                "reliability": RELIABILITY_POLICY,
+            },
+            "error_review_policy": ERROR_REVIEW_POLICY,
+        },
+    }
+    freeze_id = canonical_scientific_id(
+        PRETEST_FREEZE_PREFIX, semantic, domain="pretest-freeze", schema_version=1
+    )
+    document = {
+        "pretest_freeze_schema_version": 1,
+        "pretest_freeze_id": freeze_id,
+        **semantic,
+    }
+    return document
+
+
 def validate_pretest_freeze(
     directory: str | Path,
     *,
-    ecg_extension_result: ValidatedEcgExtensionResult,
+    development_decision: ValidatedDevelopmentDecision,
     final_packages: Sequence[ValidatedFinalPackage],
     enforce_directory_name: bool = True,
 ) -> ValidatedPretestFreeze:
+    """Revalidate frozen policy and membership against the decision and final packages."""
     root, raw, document = _validate_pretest_freeze_document(
         directory, enforce_directory_name=enforce_directory_name
     )
-    development = require_validated_ecg_extension_result(ecg_extension_result)
+    development = require_validated_development_decision(development_decision)
     packages = _validated_packages(
         final_packages,
-        expected_git_commit=str(document["science_git_commit"]),
-        expected_dependency_lock_sha256=str(document["dependency_lock_sha256"]),
-        final_family_authorities=development.manifest["final_family_authorities"],
+        selected_family_authorities=development.manifest["selected_family_authorities"],
     )
     expected_packages = [
-        {"package_id": package.package_id, "manifest_sha256": package.manifest_sha256}
+        {
+            "package_id": package.package_id,
+            "family_id": package.manifest["input"]["family"]["family_id"],
+            "seed": package.manifest["seed_policy"],
+        }
         for package in packages
     ]
     if (
-        document["ecg_extension_result_id"] != development.result_id
+        document["development_decision_id"] != development.decision_id
         or document["final_packages"] != expected_packages
-        or document["primary_thresholds"] != development.manifest["primary_thresholds"]
+        or document["bundle_id"] != development.manifest["bundle_id"]
+        or document["cv_assignment_id"] != development.manifest["cv_assignment_id"]
+        or document["held_out_policy"]["operating_point_policy"]
+        != development.manifest["decision_policy"]["threshold_derivation"]
     ):
         raise ManifestBuildError("Pre-test freeze referenced authorities are invalid")
     package_dataset = packages[0].manifest["input"]["dataset"]
     package_task = packages[0].manifest["input"]["task"]
-    expected_bundle = {
-        "bundle_id": package_dataset["bundle_id"],
-        "bundle_manifest_sha256": packages[0].manifest["bundle_manifest_sha256"],
-        "split_assignment_id": package_dataset["split_assignment_id"],
-    }
-    if document["bundle"] != expected_bundle or document["task"] != package_task:
+    if document["bundle_id"] != package_dataset["bundle_id"] or document["task"] != package_task:
         raise ManifestBuildError("Pre-test freeze data or task authority is invalid")
-    return ValidatedPretestFreeze(
-        root, document, hashlib.sha256(raw).hexdigest(), _CAPABILITY_GUARD
-    )
+    return ValidatedPretestFreeze(root, document, development, packages, _FREEZE_GUARD)
 
 
 def _validate_pretest_freeze_document(
@@ -206,14 +456,13 @@ def _validate_pretest_freeze_document(
     required = {
         "pretest_freeze_schema_version",
         "pretest_freeze_id",
-        "bundle",
+        "dataset_id",
+        "bundle_id",
+        "cv_assignment_id",
         "task",
-        "ecg_extension_result_id",
+        "development_decision_id",
         "final_packages",
         "held_out_policy",
-        "primary_thresholds",
-        "science_git_commit",
-        "dependency_lock_sha256",
     }
     schema_version = document.get("pretest_freeze_schema_version")
     if (
@@ -228,7 +477,9 @@ def _validate_pretest_freeze_document(
         key: document[key]
         for key in required - {"pretest_freeze_schema_version", "pretest_freeze_id"}
     }
-    expected = canonical_scientific_id(PRETEST_FREEZE_PREFIX, semantic)
+    expected = canonical_scientific_id(
+        PRETEST_FREEZE_PREFIX, semantic, domain="pretest-freeze", schema_version=1
+    )
     if document["pretest_freeze_id"] != expected or (
         enforce_directory_name and root.name != expected
     ):
@@ -236,49 +487,401 @@ def _validate_pretest_freeze_document(
     return root, raw, document
 
 
-def create_or_validate_test_open_record(
-    *, control_root: str | Path, capability: ValidatedPretestFreeze
-) -> ValidatedTestOpenRecord:
-    capability = _require_capability(capability)
-    root = Path(control_root)
-    if root.exists() and (root.is_symlink() or not root.is_dir()):
-        raise ManifestBuildError("Official-test control root is invalid")
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / "test-open.json"
-    meaning = {
-        "test_open_schema_version": 1,
-        "freeze_id": capability.freeze_id,
-        "bundle_id": capability.manifest["bundle"]["bundle_id"],
-        "split_assignment_id": capability.manifest["bundle"]["split_assignment_id"],
-        "science_git_commit": capability.manifest["science_git_commit"],
-        "dependency_lock_sha256": capability.manifest["dependency_lock_sha256"],
-    }
-    if not path.exists():
-        document = {
-            **meaning,
-            "created_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        }
-        encoded = (
-            json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-        ).encode()
-        publish_bytes_no_replace(path, encoded)
-    raw, observed = _read_test_open_record(path)
-    schema_version = observed.get("test_open_schema_version")
+def validate_symile_frozen_campaign(
+    *,
+    freeze: ValidatedPretestFreeze,
+    lifecycle: ValidatedSymileLifecycle,
+) -> ValidatedSymileFrozenCampaign:
+    """Join the unique canonical scientific freeze to the active current execution."""
+    scientific = _require_capability(freeze)
+    roots = require_symile_lifecycle(lifecycle)
+    current = require_current_symile_execution(roots.current_execution)
+    execution_dataset = current.execution.manifest["dataset"]
+    expected_directory = roots.control_root / "freezes" / scientific.freeze_id
+    freeze_root = roots.control_root / "freezes"
+    try:
+        entries = tuple(freeze_root.iterdir())
+    except OSError as exc:
+        raise ManifestBuildError("Canonical Symile freeze root is unavailable") from exc
     if (
-        set(observed) != {*meaning, "created_at_utc"}
-        or isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version != 1
-        or {key: observed[key] for key in meaning} != meaning
-        or not _valid_utc_timestamp(observed["created_at_utc"])
+        scientific.directory.absolute() != expected_directory.absolute()
+        or scientific.directory.resolve() != expected_directory.resolve()
+        or scientific.directory.is_symlink()
+        or not scientific.directory.is_dir()
+        or freeze_root.is_symlink()
+        or {entry.name for entry in entries} != {scientific.freeze_id}
+        or any(entry.is_symlink() or not entry.is_dir() for entry in entries)
+        or scientific.manifest["bundle_id"] != execution_dataset["bundle_id"]
+        or scientific.manifest["cv_assignment_id"] != execution_dataset["cv_assignment_id"]
     ):
-        raise ManifestBuildError("Official-test opening is already bound to another freeze")
-    return ValidatedTestOpenRecord(
-        path,
-        capability.freeze_id,
-        hashlib.sha256(raw).hexdigest(),
+        raise ManifestBuildError("Symile freeze is not the active canonical frozen campaign")
+    developments = validate_symile_execution_freeze_science(
+        current.execution,
+        scientific,
+        report_root=roots.repository_root / "reports" / "symile",
+        model_root=roots.repository_root / "models" / "symile",
+        private_root=roots.private_root,
+        manifest_root=roots.repository_root / "data" / "manifests",
+    )
+    return ValidatedSymileFrozenCampaign(
+        scientific, roots, _FROZEN_CAMPAIGN_GUARD, developments or ()
+    )
+
+
+def validate_symile_execution_freeze_science(
+    execution: ValidatedSymileExecution,
+    freeze: ValidatedPretestFreeze,
+    *,
+    report_root: str | Path,
+    model_root: str | Path,
+    private_root: str | Path,
+    manifest_root: str | Path,
+) -> tuple:
+    """Join historical execution science to recursively validated frozen authorities."""
+    historical = require_symile_execution(execution)
+    report = Path(report_root)
+    models = Path(model_root)
+    private = Path(private_root)
+    manifests = Path(manifest_root)
+    decision_id = str(freeze.manifest["development_decision_id"])
+    decision = validate_development_decision(
+        report / "development-decisions" / decision_id,
+        report_root=report,
+        model_root=models / "development",
+        prediction_root=private,
+        manifest_root=manifests,
+    )
+    development_references = decision.manifest["family_development_ids"]
+    developments = tuple(
+        validate_development_result(
+            report / "development" / "families" / str(reference["development_id"]),
+            model_root=models / "development",
+            prediction_root=private,
+            manifest_root=manifests,
+            expected_development_id=str(reference["development_id"]),
+        )
+        for reference in development_references
+    )
+    package_references = freeze.manifest["final_packages"]
+    packages = tuple(
+        validate_final_package(
+            models / "final" / "packages" / str(reference["package_id"]),
+            expected_package_id=str(reference["package_id"]),
+        )
+        for reference in package_references
+    )
+    scientific = validate_pretest_freeze(
+        freeze.directory,
+        development_decision=decision,
+        final_packages=packages,
+        enforce_directory_name=False,
+    )
+    try:
+        dataset = historical.manifest["dataset"]
+        plan = historical.manifest["formal_run_plan"]
+        if (
+            scientific.freeze_id != freeze.freeze_id
+            or scientific.manifest != freeze.manifest
+            or dataset
+            != {
+                "bundle_id": scientific.manifest["bundle_id"],
+                "cv_assignment_id": scientific.manifest["cv_assignment_id"],
+            }
+            or [item["family_id"] for item in plan] != list(DEVELOPMENT_FAMILY_ORDER)
+            or [item["family_id"] for item in development_references]
+            != list(DEVELOPMENT_FAMILY_ORDER)
+        ):
+            raise ManifestBuildError("Symile execution and scientific freeze disagree")
+        for configured, reference, development in zip(
+            plan, development_references, developments, strict=True
+        ):
+            normalized = configured["normalized_config"]
+            context = development.manifest["scientific_context"]
+            if (
+                reference["development_id"] != development.manifest["development_id"]
+                or configured["family_id"] != development.manifest["family_id"]
+                or context["bundle_id"] != dataset["bundle_id"]
+                or context["cv_assignment_id"] != dataset["cv_assignment_id"]
+                or context["task_id"] != normalized["task"]["task_id"]
+                or context["fit_config"] != package_scientific_config_from_normalized(normalized)
+            ):
+                raise ManifestBuildError("Symile execution and scientific freeze disagree")
+            _validate_development_execution_provenance(
+                development,
+                execution=historical.manifest,
+            )
+        for package in packages:
+            if not final_package_belongs_to_execution(package, historical.manifest):
+                raise ManifestBuildError("Symile execution and scientific freeze disagree")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ManifestBuildError("Symile execution and scientific freeze disagree") from exc
+    return developments
+
+
+def _validate_development_execution_provenance(
+    development,
+    *,
+    execution: Mapping[str, Any],
+) -> None:
+    if [item.manifest["fold_package_id"] for item in development.folds] != [
+        item["fold_package_id"] for item in development.manifest["fold_packages"]
+    ]:
+        raise ManifestBuildError("Development fitted evidence membership differs")
+    for package in development.folds:
+        validate_fold_execution_provenance(package, execution)
+
+
+def validate_fold_execution_provenance(
+    package: ValidatedFoldPackage, execution: Mapping[str, Any]
+) -> None:
+    """Check a validated fold against the formal execution that admitted it."""
+    lineage = package.manifest["lineage"]
+    operational = package.manifest["operational"]
+    if (
+        lineage["git_commit"] != execution["git_commit"]
+        or lineage["dependency_lock_sha256"] != execution["dependency_lock_sha256"]
+        or operational["python_version"] != execution["framework_versions"]["python"]
+    ):
+        raise ManifestBuildError("Symile development provenance differs from execution")
+    runtime = operational["runtime_provenance"]
+    loader = operational["loader_execution"]
+    if runtime is None:
+        if loader is not None:
+            raise ManifestBuildError("Symile tabular provenance differs from execution")
+        return
+    if (
+        runtime.get("torch_version") != execution["framework_versions"]["torch"]
+        or runtime.get("torchvision_version") != execution["framework_versions"]["torchvision"]
+        or runtime.get("torchxrayvision_version")
+        != execution["framework_versions"]["torchxrayvision"]
+        or not _runtime_provenance_matches(runtime, execution["neural_runtime"])
+        or not _loader_provenance_matches(loader, execution["training_loader"])
+    ):
+        raise ManifestBuildError("Symile neural provenance differs from execution")
+    weight = lineage["pretrained_weight"]
+    if weight is not None and not _pretrained_materialization_matches(
+        weight, execution["pretrained_weight"]
+    ):
+        raise ManifestBuildError("Symile pretrained provenance differs from execution")
+
+
+def final_package_belongs_to_execution(
+    package: ValidatedFinalPackage, execution: Mapping[str, Any]
+) -> bool:
+    """Match a validated final package's provenance to its admitted execution."""
+    provenance = package.manifest["execution_provenance"]
+    if (
+        provenance["git_commit"] != execution["git_commit"]
+        or provenance["git_dirty"] is not False
+        or provenance["dependency_lock_sha256"] != execution["dependency_lock_sha256"]
+        or provenance["python_version"] != execution["framework_versions"]["python"]
+    ):
+        return False
+    if package.manifest["package_kind"] == "tabular":
+        return True
+    runtime = provenance["runtime_provenance"]
+    if (
+        runtime.get("torch_version") != execution["framework_versions"]["torch"]
+        or runtime.get("torchvision_version") != execution["framework_versions"]["torchvision"]
+        or runtime.get("torchxrayvision_version")
+        != execution["framework_versions"]["torchxrayvision"]
+        or not _runtime_provenance_matches(runtime, execution["neural_runtime"])
+        or not _loader_provenance_matches(
+            provenance["loader_execution"], execution["training_loader"]
+        )
+    ):
+        return False
+    weight = package.manifest["pretrained_weight_fingerprint"]
+    return weight is None or _pretrained_materialization_matches(
+        weight, execution["pretrained_weight"]
+    )
+
+
+def _pretrained_materialization_matches(value: object, expected: object) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(expected, Mapping):
+        return False
+    return {
+        key: value.get(key) for key in ("declared_name", "stable_identifier", "byte_size", "sha256")
+    } == dict(expected)
+
+
+def _runtime_provenance_matches(value: object, expected: object) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(expected, Mapping):
+        return False
+    return (
+        value.get("resolved_device") == expected.get("device_type")
+        and ("float16" if value.get("mixed_precision_effective") is True else None)
+        == expected.get("autocast_dtype")
+        and value.get("cuda_runtime_version") == expected.get("cuda_runtime_version")
+        and value.get("cudnn_version") == expected.get("cudnn_version")
+        and value.get("gpu_device_name") == expected.get("gpu_device_name")
+        and value.get("gpu_compute_capability") == expected.get("gpu_compute_capability")
+    )
+
+
+def _loader_provenance_matches(value: object, expected: object) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(expected, Mapping):
+        return False
+    return all(
+        value.get(key) == expected.get(key) for key in ("lifecycle", "num_workers", "pin_memory")
+    )
+
+
+def require_symile_frozen_campaign(
+    value: object,
+) -> ValidatedSymileFrozenCampaign:
+    if (
+        not isinstance(value, ValidatedSymileFrozenCampaign)
+        or value._guard is not _FROZEN_CAMPAIGN_GUARD
+    ):
+        raise PermissionError("Symile test opening requires a validated frozen campaign")
+    observed = validate_symile_frozen_campaign(
+        freeze=value.freeze,
+        lifecycle=value.lifecycle,
+    )
+    if observed != value:
+        raise ManifestBuildError("Symile frozen campaign changed after validation")
+    return observed
+
+
+def open_official_test(
+    *,
+    frozen_campaign: ValidatedSymileFrozenCampaign,
+) -> ValidatedHeldOutCapability:
+    """Reconcile both permanent opening records before granting held-out access."""
+    joined = require_symile_frozen_campaign(frozen_campaign)
+    freeze = joined.freeze
+    roots = joined.lifecycle
+    current = joined.current_execution
+    execution = current.execution
+    control = roots.control_root
+    with campaign_lock(control, "Symile", trusted_root=roots.repository_root):
+        local, external = prepare_symile_test_open_hierarchy(roots)
+        local_raw = _optional_test_open_record(local)
+        external_raw = _optional_test_open_record(external)
+        if local_raw is None and external_raw is None:
+            document = {
+                "schema_version": 1,
+                "freeze_id": freeze.freeze_id,
+                "execution_id": execution.execution_id,
+                "opened_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            }
+            local_raw = canonical_json_bytes(document)
+            publish_bytes_no_replace(local, local_raw)
+            publish_bytes_no_replace(external, local_raw)
+        elif local_raw is None:
+            assert external_raw is not None
+            _validate_test_open_bytes(external_raw, freeze, execution)
+            publish_bytes_no_replace(local, external_raw)
+        elif external_raw is None:
+            _validate_test_open_bytes(local_raw, freeze, execution)
+            publish_bytes_no_replace(external, local_raw)
+        local_raw, _ = _read_test_open_record(local)
+        external_raw, _ = _read_test_open_record(external)
+        if local_raw != external_raw:
+            raise ManifestBuildError("Local and external official-test opening records differ")
+        _validate_test_open_bytes(local_raw, freeze, execution)
+    record = ValidatedTestOpenRecord(
+        local,
+        external,
+        freeze.freeze_id,
+        execution.execution_id,
+        local_raw,
         _TEST_OPEN_GUARD,
     )
+    return ValidatedHeldOutCapability(joined, record, _HELD_OUT_GUARD)
+
+
+def _validate_preserved_test_open(
+    *,
+    path: str | Path,
+    restoration: ValidatedRestorationContext,
+    freeze: ValidatedPretestFreeze,
+    execution: ValidatedSymileExecution,
+) -> ValidatedTestOpenEvidence:
+    """Mint archive-bound historical evidence for restored-campaign validation."""
+    root = require_restoration_context(restoration).root
+    freeze = _require_capability(freeze)
+    execution = require_symile_execution(execution)
+    opening = Path(path)
+    bundle_id = freeze.manifest.get("bundle_id")
+    expected_control = root / "private" / "control" / "symile"
+    if (
+        not isinstance(bundle_id, str)
+        or opening.resolve() != expected_control / "test-open.json"
+        or freeze.directory.resolve() != expected_control / "freezes" / freeze.freeze_id
+        or execution.directory.resolve() != expected_control / "executions" / execution.execution_id
+    ):
+        raise ManifestBuildError("Preserved opening evidence is outside its restored campaign")
+    raw, _ = _read_test_open_record(opening)
+    _validate_test_open_bytes(raw, freeze, execution)
+    return ValidatedTestOpenEvidence(
+        opening,
+        restoration,
+        freeze.freeze_id,
+        execution.execution_id,
+        bundle_id,
+        raw,
+        _PRESERVED_TEST_OPEN_GUARD,
+    )
+
+
+def require_validated_test_open_evidence(
+    value: object,
+    *,
+    freeze: ValidatedPretestFreeze,
+) -> ValidatedTestOpenEvidence:
+    """Reauthenticate preserved opening evidence without granting live source authority."""
+    scientific = _require_capability(freeze)
+    if (
+        not isinstance(value, ValidatedTestOpenEvidence)
+        or value._guard is not _PRESERVED_TEST_OPEN_GUARD
+    ):
+        raise PermissionError("Restored held-out access requires validated opening evidence")
+    root = require_restoration_context(value.restoration).root
+    if (
+        value.freeze_id != scientific.freeze_id
+        or value.bundle_id != scientific.manifest.get("bundle_id")
+        or value.path.resolve() != root / "private" / "control" / "symile" / "test-open.json"
+        or scientific.directory.resolve()
+        != root / "private" / "control" / "symile" / "freezes" / scientific.freeze_id
+    ):
+        raise PermissionError("Restored held-out access requires validated opening evidence")
+    raw, document = _read_test_open_record(value.path)
+    if (
+        raw != value.document_bytes
+        or document.get("freeze_id") != value.freeze_id
+        or document.get("execution_id") != value.execution_id
+    ):
+        raise ManifestBuildError("Preserved official-test opening evidence changed")
+    return value
+
+
+def _optional_test_open_record(path: Path) -> bytes | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    raw, _ = _read_test_open_record(path)
+    return raw
+
+
+def _validate_test_open_bytes(
+    raw: bytes, freeze: ValidatedPretestFreeze, execution: ValidatedSymileExecution
+) -> None:
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManifestBuildError("Official-test opening record is malformed") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "freeze_id", "execution_id", "opened_at_utc"}
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["freeze_id"] != freeze.freeze_id
+        or document["execution_id"] != execution.execution_id
+        or not _valid_utc_timestamp(document["opened_at_utc"])
+        or raw != canonical_json_bytes(document)
+    ):
+        raise ManifestBuildError("Official-test opening is bound to another formal campaign")
 
 
 def _read_test_open_record(path: Path) -> tuple[bytes, dict[str, Any]]:
@@ -295,12 +898,11 @@ def _read_test_open_record(path: Path) -> tuple[bytes, dict[str, Any]]:
 
 
 def materialize_official_test[T](
-    capability: ValidatedPretestFreeze,
-    record: ValidatedTestOpenRecord,
+    capability: ValidatedHeldOutCapability,
     operation: Callable[[], T],
 ) -> T:
-    capability = _require_capability(capability)
-    _require_test_open_record(record, capability)
+    """Reauthenticate live held-out authority before invoking the supplied source operation."""
+    require_validated_held_out_capability(capability)
     return operation()
 
 
@@ -317,7 +919,8 @@ def publish_global_result(
     predictions: Sequence[ValidatedPredictionEvidence],
     final_packages: Sequence[ValidatedFinalPackage],
     test_data: FrozenSymileTestData,
-) -> ValidatedGlobalResult:
+) -> CertifiedGlobalResult:
+    """Derive, publish, and certify held-out claims from frozen packages and predictions."""
     capability = _require_capability(capability)
     packages = _validated_frozen_packages(capability, final_packages)
     projection = _frozen_evaluation_projection(capability, test_data)
@@ -328,7 +931,9 @@ def publish_global_result(
         "prediction_ids": [item.prediction_id for item in evidence],
         "evaluation_policy": _global_evaluation_policy(),
     }
-    result_id = canonical_scientific_id(GLOBAL_RESULT_PREFIX, semantic)
+    result_id = canonical_scientific_id(
+        GLOBAL_RESULT_PREFIX, semantic, domain="global-result", schema_version=1
+    )
     document = {"global_result_schema_version": 1, "global_result_id": result_id, **semantic}
     destination = Path(report_root) / "global-results" / result_id
     stage = staging_directory(destination)
@@ -346,8 +951,8 @@ def publish_global_result(
             encoding="utf-8",
         )
 
-        def validator(path: Path, **kwargs: object) -> ValidatedGlobalResult:
-            return validate_global_result(
+        def validator(path: Path, **kwargs: object) -> GlobalResultIntegrity:
+            return validate_global_result_integrity(
                 path,
                 capability=capability,
                 predictions=evidence,
@@ -377,7 +982,85 @@ def validate_global_result(
     final_packages: Sequence[ValidatedFinalPackage],
     test_data: FrozenSymileTestData,
     enforce_directory_name: bool = True,
-) -> ValidatedGlobalResult:
+) -> CertifiedGlobalResult:
+    """Scientifically certify a global result by independently rederiving its claims."""
+    validated, packages, projection, evidence, observed_claims = _validate_global_result_artifact(
+        directory,
+        capability=capability,
+        predictions=predictions,
+        final_packages=final_packages,
+        test_data=test_data,
+        enforce_directory_name=enforce_directory_name,
+    )
+    expected_claims = _derive_global_claims(capability, packages, evidence, projection)
+    if observed_claims != expected_claims:
+        raise ManifestBuildError("Global-result claims do not rederive from prediction evidence")
+    certified = object.__new__(CertifiedGlobalResult)
+    object.__setattr__(
+        certified,
+        "_CertifiedGlobalResult__directory",
+        validated.directory,
+    )
+    object.__setattr__(
+        certified,
+        "_CertifiedGlobalResult__manifest",
+        immutable_json(validated.manifest),
+    )
+    object.__setattr__(
+        certified,
+        "_CertifiedGlobalResult__claims_sha256",
+        validated.claims_sha256,
+    )
+    object.__setattr__(
+        certified,
+        "_CertifiedGlobalResult__reliability_sha256",
+        validated.reliability_sha256,
+    )
+    object.__setattr__(
+        certified,
+        "_CertifiedGlobalResult__guard",
+        _GLOBAL_RESULT_CERTIFICATION_GUARD,
+    )
+    return certified
+
+
+def validate_global_result_integrity(
+    directory: str | Path,
+    *,
+    capability: ValidatedPretestFreeze,
+    predictions: Sequence[ValidatedPredictionEvidence],
+    final_packages: Sequence[ValidatedFinalPackage],
+    test_data: FrozenSymileTestData,
+    enforce_directory_name: bool = True,
+) -> GlobalResultIntegrity:
+    """Validate immutable global-result identity and lineage without recomputing statistics."""
+    validated, _, _, _, _ = _validate_global_result_artifact(
+        directory,
+        capability=capability,
+        predictions=predictions,
+        final_packages=final_packages,
+        test_data=test_data,
+        enforce_directory_name=enforce_directory_name,
+    )
+    return validated
+
+
+def _validate_global_result_artifact(
+    directory: str | Path,
+    *,
+    capability: ValidatedPretestFreeze,
+    predictions: Sequence[ValidatedPredictionEvidence],
+    final_packages: Sequence[ValidatedFinalPackage],
+    test_data: FrozenSymileTestData,
+    enforce_directory_name: bool,
+) -> tuple[
+    GlobalResultIntegrity,
+    tuple[ValidatedFinalPackage, ...],
+    HeldOutEvaluationProjection,
+    tuple[ValidatedPredictionEvidence, ...],
+    dict[str, object],
+]:
+    """Validate the stored result contract shared by certification and routine consumers."""
     capability = _require_capability(capability)
     root = Path(directory)
     if (
@@ -389,6 +1072,7 @@ def validate_global_result(
             "claims.json",
             "reliability.svg",
         }
+        or any(item.is_symlink() or not item.is_file() for item in root.iterdir())
     ):
         raise ManifestBuildError("Global-result directory is invalid")
     document = json.loads((root / "manifest.json").read_bytes())
@@ -403,7 +1087,8 @@ def validate_global_result(
         document.get("global_result_schema_version") if isinstance(document, dict) else None
     )
     if (
-        set(document) != required
+        not isinstance(document, dict)
+        or set(document) != required
         or isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
         or schema_version != 1
@@ -416,7 +1101,9 @@ def validate_global_result(
         key: document[key]
         for key in required - {"global_result_schema_version", "global_result_id"}
     }
-    expected = canonical_scientific_id(GLOBAL_RESULT_PREFIX, semantic)
+    expected = canonical_scientific_id(
+        GLOBAL_RESULT_PREFIX, semantic, domain="global-result", schema_version=1
+    )
     if document["global_result_id"] != expected or (
         enforce_directory_name and root.name != expected
     ):
@@ -426,15 +1113,25 @@ def validate_global_result(
     evidence = _validated_predictions(capability, packages, predictions, projection)
     if document["prediction_ids"] != [item.prediction_id for item in evidence]:
         raise ManifestBuildError("Global-result prediction order is invalid")
-    expected_claims = _derive_global_claims(capability, packages, evidence, projection)
-    observed_claims = json.loads((root / "claims.json").read_bytes())
-    if observed_claims != expected_claims:
-        raise ManifestBuildError("Global-result claims do not rederive from prediction evidence")
-    if (root / "reliability.svg").read_text(encoding="utf-8") != _reliability_svg(
-        expected_claims["reliability_curves"]
-    ):
-        raise ManifestBuildError("Global-result reliability plot does not rederive from claims")
-    return ValidatedGlobalResult(root, document)
+    claims_bytes = (root / "claims.json").read_bytes()
+    observed_claims = json.loads(claims_bytes)
+    if not isinstance(observed_claims, dict) or "reliability_curves" not in observed_claims:
+        raise ManifestBuildError("Global-result claims contract is invalid")
+    reliability_bytes = (root / "reliability.svg").read_bytes()
+    if reliability_bytes.decode("utf-8") != _reliability_svg(observed_claims["reliability_curves"]):
+        raise ManifestBuildError("Global-result reliability plot differs from stored claims")
+    return (
+        GlobalResultIntegrity(
+            root,
+            document,
+            hashlib.sha256(claims_bytes).hexdigest(),
+            hashlib.sha256(reliability_bytes).hexdigest(),
+        ),
+        packages,
+        projection,
+        evidence,
+        observed_claims,
+    )
 
 
 def publish_error_review(
@@ -448,8 +1145,8 @@ def publish_error_review(
     """Publish a restricted regenerable derivative, never a global-result authority."""
     document = _error_review_document(capability, predictions, final_packages, test_data)
     encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    path = Path(private_root) / "error-review" / "symile" / f"{document['error_review_id']}.json"
-    publish_bytes_no_replace(path, encoded)
+    path = Path(private_root) / "error-review" / "symile" / "error-review.json"
+    publish_regenerable_bytes(path, encoded)
     if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
         raise ManifestBuildError("Private error review conflicts with existing content")
     return path
@@ -470,7 +1167,7 @@ def validate_error_review(
     if (
         source.is_symlink()
         or not source.is_file()
-        or source.name != f"{expected['error_review_id']}.json"
+        or source.name != "error-review.json"
         or source.read_bytes() != encoded
     ):
         raise ManifestBuildError("Private error review does not rederive from evidence")
@@ -481,7 +1178,7 @@ def _error_review_document(capability, predictions, final_packages, test_data):
     projection = _frozen_evaluation_projection(capability, test_data)
     evidence = _validated_predictions(capability, packages, predictions, projection)
     primary = predictor_views(packages, evidence)["cxr_labs_gated"]
-    threshold = capability.manifest["primary_thresholds"]["youden_j"]
+    threshold = capability.development_decision.manifest["primary_thresholds"]["youden_j"]
     semantic = {
         "pretest_freeze_id": capability.freeze_id,
         "predictor": "cxr_labs_gated",
@@ -498,7 +1195,6 @@ def _error_review_document(capability, predictions, final_packages, test_data):
     }
     return {
         "error_review_schema_version": 1,
-        "error_review_id": canonical_scientific_id("error-review-", semantic),
         **semantic,
     }
 
@@ -534,7 +1230,7 @@ def _validated_predictions(
     for package, evidence in zip(packages, values, strict=True):
         if (
             evidence.manifest["model_package_id"] != package.package_id
-            or evidence.manifest.get("authorized_by_pretest_freeze_id") != capability.freeze_id
+            or evidence.manifest.get("authorized_by_freeze_id") != capability.freeze_id
         ):
             raise ManifestBuildError("Global-result prediction lineage is invalid")
     if len({item.prediction_id for item in values}) != FINAL_PACKAGE_COUNT:
@@ -545,11 +1241,7 @@ def _validated_predictions(
 def _global_evaluation_policy() -> dict[str, object]:
     return {
         "metric_policy": METRIC_POLICY,
-        "predictor_views": list(FINAL_PACKAGE_POLICY),
-        "neural_ensemble": (
-            f"ordered-seed-{'-'.join(str(seed) for seed in FINAL_NEURAL_MEMBER_SEEDS)}"
-            "-mean-logit-then-sigmoid-v1"
-        ),
+        "predictor_views": final_predictor_reduction_policy(),
         "raw_probability_metrics": [
             *headline_metric_names(),
             "calibration_slope",
@@ -596,7 +1288,9 @@ def _derive_global_claims(
     primary = views["cxr_labs_gated"]
     operating_points = {
         name: operating_point_metrics(primary["target"], primary["probability"], float(threshold))
-        for name, threshold in capability.manifest["primary_thresholds"].items()
+        for name, threshold in capability.development_decision.manifest[
+            "primary_thresholds"
+        ].items()
     }
     return {
         "predictor_views": {
@@ -680,6 +1374,16 @@ def predictor_views(
     packages: Sequence[ValidatedFinalPackage],
     predictions: Sequence[ValidatedPredictionEvidence],
 ) -> dict[str, pd.DataFrame]:
+    policy = final_predictor_view_policy(
+        [
+            {
+                "package_id": package.package_id,
+                "family_id": package.manifest["input"]["family"]["family_id"],
+                "seed": package.manifest["seed_policy"],
+            }
+            for package in packages
+        ]
+    )
     grouped: dict[str, list[pd.DataFrame]] = {}
     for package, evidence in zip(packages, predictions, strict=True):
         family = str(package.manifest["input"]["family"]["family_id"])
@@ -688,18 +1392,20 @@ def predictor_views(
         grouped.setdefault(family, []).append(frame)
     if set(grouped) != set(FINAL_PACKAGE_POLICY):
         raise ManifestBuildError("Global result requires exactly six predictor views")
-    views = {
-        family: (
-            frames[0].loc[:, ["sample_id", "target", "logit", "probability"]]
-            if len(frames) == 1
-            else final_member_mean_logit_ensemble(
+    views = {}
+    for view in policy:
+        family = str(view["family_id"])
+        frames = grouped[family]
+        if view["reduction"] == SINGLE_MEMBER_REDUCTION:
+            views[family] = frames[0].loc[:, ["sample_id", "target", "logit", "probability"]]
+        elif view["reduction"] == NEURAL_MEMBER_REDUCTION:
+            views[family] = final_member_mean_logit_ensemble(
                 pd.concat(frames, ignore_index=True).loc[
                     :, ["sample_id", "target", "logit", "member_seed"]
                 ]
             )
-        )
-        for family, frames in grouped.items()
-    }
+        else:
+            raise ManifestBuildError("Symile predictor-view reduction policy is invalid")
     reference = views["labs_logistic"].loc[:, ["sample_id", "target"]].reset_index(drop=True)
     if any(
         not frame.loc[:, ["sample_id", "target"]].reset_index(drop=True).equals(reference)
@@ -719,7 +1425,6 @@ def _validated_projection_subjects(
         lineage = (
             projection.dataset_id,
             projection.bundle_id,
-            projection.split_assignment_id,
             projection.task_id,
             projection.label_policy_version,
             projection.scope,
@@ -728,14 +1433,12 @@ def _validated_projection_subjects(
         )
     except (AttributeError, TypeError) as exc:
         raise ManifestBuildError("Global-result held-out projection is invalid") from exc
-    frozen_bundle = capability.manifest["bundle"]
     frozen_task = capability.manifest["task"]
     if (
         lineage
         != (
             "symile",
-            frozen_bundle["bundle_id"],
-            frozen_bundle["split_assignment_id"],
+            capability.manifest["bundle_id"],
             frozen_task["task_id"],
             frozen_task["label_policy_version"],
             "test",
@@ -764,16 +1467,14 @@ def _frozen_evaluation_projection(
     capability: ValidatedPretestFreeze,
     test_data: FrozenSymileTestData,
 ) -> HeldOutEvaluationProjection:
-    from beyondcxr.training.symile_test_data import FrozenSymileTestData
+    from beyondcxr.training.symile_test_data import canonical_held_out_evaluation_projection
 
-    if (
-        not isinstance(test_data, FrozenSymileTestData)
-        or getattr(test_data, "_capability", None) is not capability
-    ):
+    try:
+        return canonical_held_out_evaluation_projection(test_data, freeze=capability)
+    except PermissionError as exc:
         raise ManifestBuildError(
             "Global result requires official test data authorized by the same pre-test freeze"
-        )
-    return test_data.evaluation_projection()
+        ) from exc
 
 
 def _validated_frozen_packages(
@@ -782,7 +1483,11 @@ def _validated_frozen_packages(
 ) -> tuple[ValidatedFinalPackage, ...]:
     values = _validated_packages(packages)
     observed = [
-        {"package_id": package.package_id, "manifest_sha256": package.manifest_sha256}
+        {
+            "package_id": package.package_id,
+            "family_id": package.manifest["input"]["family"]["family_id"],
+            "seed": package.manifest["seed_policy"],
+        }
         for package in values
     ]
     if observed != capability.manifest["final_packages"]:
@@ -793,9 +1498,7 @@ def _validated_frozen_packages(
 def _validated_packages(
     packages: Sequence[ValidatedFinalPackage],
     *,
-    expected_git_commit: str | None = None,
-    expected_dependency_lock_sha256: str | None = None,
-    final_family_authorities: Mapping[str, object] | None = None,
+    selected_family_authorities: Mapping[str, object] | None = None,
 ) -> tuple[ValidatedFinalPackage, ...]:
     values = tuple(
         validate_final_package(
@@ -809,11 +1512,18 @@ def _validated_packages(
     for package in values:
         family = package.manifest["input"]["family"]["family_id"]
         by_family.setdefault(family, []).append(package)
-        if final_family_authorities is not None:
-            authority = final_family_authorities.get(family)
+        if selected_family_authorities is not None:
+            authority = selected_family_authorities.get(family)
             if (
                 not isinstance(authority, Mapping)
-                or package.manifest["family_development_id"] != authority.get("development_id")
+                or (
+                    family != "labs_logistic"
+                    and package.manifest["family_development_id"] != authority.get("development_id")
+                )
+                or (
+                    family == "labs_logistic"
+                    and package.manifest["family_development_id"] is not None
+                )
                 or package.manifest["final_training_budget"]
                 != authority.get("final_training_budget")
                 or package.manifest["input"] != authority.get("final_input")
@@ -823,14 +1533,6 @@ def _validated_packages(
                 raise ManifestBuildError(
                     "Final package differs from its development-derived family authority"
                 )
-        if expected_git_commit is not None:
-            provenance = package.manifest["execution_provenance"]
-            if (
-                provenance.get("git_commit") != expected_git_commit
-                or provenance.get("dependency_lock_sha256") != expected_dependency_lock_sha256
-                or provenance.get("git_dirty") is not False
-            ):
-                raise ManifestBuildError("Final package execution provenance differs from freeze")
     expected = {family: int(policy["members"]) for family, policy in FINAL_PACKAGE_POLICY.items()}
     if (
         len(values) != FINAL_PACKAGE_COUNT
@@ -846,11 +1548,8 @@ def _validated_packages(
         raise ManifestBuildError("Final packages are not in canonical family order")
     datasets = [package.manifest["input"]["dataset"] for package in values]
     tasks = [package.manifest["input"]["task"] for package in values]
-    manifest_hashes = [package.manifest["bundle_manifest_sha256"] for package in values]
-    if (
-        any(dataset != datasets[0] for dataset in datasets[1:])
-        or any(task != tasks[0] for task in tasks[1:])
-        or any(value != manifest_hashes[0] for value in manifest_hashes[1:])
+    if any(dataset != datasets[0] for dataset in datasets[1:]) or any(
+        task != tasks[0] for task in tasks[1:]
     ):
         raise ManifestBuildError("Final packages do not share one dataset and task authority")
     cxr_by_seed = {
@@ -883,40 +1582,62 @@ def _validated_packages(
 
 
 def _require_capability(value: ValidatedPretestFreeze) -> ValidatedPretestFreeze:
-    if not isinstance(value, ValidatedPretestFreeze) or value._guard is not _CAPABILITY_GUARD:
+    if not isinstance(value, ValidatedPretestFreeze) or value._guard is not _FREEZE_GUARD:
         raise ManifestBuildError("A genuine ValidatedPretestFreeze is required")
-    root, raw, document = _validate_pretest_freeze_document(
-        value.directory, enforce_directory_name=False
+    if value._operation is not None:
+        operation = value._operation
+        if value is not operation.capability.freeze:
+            raise PermissionError("Freeze does not belong to the authenticated operation")
+        require_validated_held_out_capability(operation.capability)
+        return value
+    observed = validate_pretest_freeze(
+        value.directory,
+        development_decision=value.development_decision,
+        final_packages=value.final_packages,
+        enforce_directory_name=False,
     )
-    if (
-        root != value.directory
-        or document != value.manifest
-        or hashlib.sha256(raw).hexdigest() != value.manifest_sha256
-    ):
+    if observed != value:
         raise ManifestBuildError("Validated pre-test freeze changed after recursive validation")
     return value
 
 
-def _require_test_open_record(
-    value: ValidatedTestOpenRecord, capability: ValidatedPretestFreeze
-) -> ValidatedTestOpenRecord:
+def require_validated_held_out_capability(
+    value: object,
+) -> ValidatedHeldOutCapability:
+    """Reauthenticate the complete live official-test authority."""
+    if not isinstance(value, ValidatedHeldOutCapability) or value._guard is not _HELD_OUT_GUARD:
+        raise PermissionError("Official-test access requires a validated held-out capability")
+    operation = value._operation
+    if operation is None:
+        joined = require_symile_frozen_campaign(value.frozen_campaign)
+    else:
+        if (
+            not operation.active
+            or value.frozen_campaign is not operation.capability.frozen_campaign
+            or value.opening is not operation.capability.opening
+            or _held_out_state(value) != operation.state
+        ):
+            raise PermissionError("Official-test operation is expired or changed")
+        joined = value.frozen_campaign
+    freeze = joined.freeze
+    roots = joined.lifecycle
+    current = joined.current_execution
+    execution = current.execution
+    record = value.opening
     if (
-        not isinstance(value, ValidatedTestOpenRecord)
-        or value._guard is not _TEST_OPEN_GUARD
-        or value.freeze_id != capability.freeze_id
-        or value.path.name != "test-open.json"
+        not isinstance(record, ValidatedTestOpenRecord)
+        or record._guard is not _TEST_OPEN_GUARD
+        or record.freeze_id != freeze.freeze_id
+        or record.execution_id != execution.execution_id
+        or record.path != roots.control_root / "test-open.json"
+        or record.external_path != roots.backup_root / "control/symile/test-open.json"
     ):
-        raise ManifestBuildError("Official-test access requires the same-freeze test-open record")
-    validated = create_or_validate_test_open_record(
-        control_root=value.path.parent,
-        capability=capability,
-    )
-    if (
-        validated.path != value.path
-        or validated.freeze_id != value.freeze_id
-        or validated.document_sha256 != value.document_sha256
-    ):
-        raise ManifestBuildError("Official-test test-open record changed after validation")
+        raise ManifestBuildError("Official-test capability authorities disagree")
+    local, _ = _read_test_open_record(record.path)
+    external, _ = _read_test_open_record(record.external_path)
+    if local != external or local != record.document_bytes:
+        raise ManifestBuildError("Official-test opening evidence changed after validation")
+    _validate_test_open_bytes(local, freeze, execution)
     return value
 
 
@@ -931,120 +1652,46 @@ def _valid_utc_timestamp(value: object) -> bool:
 
 
 def _validate_freeze_fields(document: Mapping[str, Any]) -> None:
-    bundle = document["bundle"]
     task = document["task"]
     packages = document["final_packages"]
-    thresholds = document["primary_thresholds"]
     held_out = document["held_out_policy"]
-    neural_runtime = (
-        held_out.get("neural_inference_runtime") if isinstance(held_out, Mapping) else None
-    )
-    runtime_keys = {
-        "device_type",
-        "autocast_dtype",
-        "deterministic_algorithms",
-        "cudnn_deterministic",
-        "cudnn_benchmark",
-        "cuda_runtime_version",
-        "cudnn_version",
-        "gpu_device_name",
-        "gpu_compute_capability",
-    }
-    device_type = neural_runtime.get("device_type") if isinstance(neural_runtime, Mapping) else None
-    autocast_dtype = (
-        neural_runtime.get("autocast_dtype") if isinstance(neural_runtime, Mapping) else None
-    )
-    cuda_values = (
-        tuple(
-            neural_runtime.get(key)
-            for key in runtime_keys
-            - {
-                "device_type",
-                "autocast_dtype",
-                "deterministic_algorithms",
-                "cudnn_deterministic",
-                "cudnn_benchmark",
-            }
-        )
-        if isinstance(neural_runtime, Mapping)
-        else ()
-    )
-    cudnn_version = (
-        neural_runtime.get("cudnn_version") if isinstance(neural_runtime, Mapping) else None
-    )
-    capability = (
-        neural_runtime.get("gpu_compute_capability")
-        if isinstance(neural_runtime, Mapping)
-        else None
-    )
     if (
-        not isinstance(bundle, Mapping)
-        or set(bundle) != {"bundle_id", "bundle_manifest_sha256", "split_assignment_id"}
-        or not _identity(bundle["bundle_id"], "bundle-")
-        or not _sha256(bundle["bundle_manifest_sha256"])
-        or not _identity(bundle["split_assignment_id"], "split-assignment-")
+        document["dataset_id"] != "symile"
+        or not _identity(document["bundle_id"], "bundle-")
+        or not _identity(document["cv_assignment_id"], "cv-assignment-")
         or not isinstance(task, Mapping)
         or task
         != {
             "task_id": TASK_ID,
             "label_policy_version": LABEL_POLICY_VERSION,
         }
-        or not _identity(document["ecg_extension_result_id"], "ecg-extension-result-")
+        or not _identity(document["development_decision_id"], "development-decision-")
         or not isinstance(packages, list)
         or len(packages) != FINAL_PACKAGE_COUNT
         or any(
             not isinstance(item, Mapping)
-            or set(item) != {"package_id", "manifest_sha256"}
+            or set(item) != {"package_id", "family_id", "seed"}
             or not _identity(item["package_id"], "final-package-")
-            or not _sha256(item["manifest_sha256"])
+            or not isinstance(item["family_id"], str)
+            or type(item["seed"]) is not int
             for item in packages
         )
         or len({item["package_id"] for item in packages}) != FINAL_PACKAGE_COUNT
-        or not isinstance(thresholds, Mapping)
-        or set(thresholds) != {"youden_j", "target_sensitivity"}
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, int | float)
-            or not math.isfinite(value)
-            or not 0.0 <= value <= 1.0
-            for value in thresholds.values()
-        )
-        or not isinstance(neural_runtime, Mapping)
-        or set(neural_runtime) != runtime_keys
-        or device_type not in {"cpu", "cuda"}
-        or autocast_dtype not in {None, "float16"}
-        or neural_runtime["deterministic_algorithms"] != "enabled_warn_only"
-        or neural_runtime["cudnn_deterministic"] is not True
-        or neural_runtime["cudnn_benchmark"] is not False
-        or (
-            device_type == "cpu"
-            and (autocast_dtype is not None or any(value is not None for value in cuda_values))
-        )
-        or (
-            device_type == "cuda"
-            and (
-                not isinstance(neural_runtime["cuda_runtime_version"], str)
-                or not neural_runtime["cuda_runtime_version"]
-                or not isinstance(neural_runtime["gpu_device_name"], str)
-                or not neural_runtime["gpu_device_name"]
-                or isinstance(cudnn_version, bool)
-                or (cudnn_version is not None and not isinstance(cudnn_version, int))
-                or not isinstance(capability, list)
-                or len(capability) != 2
-                or any(
-                    isinstance(value, bool) or not isinstance(value, int) or value < 0
-                    for value in capability
-                )
-            )
-        )
+        or not isinstance(held_out, Mapping)
         or held_out
         != {
+            "predictor_views": final_predictor_view_policy(packages),
+            "inference_policy": SYMILE_TEST_INFERENCE_POLICY,
             "metric_policy": METRIC_POLICY,
+            "operating_point_policy": DEVELOPMENT_DECISION_POLICY["threshold_derivation"],
+            "subgroup_policy": SUBGROUP_POLICY,
             "bootstrap": BOOTSTRAP_POLICY,
-            "neural_inference_runtime": dict(neural_runtime),
+            "calibration_policy": {
+                "coefficients": "logit_calibration_slope_and_intercept",
+                "reliability": RELIABILITY_POLICY,
+            },
+            "error_review_policy": ERROR_REVIEW_POLICY,
         }
-        or not _git_commit(document["science_git_commit"])
-        or not _sha256(document["dependency_lock_sha256"])
     ):
         raise ManifestBuildError("Pre-test freeze fields are invalid")
 
@@ -1057,14 +1704,6 @@ def _sha256(value: object) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
-def _git_commit(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 40
         and all(character in "0123456789abcdef" for character in value)
     )
 
@@ -1092,6 +1731,8 @@ def _read_single_json(directory: str | Path) -> tuple[Path, bytes, dict[str, Any
         root.is_symlink()
         or not root.is_dir()
         or {path.name for path in root.iterdir()} != {"manifest.json"}
+        or (root / "manifest.json").is_symlink()
+        or not (root / "manifest.json").is_file()
     ):
         raise ManifestBuildError("Scientific control object directory is invalid")
     raw = (root / "manifest.json").read_bytes()

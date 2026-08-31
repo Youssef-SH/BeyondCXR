@@ -1,4 +1,4 @@
-"""Run the single safety-coupled Symile core and ECG-extension scientific campaign."""
+"""Run the single safety-coupled Symile scientific campaign."""
 
 from __future__ import annotations
 
@@ -6,29 +6,23 @@ import argparse
 import json
 import shutil
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import mlflow
 
 from beyondcxr.data.bundle_contract import BUNDLES_DIRECTORY
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.symile_artifacts import validate_symile_bundle, validate_symile_bundle_reference
+from beyondcxr.data.symile_artifacts import validate_symile_bundle_reference
 from beyondcxr.data.symile_cv import CV_DIRECTORY
 from beyondcxr.data.symile_preprocess import LAB_OBSERVED_COLUMNS
-from beyondcxr.data.symile_source import establish_authenticated_release_asset
+from beyondcxr.data.symile_source import (
+    DevelopmentReleaseAsset,
+    establish_development_release_assets,
+)
 from beyondcxr.models.cxr_baseline import fingerprint_pretrained_weights
-from beyondcxr.training.config import (
-    ExperimentConfig,
-    load_symile_development_config,
-    with_runtime,
-)
-from beyondcxr.training.device import (
-    ResolvedDevice,
-    neural_inference_runtime_policy,
-    resolve_device,
-)
+from beyondcxr.training.config import ExperimentConfig, load_symile_development_config, with_runtime
+from beyondcxr.training.device import ResolvedDevice, resolve_device
 from beyondcxr.training.operational_validation import (
     validate_existing_sqlite_database,
     validate_writable_directory_destination,
@@ -36,23 +30,35 @@ from beyondcxr.training.operational_validation import (
 )
 from beyondcxr.training.preservation import (
     PreservationMember,
+    PreservationRole,
+    ValidatedRestorationContext,
+    _validated_restoration_context,
     export_and_verify,
+    require_restoration_context,
     validate_exact_restored_closure,
     validate_preservation_paths,
 )
-from beyondcxr.training.symile_analysis import analyze_symile_development
 from beyondcxr.training.symile_campaign_control import (
     PRETEST_FREEZE_PREFIX,
-    ValidatedGlobalResult,
+    CertifiedGlobalResult,
+    ValidatedHeldOutCapability,
     ValidatedPretestFreeze,
-    ValidatedTestOpenRecord,
-    create_or_validate_test_open_record,
+    ValidatedSymileFrozenCampaign,
+    _validate_preserved_test_open,
+    held_out_operation,
+    open_official_test,
     publish_error_review,
     publish_global_result,
     publish_pretest_freeze,
+    require_certified_global_result,
+    require_symile_frozen_campaign,
+    require_validated_held_out_capability,
     validate_error_review,
     validate_global_result,
+    validate_global_result_integrity,
     validate_pretest_freeze,
+    validate_symile_execution_freeze_science,
+    validate_symile_frozen_campaign,
 )
 from beyondcxr.training.symile_data import (
     SymileCxrStore,
@@ -60,15 +66,37 @@ from beyondcxr.training.symile_data import (
     load_symile_development_cohort,
 )
 from beyondcxr.training.symile_development import run_symile_development
-from beyondcxr.training.symile_ecg_data import SymileEcgStore
-from beyondcxr.training.symile_ecg_extension_result import (
-    ValidatedEcgExtensionResult,
-    publish_ecg_extension_result,
+from beyondcxr.training.symile_development_decision import (
+    ValidatedDevelopmentDecision,
+    publish_development_decision,
+    validate_development_decision,
+)
+from beyondcxr.training.symile_development_reports import (
+    FOCUSED_SUBGROUP_FILENAME,
+    analyze_symile_development,
+    derive_focused_subgroup_derivative,
     publish_focused_subgroup_derivative,
-    validate_ecg_extension_result,
+    publish_operation_analysis,
+    publish_operation_subgroups,
+    validate_analysis_result,
     validate_focused_subgroup_derivative,
 )
+from beyondcxr.training.symile_ecg_data import SymileEcgStore
+from beyondcxr.training.symile_execution import (
+    ValidatedCurrentSymileExecution,
+    ValidatedSymileExecution,
+    ValidatedSymileProspectiveMutation,
+    build_symile_formal_preflight,
+    publish_or_validate_symile_execution,
+    symile_prospective_mutation,
+    symile_test_is_open,
+    validate_active_symile_execution,
+    validate_current_symile_execution,
+    validate_symile_execution,
+    validate_symile_lifecycle,
+)
 from beyondcxr.training.symile_families import (
+    DEVELOPMENT_FAMILY_ORDER,
     FINAL_NEURAL_FAMILIES,
     FINAL_NEURAL_MEMBER_SEEDS,
     FINAL_PACKAGE_COUNT,
@@ -86,68 +114,170 @@ from beyondcxr.training.symile_final_training import (
     fit_final_neural_member,
     fit_final_tabular_family,
 )
+from beyondcxr.training.symile_formal import SYMILE_FORMAL_RUN_PLAN
 from beyondcxr.training.symile_statistics import focused_development_subgroups
 from beyondcxr.training.symile_test_data import (
     FrozenSymileTestData,
+    RestoredSymileTestData,
     validate_prediction_against_test_projection,
 )
 from beyondcxr.training.symile_test_inference import (
     publish_frozen_test_predictions,
-    resolve_held_out_neural_runtime,
+    validate_restored_test_prediction_publication,
 )
+from beyondcxr.utils.immutable_json import immutable_json
 from beyondcxr.utils.mlflow_utils import (
     configure_mlflow,
     discover_repository_root,
     environment_provenance,
-    git_revision,
     log_source_config,
     serialize_modalities,
     tracked_run,
-    uv_lock_sha256,
 )
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
     validate_prediction_evidence,
 )
 from beyondcxr.utils.publication import validate_path_component
+from beyondcxr.utils.semantic_identity import canonical_json_bytes
 from beyondcxr.utils.symile_publication import (
     ValidatedDevelopmentResult,
-    validate_analysis_result,
     validate_development_result,
     validated_development_repeat_oof,
 )
 
-_CONFIGS = {
-    family: Path("configs") / f"symile_{family}.yaml"
-    for family in (*SYMILE_CORE_DEVELOPMENT_FAMILIES, SYMILE_ECG_GATED_FAMILY)
-}
+_CONFIGS = {spec.family_id: spec.config_relative for spec in SYMILE_FORMAL_RUN_PLAN}
 _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES = 32 * 1024**3
 _SYMILE_BACKUP_MINIMUM_FREE_BYTES = 8 * 1024**3
+_RESTORED_CAMPAIGN_GUARD = object()
 
 
-@dataclass(frozen=True)
+def _symile_export_name(*, global_result_id: str, execution_id: str) -> str:
+    """Return the specification-defined stable Symile preservation name."""
+    return f"symile-{global_result_id}-{execution_id}"
+
+
 class RestoredCampaignClosure:
-    """Recursively validated campaign state exposed to downstream release consumers."""
+    """Immutable view of the exact campaign state certified during restoration."""
 
-    freeze: ValidatedPretestFreeze
-    extension: ValidatedEcgExtensionResult
-    analysis: dict[str, object]
-    subgroup: dict[str, object]
-    developments: tuple[ValidatedDevelopmentResult, ...]
-    packages: tuple[ValidatedFinalPackage, ...]
-    predictions: tuple[ValidatedPredictionEvidence, ...]
-    global_result: ValidatedGlobalResult
-    test_data: FrozenSymileTestData
+    __slots__ = (
+        "__freeze",
+        "__execution",
+        "__development_decision",
+        "__analysis",
+        "__subgroup",
+        "__developments",
+        "__packages",
+        "__predictions",
+        "__global_result",
+        "__test_data",
+        "__restored_root",
+        "__restoration_context",
+        "__authority_state",
+        "__guard",
+    )
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("RestoredCampaignClosure is created only by restoration validation")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("RestoredCampaignClosure is immutable")
+
+    def __copy__(self) -> RestoredCampaignClosure:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> RestoredCampaignClosure:
+        memo[id(self)] = self
+        return self
+
+    @property
+    def freeze(self) -> ValidatedPretestFreeze:
+        return self.__freeze
+
+    @property
+    def execution(self) -> ValidatedSymileExecution:
+        return self.__execution
+
+    @property
+    def development_decision(self) -> ValidatedDevelopmentDecision:
+        return self.__development_decision
+
+    @property
+    def analysis(self) -> Mapping[str, object]:
+        return self.__analysis
+
+    @property
+    def subgroup(self) -> Mapping[str, object]:
+        return self.__subgroup
+
+    @property
+    def developments(self) -> tuple[ValidatedDevelopmentResult, ...]:
+        return self.__developments
+
+    @property
+    def packages(self) -> tuple[ValidatedFinalPackage, ...]:
+        return self.__packages
+
+    @property
+    def predictions(self) -> tuple[ValidatedPredictionEvidence, ...]:
+        return self.__predictions
+
+    @property
+    def global_result(self) -> CertifiedGlobalResult:
+        return self.__global_result
+
+    @property
+    def test_data(self) -> FrozenSymileTestData:
+        return self.__test_data
+
+    @property
+    def restored_root(self) -> Path:
+        return self.__restored_root
+
+    @property
+    def restoration_context(self) -> ValidatedRestorationContext:
+        return self.__restoration_context
+
+
+def _restored_authority_state(value: RestoredCampaignClosure) -> tuple[object, ...]:
+    return (
+        immutable_json(value.freeze.manifest),
+        immutable_json(value.execution.manifest),
+        immutable_json(value.development_decision.manifest),
+        tuple(immutable_json(item.manifest) for item in value.developments),
+        tuple(immutable_json(item.manifest) for item in value.packages),
+        tuple(immutable_json(item.manifest) for item in value.predictions),
+    )
+
+
+def require_restored_campaign(value: object) -> RestoredCampaignClosure:
+    """Require a deeply certified campaign within its active restoration lifetime."""
+    if (
+        not isinstance(value, RestoredCampaignClosure)
+        or value._RestoredCampaignClosure__guard is not _RESTORED_CAMPAIGN_GUARD
+    ):
+        raise PermissionError("Serving deployment requires a validated restored campaign")
+    if not value.restored_root.is_dir():
+        raise ManifestBuildError("Restored campaign authority is no longer available")
+    restoration = require_restoration_context(value.restoration_context)
+    if restoration.root != value.restored_root:
+        raise PermissionError("Restored campaign belongs to another restoration root")
+    if not value.global_result.directory.resolve().is_relative_to(value.restored_root):
+        raise PermissionError("Certified global result belongs to another restoration root")
+    require_certified_global_result(value.global_result)
+    if _restored_authority_state(value) != value._RestoredCampaignClosure__authority_state:
+        raise ManifestBuildError("Restored campaign authority changed after validation")
+    return value
 
 
 def run_symile_campaign(
     *,
+    bundle_id: str,
+    cv_assignment_id: str,
     source_root: str | Path,
-    device: str = "auto",
-    workers: int = 2,
     backup_root: str | Path,
 ) -> dict[str, str]:
-    """Execute the prespecified end-to-end Symile campaign."""
+    """Run or resume Symile through its immutable pre-test scientific freeze."""
     repository_root = discover_repository_root()
     manifest_root = repository_root / "data" / "manifests"
     model_root = repository_root / "models" / "symile"
@@ -191,56 +321,107 @@ def run_symile_campaign(
     validate_existing_sqlite_database(tracking_database, "Symile campaign tracking database")
     _validate_symile_storage_readiness(repository_root, backup_root)
     tracking_uri = f"sqlite:///{tracking_database}"
-    commit, dirty = git_revision(repository_root)
-    if dirty:
-        raise ManifestBuildError("Formal Symile campaign requires a clean Git worktree")
-    lock_hash = uv_lock_sha256(repository_root / "uv.lock")
+    control_root = Path(private_root) / "control" / "symile"
+    if symile_test_is_open(
+        control_root / "test-open.json",
+        backup_root / "control/symile/test-open.json",
+    ):
+        raise ManifestBuildError(
+            "Official Symile test data are already open; resume only the held-out phase"
+        )
     configs = {
         family: with_runtime(
-            load_symile_development_config(repository_root / path),
+            load_symile_development_config(
+                repository_root / path, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+            ),
             manifest_directory=manifest_root,
             source_root=source_root,
             model_directory=Path(model_root) / "development",
             report_directory=Path(report_root) / "development",
             private_output_directory=private_root,
-            device=device,
-            num_workers=workers,
+            device="cuda",
+            num_workers=2,
         )
         for family, path in _CONFIGS.items()
     }
-    control_root = Path(private_root) / "control" / "symile"
-    test_open_path = control_root / "test-open.json"
-    opened = test_open_path.exists() or test_open_path.is_symlink()
-    _preflight_symile_campaign(
+    development_assets = _preflight_symile_campaign(
         configs,
         source_root=source_root,
-        require_pretrained_weights=not opened,
+        require_pretrained_weights=True,
     )
-    if opened:
-        freeze, record, ecg_extension, packages = _resolve_opened_pretest_state(
-            control_root=control_root,
-            model_root=model_root,
-            report_root=report_root,
+    preflight = build_symile_formal_preflight(
+        repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+    )
+    frozen = _resolve_unique_pretest_state(
+        control_root=control_root,
+        model_root=model_root,
+        report_root=report_root,
+        private_root=private_root,
+        manifest_root=manifest_root,
+    )
+    if frozen is not None:
+        freeze, _decision, _packages = frozen
+        execution = validate_active_symile_execution(control_root)
+        current = validate_current_symile_execution(execution, preflight)
+        lifecycle = validate_symile_lifecycle(
+            current,
+            repository_root=repository_root,
             private_root=private_root,
-            manifest_root=manifest_root,
-            science_git_commit=commit,
-            dependency_lock_sha256=lock_hash,
+            backup_root=backup_root,
         )
-        runtime = resolve_held_out_neural_runtime(packages, device)
-        return _complete_opened_campaign(
-            freeze=freeze,
-            record=record,
-            ecg_extension=ecg_extension,
-            packages=packages,
+        with symile_prospective_mutation(lifecycle):
+            validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
+            return {
+                "status": "pretest_ready",
+                "execution_id": current.execution.execution_id,
+                "freeze_id": freeze.freeze_id,
+            }
+    execution = publish_or_validate_symile_execution(preflight)
+    current_execution = validate_current_symile_execution(
+        execution,
+        build_symile_formal_preflight(
+            repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+        ),
+    )
+    lifecycle = validate_symile_lifecycle(
+        current_execution,
+        repository_root=repository_root,
+        private_root=private_root,
+        backup_root=backup_root,
+    )
+    with symile_prospective_mutation(lifecycle) as prospective_mutation:
+        return _run_symile_prospective_campaign(
+            prospective_mutation=prospective_mutation,
+            repository_root=repository_root,
+            configs=configs,
             source_root=source_root,
             manifest_root=manifest_root,
             model_root=model_root,
             report_root=report_root,
             private_root=private_root,
-            export_root=export_root,
-            backup_root=backup_root,
-            runtime=runtime,
+            control_root=control_root,
+            tracking_uri=tracking_uri,
+            current_execution=current_execution,
+            development_assets=development_assets,
         )
+
+
+def _run_symile_prospective_campaign(
+    *,
+    prospective_mutation: ValidatedSymileProspectiveMutation,
+    repository_root: Path,
+    configs: dict[str, ExperimentConfig],
+    source_root: Path,
+    manifest_root: Path,
+    model_root: Path,
+    report_root: Path,
+    private_root: Path,
+    control_root: Path,
+    tracking_uri: str,
+    current_execution: ValidatedCurrentSymileExecution,
+    development_assets: tuple[DevelopmentReleaseAsset, ...] | None,
+) -> dict[str, str]:
+    """Create the complete prospectively fixed Symile scientific state."""
     developments = {}
     for family in SYMILE_CORE_DEVELOPMENT_FAMILIES:
         source_id = (
@@ -250,11 +431,29 @@ def run_symile_campaign(
         )
         developments[family] = run_symile_development(
             configs[family],
+            prospective_mutation=prospective_mutation,
             source_cxr_development_id=source_id,
             tracking_uri=tracking_uri,
             repository_root=repository_root,
+            development_assets=development_assets,
         )
-    _, analysis_directory = analyze_symile_development(
+    developments[SYMILE_ECG_GATED_FAMILY] = run_symile_development(
+        configs[SYMILE_ECG_GATED_FAMILY],
+        prospective_mutation=prospective_mutation,
+        source_cxr_development_id=developments["cxr_densenet"].manifest["development_id"],
+        tracking_uri=tracking_uri,
+        repository_root=repository_root,
+        development_assets=development_assets,
+    )
+    development_decision = publish_development_decision(
+        prospective_mutation=prospective_mutation,
+        report_root=report_root,
+        family_developments=developments,
+        model_root=Path(model_root) / "development",
+        prediction_root=private_root,
+        manifest_root=manifest_root,
+    )
+    analyze_symile_development(
         [
             developments[family].manifest["development_id"]
             for family in SYMILE_CORE_DEVELOPMENT_FAMILIES
@@ -264,12 +463,6 @@ def run_symile_campaign(
         prediction_root=private_root,
         manifest_root=manifest_root,
     )
-    developments[SYMILE_ECG_GATED_FAMILY] = run_symile_development(
-        configs[SYMILE_ECG_GATED_FAMILY],
-        source_cxr_development_id=developments["cxr_densenet"].manifest["development_id"],
-        tracking_uri=tracking_uri,
-        repository_root=repository_root,
-    )
     primary_repeat_oof = validated_development_repeat_oof(
         developments["cxr_labs_gated"], private_root
     )
@@ -277,23 +470,15 @@ def run_symile_campaign(
     cohort = load_symile_development_cohort(configs["cxr_labs_gated"]).frame
     attributes = cohort.loc[:, ["sample_id", "age_years", "sex", "view_position"]].copy()
     attributes["observed_lab_count"] = cohort.loc[:, LAB_OBSERVED_COLUMNS].sum(axis=1)
-    subgroup_reference = publish_focused_subgroup_derivative(
+    publish_focused_subgroup_derivative(
         report_root=report_root,
         summary=focused_development_subgroups(cxr_repeat_oof, primary_repeat_oof, attributes),
     )
-    ecg_extension = publish_ecg_extension_result(
-        report_root=report_root,
-        core_analysis_directory=analysis_directory,
-        ecg_development=developments[SYMILE_ECG_GATED_FAMILY],
-        focused_subgroup_derivative=subgroup_reference,
-        model_root=Path(model_root) / "development",
-        prediction_root=private_root,
-        manifest_root=manifest_root,
-    )
     provenance = {
-        "git_commit": commit,
+        "git_commit": current_execution.execution.manifest["git_commit"],
         "git_dirty": False,
-        "dependency_lock_sha256": lock_hash,
+        "dependency_lock_sha256": current_execution.execution.manifest["dependency_lock_sha256"],
+        "python_version": current_execution.execution.manifest["framework_versions"]["python"],
     }
     final_configs = {
         family: with_runtime(
@@ -303,8 +488,8 @@ def run_symile_campaign(
             model_directory=model_root,
             report_directory=report_root,
             private_output_directory=private_root,
-            device=device,
-            num_workers=workers,
+            device="cuda",
+            num_workers=2,
         )
         for family in (*FINAL_NEURAL_FAMILIES, *FINAL_TABULAR_FAMILIES)
     }
@@ -319,7 +504,8 @@ def run_symile_campaign(
                 provenance=provenance,
                 fit=lambda operational, family=family, config=config: fit_final_tabular_family(
                     config,
-                    development=None if family == "labs_logistic" else developments[family],
+                    prospective_mutation=prospective_mutation,
+                    development=developments[family],
                     operational=operational,
                 ),
             )
@@ -334,12 +520,14 @@ def run_symile_campaign(
             provenance=provenance,
             fit=lambda operational, seed=seed, config=config: fit_final_neural_member(
                 config,
+                prospective_mutation=prospective_mutation,
                 development=developments["cxr_densenet"],
                 member_seed=seed,
-                expected_pretrained_scientific_identity=ecg_extension.manifest[
-                    "final_family_authorities"
+                expected_pretrained_scientific_identity=development_decision.manifest[
+                    "selected_family_authorities"
                 ]["cxr_densenet"]["pretrained_scientific_identity"],
                 operational=operational,
+                development_assets=development_assets,
             ),
         )
         packages.append(package)
@@ -358,49 +546,35 @@ def run_symile_campaign(
                     fit=lambda operational, family=family, seed=seed, config=config: (
                         fit_final_neural_member(
                             config,
+                            prospective_mutation=prospective_mutation,
                             development=developments[family],
                             member_seed=seed,
                             expected_pretrained_scientific_identity=None,
                             source_cxr_package=cxr_by_seed[seed],
                             operational=operational,
+                            development_assets=development_assets,
                         )
                     ),
                 )
             )
     first = configs["labs_logistic"]
-    runtime = resolve_held_out_neural_runtime(packages, device)
     freeze = publish_pretest_freeze(
+        prospective_mutation=prospective_mutation,
         control_root=control_root,
-        bundle={
-            "bundle_id": first.dataset.bundle_id,
-            "bundle_manifest_sha256": first.dataset.bundle_manifest_sha256,
-            "split_assignment_id": first.dataset.split_assignment_id,
-        },
+        bundle_id=first.dataset.bundle_id,
+        cv_assignment_id=str(first.dataset.cv_assignment_id),
         task={
             "task_id": first.task.task_id,
             "label_policy_version": first.task.label_policy_version,
         },
-        ecg_extension_result=ecg_extension,
+        development_decision=development_decision,
         final_packages=packages,
-        neural_inference_runtime=neural_inference_runtime_policy(runtime),
-        science_git_commit=commit,
-        dependency_lock_sha256=lock_hash,
     )
-    record = create_or_validate_test_open_record(control_root=control_root, capability=freeze)
-    return _complete_opened_campaign(
-        freeze=freeze,
-        record=record,
-        ecg_extension=ecg_extension,
-        packages=packages,
-        source_root=source_root,
-        manifest_root=manifest_root,
-        model_root=model_root,
-        report_root=report_root,
-        private_root=private_root,
-        export_root=export_root,
-        backup_root=backup_root,
-        runtime=runtime,
-    )
+    return {
+        "status": "pretest_ready",
+        "execution_id": current_execution.execution.execution_id,
+        "freeze_id": freeze.freeze_id,
+    }
 
 
 def _preservation_topology_sources(
@@ -424,12 +598,153 @@ def _preservation_topology_sources(
     return (*checkout_sources, *external)
 
 
+def complete_symile_test_phase(
+    *,
+    frozen_campaign: ValidatedSymileFrozenCampaign,
+    development_decision: ValidatedDevelopmentDecision,
+    packages: tuple[ValidatedFinalPackage, ...],
+    source_root: Path,
+    manifest_root: Path,
+    model_root: Path,
+    report_root: Path,
+    private_root: Path,
+    export_root: Path,
+    backup_root: Path,
+    runtime: ResolvedDevice,
+) -> dict[str, str]:
+    """Open or resume only the irreversible/post-open Symile phase."""
+    frozen_campaign = require_symile_frozen_campaign(frozen_campaign)
+    lifecycle = frozen_campaign.lifecycle
+    if (
+        Path(private_root).resolve() != lifecycle.private_root
+        or Path(backup_root).resolve() != lifecycle.backup_root
+    ):
+        raise ManifestBuildError("Symile held-out phase roots differ from validated lifecycle")
+    capability = open_official_test(
+        frozen_campaign=frozen_campaign,
+    )
+    with held_out_operation(capability) as capability:
+        return _complete_opened_campaign(
+            capability=capability,
+            development_decision=development_decision,
+            packages=packages,
+            source_root=source_root,
+            manifest_root=manifest_root,
+            model_root=model_root,
+            report_root=report_root,
+            private_root=private_root,
+            export_root=export_root,
+            backup_root=backup_root,
+            runtime=runtime,
+        )
+
+
+def resume_symile_test_phase(
+    *,
+    source_root: str | Path,
+    backup_root: str | Path,
+) -> dict[str, str]:
+    """Resolve the sole frozen execution and open or resume its held-out phase."""
+    repository_root = discover_repository_root()
+    if Path.cwd().resolve() != repository_root:
+        raise ManifestBuildError("Formal Symile campaign must run from the repository root")
+    _validate_canonical_formal_layout(repository_root)
+    source = Path(source_root).resolve()
+    backup = _repository_path(repository_root, backup_root)
+    if backup.resolve().is_relative_to(repository_root.resolve()):
+        raise ManifestBuildError("Symile backup must reside outside the repository root")
+    manifest_root = repository_root / "data" / "manifests"
+    model_root = repository_root / "models" / "symile"
+    report_root = repository_root / "reports" / "symile"
+    private_root = repository_root / "private"
+    export_root = repository_root / "outbox"
+    control_root = private_root / "control" / "symile"
+    preservation_sources = _preservation_topology_sources(
+        repository_root=repository_root,
+        configurable_roots=(source, manifest_root, model_root, report_root, private_root),
+    )
+    validate_preservation_paths(
+        sources=preservation_sources,
+        export_root=export_root,
+        backup_root=backup,
+    )
+    for destination in (model_root, report_root, private_root, export_root, backup):
+        validate_writable_directory_destination(
+            destination, "Symile campaign directory destination"
+        )
+    _validate_symile_storage_readiness(repository_root, backup)
+    execution = validate_active_symile_execution(control_root)
+    bundle_id = execution.manifest["dataset"]["bundle_id"]
+    cv_assignment_id = execution.manifest["dataset"]["cv_assignment_id"]
+    configs = {
+        family: with_runtime(
+            load_symile_development_config(
+                repository_root / path, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+            ),
+            manifest_directory=manifest_root,
+            source_root=source,
+            model_directory=model_root / "development",
+            report_directory=report_root / "development",
+            private_output_directory=private_root,
+            device="cuda",
+            num_workers=2,
+        )
+        for family, path in _CONFIGS.items()
+    }
+    _preflight_symile_campaign(configs, source_root=source, require_pretrained_weights=True)
+    preflight = build_symile_formal_preflight(
+        repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+    )
+    execution = validate_active_symile_execution(control_root)
+    current = validate_current_symile_execution(execution, preflight)
+    lifecycle = validate_symile_lifecycle(
+        current,
+        repository_root=repository_root,
+        private_root=private_root,
+        backup_root=backup,
+    )
+    resolved = _resolve_unique_pretest_state(
+        control_root=control_root,
+        model_root=model_root,
+        report_root=report_root,
+        private_root=private_root,
+        manifest_root=manifest_root,
+    )
+    if resolved is None:
+        raise ManifestBuildError(
+            "No completed Symile pre-test freeze exists; run `make symile` first"
+        )
+    freeze, decision, packages = resolved
+    frozen_campaign = validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
+    neural_config = configs["cxr_labs_gated"]
+    if neural_config.neural is None:
+        raise ManifestBuildError("Symile formal neural runtime configuration is missing")
+    runtime = resolve_device(
+        neural_config.runtime.device,
+        mixed_precision=neural_config.neural.mixed_precision,
+        pin_memory_policy=neural_config.runtime.pin_memory_policy,
+    )
+    return complete_symile_test_phase(
+        frozen_campaign=frozen_campaign,
+        development_decision=decision,
+        packages=packages,
+        source_root=source,
+        manifest_root=manifest_root,
+        model_root=model_root,
+        report_root=report_root,
+        private_root=private_root,
+        export_root=export_root,
+        backup_root=backup,
+        runtime=runtime,
+    )
+
+
 def _preflight_symile_campaign(
     configs: dict[str, ExperimentConfig],
     *,
     source_root: Path,
     require_pretrained_weights: bool = True,
-) -> None:
+) -> tuple[DevelopmentReleaseAsset, ...]:
     """Prove all formal authorities, source assets, and runtimes before development."""
     if set(configs) != set(_CONFIGS):
         raise ManifestBuildError("Symile campaign configuration family set is incomplete")
@@ -438,8 +753,6 @@ def _preflight_symile_campaign(
         (
             config.dataset.dataset_id,
             config.dataset.bundle_id,
-            config.dataset.bundle_manifest_sha256,
-            config.dataset.split_assignment_id,
             config.dataset.cv_assignment_id,
             config.task.task_id,
             config.task.label_policy_version,
@@ -457,25 +770,17 @@ def _preflight_symile_campaign(
         / BUNDLES_DIRECTORY
         / reference_config.dataset.bundle_id
     )
-    validate_symile_bundle(
-        bundle_directory,
-        expected_bundle_id=reference_config.dataset.bundle_id,
-    )
     data = load_symile_development(reference_config)
     reference = validate_symile_bundle_reference(
         bundle_directory,
         expected_bundle_id=reference_config.dataset.bundle_id,
-        expected_manifest_sha256=reference_config.dataset.bundle_manifest_sha256,
     )
-    source = reference.manifest["source"]
-    for asset in source["source_assets"]:
-        establish_authenticated_release_asset(
-            source_root,
-            checksum_manifest_sha256=source["checksum_manifest_sha256"],
-            relative_path=asset["relative_path"],
-        )
-    SymileCxrStore(data.bundle, source_root)
-    SymileEcgStore(data.bundle, source_root)
+    development_assets = establish_development_release_assets(
+        source_root,
+        checksum_manifest_sha256=str(reference.manifest["source"]["checksum_manifest_sha256"]),
+    )
+    SymileCxrStore(data.bundle, source_root, development_assets=development_assets)
+    SymileEcgStore(data.bundle, source_root, development_assets=development_assets)
     neural_weights = {
         str(config.family.parameters["weights"]) for config in typed if config.neural is not None
     }
@@ -495,46 +800,49 @@ def _preflight_symile_campaign(
         runtime_contracts.add(
             (
                 runtime.device.type,
-                str(runtime.autocast_dtype),
+                runtime.mixed_precision_effective,
                 runtime.pin_memory_effective,
                 config.runtime.num_workers,
             )
         )
     if len(runtime_contracts) != 1:
         raise ManifestBuildError("Symile neural configurations disagree on runtime contract")
+    return development_assets
 
 
-def _resolve_opened_pretest_state(
+def _resolve_unique_pretest_state(
     *,
     control_root: Path,
     model_root: Path,
     report_root: Path,
     private_root: Path,
     manifest_root: Path,
-    science_git_commit: str,
-    dependency_lock_sha256: str,
-) -> tuple[
-    ValidatedPretestFreeze,
-    ValidatedTestOpenRecord,
-    ValidatedEcgExtensionResult,
-    tuple[ValidatedFinalPackage, ...],
-]:
-    test_open_path = control_root / "test-open.json"
-    if test_open_path.is_symlink() or not test_open_path.is_file():
-        raise ManifestBuildError("Official-test opening record is invalid")
-    try:
-        opened = json.loads(test_open_path.read_bytes())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ManifestBuildError("Official-test opening record is malformed") from exc
-    freeze_id = opened.get("freeze_id") if isinstance(opened, dict) else None
-    if (
-        not isinstance(freeze_id, str)
-        or not freeze_id.startswith(PRETEST_FREEZE_PREFIX)
-        or len(freeze_id) != len(PRETEST_FREEZE_PREFIX) + 64
-    ):
-        raise ManifestBuildError("Official-test opening record is malformed")
+) -> (
+    tuple[
+        ValidatedPretestFreeze,
+        ValidatedDevelopmentDecision,
+        tuple[ValidatedFinalPackage, ...],
+    ]
+    | None
+):
+    freezes_root = control_root / "freezes"
+    if not freezes_root.exists() and not freezes_root.is_symlink():
+        return None
+    if freezes_root.is_symlink() or not freezes_root.is_dir():
+        raise ManifestBuildError("Symile scientific freeze root is invalid")
+    entries = tuple(freezes_root.iterdir())
+    if any(path.is_symlink() or not path.is_dir() for path in entries):
+        raise ManifestBuildError("Symile scientific freeze root contains invalid state")
+    directories = entries
+    if not directories:
+        return None
+    if len(directories) != 1:
+        raise ManifestBuildError("Symile scientific freeze selection is ambiguous")
+    freeze_root = directories[0]
+    freeze_id = freeze_root.name
+    if not freeze_id.startswith(PRETEST_FREEZE_PREFIX):
+        raise ManifestBuildError("Persisted pre-test freeze identity is malformed")
     validate_path_component(freeze_id, "Symile pre-test freeze identity")
-    freeze_root = control_root / "freezes" / freeze_id
     freeze_manifest_path = freeze_root / "manifest.json"
     if freeze_root.is_symlink() or not freeze_root.is_dir() or freeze_manifest_path.is_symlink():
         raise ManifestBuildError("Persisted pre-test freeze is invalid")
@@ -542,25 +850,25 @@ def _resolve_opened_pretest_state(
         frozen = json.loads(freeze_manifest_path.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestBuildError("Persisted pre-test freeze is malformed") from exc
-    extension_id = frozen.get("ecg_extension_result_id") if isinstance(frozen, dict) else None
+    decision_id = frozen.get("development_decision_id") if isinstance(frozen, dict) else None
     package_refs = frozen.get("final_packages") if isinstance(frozen, dict) else None
     if (
-        not isinstance(extension_id, str)
+        not isinstance(decision_id, str)
         or not isinstance(package_refs, list)
         or len(package_refs) != FINAL_PACKAGE_COUNT
         or any(
             not isinstance(reference, dict)
-            or set(reference) != {"package_id", "manifest_sha256"}
+            or set(reference) != {"package_id", "family_id", "seed"}
             or not isinstance(reference["package_id"], str)
             for reference in package_refs
         )
     ):
         raise ManifestBuildError("Persisted pre-test freeze is malformed")
-    validate_path_component(extension_id, "ECG extension result identity")
+    validate_path_component(decision_id, "Symile development decision identity")
     for reference in package_refs:
         validate_path_component(reference["package_id"], "Final package identity")
-    extension = validate_ecg_extension_result(
-        report_root / "ecg-extension-results" / extension_id,
+    development_decision = validate_development_decision(
+        report_root / "development-decisions" / decision_id,
         report_root=report_root,
         model_root=model_root / "development",
         prediction_root=private_root,
@@ -575,23 +883,62 @@ def _resolve_opened_pretest_state(
     )
     freeze = validate_pretest_freeze(
         freeze_root,
-        ecg_extension_result=extension,
+        development_decision=development_decision,
         final_packages=packages,
     )
+    return freeze, development_decision, packages
+
+
+def _decision_family_ids(
+    development_decision: ValidatedDevelopmentDecision,
+) -> dict[str, str]:
+    references = development_decision.manifest.get("family_development_ids")
     if (
-        freeze.manifest["science_git_commit"] != science_git_commit
-        or freeze.manifest["dependency_lock_sha256"] != dependency_lock_sha256
+        not isinstance(references, list)
+        or [item.get("family_id") for item in references if isinstance(item, dict)]
+        != list(DEVELOPMENT_FAMILY_ORDER)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"family_id", "development_id"}
+            or not isinstance(item["development_id"], str)
+            for item in references
+        )
     ):
-        raise ManifestBuildError("Opened pre-test freeze differs from current source provenance")
-    record = create_or_validate_test_open_record(control_root=control_root, capability=freeze)
-    return freeze, record, extension, packages
+        raise ManifestBuildError("Symile development decision family membership is invalid")
+    return {str(item["family_id"]): str(item["development_id"]) for item in references}
+
+
+def _ensure_decision_subgroup_derivative(
+    development_decision: ValidatedDevelopmentDecision,
+    *,
+    report_root: Path,
+    model_root: Path,
+    private_root: Path,
+    manifest_root: Path,
+) -> Path:
+    family_ids = _decision_family_ids(development_decision)
+    primary = validate_development_result(
+        report_root / "development/families" / family_ids["cxr_labs_gated"],
+        model_root=model_root / "development",
+        prediction_root=private_root,
+        manifest_root=manifest_root,
+        expected_development_id=family_ids["cxr_labs_gated"],
+    )
+    summary = derive_focused_subgroup_derivative(
+        cxr_development_id=family_ids["cxr_densenet"],
+        primary_repeats=validated_development_repeat_oof(primary, private_root),
+        report_root=report_root,
+        model_root=model_root / "development",
+        prediction_root=private_root,
+        manifest_root=manifest_root,
+    )
+    return publish_focused_subgroup_derivative(report_root=report_root, summary=summary)
 
 
 def _complete_opened_campaign(
     *,
-    freeze: ValidatedPretestFreeze,
-    record: ValidatedTestOpenRecord,
-    ecg_extension: ValidatedEcgExtensionResult,
+    capability: ValidatedHeldOutCapability,
+    development_decision: ValidatedDevelopmentDecision,
     packages: list[ValidatedFinalPackage] | tuple[ValidatedFinalPackage, ...],
     source_root: Path,
     manifest_root: Path,
@@ -602,10 +949,9 @@ def _complete_opened_campaign(
     backup_root: Path,
     runtime: ResolvedDevice,
 ) -> dict[str, str]:
-    analysis_id = str(ecg_extension.manifest["core_analysis_id"])
+    freeze = capability.freeze
     predictions, test_data = publish_frozen_test_predictions(
-        capability=freeze,
-        test_open_record=record,
+        capability=capability,
         final_packages=packages,
         source_root=source_root,
         manifest_root=manifest_root,
@@ -628,8 +974,10 @@ def _complete_opened_campaign(
     )
     export_members = _campaign_export_members(
         freeze=freeze,
-        record=record,
-        ecg_extension=ecg_extension,
+        execution=capability.execution,
+        opening_path=capability.opening.path,
+        live_capability=capability,
+        development_decision=development_decision,
         packages=packages,
         predictions=predictions,
         global_result=global_result,
@@ -645,12 +993,14 @@ def _complete_opened_campaign(
         members=export_members,
         export_root=export_root,
         backup_root=backup_root,
-        export_name=global_result.result_id,
+        export_name=_symile_export_name(
+            global_result_id=global_result.result_id,
+            execution_id=capability.execution.execution_id,
+        ),
         restoration_validator=validate_restored_campaign,
     )
     return {
-        "core_analysis_id": analysis_id,
-        "ecg_extension_result_id": ecg_extension.result_id,
+        "development_decision_id": development_decision.decision_id,
         "pretest_freeze_id": freeze.freeze_id,
         "global_result_id": global_result.result_id,
         "export": archive.as_posix(),
@@ -659,6 +1009,8 @@ def _complete_opened_campaign(
 
 def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     """Recursively validate one campaign from its restored artifact tree."""
+    restoration = _validated_restoration_context(restored_root)
+    restored_root = restoration.root
     manifest_root = restored_root / "data" / "manifests"
     model_root = restored_root / "models" / "symile"
     report_root = restored_root / "reports" / "symile"
@@ -668,13 +1020,13 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     try:
         opened = json.loads(test_open_path.read_bytes())
         freeze_id = opened["freeze_id"]
+        validate_path_component(freeze_id, "Restored Symile freeze identity")
         frozen = json.loads((control_root / "freezes" / freeze_id / "manifest.json").read_bytes())
-        extension_id = frozen["ecg_extension_result_id"]
+        decision_id = frozen["development_decision_id"]
         package_references = frozen["final_packages"]
     except (OSError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestBuildError("Restored campaign control lineage is invalid") from exc
-    validate_path_component(freeze_id, "Restored Symile freeze identity")
-    validate_path_component(extension_id, "Restored ECG extension identity")
+    validate_path_component(decision_id, "Restored development decision identity")
     if not isinstance(package_references, list) or len(package_references) != FINAL_PACKAGE_COUNT:
         raise ManifestBuildError("Restored campaign package lineage is invalid")
     package_ids = []
@@ -683,25 +1035,33 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
             raise ManifestBuildError("Restored campaign package lineage is invalid")
         validate_path_component(reference["package_id"], "Restored final package identity")
         package_ids.append(reference["package_id"])
-    extension = validate_ecg_extension_result(
-        report_root / "ecg-extension-results" / extension_id,
+    development_decision = validate_development_decision(
+        report_root / "development-decisions" / decision_id,
         report_root=report_root,
         model_root=model_root / "development",
         prediction_root=private_root,
         manifest_root=manifest_root,
     )
-    analysis_id = str(extension.manifest["core_analysis_id"])
-    analysis = validate_analysis_result(
-        report_root / "development" / "analyses" / analysis_id,
+    analysis_path = analyze_symile_development(
+        [
+            item["development_id"]
+            for item in development_decision.manifest["family_development_ids"]
+            if item["family_id"] in SYMILE_CORE_DEVELOPMENT_FAMILIES
+        ],
         report_root=report_root / "development",
         model_root=model_root / "development",
         prediction_root=private_root,
         manifest_root=manifest_root,
-        expected_analysis_id=analysis_id,
     )
-    development_ids = (
-        *analysis["family_development_ids"].values(),
-        extension.manifest["ecg_development_id"],
+    analysis = validate_analysis_result(
+        analysis_path,
+        report_root=report_root / "development",
+        model_root=model_root / "development",
+        prediction_root=private_root,
+        manifest_root=manifest_root,
+    )
+    development_ids = tuple(
+        item["development_id"] for item in development_decision.manifest["family_development_ids"]
     )
     developments = tuple(
         validate_development_result(
@@ -713,11 +1073,14 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
         )
         for development_id in development_ids
     )
-    subgroup_id = str(extension.manifest["focused_subgroup_derivative"])
-    subgroup = validate_focused_subgroup_derivative(
-        report_root / "development-subgroups" / f"{subgroup_id}.json",
-        expected_id=subgroup_id,
+    subgroup_path = _ensure_decision_subgroup_derivative(
+        development_decision,
+        report_root=report_root,
+        model_root=model_root,
+        private_root=private_root,
+        manifest_root=manifest_root,
     )
+    subgroup = validate_focused_subgroup_derivative(subgroup_path)
     packages = tuple(
         validate_final_package(
             model_root / "final" / "packages" / package_id,
@@ -727,10 +1090,46 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     )
     freeze = validate_pretest_freeze(
         control_root / "freezes" / freeze_id,
-        ecg_extension_result=extension,
+        development_decision=development_decision,
         final_packages=packages,
     )
-    record = create_or_validate_test_open_record(control_root=control_root, capability=freeze)
+    active_execution = control_root / "active-execution.json"
+    try:
+        active_raw = active_execution.read_bytes()
+        active_document = json.loads(active_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManifestBuildError("Restored active execution receipt is unreadable") from exc
+    execution_id = (
+        active_document.get("execution_id") if isinstance(active_document, dict) else None
+    )
+    expected_active = {"schema_version": 1, "execution_id": execution_id}
+    if (
+        active_execution.is_symlink()
+        or not active_execution.is_file()
+        or not isinstance(execution_id, str)
+        or active_document != expected_active
+        or active_raw != canonical_json_bytes(expected_active)
+    ):
+        raise ManifestBuildError("Restored active execution receipt is invalid")
+    validate_path_component(execution_id, "Restored Symile execution identity")
+    execution = validate_symile_execution(
+        control_root / "executions" / execution_id,
+        expected_execution_id=execution_id,
+    )
+    validate_symile_execution_freeze_science(
+        execution,
+        freeze,
+        report_root=report_root,
+        model_root=model_root,
+        private_root=private_root,
+        manifest_root=manifest_root,
+    )
+    opening_evidence = _validate_preserved_test_open(
+        path=test_open_path,
+        restoration=restoration,
+        freeze=freeze,
+        execution=execution,
+    )
     prediction_root = private_root / "predictions" / "symile" / "test"
     if prediction_root.is_symlink() or not prediction_root.is_dir():
         raise ManifestBuildError("Restored held-out prediction root is invalid")
@@ -747,14 +1146,20 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     ):
         raise ManifestBuildError("Restored held-out prediction membership is invalid")
     predictions = tuple(by_package[package_id] for package_id in package_ids)
-    test_data = FrozenSymileTestData(
+    test_data = RestoredSymileTestData(
+        opening_evidence,
         freeze,
-        record,
         load_final_package_config(packages[0]),
         manifest_root=manifest_root,
     )
     projection = test_data.evaluation_projection()
     for evidence in predictions:
+        validate_restored_test_prediction_publication(
+            evidence,
+            freeze=freeze,
+            execution=execution,
+            opening=opening_evidence,
+        )
         validate_prediction_against_test_projection(
             evidence,
             capability=freeze,
@@ -762,8 +1167,7 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
             expected_package_ids=tuple(package_ids),
         )
     global_directories = tuple((report_root / "global-results").iterdir())
-    error_reviews = tuple((private_root / "error-review" / "symile").iterdir())
-    if len(global_directories) != 1 or len(error_reviews) != 1:
+    if len(global_directories) != 1:
         raise ManifestBuildError("Restored campaign result membership is invalid")
     global_result = validate_global_result(
         global_directories[0],
@@ -772,9 +1176,8 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
         final_packages=packages,
         test_data=test_data,
     )
-    error_review = error_reviews[0]
-    validate_error_review(
-        error_review,
+    error_review = publish_error_review(
+        private_root=private_root,
         capability=freeze,
         predictions=predictions,
         final_packages=packages,
@@ -782,42 +1185,64 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     )
     validate_exact_restored_closure(
         restored_root,
-        _campaign_export_members(
+        _project_campaign_export_members(
             freeze=freeze,
-            record=record,
-            ecg_extension=extension,
+            execution=execution,
+            opening_path=opening_evidence.path,
+            development_decision=development_decision,
+            developments=developments,
             packages=packages,
             predictions=predictions,
             global_result=global_result,
             error_review=error_review,
-            test_data=test_data,
             manifest_root=manifest_root,
             model_root=model_root,
             report_root=report_root,
             private_root=private_root,
+            analysis_path=analysis_path,
+            subgroup_path=subgroup_path,
         ),
     )
-    return RestoredCampaignClosure(
-        freeze=freeze,
-        extension=extension,
-        analysis=analysis,
-        subgroup=subgroup,
-        developments=developments,
-        packages=packages,
-        predictions=predictions,
-        global_result=global_result,
-        test_data=test_data,
+    restored = object.__new__(RestoredCampaignClosure)
+    fields = {
+        "freeze": freeze,
+        "execution": execution,
+        "development_decision": development_decision,
+        "analysis": immutable_json(analysis),
+        "subgroup": immutable_json(subgroup),
+        "developments": tuple(developments),
+        "packages": tuple(packages),
+        "predictions": tuple(predictions),
+        "global_result": require_certified_global_result(global_result),
+        "test_data": test_data,
+        "restored_root": restored_root.resolve(),
+        "restoration_context": restoration,
+    }
+    for name, item in fields.items():
+        object.__setattr__(restored, f"_RestoredCampaignClosure__{name}", item)
+    object.__setattr__(
+        restored,
+        "_RestoredCampaignClosure__authority_state",
+        _restored_authority_state(restored),
     )
+    object.__setattr__(
+        restored,
+        "_RestoredCampaignClosure__guard",
+        _RESTORED_CAMPAIGN_GUARD,
+    )
+    return restored
 
 
 def _campaign_export_members(
     *,
     freeze: ValidatedPretestFreeze,
-    record: ValidatedTestOpenRecord,
-    ecg_extension: ValidatedEcgExtensionResult,
+    execution: ValidatedSymileExecution,
+    opening_path: Path,
+    live_capability: ValidatedHeldOutCapability | None,
+    development_decision: ValidatedDevelopmentDecision,
     packages: list[ValidatedFinalPackage] | tuple[ValidatedFinalPackage, ...],
     predictions: tuple[ValidatedPredictionEvidence, ...],
-    global_result: ValidatedGlobalResult,
+    global_result: CertifiedGlobalResult,
     error_review: Path,
     test_data: FrozenSymileTestData,
     manifest_root: Path,
@@ -826,76 +1251,35 @@ def _campaign_export_members(
     private_root: Path,
 ) -> tuple[PreservationMember, ...]:
     """Resolve the exact recursively validated authority closure for one campaign."""
-    analysis_id = str(ecg_extension.manifest["core_analysis_id"])
-    analysis = validate_analysis_result(
-        report_root / "development" / "analyses" / analysis_id,
-        report_root=report_root / "development",
-        model_root=model_root / "development",
-        prediction_root=private_root,
-        manifest_root=manifest_root,
-        expected_analysis_id=analysis_id,
+    global_result = require_certified_global_result(global_result)
+    if live_capability is None or live_capability._operation is None:
+        raise PermissionError("Preservation requires an active held-out operation")
+    live_capability = require_validated_held_out_capability(live_capability)
+    analysis_path = publish_operation_analysis(
+        live_capability, report_root=report_root / "development"
     )
-    family_development_ids = analysis["family_development_ids"]
-    if set(family_development_ids) != set(SYMILE_CORE_DEVELOPMENT_FAMILIES):
-        raise ManifestBuildError("Campaign core analysis does not contain the exact six families")
-    development_ids = [
-        *(str(family_development_ids[family]) for family in SYMILE_CORE_DEVELOPMENT_FAMILIES),
-        str(ecg_extension.manifest["ecg_development_id"]),
-    ]
-    developments = [
-        validate_development_result(
-            report_root / "development" / "families" / development_id,
-            model_root=model_root / "development",
-            prediction_root=private_root,
-            manifest_root=manifest_root,
-        )
-        for development_id in development_ids
-    ]
-    if [item.manifest["development_id"] for item in developments] != development_ids:
-        raise ManifestBuildError("Campaign development authority order is invalid")
-    cv_ids = {item.manifest["scientific_context"]["cv_assignment_id"] for item in developments}
-    bundle_ids = {item.manifest["scientific_context"]["bundle_id"] for item in developments}
+    validated_freeze = live_capability.freeze
+    validated_decision = validated_freeze.development_decision
+    validated_packages = validated_freeze.final_packages
+    developments = live_capability.frozen_campaign.developments
     if (
-        cv_ids == {None}
-        or len(cv_ids) != 1
-        or bundle_ids != {freeze.manifest["bundle"]["bundle_id"]}
+        validated_freeze != freeze
+        or validated_decision != development_decision
+        or tuple(package.package_id for package in validated_packages)
+        != tuple(package.package_id for package in packages)
+        or live_capability.execution != execution
+        or live_capability.opening.path != opening_path
     ):
-        raise ManifestBuildError("Campaign data authorities are inconsistent")
-    cv_id = str(next(iter(cv_ids)))
-
-    validated_extension = validate_ecg_extension_result(
-        report_root / "ecg-extension-results" / ecg_extension.result_id,
-        report_root=report_root,
-        model_root=model_root / "development",
-        prediction_root=private_root,
-        manifest_root=manifest_root,
-    )
-    validated_packages = tuple(
-        validate_final_package(
-            model_root / "final" / "packages" / package.package_id,
-            expected_package_id=package.package_id,
-        )
-        for package in packages
-    )
-    validated_freeze = validate_pretest_freeze(
-        private_root / "control" / "symile" / "freezes" / freeze.freeze_id,
-        ecg_extension_result=validated_extension,
-        final_packages=validated_packages,
-    )
-    if validated_freeze.manifest_sha256 != freeze.manifest_sha256:
-        raise ManifestBuildError("Campaign freeze changed before export")
-    validated_record = create_or_validate_test_open_record(
-        control_root=private_root / "control" / "symile", capability=freeze
-    )
-    if validated_record != record:
-        raise ManifestBuildError("Campaign test-open record changed before export")
-    validated_global_result = validate_global_result(
+        raise ManifestBuildError("Campaign preservation lifecycle authorities disagree")
+    validated_global_result = validate_global_result_integrity(
         report_root / "global-results" / global_result.result_id,
         capability=freeze,
         predictions=predictions,
         final_packages=packages,
         test_data=test_data,
     )
+    if not global_result.matches_integrity(validated_global_result):
+        raise ManifestBuildError("Campaign global result changed before export")
     validate_error_review(
         error_review,
         capability=freeze,
@@ -904,9 +1288,70 @@ def _campaign_export_members(
         test_data=test_data,
     )
 
+    validated_predictions = tuple(
+        validate_prediction_evidence(
+            private_root / "predictions" / "symile" / "test" / prediction.prediction_id,
+            expected_prediction_id=prediction.prediction_id,
+        )
+        for prediction in predictions
+    )
+    subgroup_path = publish_operation_subgroups(
+        live_capability,
+        report_root=report_root,
+        model_root=model_root,
+        manifest_root=manifest_root,
+    )
+    return _project_campaign_export_members(
+        freeze=validated_freeze,
+        execution=execution,
+        opening_path=opening_path,
+        development_decision=validated_decision,
+        developments=tuple(developments),
+        packages=validated_packages,
+        predictions=validated_predictions,
+        global_result=global_result,
+        error_review=error_review,
+        manifest_root=manifest_root,
+        model_root=model_root,
+        report_root=report_root,
+        private_root=private_root,
+        analysis_path=analysis_path,
+        subgroup_path=subgroup_path,
+    )
+
+
+def _project_campaign_export_members(
+    *,
+    freeze: ValidatedPretestFreeze,
+    execution: ValidatedSymileExecution,
+    opening_path: Path,
+    development_decision: ValidatedDevelopmentDecision,
+    developments: tuple[ValidatedDevelopmentResult, ...],
+    packages: tuple[ValidatedFinalPackage, ...],
+    predictions: tuple[ValidatedPredictionEvidence, ...],
+    global_result: CertifiedGlobalResult,
+    error_review: Path,
+    manifest_root: Path,
+    model_root: Path,
+    report_root: Path,
+    private_root: Path,
+    analysis_path: Path,
+    subgroup_path: Path,
+) -> tuple[PreservationMember, ...]:
+    """Project already validated campaign authorities into exact archive membership."""
+    cv_ids = {item.manifest["scientific_context"]["cv_assignment_id"] for item in developments}
+    if len(cv_ids) != 1 or None in cv_ids:
+        raise ManifestBuildError("Campaign data authorities are inconsistent")
+    cv_id = str(next(iter(cv_ids)))
+
     members: list[PreservationMember] = []
 
-    def add(path: Path, restore_relative: Path) -> None:
+    def add(
+        path: Path,
+        restore_relative: Path,
+        *,
+        role: PreservationRole = "scientific_authority",
+    ) -> None:
         if (
             path.is_symlink()
             or not path.exists()
@@ -914,9 +1359,9 @@ def _campaign_export_members(
             or ".." in restore_relative.parts
         ):
             raise ManifestBuildError("Campaign export authority path is invalid")
-        members.append(PreservationMember(path, restore_relative))
+        members.append(PreservationMember(path, restore_relative, role))
 
-    bundle_id = str(freeze.manifest["bundle"]["bundle_id"])
+    bundle_id = str(freeze.manifest["bundle_id"])
     add(
         manifest_root / "symile" / BUNDLES_DIRECTORY / bundle_id,
         Path("data/manifests/symile") / BUNDLES_DIRECTORY / bundle_id,
@@ -942,43 +1387,54 @@ def _campaign_export_members(
                 private_root / "predictions" / "symile" / "oof" / prediction_id,
                 Path("private/predictions/symile/oof") / prediction_id,
             )
+    add(analysis_path, Path("reports/symile/development/analyses/core"), role="derivative")
     add(
-        report_root / "development" / "analyses" / analysis_id,
-        Path("reports/symile/development/analyses") / analysis_id,
-    )
-    subgroup_id = str(ecg_extension.manifest["focused_subgroup_derivative"])
-    add(
-        report_root / "development-subgroups" / f"{subgroup_id}.json",
-        Path("reports/symile/development-subgroups") / f"{subgroup_id}.json",
+        subgroup_path,
+        Path("reports/symile/development-subgroups") / FOCUSED_SUBGROUP_FILENAME,
+        role="derivative",
     )
     add(
-        validated_extension.directory,
-        Path("reports/symile/ecg-extension-results") / validated_extension.result_id,
+        development_decision.directory,
+        Path("reports/symile/development-decisions") / development_decision.decision_id,
     )
-    for package in validated_packages:
+    for package in packages:
         add(
             package.directory,
             Path("models/symile/final/packages") / package.package_id,
         )
     add(
-        validated_freeze.directory,
-        Path("private/control/symile/freezes") / validated_freeze.freeze_id,
+        freeze.directory,
+        Path("private/control/symile/freezes") / freeze.freeze_id,
     )
-    add(validated_record.path, Path("private/control/symile/test-open.json"))
-    for prediction in predictions:
-        evidence = validate_prediction_evidence(
-            private_root / "predictions" / "symile" / "test" / prediction.prediction_id,
-            expected_prediction_id=prediction.prediction_id,
-        )
+    add(
+        execution.directory,
+        Path("private/control/symile/executions") / execution.execution_id,
+        role="operational_evidence",
+    )
+    add(
+        execution.directory.parent.parent / "active-execution.json",
+        Path("private/control/symile/active-execution.json"),
+        role="operational_evidence",
+    )
+    add(
+        opening_path,
+        Path("private/control/symile/test-open.json"),
+        role="operational_evidence",
+    )
+    for evidence in predictions:
         add(
             evidence.directory,
             Path("private/predictions/symile/test") / evidence.prediction_id,
         )
     add(
-        validated_global_result.directory,
-        Path("reports/symile/global-results") / validated_global_result.result_id,
+        global_result.directory,
+        Path("reports/symile/global-results") / global_result.result_id,
     )
-    add(error_review, Path("private/error-review/symile") / error_review.name)
+    add(
+        error_review,
+        Path("private/error-review/symile") / error_review.name,
+        role="derivative",
+    )
     resolved = [member.path.resolve() for member in members]
     if len(resolved) != len(set(resolved)):
         raise ManifestBuildError("Campaign export authority paths contain duplicates")
@@ -1006,11 +1462,7 @@ def _tracked_final_fit(
         "family_id": config.family.family_id,
         "modalities": serialize_modalities(config.family.modalities),
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "member_seed": str(member_seed),
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "git_commit": str(provenance["git_commit"]),
         "git_dirty": "false",
         "dependency_lock_sha256": str(provenance["dependency_lock_sha256"]),
@@ -1072,7 +1524,7 @@ def _validate_canonical_formal_layout(repository_root: Path) -> None:
             "models/symile/final",
             "reports/symile/development",
             "reports/symile/development-subgroups",
-            "reports/symile/ecg-extension-results",
+            "reports/symile/development-decisions",
             "reports/symile/global-results",
             "private/control/symile",
             "private/predictions/symile",
@@ -1112,9 +1564,9 @@ def _validate_canonical_formal_layout(repository_root: Path) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--backup-root", type=Path, required=True)
+    parser.add_argument("--bundle-id", required=True)
+    parser.add_argument("--cv-assignment-id", required=True)
     return parser
 
 

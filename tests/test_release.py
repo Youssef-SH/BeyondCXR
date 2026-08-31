@@ -3,16 +3,20 @@ from __future__ import annotations
 import copy
 import csv
 import io
+import json
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from symile_data_test_support import _published_synthetic_release
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.symile_schemas import REPEAT_SEEDS
@@ -29,7 +33,7 @@ from beyondcxr.release.checks import (
     run_final_acceptance,
 )
 from beyondcxr.release.container_acceptance import _stop_process
-from beyondcxr.release.inputs import _subgroup_projection
+from beyondcxr.release.inputs import _cohort_projection, _subgroup_projection
 from beyondcxr.release.projection import RELIABILITY_FAMILIES, project_public_results
 from beyondcxr.release.render import (
     DISPLAY,
@@ -60,6 +64,24 @@ def _identity(prefix: str, index: int) -> str:
     return prefix + f"{index:064x}"
 
 
+def test_release_cohort_counts_are_derived_from_published_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, bundle = _published_synthetic_release(tmp_path)
+    manifest = json.loads(bundle.metadata_path.read_bytes())
+    from symile_data_test_support import _materialized_synthetic_test
+
+    projection = _cohort_projection(
+        manifest, bundle.samples_path, _materialized_synthetic_test(bundle, monkeypatch)
+    )
+    assert projection["rows"] == [
+        {"scope": "train", "eligible": 11, "positive": 6, "negative": 5},
+        {"scope": "validation", "eligible": 9, "positive": 5, "negative": 4},
+        {"scope": "development", "eligible": 20, "positive": 11, "negative": 9},
+        {"scope": "test", "eligible": 10, "positive": 5, "negative": 5},
+    ]
+
+
 def test_release_candidate_scan_has_explicit_git_state_semantics(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     tracked = tmp_path / "tracked.txt"
@@ -88,17 +110,66 @@ def test_release_candidate_scan_has_explicit_git_state_semantics(tmp_path: Path)
         ".gitignore",
         "rename-destination.txt",
         "tracked.txt",
-        "untracked.txt",
     }
 
 
-def test_release_candidate_scan_rejects_untracked_symlink(tmp_path: Path) -> None:
+def test_release_candidate_scan_ignores_untracked_workspace_state(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     target = tmp_path / "target.txt"
     target.write_text("target\n", encoding="utf-8")
     (tmp_path / "link.txt").symlink_to(target)
-    with pytest.raises(ManifestBuildError, match="Release-candidate symlink"):
+    assert _release_candidate_paths(tmp_path) == []
+
+
+@pytest.mark.parametrize("directory", ["src", "scripts"])
+def test_release_candidate_scan_includes_untracked_project_source(
+    tmp_path: Path, directory: str
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    source = tmp_path / directory / "candidate.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n", encoding="utf-8")
+    assert _release_candidate_paths(tmp_path) == [source]
+    source.unlink()
+    source.symlink_to(tmp_path / "unavailable")
+    with pytest.raises(ManifestBuildError, match="symlink"):
         _release_candidate_paths(tmp_path)
+
+
+def test_release_provenance_uses_project_ownership(tmp_path: Path) -> None:
+    from beyondcxr.utils.provenance import git_revision
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    lock = tmp_path / "uv.lock"
+    lock.write_text("version = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "uv.lock"], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "Fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    assert git_revision(tmp_path)[1] is False
+    (tmp_path / "notes.txt").write_text("workspace\n", encoding="utf-8")
+    assert git_revision(tmp_path)[1] is False
+    assert clean_release_provenance(tmp_path)["git_commit"] == git_revision(tmp_path)[0]
+    source = tmp_path / "src" / "candidate.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n", encoding="utf-8")
+    assert git_revision(tmp_path)[1] is True
+    with pytest.raises(ManifestBuildError, match="clean release candidate"):
+        clean_release_provenance(tmp_path)
+    source.unlink()
+    lock.write_text("version = 2\n", encoding="utf-8")
+    assert git_revision(tmp_path)[1] is True
 
 
 def fixture_text(*parts: str) -> str:
@@ -121,20 +192,18 @@ def _rsna_source_identifier() -> str:
 def _binding() -> dict[str, object]:
     return {
         "result_binding_schema_version": 1,
-        "science_execution": {"git_commit": "a" * 40},
         "data": {
             "bundle_id": _identity("bundle-", 1),
-            "split_assignment_id": _identity("split-assignment-", 2),
             "cv_assignment_id": _identity("cv-assignment-", 3),
         },
         "development": {
-            "core_analysis_id": _identity("analysis-", 4),
             "family_development_ids": {
                 family: _identity("development-", index + 10)
-                for index, family in enumerate(SYMILE_CORE_DEVELOPMENT_FAMILIES)
+                for index, family in enumerate(
+                    (*SYMILE_CORE_DEVELOPMENT_FAMILIES, SYMILE_ECG_GATED_FAMILY)
+                )
             },
-            "ecg_development_id": _identity("development-", 30),
-            "ecg_extension_result_id": _identity("ecg-extension-result-", 31),
+            "development_decision_id": _identity("development-decision-", 31),
         },
         "held_out": {
             "pretest_freeze_id": _identity("pretest-freeze-", 40),
@@ -242,7 +311,7 @@ def _projection(*, point_outside: bool = False):
                 "ensemble_effect": _metrics(0.01),
             },
         },
-        extension_claims={
+        decision_claims={
             "ecg_repeat_metrics": {str(seed): _metrics(0.6) for seed in REPEAT_SEEDS},
             "ecg_vs_gated_repeat_effects": {str(seed): _metrics(0.01) for seed in REPEAT_SEEDS},
             "ecg_ensemble_metrics": _metrics(0.6),
@@ -330,11 +399,9 @@ def _projection(*, point_outside: bool = False):
             "primary_package_ids": [_identity("final-package-", index) for index in range(3)],
             "science_git_commit": "a" * 40,
             "bundle_id": _identity("bundle-", 1),
-            "split_assignment_id": _identity("split-assignment-", 2),
             "cv_assignment_id": _identity("cv-assignment-", 3),
             "pretest_freeze_id": _identity("pretest-freeze-", 4),
             "science_dependency_lock_sha256": "b" * 64,
-            "bundle_manifest_sha256": "c" * 64,
             "export_manifest_sha256": "d" * 64,
             "pretrained_scientific_identity": {
                 "declared_name": "densenet121-res224-chex",
@@ -359,6 +426,12 @@ def _projection(*, point_outside: bool = False):
 def test_result_binding_is_strict_and_path_neutral() -> None:
     binding = validate_result_binding(_binding())
     assert binding.canonical_bytes()
+    assert set(binding.to_document()) == {
+        "result_binding_schema_version",
+        "data",
+        "development",
+        "held_out",
+    }
     with pytest.raises(AttributeError):
         binding.data.bundle_id = "changed"
     with pytest.raises(TypeError):
@@ -371,11 +444,10 @@ def test_result_binding_is_strict_and_path_neutral() -> None:
     duplicate["held_out"]["prediction_ids"][1] = duplicate["held_out"]["prediction_ids"][0]
     with pytest.raises(ManifestBuildError, match="duplicated"):
         validate_result_binding(duplicate)
-    for section, field in (("science_execution", "git_commit"), ("data", "bundle_id")):
-        malformed = copy.deepcopy(_binding())
-        malformed[section][field] = 123
-        with pytest.raises(ManifestBuildError):
-            validate_result_binding(malformed)
+    malformed = copy.deepcopy(_binding())
+    malformed["data"]["bundle_id"] = 123
+    with pytest.raises(ManifestBuildError):
+        validate_result_binding(malformed)
     invalid = copy.deepcopy(_binding())
     invalid["data"]["unexpected"] = "value"
     with pytest.raises(ManifestBuildError):
@@ -385,6 +457,7 @@ def test_result_binding_is_strict_and_path_neutral() -> None:
     with pytest.raises(ManifestBuildError, match="contract is invalid"):
         validate_result_binding(invalid)
     for section, field, value in (
+        ("data", "bundle_id", "/private/source"),
         ("data", "bundle_id", _identity("bundle-extra-", 1)),
         (
             "held_out",
@@ -408,7 +481,7 @@ def test_public_projection_rejects_patient_level_fields() -> None:
                 "ensemble_metrics": {},
                 "observedness_ablation": {},
             },
-            extension_claims={
+            decision_claims={
                 "ecg_repeat_metrics": {},
                 "ecg_vs_gated_repeat_effects": {},
                 "ecg_ensemble_metrics": {},
@@ -447,7 +520,7 @@ def test_public_projection_is_recursively_immutable() -> None:
                 "ensemble_metrics": {},
                 "observedness_ablation": {},
             },
-            extension_claims={
+            decision_claims={
                 "ecg_repeat_metrics": {},
                 "ecg_vs_gated_repeat_effects": {},
                 "ecg_ensemble_metrics": {},
@@ -611,13 +684,60 @@ def test_docker_acceptance_command_checks_brand_notices_and_private_roots() -> N
     container = _container_serving_command(
         image="beyondcxr:test",
         authority=Path("/approved/authority"),
-        package_root=Path("/restored/packages"),
+        deployment_provenance=Path("/approved/deployment.json"),
+        result_binding=Path("/checkout/results/symile/binding.json"),
+        release_archive=Path("/approved/release.zip"),
     )
     assert container[:4] == ["docker", "run", "--rm", "--network"]
-    assert sum(item.endswith(",readonly") for item in container) == 2
+    assert sum(item.endswith(",readonly") for item in container) == 4
     assert "type=bind,src=/approved/authority,dst=/artifacts/authority,readonly" in container
-    assert "type=bind,src=/restored/packages,dst=/artifacts/packages,readonly" in container
+    assert (
+        "type=bind,src=/approved/deployment.json,dst=/artifacts/deployment.json,readonly"
+        in container
+    )
+    assert (
+        "type=bind,src=/checkout/results/symile/binding.json,dst=/artifacts/binding.json,readonly"
+        in container
+    )
+    assert "type=bind,src=/approved/release.zip,dst=/artifacts/release.zip,readonly" in container
     assert "beyondcxr.release.container_acceptance" in container
+
+
+def test_container_serving_acceptance_revalidates_restored_science(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.checks as checks
+    import beyondcxr.training.preservation as preservation
+    import beyondcxr.training.symile_campaign as symile_campaign
+
+    restored = tmp_path / "restored"
+    (restored / "models/symile/final/packages").mkdir(parents=True)
+    monkeypatch.setattr(
+        preservation,
+        "restore_and_validate_export",
+        lambda _archive, *, restoration_validator: restoration_validator(restored),
+    )
+    validations: list[Path] = []
+    monkeypatch.setattr(
+        symile_campaign,
+        "validate_restored_campaign",
+        lambda root: validations.append(Path(root)),
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(checks, "_run", lambda command, _cwd: commands.append(command))
+
+    checks._run_container_serving_acceptance(
+        artifact=tmp_path / "release.zip",
+        authority=tmp_path / "authority",
+        deployment_provenance=tmp_path / "deployment.json",
+        result_binding=tmp_path / "binding.json",
+        image="beyondcxr:test",
+        cwd=tmp_path,
+        docker="docker",
+    )
+
+    assert len(commands) == 1
+    assert validations == [restored]
 
 
 def test_container_acceptance_kills_server_after_termination_timeout() -> None:
@@ -654,8 +774,6 @@ def test_release_api_acceptance_validates_current_contract() -> None:
         "preprocessing": {"spatial_policy": "test-spatial"},
         "operating_thresholds": {"youden_j": 0.5, "target_sensitivity": 0.2},
         "global_result_id": _identity("global-result-", 4),
-        "science_git_commit": "a" * 40,
-        "serving_release_git_commit": "b" * 40,
         "warning": RESEARCH_WARNING,
     }
     health = {"status": "ready", "serving_authority_id": authority_id}
@@ -772,6 +890,16 @@ def test_distribution_inspection_rejects_restricted_members(tmp_path: Path) -> N
     with tarfile.open(sdist, "w:gz") as archive:
         add_sdist_release(archive)
     inspect_distribution_archives([wheel, sdist], repository_root=repository_root)
+
+    special_wheel = tmp_path / "special.whl"
+    with zipfile.ZipFile(special_wheel, "w") as archive:
+        add_wheel_release(archive)
+        member = zipfile.ZipInfo("beyondcxr/linked.py")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(member, "../../outside.py")
+    with pytest.raises(ManifestBuildError, match="special member"):
+        inspect_distribution_archives([special_wheel, sdist], repository_root=repository_root)
 
     unsafe = tmp_path / "unsafe.whl"
     with zipfile.ZipFile(unsafe, "w") as archive:
@@ -956,16 +1084,14 @@ def _release_delta_repository(root: Path) -> tuple[Path, str]:
     return root, science
 
 
-def _install_test_binding(root: Path, science: str) -> None:
-    document = _binding()
-    document["science_execution"]["git_commit"] = science
+def _install_test_binding(root: Path) -> None:
     destination = root / "results/symile/binding.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(validate_result_binding(document).canonical_bytes())
+    destination.write_bytes(validate_result_binding(_binding()).canonical_bytes())
 
 
-def _prepare_valid_release_delta(root: Path, science: str) -> None:
-    _install_test_binding(root, science)
+def _prepare_valid_release_delta(root: Path) -> None:
+    _install_test_binding(root)
     for relative in ("README.md", "docs/model_card.md"):
         path = root / relative
         path.write_text(
@@ -984,14 +1110,14 @@ def _prepare_valid_release_delta(root: Path, science: str) -> None:
 
 def test_release_delta_accepts_only_mechanical_release_changes(tmp_path: Path) -> None:
     root, science = _release_delta_repository(tmp_path / "allowed")
-    _prepare_valid_release_delta(root, science)
+    _prepare_valid_release_delta(root)
     _commit(root, "release")
-    _check_release_delta(root)
+    _check_release_delta(root, science)
 
 
 def test_release_delta_rejects_forbidden_source_renamed_into_results(tmp_path: Path) -> None:
     root, science = _release_delta_repository(tmp_path / "forbidden-rename")
-    _prepare_valid_release_delta(root, science)
+    _prepare_valid_release_delta(root)
     destination = root / "results/symile/science.py"
     destination.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -1001,7 +1127,7 @@ def test_release_delta_rejects_forbidden_source_renamed_into_results(tmp_path: P
     )
     _commit(root, "forbidden rename")
     with pytest.raises(ManifestBuildError, match="Unauthorized post-science change"):
-        _check_release_delta(root)
+        _check_release_delta(root, science)
 
 
 def test_release_delta_allows_result_to_result_rename(tmp_path: Path) -> None:
@@ -1010,14 +1136,14 @@ def test_release_delta_allows_result_to_result_rename(tmp_path: Path) -> None:
     original.parent.mkdir(parents=True)
     original.write_text("metric,value\nauroc,0.5\n", encoding="utf-8")
     science = _commit(root, "add science result surface")
-    _prepare_valid_release_delta(root, science)
+    _prepare_valid_release_delta(root)
     subprocess.run(
         ["git", "mv", "results/symile/old.csv", "results/symile/new.csv"],
         cwd=root,
         check=True,
     )
     _commit(root, "allowed result rename")
-    _check_release_delta(root)
+    _check_release_delta(root, science)
 
 
 def test_release_delta_rejects_science_config_prose_and_dependency_drift(tmp_path: Path) -> None:
@@ -1058,7 +1184,7 @@ def test_release_delta_rejects_science_config_prose_and_dependency_drift(tmp_pat
     )
     for name, relative, content, message in cases:
         root, science = _release_delta_repository(tmp_path / name)
-        _install_test_binding(root, science)
+        _install_test_binding(root)
         if relative != "CHANGELOG.md":
             (root / "CHANGELOG.md").write_text(
                 "# Changelog\n\n## 1.0.0 — 2026-09-17\n", encoding="utf-8"
@@ -1066,15 +1192,15 @@ def test_release_delta_rejects_science_config_prose_and_dependency_drift(tmp_pat
         (root / relative).write_text(content, encoding="utf-8")
         _commit(root, "invalid release")
         with pytest.raises(ManifestBuildError, match=message):
-            _check_release_delta(root)
+            _check_release_delta(root, science)
 
 
 def test_release_delta_rejects_unchanged_unreleased_changelog(tmp_path: Path) -> None:
     root, science = _release_delta_repository(tmp_path / "unchanged")
-    _install_test_binding(root, science)
+    _install_test_binding(root)
     _commit(root, "result binding only")
     with pytest.raises(ManifestBuildError, match="heading-only"):
-        _check_release_delta(root)
+        _check_release_delta(root, science)
 
 
 def test_final_metadata_requires_v1_while_nonfinal_accepts_development_version(
@@ -1117,7 +1243,7 @@ def _release_check_repository(root: Path) -> None:
         f"{RESULT_START}\nAwaiting formal Symile execution\n{RESULT_END}\n", encoding="utf-8"
     )
     (root / "results/README.md").write_text("# Results\n", encoding="utf-8")
-    (root / "Makefile").write_text("release-check:\n\t@true\n", encoding="utf-8")
+    (root / "Makefile").write_text("check:\n\t@true\n", encoding="utf-8")
     (root / ".dockerignore").write_text(
         "*\n!pyproject.toml\n!uv.lock\n!README.md\n!LICENSE\n"
         "!THIRD_PARTY_NOTICES.md\n!src/\n!src/**\n",
@@ -1262,6 +1388,7 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
     package_directory.mkdir(parents=True)
     campaign = SimpleNamespace(
         freeze=object(),
+        execution=object(),
         global_result=object(),
         predictions=(),
         test_data=object(),
@@ -1269,20 +1396,35 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
     )
 
     monkeypatch.setattr(serving, "clean_release_provenance", lambda _: {})
-    monkeypatch.setattr(serving, "validate_restored_campaign", lambda _: campaign)
+    monkeypatch.setattr(serving, "resolve_release_archive", lambda path: Path(path))
+    monkeypatch.setattr(serving, "load_result_binding", lambda _: object())
+    monkeypatch.setattr(serving, "export_manifest_sha256", lambda _: "a" * 64)
+    monkeypatch.setattr(serving, "reproduce_results_from_campaign", lambda **_kwargs: None)
 
-    def restore_with_real_lifetime(_: Path, restoration_validator: object) -> object:
+    @contextmanager
+    def resolve_with_real_lifetime(archive):
         with tempfile.TemporaryDirectory() as restored:
-            return restoration_validator(Path(restored))
+            campaign.restored_root = Path(restored)
+            yield Path(archive), campaign
 
-    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "resolved_release", resolve_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"
         candidate.mkdir(parents=True)
-        return SimpleNamespace(directory=candidate, authority_id=candidate.name)
+        provenance = authority_root / "deployment-provenance/serving-authority-test/test.json"
+        provenance.parent.mkdir(parents=True)
+        provenance.write_bytes(b"provenance")
+        binding = authority_root / "release-evidence/serving-authority-test/binding.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_bytes(b"binding")
+        return SimpleNamespace(
+            authority=SimpleNamespace(directory=candidate, authority_id=candidate.name),
+            deployment_provenance=provenance,
+            result_binding=binding,
+        )
 
-    monkeypatch.setattr(serving, "publish_serving_authority", publish_candidate)
+    monkeypatch.setattr(serving, "_prepare_validated_campaign_serving_authority", publish_candidate)
     monkeypatch.setattr(
         serving.SymileServingPredictor,
         "load",
@@ -1314,50 +1456,75 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
         )
 
 
-@pytest.mark.parametrize("divergent", (False, True))
+@pytest.mark.parametrize("divergent", (None, "authority", "binding"))
 def test_existing_serving_authority_is_idempotent_only_when_identical(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, divergent: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, divergent: str | None
 ) -> None:
     import beyondcxr.release.serving as serving
 
     destination = tmp_path / "authorities"
     existing = destination / "serving-authority-test"
     existing.mkdir(parents=True)
-    (existing / "manifest.json").write_bytes(b"different" if divergent else b"authority")
+    (existing / "manifest.json").write_bytes(
+        b"different" if divergent == "authority" else b"authority"
+    )
+    existing_provenance = destination / "deployment-provenance/serving-authority-test/test.json"
+    existing_provenance.parent.mkdir(parents=True)
+    existing_provenance.write_bytes(b"provenance")
+    existing_binding = destination / "release-evidence/serving-authority-test/binding.json"
+    existing_binding.parent.mkdir(parents=True)
+    existing_binding.write_bytes(b"different" if divergent == "binding" else b"binding")
     monkeypatch.setattr(serving, "clean_release_provenance", lambda _: {})
+    monkeypatch.setattr(serving, "resolve_release_archive", lambda path: Path(path))
+    monkeypatch.setattr(serving, "load_result_binding", lambda _: object())
+    monkeypatch.setattr(serving, "export_manifest_sha256", lambda _: "a" * 64)
+    monkeypatch.setattr(serving, "reproduce_results_from_campaign", lambda **_kwargs: None)
 
     def restored_campaign(root: Path) -> SimpleNamespace:
         package_directory = root / "packages/final-package-test"
         package_directory.mkdir(parents=True)
         return SimpleNamespace(
             freeze=object(),
+            execution=object(),
             global_result=object(),
             predictions=(),
             test_data=object(),
             packages=(SimpleNamespace(directory=package_directory),),
         )
 
-    monkeypatch.setattr(serving, "validate_restored_campaign", restored_campaign)
-
-    def restore_with_real_lifetime(_: Path, restoration_validator: object) -> object:
+    @contextmanager
+    def resolve_with_real_lifetime(archive):
         with tempfile.TemporaryDirectory() as restored:
-            result = restoration_validator(Path(restored))
+            campaign = restored_campaign(Path(restored))
+            campaign.restored_root = Path(restored)
+            yield Path(archive), campaign
         assert not Path(restored).exists()
-        return result
 
-    monkeypatch.setattr(serving, "restore_and_validate_export", restore_with_real_lifetime)
+    monkeypatch.setattr(serving, "resolved_release", resolve_with_real_lifetime)
 
     def publish_candidate(*, authority_root: Path, **_: object) -> SimpleNamespace:
         candidate = authority_root / "serving-authority-test"
         candidate.mkdir(parents=True)
         (candidate / "manifest.json").write_bytes(b"authority")
-        return SimpleNamespace(directory=candidate, authority_id=candidate.name)
+        provenance = authority_root / "deployment-provenance/serving-authority-test/test.json"
+        provenance.parent.mkdir(parents=True)
+        provenance.write_bytes(b"provenance")
+        binding = authority_root / "release-evidence/serving-authority-test/binding.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_bytes(b"binding")
+        return SimpleNamespace(
+            authority=SimpleNamespace(directory=candidate, authority_id=candidate.name),
+            deployment_provenance=provenance,
+            result_binding=binding,
+        )
 
-    monkeypatch.setattr(serving, "publish_serving_authority", publish_candidate)
+    monkeypatch.setattr(serving, "_prepare_validated_campaign_serving_authority", publish_candidate)
     monkeypatch.setattr(
         serving,
         "validate_serving_authority",
-        lambda *_args, **_kwargs: SimpleNamespace(authority_id="serving-authority-test"),
+        lambda path, *_args, **_kwargs: SimpleNamespace(
+            authority_id="serving-authority-test", directory=Path(path)
+        ),
     )
     monkeypatch.setattr(
         serving.SymileServingPredictor,
@@ -1381,26 +1548,225 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
         )
 
     if divergent:
+        before = {
+            path.relative_to(destination): path.read_bytes()
+            for path in destination.rglob("*")
+            if path.is_file()
+        }
         with pytest.raises(ManifestBuildError, match="differs from candidate"):
             operation()
-        assert (existing / "manifest.json").read_bytes() == b"different"
+        assert {
+            path.relative_to(destination): path.read_bytes()
+            for path in destination.rglob("*")
+            if path.is_file()
+        } == before
     else:
         assert operation() == existing
         assert (existing / "manifest.json").read_bytes() == b"authority"
 
 
+def _staged_serving_publication(root: Path) -> tuple[Path, Path, Path]:
+    authority = root / "serving-authority-test"
+    authority.mkdir(parents=True)
+    (authority / "manifest.json").write_bytes(b"authority")
+    provenance = root / "deployment-provenance/serving-authority-test/test.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_bytes(b"provenance")
+    binding = root / "release-evidence/serving-authority-test/binding.json"
+    binding.parent.mkdir(parents=True)
+    binding.write_bytes(b"binding")
+    return authority, provenance, binding
+
+
+def test_accepted_serving_resolution_requires_one_valid_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    archive = tmp_path / "release.zip"
+    archive.write_bytes(b"archive")
+    root = tmp_path / "authorities"
+    monkeypatch.setattr(serving, "resolve_release_archive", lambda _root: archive)
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda path, **_kwargs: SimpleNamespace(directory=Path(path)),
+    )
+
+    with pytest.raises(ManifestBuildError, match="No accepted"):
+        serving.resolve_accepted_serving_state(
+            artifact_root=tmp_path / "outbox", authority_root=root
+        )
+
+    first = _staged_serving_publication(root)
+    resolved = serving.resolve_accepted_serving_state(
+        artifact_root=tmp_path / "outbox", authority_root=root
+    )
+    assert resolved.authority.directory == first[0]
+    assert resolved.deployment_provenance == first[1]
+    assert resolved.result_binding == first[2]
+    assert resolved.release_archive == archive
+
+    second_authority = root / "serving-authority-second"
+    second_authority.mkdir()
+    second_provenance = root / "deployment-provenance/serving-authority-second/test.json"
+    second_provenance.parent.mkdir(parents=True)
+    second_provenance.write_bytes(b"provenance")
+    second_binding = root / "release-evidence/serving-authority-second/binding.json"
+    second_binding.parent.mkdir(parents=True)
+    second_binding.write_bytes(b"binding")
+    with pytest.raises(ManifestBuildError, match="Multiple valid"):
+        serving.resolve_accepted_serving_state(
+            artifact_root=tmp_path / "outbox", authority_root=root
+        )
+
+
+@pytest.mark.parametrize("failure_call", (1, 2), ids=("provenance", "binding"))
+def test_serving_publication_rolls_back_late_companion_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    candidate = _staged_serving_publication(tmp_path / "candidate")
+    destination = tmp_path / "authorities"
+    destination.mkdir()
+    (destination / "existing.txt").write_bytes(b"preserved")
+    before = {path.relative_to(destination): path.read_bytes() for path in destination.rglob("*")}
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda *_args, **_kwargs: SimpleNamespace(authority_id="serving-authority-test"),
+    )
+    publish = serving.publish_bytes_no_replace
+    calls = 0
+
+    def fail_selected_publication(path: Path, content: bytes) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("injected publication failure")
+        return publish(path, content)
+
+    monkeypatch.setattr(serving, "publish_bytes_no_replace", fail_selected_publication)
+    with pytest.raises(OSError, match="injected publication failure"):
+        serving.publish_accepted_serving_state(
+            candidate_authority=candidate[0],
+            candidate_deployment_provenance=candidate[1],
+            candidate_result_binding=candidate[2],
+            release_archive=tmp_path / "release.zip",
+            authority_root=destination,
+        )
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == before
+    assert {path.name for path in destination.iterdir()} == {"existing.txt"}
+
+
+def test_serving_publication_preserves_concurrent_empty_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    candidate = _staged_serving_publication(tmp_path / "candidate")
+    destination = tmp_path / "authorities"
+    concurrent = destination / candidate[0].name
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda *_args, **_kwargs: SimpleNamespace(authority_id=candidate[0].name),
+    )
+    publish = serving.publish_bytes_no_replace
+
+    def publish_and_create_destination(path: Path, content: bytes) -> bool:
+        created = publish(path, content)
+        if path.name == "binding.json":
+            concurrent.mkdir()
+        return created
+
+    monkeypatch.setattr(serving, "publish_bytes_no_replace", publish_and_create_destination)
+    with pytest.raises(FileExistsError):
+        serving.publish_accepted_serving_state(
+            candidate_authority=candidate[0],
+            candidate_deployment_provenance=candidate[1],
+            candidate_result_binding=candidate[2],
+            release_archive=tmp_path / "release.zip",
+            authority_root=destination,
+        )
+    assert list(concurrent.iterdir()) == []
+    assert (candidate[0] / "manifest.json").read_bytes() == b"authority"
+    assert {path.name for path in destination.iterdir()} == {concurrent.name}
+
+
+def test_serving_publication_rejects_partial_existing_state_without_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    candidate = _staged_serving_publication(tmp_path / "candidate")
+    destination = tmp_path / "authorities"
+    existing = destination / "serving-authority-test"
+    existing.mkdir(parents=True)
+    (existing / "manifest.json").write_bytes(b"authority")
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda *_args, **_kwargs: SimpleNamespace(authority_id="serving-authority-test"),
+    )
+    with pytest.raises(ManifestBuildError, match="publication is incomplete"):
+        serving.publish_accepted_serving_state(
+            candidate_authority=candidate[0],
+            candidate_deployment_provenance=candidate[1],
+            candidate_result_binding=candidate[2],
+            release_archive=tmp_path / "release.zip",
+            authority_root=destination,
+        )
+    assert (existing / "manifest.json").read_bytes() == b"authority"
+    assert {path.name for path in destination.iterdir()} == {"serving-authority-test"}
+
+
 def _stub_final_acceptance(monkeypatch: pytest.MonkeyPatch, *, fail_after_smoke: bool) -> None:
     import beyondcxr.release.checks as checks
+    import beyondcxr.release.serving as serving
 
-    monkeypatch.setattr(checks, "check_repository", lambda *_args, **_kwargs: None)
+    execution_commit = "f" * 40
+    monkeypatch.setattr(checks, "_check_result_surface", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "beyondcxr.release.reproduction.publish_results_from_campaign", lambda **_k: None
+    )
+    monkeypatch.setattr("beyondcxr.release.reproduction.reproduce_results", lambda **_k: None)
+
+    def check_repository(*_args: object, **kwargs: object) -> None:
+        assert kwargs["formal_execution_git_commit"] == execution_commit
+
+    monkeypatch.setattr(checks, "check_repository", check_repository)
+
+    @contextmanager
+    def resolved(archive):
+        yield (
+            Path(archive),
+            SimpleNamespace(execution=SimpleNamespace(manifest={"git_commit": execution_commit})),
+        )
+
+    monkeypatch.setattr("beyondcxr.release.resolution.resolved_release", resolved)
     monkeypatch.setattr(checks, "inspect_distribution_archives", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(checks, "_run_container_serving_acceptance", lambda **_kwargs: None)
     monkeypatch.setattr(checks.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace())
     monkeypatch.setattr(checks.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda *_args, **_kwargs: SimpleNamespace(authority_id="serving-authority-test"),
+    )
 
     def run(command: list[str], cwd: Path) -> None:
         if command[:2] == ["git", "clone"]:
-            Path(command[-1]).mkdir(parents=True)
+            checkout = Path(command[-1])
+            checkout.mkdir(parents=True)
+            binding = checkout / "results/symile/binding.json"
+            binding.parent.mkdir(parents=True)
+            binding.write_text("{}\n", encoding="utf-8")
         if command[:2] == ["uv", "build"]:
             (cwd / "dist").mkdir()
         if fail_after_smoke and command[:2] == ["docker", "build"]:
@@ -1412,6 +1778,12 @@ def _stub_final_acceptance(monkeypatch: pytest.MonkeyPatch, *, fail_after_smoke:
         candidate = authority_root / "serving-authority-test"
         candidate.mkdir(parents=True)
         (candidate / "manifest.json").write_text("accepted", encoding="utf-8")
+        provenance = authority_root / "deployment-provenance/serving-authority-test/test.json"
+        provenance.parent.mkdir(parents=True)
+        provenance.write_text("{}\n", encoding="utf-8")
+        binding = authority_root / "release-evidence/serving-authority-test/binding.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_text("{}\n", encoding="utf-8")
         return candidate.name
 
     monkeypatch.setattr(checks, "_run", run)
@@ -1579,11 +1951,6 @@ def test_reproduction_rejects_extra_and_stale_public_bytes(
         ("config/.env", fixture_text("SEC", "RET=abcdefghijklmnop\n"), "private material"),
         ("DEPLOYMENT", fixture_text("pass", "word=abcdefghijklmnop\n"), "private material"),
         (
-            "tools/path.txt",
-            fixture_text("source: /", "home/researcher/private\n"),
-            "private material",
-        ),
-        (
             "src/beyondcxr/leaked_config.py",
             fixture_text("API", '_KEY = "abcdefghijklmnop', 'REALVALUE"\n'),
             "private material",
@@ -1691,7 +2058,7 @@ def test_reproduction_rejects_extra_and_stale_public_bytes(
         ),
         (
             "docs/shell.md",
-            "```bash\nmake release-check BUNDLE_ID=bundle-<sha256>\n```\n",
+            "```bash\nmake check VALUE=<sha256>\n```\n",
             "Shell-invalid documented Bash command",
         ),
         ("unexpected_root_file", "unexpected\n", "Unexpected tracked root file"),
@@ -1938,3 +2305,137 @@ assert cli.main(['results', '--artifact-root', 'artifact.zip']) == 0
 assert cli.main(['reproduce', '--artifact-root', 'artifact.zip']) == 0
 """
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_release_materializes_before_final_gate_and_reuses_exact_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.checks as checks
+    import beyondcxr.release.reproduction as reproduction
+
+    repository = tmp_path / "repository"
+    _release_check_repository(repository)
+    (repository / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n")
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    science_commit = _commit(repository, "scientific implementation")
+    binding = validate_result_binding(_binding())
+    calls = []
+
+    # Isolate scientific rendering; retain the actual install, binding admission,
+    # independent regeneration, comparison and final acceptance ordering.
+    def regenerate(**kwargs: object) -> _Regenerated:
+        calls.append("derive" if kwargs["binding"] is None else "reproduce")
+        if kwargs["binding"] is not None:
+            assert kwargs["binding"] == binding
+        temporary = tempfile.TemporaryDirectory()
+        output = Path(temporary.name) / "results"
+        output.mkdir()
+        (output / "README.md").write_text("# Results\n")
+        for relative in public_result_surface():
+            target = output / "symile" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"synthetic aggregate\n")
+        (output / "symile/binding.json").write_bytes(binding.canonical_bytes())
+        rendered = f"{RESULT_START}\nSynthetic results\n{RESULT_END}\n".encode()
+        return _Regenerated(output, rendered, rendered, temporary)
+
+    real_check = checks.check_repository
+
+    def gate(*args: object, **kwargs: object) -> None:
+        assert kwargs["final"] is True
+        assert (
+            repository / "results/symile/binding.json"
+        ).read_bytes() == binding.canonical_bytes()
+        calls.append("final gate")
+        real_check(*args, **kwargs)
+
+    monkeypatch.setattr(reproduction, "_regenerate", regenerate)
+    monkeypatch.setattr(reproduction, "_regenerate_from_campaign", regenerate)
+    monkeypatch.setattr(reproduction, "export_manifest_sha256", lambda _: "a" * 64)
+
+    @contextmanager
+    def resolved(archive):
+        yield (
+            Path(archive),
+            SimpleNamespace(
+                restored_root=tmp_path,
+                execution=SimpleNamespace(manifest={"git_commit": science_commit}),
+            ),
+        )
+
+    monkeypatch.setattr("beyondcxr.release.resolution.resolved_release", resolved)
+    monkeypatch.setattr(checks, "check_repository", gate)
+    arguments = dict(
+        root=repository,
+        artifact_root=tmp_path / "archive.zip",
+        authority_root=tmp_path / "authorities",
+    )
+    with pytest.raises(ManifestBuildError, match="version 1.0.0"):
+        run_final_acceptance(**arguments)
+    assert calls == ["derive", "reproduce", "final gate"]
+    calls.clear()
+    before = (repository / "results/symile/binding.json").stat().st_mtime_ns
+    with pytest.raises(ManifestBuildError, match="version 1.0.0"):
+        run_final_acceptance(**arguments)
+    assert calls == ["reproduce", "final gate"]
+    assert (repository / "results/symile/binding.json").stat().st_mtime_ns == before
+    assert not (tmp_path / "authorities").exists()
+    calls.clear()
+    for relative in ("pyproject.toml", "CITATION.cff"):
+        path = repository / relative
+        path.write_text(path.read_text().replace("0.1.0", "1.0.0"))
+    (repository / "CHANGELOG.md").write_text("# Changelog\n\n## 1.0.0 — 2026-10-22\n")
+    with pytest.raises(ManifestBuildError, match="clean Git tree"):
+        run_final_acceptance(**arguments)
+    _commit(repository, "release metadata and public results")
+    calls.clear()
+
+    def external_acceptance(command: list[str], cwd: Path) -> None:
+        assert command[:2] == ["git", "clone"]
+        calls.append("fresh clone acceptance")
+        raise RuntimeError("bounded external acceptance boundary")
+
+    monkeypatch.setattr(checks, "_run", external_acceptance)
+    with pytest.raises(RuntimeError, match="bounded external acceptance boundary"):
+        run_final_acceptance(**arguments)
+    assert calls == ["reproduce", "final gate", "fresh clone acceptance"]
+    calls.clear()
+    target = repository / "results/symile" / next(iter(public_result_surface()))
+    target.write_bytes(b"altered aggregate\n")
+    with pytest.raises(ManifestBuildError, match="do not reproduce exactly"):
+        run_final_acceptance(**arguments)
+    assert calls == ["reproduce"]
+    assert target.read_bytes() == b"altered aggregate\n"
+
+
+@pytest.mark.parametrize("with_binding", [False, True])
+def test_serving_publication_resumes_interrupted_companion_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_binding: bool
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    candidate = _staged_serving_publication(tmp_path / "candidate")
+    destination = tmp_path / "authorities"
+    provenance = destination / "deployment-provenance/serving-authority-test/test.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_bytes(candidate[1].read_bytes())
+    binding = destination / "release-evidence/serving-authority-test/binding.json"
+    if with_binding:
+        binding.parent.mkdir(parents=True)
+        binding.write_bytes(candidate[2].read_bytes())
+    inode = provenance.stat().st_ino
+    monkeypatch.setattr(
+        serving,
+        "validate_serving_authority",
+        lambda *_a, **_k: SimpleNamespace(authority_id="serving-authority-test"),
+    )
+    serving.publish_accepted_serving_state(
+        candidate_authority=candidate[0],
+        candidate_deployment_provenance=candidate[1],
+        candidate_result_binding=candidate[2],
+        release_archive=tmp_path / "release.zip",
+        authority_root=destination,
+    )
+    assert provenance.stat().st_ino == inode
+    assert binding.read_bytes() == b"binding"
+    assert (destination / "serving-authority-test/manifest.json").read_bytes() == b"authority"

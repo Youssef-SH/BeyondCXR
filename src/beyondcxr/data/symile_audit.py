@@ -10,12 +10,15 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
-import pyarrow.parquet as pq
 
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import sha256_file
-from beyondcxr.data.symile_artifacts import resolve_symile_bundle
-from beyondcxr.data.symile_schemas import LAB_ITEM_IDS, LAB_NAMES, OFFICIAL_SPLITS
+from beyondcxr.data.symile_artifacts import (
+    read_symile_labs,
+    read_symile_samples,
+    resolve_symile_bundle,
+    strict_pneumonia_rows,
+)
+from beyondcxr.data.symile_schemas import DEVELOPMENT_SPLITS, LAB_ITEM_IDS, LAB_NAMES
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
     configure_logging,
@@ -44,10 +47,9 @@ def generate_symile_audit(
             bundle_id=bundle_id,
             full_validation=True,
         )
-        samples = pq.read_table(bundle.samples_path).to_pandas()
-        labs = pq.read_table(bundle.labs_path).to_pandas()
+        samples = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
+        labs = read_symile_labs(bundle, sample_ids=samples["sample_id"].astype(str).tolist())
         metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
-        manifest_sha256 = sha256_file(bundle.metadata_path)
     destination = Path(output_directory) / bundle.bundle_id
     stage = staging_directory(destination)
     try:
@@ -59,7 +61,7 @@ def generate_symile_audit(
             lineterminator="\n",
         )
         (stage / AUDIT_FILENAME).write_text(
-            _audit_markdown(bundle.bundle_id, manifest_sha256, metadata, samples),
+            _audit_markdown(bundle.bundle_id, metadata, samples),
             encoding="utf-8",
         )
         if {path.name for path in stage.iterdir()} != set(REPORT_FILENAMES):
@@ -78,8 +80,6 @@ def generate_symile_audit(
             shutil.rmtree(stage)
     return {
         "bundle_id": bundle.bundle_id,
-        "bundle_manifest_sha256": manifest_sha256,
-        "split_assignment_id": metadata["membership"]["split_assignment_id"],
         "report_directory": destination.as_posix(),
         "reports": list(REPORT_FILENAMES),
     }
@@ -89,14 +89,8 @@ def _laboratory_missingness(samples: pd.DataFrame, labs: pd.DataFrame) -> pd.Dat
     frame = samples[["sample_id", "official_split"]].merge(
         labs, on="sample_id", validate="one_to_one"
     )
-    scopes = [("overall", frame)]
-    scopes.extend((split, frame.loc[frame["official_split"] == split]) for split in OFFICIAL_SPLITS)
-    scopes.append(
-        (
-            "development",
-            frame.loc[frame["official_split"].isin(["train", "validation"])],
-        )
-    )
+    scopes = [(split, frame.loc[frame["official_split"] == split]) for split in DEVELOPMENT_SPLITS]
+    scopes.append(("development", frame))
     records: list[dict[str, object]] = []
     for scope, scoped in scopes:
         for item_id in LAB_ITEM_IDS:
@@ -118,53 +112,34 @@ def _laboratory_missingness(samples: pd.DataFrame, labs: pd.DataFrame) -> pd.Dat
 
 def _audit_markdown(
     bundle_id: str,
-    manifest_sha256: str,
     metadata: dict[str, object],
     samples: pd.DataFrame,
 ) -> str:
-    membership = metadata["membership"]
     counts = metadata["qualification"]["membership_counts"]
-    strict = metadata["qualification"]["strict_pneumonia_counts"]
+    strict = _development_strict_counts(samples)
     asset_count = len(metadata["source"]["source_assets"])
     lines = [
         "# Symile-MIMIC data audit",
         "",
         f"- Dataset release: Symile-MIMIC {metadata['dataset']['release']}",
         f"- Bundle ID: `{bundle_id}`",
-        f"- Bundle-manifest SHA-256: `{manifest_sha256}`",
-        f"- Official split assignment ID: `{membership['split_assignment_id']}`",
+        "- Development membership: intrinsic to the bundle samples table",
         f"- Authenticated official source assets: {asset_count:,}",
         "- Source authentication: passed",
         "",
-        "## Official membership and reconciliation",
+        "## Development membership",
         "",
-        (
-            f"The authenticated full source contains {counts['full_admissions']:,} admissions. "
-            f"The official classification spine contains {counts['official_admissions']:,}: "
-            f"{counts['train_admissions']:,} train, "
-            f"{counts['validation_admissions']:,} validation, and "
-            f"{counts['test_admissions']:,} positive test queries."
-        ),
-        "",
-        (
-            f"The remaining {counts['excluded_admissions']:,} admissions comprise "
-            f"{counts['train_subject_exclusions']:,} admissions excluded because their patients "
-            f"were assigned to train and {counts['validation_subject_exclusions']:,} excluded "
-            "because their patients were assigned to validation. Unexplained exclusions: "
-            f"{counts['unexplained_exclusions']:,}."
-        ),
-        "",
-        "- Admission overlap across official splits: 0",
-        "- Patient overlap across official splits: 0",
-        "- Retrieval-negative rows used as classification samples: 0",
-        "- Validation retrieval rows used as a classification split: 0",
+        f"- Train admissions: {counts['train_admissions']:,}",
+        f"- Validation admissions: {counts['validation_admissions']:,}",
+        "- Development admission and patient overlap: 0",
+        "- Complete source reconciliation and test qualification require authorized opening.",
         "",
         "## Strict pneumonia",
         "",
         "| Scope | Eligible | Positive | Negative |",
         "| --- | ---: | ---: | ---: |",
     ]
-    for scope in ("train", "validation", "development", "test"):
+    for scope in ("train", "validation", "development"):
         entry = strict[scope]
         lines.append(
             f"| {scope} | {entry['eligible']:,} | {entry['positive']:,} | {entry['negative']:,} |"
@@ -178,7 +153,7 @@ def _audit_markdown(
                 "infectious-pneumonia diagnosis lies outside the endpoint definition."
             ),
             "",
-            "## Modality qualification",
+            "## Development modality qualification",
             "",
             "- Common split/source-row alignment: passed",
             (
@@ -204,7 +179,7 @@ def _audit_markdown(
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for split in OFFICIAL_SPLITS:
+    for split in DEVELOPMENT_SPLITS:
         scoped = samples.loc[samples["official_split"] == split]
         lines.append(
             f"| {split} | {len(scoped):,} | {scoped['subject_id'].nunique():,} | "
@@ -234,6 +209,23 @@ def _audit_markdown(
         ]
     )
     return "\n".join(lines)
+
+
+def _development_strict_counts(samples: pd.DataFrame) -> dict[str, dict[str, int]]:
+    result: dict[str, dict[str, int]] = {}
+    for split in DEVELOPMENT_SPLITS:
+        eligible = strict_pneumonia_rows(samples.loc[samples["official_split"] == split].copy())
+        positive = int((eligible["target"] == 1).sum())
+        result[split] = {
+            "eligible": len(eligible),
+            "positive": positive,
+            "negative": len(eligible) - positive,
+        }
+    result["development"] = {
+        key: sum(result[split][key] for split in DEVELOPMENT_SPLITS)
+        for key in ("eligible", "positive", "negative")
+    }
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:

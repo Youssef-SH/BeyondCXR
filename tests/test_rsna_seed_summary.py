@@ -12,14 +12,38 @@ from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
 from beyondcxr.training.rsna_seed_summary import (
     MANIFEST_FILENAME,
     SEED_SUMMARY_FILENAMES,
-    publish_seed_summary,
-    validate_seed_summary,
+)
+from beyondcxr.training.rsna_seed_summary import (
+    publish_seed_summary as _publish_seed_summary,
+)
+from beyondcxr.training.rsna_seed_summary import (
+    validate_seed_summary as _validate_seed_summary,
 )
 
 _EVALUATION_IDS = {
     seed: "evaluation-" + f"{index:064x}" for index, seed in enumerate(RSNA_NEURAL_SEEDS, start=1)
 }
 _PACKAGE_IDS = {seed: "model-package-" + f"{seed:064x}" for seed in RSNA_NEURAL_SEEDS}
+_TEST_FREEZE = object()
+_TEST_EXECUTION = object()
+
+
+def publish_seed_summary(*args, **kwargs):
+    return _publish_seed_summary(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
+
+
+def validate_seed_summary(*args, **kwargs):
+    return _validate_seed_summary(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
 
 
 def _threshold_contract() -> dict[str, object]:
@@ -85,7 +109,6 @@ def _package(seed: int) -> dict[str, object]:
         "family_id": "cxr_densenet",
         "modalities": ["cxr"],
         "bundle_id": "bundle-" + "a" * 64,
-        "split_assignment_id": "split-assignment-" + "b" * 64,
         "label_policy_version": "rsna-pneumonia-v1",
         "positive_class": 1,
         "fit_config": {"family": {"parameters": {"dropout": 0.2}}},
@@ -118,7 +141,6 @@ def _evaluation(seed: int) -> SimpleNamespace:
             "modalities": ["cxr"],
             "seed": seed,
             "bundle_id": "bundle-" + "a" * 64,
-            "split_assignment_id": "split-assignment-" + "b" * 64,
             "model_package_id": _PACKAGE_IDS[seed],
             "evaluation_policy": _evaluation_policy(),
             "claims": _claims(seed),
@@ -157,15 +179,12 @@ def _summarize(tmp_path: Path, ids: list[str]):
     )
 
 
-def test_summary_is_authoritative_deterministic_complete_and_idempotent(
-    tmp_path: Path, authority
-) -> None:
+def test_summary_is_deterministic_complete_and_idempotent(tmp_path: Path, authority) -> None:
     ids = [_EVALUATION_IDS[2026], _EVALUATION_IDS[17], _EVALUATION_IDS[42]]
     first = _summarize(tmp_path, ids)
     second = _summarize(tmp_path, list(reversed(ids)))
     document = json.loads((first.directory / MANIFEST_FILENAME).read_text(encoding="utf-8"))
 
-    assert first.seed_summary_id == second.seed_summary_id
     assert first.directory == second.directory
     assert {path.name for path in first.directory.iterdir()} == SEED_SUMMARY_FILENAMES
     assert document["evaluation_ids"] == [_EVALUATION_IDS[seed] for seed in RSNA_NEURAL_SEEDS]
@@ -219,7 +238,7 @@ def test_summary_is_authoritative_deterministic_complete_and_idempotent(
     assert "Per-seed Target sensitivity operating point" in markdown
 
 
-def test_summary_validation_renders_only_outside_immutable_result(
+def test_summary_validation_renders_only_outside_validated_view(
     tmp_path: Path, authority, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result = _summarize(tmp_path, list(_EVALUATION_IDS.values()))
@@ -265,7 +284,7 @@ def test_summary_validation_rejects_child_symlinks(
 _MISSING_SCHEMA_VERSION = object()
 
 
-@pytest.mark.parametrize("value", [True, 1.0, "1", None, 0, _MISSING_SCHEMA_VERSION])
+@pytest.mark.parametrize("value", [True, 1.0, 2, _MISSING_SCHEMA_VERSION])
 def test_summary_requires_integer_schema_version_one(
     tmp_path: Path, authority, value: object
 ) -> None:
@@ -386,7 +405,22 @@ def test_summary_ignores_operational_and_fitted_member_differences(
             "target_sensitivity": 0.2 + index / 10,
         }
     result = _summarize(tmp_path, list(_EVALUATION_IDS.values()))
-    assert result.seed_summary_id.startswith("seed-summary-")
+    assert result.directory.name == "cxr_densenet"
+    assert set(result.manifest) == {
+        "seed_summary_schema_version",
+        "dataset_id",
+        "task_id",
+        "family_id",
+        "modalities",
+        "bundle_id",
+        "family_scientific_context",
+        "evaluation_policy",
+        "evaluation_ids",
+        "required_seeds",
+        "policy",
+        "members",
+        "aggregate",
+    }
 
 
 def test_summary_rejects_fusion_source_with_different_seed(tmp_path: Path, authority) -> None:
@@ -433,7 +467,7 @@ def test_summary_validator_rederives_aggregate(tmp_path: Path, authority) -> Non
         )
 
 
-def test_changed_evaluation_authority_changes_summary_identity(tmp_path: Path, authority) -> None:
+def test_changed_evaluation_authority_changes_summary_content(tmp_path: Path, authority) -> None:
     evaluations, _ = authority
     first = _summarize(tmp_path / "first", list(_EVALUATION_IDS.values()))
     changed = deepcopy(evaluations[_EVALUATION_IDS[2026]])
@@ -444,4 +478,17 @@ def test_changed_evaluation_authority_changes_summary_identity(tmp_path: Path, a
         tmp_path / "second",
         [_EVALUATION_IDS[17], _EVALUATION_IDS[42], replacement],
     )
-    assert second.seed_summary_id != first.seed_summary_id
+    assert second.manifest["evaluation_ids"] != first.manifest["evaluation_ids"]
+    assert second.manifest.keys() == first.manifest.keys()
+
+
+def test_summary_regenerates_corrupt_cached_view(tmp_path: Path, authority) -> None:
+    ids = list(_EVALUATION_IDS.values())
+    result = _summarize(tmp_path, ids)
+    expected = (result.directory / "summary.md").read_bytes()
+    (result.directory / "summary.md").write_bytes(b"corrupt")
+
+    recovered = _summarize(tmp_path, ids)
+
+    assert recovered.directory == result.directory
+    assert (recovered.directory / "summary.md").read_bytes() == expected

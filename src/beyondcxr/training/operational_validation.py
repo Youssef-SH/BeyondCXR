@@ -9,6 +9,43 @@ from pathlib import Path
 from beyondcxr.data.errors import ManifestBuildError
 
 
+def validate_directory_chain(
+    trusted_root: str | Path,
+    target: str | Path,
+    context: str,
+    *,
+    create: bool = False,
+) -> Path:
+    """Validate each path component below one trusted root without following symlinks."""
+    root = Path(trusted_root).absolute()
+    destination = Path(target).absolute()
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise ManifestBuildError(f"{context} escapes its trusted root") from exc
+    if ".." in relative.parts:
+        raise ManifestBuildError(f"{context} escapes its trusted root")
+    current = root
+    for part in (".", *relative.parts):
+        if part != ".":
+            current = current / part
+        if current.is_symlink():
+            raise ManifestBuildError(f"{context} contains a symlink")
+        if current.exists():
+            if not current.is_dir():
+                raise ManifestBuildError(f"{context} contains a non-directory component")
+            continue
+        if not create:
+            raise ManifestBuildError(f"{context} is unavailable")
+        try:
+            current.mkdir()
+        except OSError as exc:
+            raise ManifestBuildError(f"{context} cannot be created safely") from exc
+        if current.is_symlink() or not current.is_dir():
+            raise ManifestBuildError(f"{context} was not created safely")
+    return destination.resolve()
+
+
 def validate_writable_directory_destination(value: str | Path, context: str) -> Path:
     """Validate one existing or prospective writable directory without creating it."""
     return _validate_destination_kind(value, context, kind="directory")

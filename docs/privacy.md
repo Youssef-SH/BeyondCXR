@@ -54,8 +54,9 @@ status.
 The destination must be separately approved, persistent, and outside the resolved repository root.
 Local MLflow databases and `mlartifacts/` are private operational state, not public exports.
 Handled scientific-command failures report exception types without copying exception text into
-stderr. The interactive `rsna-inspect` utility deliberately displays source metadata and pixels:
-use it only in an authorized private session and do not publish its output or screenshots.
+stderr. The interactive command `uv run python scripts/inspect_dicom.py IMAGE.dcm` displays source
+metadata and pixels. Use it only in an authorized private session and do not publish its output
+or screenshots.
 
 The research serving process is stateless with respect to patients. It keeps no upload archive,
 request or response archive, patient database, or prediction cache. BeyondCXR retains no submitted

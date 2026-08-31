@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -23,6 +24,10 @@ from beyondcxr.training.symile_final_packages import (
     load_final_package_config,
 )
 from beyondcxr.training.symile_statistics import sigmoid
+from beyondcxr.utils.immutable_json import immutable_json, json_projection
+
+if TYPE_CHECKING:
+    from beyondcxr.training.symile_campaign import RestoredCampaignClosure
 
 
 class SymileServingPredictor:
@@ -52,16 +57,26 @@ class SymileServingPredictor:
             brightness_jitter=float(config.augmentation["brightness_jitter"]),
             contrast_jitter=float(config.augmentation["contrast_jitter"]),
         )
+        self._model_info = immutable_json(serving_model_info(self.authority))
 
     @classmethod
     def load(
         cls,
         authority_path: str | Path,
         *,
-        package_root: str | Path,
+        deployment_provenance: str | Path,
+        result_binding: str | Path,
+        release_archive: str | Path,
         device: str = "cpu",
+        restored_campaign: RestoredCampaignClosure | None = None,
     ) -> SymileServingPredictor:
-        authority = validate_serving_authority(authority_path, package_root=package_root)
+        authority = validate_serving_authority(
+            authority_path,
+            deployment_provenance=deployment_provenance,
+            result_binding=result_binding,
+            release_archive=release_archive,
+            restored_campaign=restored_campaign,
+        )
         return cls(authority, device=device)
 
     def predict(self, request: ValidatedServingInput) -> float:
@@ -83,7 +98,7 @@ class SymileServingPredictor:
         return probability
 
     def model_info(self) -> dict[str, object]:
-        return serving_model_info(self.authority)
+        return json_projection(self._model_info)
 
 
 def serving_model_info(authority: ValidatedServingAuthority) -> dict[str, object]:
@@ -102,8 +117,6 @@ def serving_model_info(authority: ValidatedServingAuthority) -> dict[str, object
         "preprocessing": dict(manifest["preprocessing"]),
         "operating_thresholds": dict(manifest["primary_thresholds"]),
         "global_result_id": manifest["global_result"]["global_result_id"],
-        "science_git_commit": manifest["science_execution"]["git_commit"],
-        "serving_release_git_commit": manifest["serving_release"]["git_commit"],
         "warning": manifest["warning"],
     }
 

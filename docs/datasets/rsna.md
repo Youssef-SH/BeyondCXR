@@ -1,33 +1,27 @@
-# RSNA Pneumonia Detection Challenge
+# RSNA Stage 2 source guide
 
 RSNA Stage 2 provides BeyondCXR's supporting CXR qualification. It establishes DICOM ingestion,
 image modeling, metadata fusion, and localization; it is not external validation of the primary
-Symile predictor. Dataset roles and transfer constraints are summarized in the
-[data statement](../data_statement.md).
+Symile predictor. Dataset roles and transfer constraints are in the [data statement](../data_statement.md).
 
-## Source and access
+## Source readiness
 
-The adapter uses the Stage 2 files from the RSNA Pneumonia Detection Challenge. Access is through
-the competition host under the dataset's terms. Source CSV files and DICOM images remain in
-user-managed local storage.
-
-The optional acquisition dependency group provides the Kaggle CLI so you can download the
-competition data after accepting the rules and configuring authentication outside this repository:
+Accept the competition rules and configure standard Kaggle CLI authentication. Then run:
 
 ```bash
-uv run --group acquisition kaggle competitions download \
-  -c rsna-pneumonia-detection-challenge \
-  -p data/raw/rsna/archive
+make rsna
 ```
 
-Extract the archive into `data/raw/rsna/extracted/`.
+The workflow first validates the configured source. A valid source is reused without network
+access. If the configured source is absent, it downloads the official competition archive into a
+staging directory, rejects unsafe paths, links, duplicate or unexpected members, validates the
+release layout, and installs it atomically. An existing invalid or conflicting source is never
+overwritten.
 
-Publish the dataset authority separately with `make rsna-manifest SOURCE_ROOT=...`. Record the
-resulting bundle ID, manifest SHA-256, and split-assignment ID in every RSNA experiment config, then
-transfer that exact immutable bundle directory to the formal host. `make rsna-campaign` validates
-those bytes and the external DICOM inventory; it does not rebuild the bundle or use `CURRENT`.
+The canonical source root is `data/raw/rsna/extracted`. A one-time alternate root can be recorded
+with `make setup RSNA_SOURCE_ROOT=/approved/rsna/source`.
 
-## Verified local layout
+## Verified release layout
 
 ```text
 stage_2_train_labels.csv
@@ -37,61 +31,45 @@ stage_2_train_images/    26,684 labeled DICOMs
 stage_2_test_images/      3,000 unlabeled DICOMs
 ```
 
-There are 29,684 DICOM files in total. The bundle contains the 26,684 images with training labels.
-The 3,000 competition test images remain source-only because targets are unavailable.
+The bundle contains the 26,684 labeled images. Competition test images remain source-only because
+targets are unavailable. Exact upstream files and DICOMs are authenticated; the scientific bundle
+identity is derived from logical cohort, label, annotation, policy, and split content rather than
+the source root or physical Parquet encoding.
 
-## Labels
+## Cohort, labels, and split
 
-`stage_2_train_labels.csv` contains `patientId, x, y, width, height, Target`. It has 30,227 rows for
-26,684 images. Repeated positive rows represent multiple boxes. The normalized annotation artifact
-contains 9,555 boxes for 6,012 positive samples. The remaining 20,672 samples are negative and have
-no annotation rows.
+`stage_2_train_labels.csv` contains `patientId, x, y, width, height, Target`. Repeated positive rows
+represent multiple boxes. `stage_2_detailed_class_info.csv` supplies `Normal`,
+`No Lung Opacity / Not Normal`, or `Lung Opacity`; target/class compatibility is validated.
 
-`stage_2_detailed_class_info.csv` provides one consistent class per source identifier:
+The label CSV has 30,227 rows for 26,684 images. The normalized annotation evidence contains 9,555
+boxes for 6,012 positive samples; the remaining 20,672 samples are negative and have no annotation
+rows. The class is retained as the auxiliary `rsna_class` task. `Target=1` pairs with
+`Lung Opacity`; `Target=0` pairs with either remaining class.
 
-- `Normal`
-- `No Lung Opacity / Not Normal`
-- `Lung Opacity`
+The labeled cohort receives the prespecified patient-disjoint 70/15/15 train, validation, and test
+assignment with seed 42. The exact assignment is intrinsic to the RSNA bundle. The challenge target
+comes from the public competition labeling process and is not a confirmed clinical diagnosis.
 
-The class is encoded as the auxiliary `rsna_class` task in the label artifact. `Target=1` pairs
-with `Lung Opacity`; `Target=0` pairs with either remaining class.
+## Source qualification
 
-The challenge target is derived from the public competition labeling process. It is not equivalent
-to microbiologically confirmed clinical pneumonia.
+All labeled DICOM headers are qualified without pixel decoding. The reviewed release contains
+1024-by-1024 `MONOCHROME2` images, one transfer syntax, AP or PA views, F or M patient sex values,
+and 18 observed pixel-spacing pairs. Patient age, sex, projection, pixel spacing, and dimensions
+enter the sample evidence. SOP Instance UID is required and unique. Photometric interpretation,
+transfer syntax, bit depth, compression, modality, body part, and UID consistency remain
+source-quality evidence rather than model claims.
 
-## Patient split
+Bare integer ages are interpreted as years under the dataset contract; standard DICOM day, week,
+month, and year forms are also supported. The source contains five observed ages above 120 years,
+which are retained and marked implausible. Missing and malformed values remain distinct
+source-quality outcomes and yield null sample ages.
 
-The labeled cohort receives a deterministic 70/15/15 train, validation, and test assignment,
-stratified on the pneumonia target at the patient level with seed 42. The split artifact is part of
-the validated bundle. The manifest records the recipe and exact assignment identities. Audit
-reports contain aggregate counts only.
+Metadata and missingness can encode demographic, workflow, acquisition, and equipment
+associations. Metadata-only baselines quantify those associations only within the internal
+patient-disjoint RSNA challenge holdout.
 
-## DICOM characteristics
-
-All 26,684 labeled headers were read with pixel decoding disabled. Verified aggregate properties:
-
-- 1024 × 1024 pixels
-- `MONOCHROME2`
-- one transfer syntax
-- AP or PA view
-- F or M patient sex
-- 18 distinct pixel-spacing pairs
-
-Patient age, sex, projection, pixel spacing, and image dimensions enter the sample artifact.
-Photometric interpretation, transfer syntax, bit depth, compression, modality, body part, and UID
-consistency are source-quality evidence.
-
-The bundle records each source CSV's SHA-256 and authenticates every labeled DICOM against the
-source inventory. Metadata models consume validated DICOM header fields. SOP Instance UID is
-required and unique across labeled samples.
-
-Metadata values and missingness, including pixel spacing, can encode demographic, workflow,
-acquisition, and equipment associations. The metadata-only baselines quantify those associations
-only within the internal patient-disjoint RSNA challenge holdout.
-
-## Known data-quality findings
-
-RSNA age values use bare integers interpreted as years under the dataset contract. Standard DICOM
-day, week, month, and year forms are also supported. The bundle preserves five observed values
-above 120 years and marks them as implausible. Missing and malformed values remain distinct
-source-quality outcomes and produce null sample ages.
+The completed workflow builds or reuses the exact bundle, produces aggregate audits, materializes
+the reviewed pretrained initialization, performs formal execution, freezes packages before
+held-out access, evaluates and localizes, and preserves the recursively validated campaign to the
+configured external backup.

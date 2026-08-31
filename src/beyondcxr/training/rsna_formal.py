@@ -48,8 +48,6 @@ RSNA_NEURAL_SEEDS = tuple(
 class RsnaAuthorityCoordinates:
     dataset_id: str
     bundle_id: str
-    bundle_manifest_sha256: str
-    split_assignment_id: str
     task_id: str
     label_policy_version: str
     bundle_directory: Path

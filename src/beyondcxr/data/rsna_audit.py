@@ -13,7 +13,6 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_artifacts import resolve_bundle
 from beyondcxr.data.rsna_source import RSNA_CLASS_VALUES
 from beyondcxr.data.rsna_splitting import SPLIT_NAMES
@@ -24,7 +23,7 @@ from beyondcxr.utils.operational_logging import (
     timed_phase,
 )
 from beyondcxr.utils.privacy import validate_public_reports
-from beyondcxr.utils.publication import publish_directory, staging_directory
+from beyondcxr.utils.publication import install_regenerable_directory, staging_directory
 
 REPORT_FILENAMES = (
     "dataset_summary.md",
@@ -102,31 +101,29 @@ def _generate_rsna_audit(
             [stage / filename for filename in REPORT_FILENAMES],
             forbidden_source_values=_source_identifiers(sample_frame),
         )
-        if output.exists() or output.is_symlink():
-            if (
-                output.is_symlink()
-                or not output.is_dir()
-                or _audit_bytes(output) != _audit_bytes(stage)
-            ):
-                raise ValueError("Existing RSNA audit differs from the frozen bundle derivative")
-        else:
-            publish_directory(stage, output)
+        expected = _audit_bytes(stage)
+
+        def validate_cached(path: Path, **_: object) -> None:
+            if _audit_bytes(path) != expected:
+                raise ValueError("RSNA audit differs from the frozen bundle derivative")
+
+        install_regenerable_directory(stage, output, validate_cached)
     finally:
         if stage.exists():
             shutil.rmtree(stage)
 
     return {
         "bundle_id": bundle.bundle_id,
-        "bundle_manifest_sha256": sha256_file(bundle.metadata_path),
         "split_recipe_id": str(metadata["membership"]["split"]["split_recipe_id"]),
-        "split_assignment_id": str(metadata["membership"]["split"]["split_assignment_id"]),
         "report_directory": output.as_posix(),
         "reports": list(REPORT_FILENAMES),
     }
 
 
 def _audit_bytes(directory: Path) -> dict[str, bytes]:
-    """Return the exact bounded audit file set for idempotent immutable publication."""
+    """Return the exact bounded file set for regenerable audit publication."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("RSNA audit must be a physical directory")
     paths = tuple(directory.iterdir())
     if {path.name for path in paths} != set(REPORT_FILENAMES) or any(
         path.is_symlink() or not path.is_file() for path in paths
@@ -299,7 +296,7 @@ def _split_summary(metadata: dict[str, object], frame: pd.DataFrame) -> str:
         "# RSNA split summary",
         "",
         f"Split recipe ID: `{split_metadata['split_recipe_id']}`",
-        f"Split assignment ID: `{split_metadata['split_assignment_id']}`",
+        "Split assignment: intrinsic to the bundle splits table",
         "",
         "| Split | Samples | Patients | Positive | Negative | Positive rate |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",

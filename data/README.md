@@ -1,85 +1,17 @@
 # Local data workspace
 
-This directory holds local source data and generated patient-level artifacts. Git tracks this file
-and directory placeholders; local data content is ignored.
+Raw sources and generated patient-level artifacts belong here and remain outside Git.
 
-Dataset access, cohort roles, and distribution constraints are documented in the
-[data statement](../docs/data_statement.md). This page owns only the local filesystem layout.
+| Location | Contents |
+| --- | --- |
+| `raw/rsna/extracted/` | RSNA Stage 2 source release |
+| `raw/symile/extracted/` | Operator-supplied Symile-MIMIC release |
+| `manifests/rsna/bundles/` | Validated RSNA bundles, including split assignments |
+| `manifests/symile/bundles/` | Validated Symile bundles |
+| `manifests/symile/cv/` | Separate development CV assignments |
+| `cache/rsna/` | Disposable deterministic CXR caches |
 
-## RSNA source and artifact layout
-
-The RSNA source and generated artifacts use this layout:
-
-```text
-data/
-  raw/
-    rsna/
-      archive/
-        rsna-pneumonia-detection-challenge.zip
-      extracted/
-        stage_2_train_labels.csv
-        stage_2_detailed_class_info.csv
-        stage_2_sample_submission.csv
-        stage_2_train_images/
-        stage_2_test_images/
-  interim/
-  processed/
-  manifests/
-    rsna/
-      CURRENT
-      bundles/
-        bundle-<sha256>/
-          manifest.json
-          samples.parquet
-          labels.parquet
-          annotations.parquet
-          splits.parquet
-          source_inventory.parquet
-  cache/
-    rsna/
-      cache-<sha256>/
-        images.npy
-        index.parquet
-        metadata.json
-```
-
-Bundle construction requires `stage_2_train_labels.csv`,
-`stage_2_detailed_class_info.csv`, and `stage_2_train_images/`. The submission CSV and unlabeled
-test images are shown for completeness and remain source-only.
-
-After accepting the competition terms and configuring the Kaggle CLI outside the repository, the
-archive can be downloaded with the command in
-[`docs/datasets/rsna.md`](../docs/datasets/rsna.md). Extract it into the layout above and run:
-
-```bash
-make rsna-manifest SOURCE_ROOT=data/raw/rsna/extracted
-```
-
-The CXR cache is a disposable memory-mapped deterministic derivative used by neural workflows.
-
-## Symile-MIMIC source and artifact layout
-
-The Symile-MIMIC source and generated artifacts use this layout:
-
-```text
-data/
-  raw/symile/extracted/             # official restricted Symile-MIMIC 1.0.0 release
-  manifests/symile/
-    CURRENT
-    bundles/bundle-<sha256>/
-      manifest.json
-      samples.parquet
-      labs.parquet
-    cv/cv-assignment-<sha256>/
-      manifest.json
-      assignments.parquet
-```
-
-Run `make symile-manifest`, `make symile-audit`, and `make symile-cv` in that order. `CURRENT` is
-an interactive bundle selector. Durable consumers pin immutable bundle and CV assignment
-identities. Official CXR, ECG, lab-percentile, missingness, and identifier NPY arrays remain
-external restricted source assets authenticated through the bundle-bound release checksum manifest.
-
-Keep raw images, source CSVs, generated bundle and cache artifacts, and credentials outside version
-control. These files contain patient-level information even when public identifiers are
-deidentified.
+Source roots can be configured during setup. See the [RSNA](../docs/datasets/rsna.md) and
+[Symile](../docs/datasets/symile.md) source guides for release layouts and qualification, and the
+[data contract](../docs/data_contract.md) for artifact schemas. Access and transfer constraints
+are described in the [data statement](../docs/data_statement.md).

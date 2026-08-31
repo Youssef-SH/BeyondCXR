@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -17,6 +18,9 @@ from beyondcxr.serving.preprocessing import (
     ServingInputError,
     validated_serving_input,
 )
+
+if TYPE_CHECKING:
+    from beyondcxr.training.symile_campaign import RestoredCampaignClosure
 
 MAX_REQUEST_BODY_BYTES = 21 * 1024 * 1024
 
@@ -81,19 +85,33 @@ class _RequestBodyLimitMiddleware:
 def create_app(
     *,
     authority_path: str | Path | None = None,
-    package_root: str | Path | None = None,
+    deployment_provenance: str | Path | None = None,
+    result_binding: str | Path | None = None,
+    release_archive: str | Path | None = None,
     device: str = "cpu",
+    restored_campaign: RestoredCampaignClosure | None = None,
 ) -> FastAPI:
     """Create one app whose lifespan fails unless its complete authority loads."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if authority_path is None or package_root is None:
-            raise RuntimeError("A serving authority and package root are required")
+        if (
+            authority_path is None
+            or deployment_provenance is None
+            or result_binding is None
+            or release_archive is None
+        ):
+            raise RuntimeError(
+                "A serving authority, deployment provenance, result binding, and canonical "
+                "release archive are required"
+            )
         loaded = SymileServingPredictor.load(
             authority_path,
-            package_root=package_root,
+            deployment_provenance=deployment_provenance,
+            result_binding=result_binding,
+            release_archive=release_archive,
             device=device,
+            restored_campaign=restored_campaign,
         )
         app.state.predictor = loaded
         yield

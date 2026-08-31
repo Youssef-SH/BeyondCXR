@@ -29,11 +29,10 @@ from beyondcxr.training.config import (
 from beyondcxr.training.execution import LoaderExecutionPolicy
 from beyondcxr.training.rsna_validation_evidence import (
     VALIDATION_EVIDENCE_FILENAME,
-    evidence_semantic_sha256,
     validate_validation_evidence,
+    validation_evidence_id,
 )
 from beyondcxr.utils.package_identity import (
-    canonical_scientific_id,
     fitted_object_state_sha256,
     package_scientific_config_payload,
     pretrained_weight_semantic_identity,
@@ -44,6 +43,7 @@ from beyondcxr.utils.publication import (
     staging_directory,
 )
 from beyondcxr.utils.rsna_model_publication import threshold_contract, validated_threshold_contract
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops
 
 NEURAL_MODEL_FILENAME = "model.pt"
@@ -72,14 +72,10 @@ NEURAL_MANIFEST_FIELDS = frozenset(
         "task_id",
         "positive_class",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "label_policy_version",
-        "config_source_sha256",
-        "config_semantic_sha256",
         "checkpoint_sha256",
         "validation_evidence_sha256",
-        "validation_evidence_semantic_sha256",
+        "validation_evidence_id",
         "fit_config",
         "model_state_sha256",
         "preprocessor_state_sha256",
@@ -212,7 +208,8 @@ def publish_neural_model_package(
             raise ValueError("Neural publication requires CXR or fusion modality")
         checkpoint = load_neural_checkpoint(model_path)
         config = with_runtime(
-            load_experiment_config(config_path), seed=int(manifest["training_policy"]["seed"])
+            load_experiment_config(config_path, bundle_id=manifest["bundle_id"]),
+            seed=int(manifest["training_policy"]["seed"]),
         )
         preprocessor_state = None
         if package_kind == "fusion":
@@ -229,7 +226,7 @@ def publish_neural_model_package(
             "task_id": config.task.task_id,
             "checkpoint_sha256": sha256_file(model_path),
             "validation_evidence_sha256": sha256_file(evidence_path),
-            "validation_evidence_semantic_sha256": evidence_semantic_sha256(
+            "validation_evidence_id": validation_evidence_id(
                 json.loads(evidence_path.read_bytes())
             ),
             "fit_config": package_scientific_config_payload(config),
@@ -344,7 +341,6 @@ def neural_model_package_id(document: Mapping[str, Any]) -> str:
     payload = {
         "dataset_id": document["dataset_id"],
         "bundle_id": document["bundle_id"],
-        "split_assignment_id": document["split_assignment_id"],
         "task_id": document["task_id"],
         "label_policy_version": document["label_policy_version"],
         "positive_class": document["positive_class"],
@@ -371,9 +367,11 @@ def neural_model_package_id(document: Mapping[str, Any]) -> str:
         "training_transform_contract": document["training_transform_contract"],
         "evaluation_transform_contract": document["evaluation_transform_contract"],
         "training_policy": document["training_policy"],
-        "validation_evidence_semantic_sha256": document["validation_evidence_semantic_sha256"],
+        "validation_evidence_id": document["validation_evidence_id"],
     }
-    return canonical_scientific_id(NEURAL_PACKAGE_ID_PREFIX, payload)
+    return canonical_scientific_id(
+        NEURAL_PACKAGE_ID_PREFIX, payload, domain="model-package", schema_version=1
+    )
 
 
 def _validate_checkpoint(document: object) -> None:
@@ -442,7 +440,6 @@ def _validate_manifest_metadata(
         "family_id",
         "task_id",
         "bundle_id",
-        "split_assignment_id",
         "label_policy_version",
     ):
         if not isinstance(document[field], str) or not document[field]:
@@ -455,22 +452,26 @@ def _validate_manifest_metadata(
     ):
         raise ValueError("Neural model manifest positive class must be integer 1")
     for field in (
-        "bundle_manifest_sha256",
-        "config_source_sha256",
-        "config_semantic_sha256",
         "checkpoint_sha256",
         "validation_evidence_sha256",
-        "validation_evidence_semantic_sha256",
     ):
         if not _is_sha256(document[field]):
             raise ValueError(f"Neural model manifest {field} must be a lowercase SHA-256")
+    validation_id = document["validation_evidence_id"]
+    if (
+        not isinstance(validation_id, str)
+        or not validation_id.startswith("validation-evidence-")
+        or len(validation_id) != len("validation-evidence-") + 64
+        or any(character not in "0123456789abcdef" for character in validation_id[20:])
+    ):
+        raise ValueError("Neural model validation evidence identity is invalid")
     if document["checkpoint_sha256"] != sha256_file(model_path):
         raise ValueError("Neural checkpoint hash does not match package bytes")
-    if document["config_source_sha256"] != sha256_file(config_path):
-        raise ValueError("Neural config hash does not match package bytes")
     training_policy = document.get("training_policy")
     seed = training_policy.get("seed") if isinstance(training_policy, dict) else None
-    config = with_runtime(load_experiment_config(config_path), seed=seed)
+    config = with_runtime(
+        load_experiment_config(config_path, bundle_id=document["bundle_id"]), seed=seed
+    )
     validate_validation_evidence(evidence_path, package=document, config=config)
     if (
         document["dataset_id"] != config.dataset.dataset_id
@@ -479,7 +480,6 @@ def _validate_manifest_metadata(
         or document["family_id"] != config.family.family_id
         or document["modalities"] != list(config.family.modalities)
         or document["fit_config"] != package_scientific_config_payload(config)
-        or document["config_semantic_sha256"] != config.config_semantic_sha256
     ):
         raise ValueError("Neural package identity differs from archived configuration")
     selection = document["selection"]
@@ -685,7 +685,6 @@ def _validate_fusion_source_package(directory: Path, document: Mapping[str, Any]
         "dataset_id": document["dataset_id"],
         "task_id": document["task_id"],
         "bundle_id": document["bundle_id"],
-        "split_assignment_id": document["split_assignment_id"],
         "label_policy_version": document["label_policy_version"],
         "family_id": "cxr_densenet",
         "modalities": ["cxr"],
@@ -696,8 +695,12 @@ def _validate_fusion_source_package(directory: Path, document: Mapping[str, Any]
         or source["training_policy"]["seed"] != document["training_policy"]["seed"]
     ):
         raise ValueError("Fusion source CXR package scientific lineage is incompatible")
-    source_config = load_experiment_config(source_directory / CONFIG_FILENAME)
-    fusion_config = load_experiment_config(directory / CONFIG_FILENAME)
+    source_config = load_experiment_config(
+        source_directory / CONFIG_FILENAME, bundle_id=source["bundle_id"]
+    )
+    fusion_config = load_experiment_config(
+        directory / CONFIG_FILENAME, bundle_id=document["bundle_id"]
+    )
     encoder_fields = ("encoder_name", "weights", "image_size", "embedding_dimension")
     if (
         source_config.neural != fusion_config.neural
@@ -745,7 +748,6 @@ def _identity_fields(manifest_fields: frozenset[str]) -> frozenset[str]:
     return manifest_fields - {
         "model_package_id",
         "runtime_provenance",
-        "config_source_sha256",
     }
 
 

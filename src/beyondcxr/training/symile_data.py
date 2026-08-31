@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,12 +37,13 @@ from beyondcxr.data.symile_schemas import (
     TASK_ID,
 )
 from beyondcxr.data.symile_source import (
-    AuthenticatedReleaseAsset,
-    establish_authenticated_release_asset,
-    modality_asset_path,
-    reopen_authenticated_release_memmap,
+    DevelopmentReleaseAsset,
+    establish_development_release_asset,
+    reopen_development_release_memmap,
+    select_development_release_asset,
 )
 from beyondcxr.training.config import ExperimentConfig
+from beyondcxr.utils.semantic_identity import canonical_scientific_id
 
 DEVELOPMENT_COUNT = 2_368
 DEVELOPMENT_POSITIVES = 1_104
@@ -58,7 +58,6 @@ class SymileDevelopmentCohort:
     """Own the authenticated full-development cohort without CV authority."""
 
     bundle: SymileBundlePaths
-    bundle_manifest_sha256: str
     frame: pd.DataFrame
 
 
@@ -72,10 +71,6 @@ class SymileDevelopmentData:
     @property
     def bundle(self) -> SymileBundlePaths:
         return self.cohort.bundle
-
-    @property
-    def bundle_manifest_sha256(self) -> str:
-        return self.cohort.bundle_manifest_sha256
 
     @property
     def frame(self) -> pd.DataFrame:
@@ -109,19 +104,13 @@ def load_symile_development_cohort(
     enforce_production_counts: bool = True,
 ) -> SymileDevelopmentCohort:
     """Load authenticated train/validation rows without resolving a CV assignment."""
+    if config.dataset.bundle_id is None or config.dataset.cv_assignment_id is None:
+        raise ManifestBuildError("Symile data access requires explicit bundle and CV identities")
     bundle = resolve_symile_bundle(
         config.runtime.manifest_directory,
         bundle_id=config.dataset.bundle_id,
-        full_validation=False,
+        full_validation=True,
     )
-    bundle_reference = validate_symile_bundle_reference(
-        bundle.bundle_directory,
-        expected_bundle_id=config.dataset.bundle_id,
-        expected_manifest_sha256=config.dataset.bundle_manifest_sha256,
-    )
-    split_id = bundle_reference.manifest["membership"]["split_assignment_id"]
-    if split_id != config.dataset.split_assignment_id:
-        raise ManifestBuildError("Symile official split assignment differs from configuration")
     samples = strict_pneumonia_rows(read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS))
     sample_ids = samples["sample_id"].astype(str).tolist()
     labs = read_symile_labs(bundle, sample_ids=sample_ids)
@@ -138,7 +127,7 @@ def load_symile_development_cohort(
         raise ManifestBuildError(
             "Symile development cohort differs from the frozen core-development contract"
         )
-    return SymileDevelopmentCohort(bundle, bundle_reference.manifest_sha256, frame)
+    return SymileDevelopmentCohort(bundle, frame)
 
 
 def load_symile_development(
@@ -231,14 +220,16 @@ def derive_inner_split(outer: SymileOuterFold) -> SymileInnerSplit:
     }
     identity_payload = {
         "policy": policy,
-        "assignments": sorted(zip(frame["sample_id"].astype(str), roles, strict=True)),
+        "assignments": [
+            [sample_id, str(role)]
+            for sample_id, role in sorted(zip(frame["sample_id"].astype(str), roles, strict=True))
+        ],
     }
-    digest = hashlib.sha256(
-        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
     return SymileInnerSplit(
         inner_seed,
-        "inner-split-" + digest,
+        canonical_scientific_id(
+            "inner-split-", identity_payload, domain="symile-inner-split", schema_version=1
+        ),
         policy,
         training_indices,
         validation_indices,
@@ -256,22 +247,38 @@ def derive_inner_seed(repeat_seed: int, outer_fold: int) -> int:
 class SymileCxrStore:
     """Authenticate and expose read-only official train/validation CXR tensors."""
 
-    def __init__(self, bundle: SymileBundlePaths, source_root: str | Path) -> None:
+    def __init__(
+        self,
+        bundle: SymileBundlePaths,
+        source_root: str | Path,
+        *,
+        development_assets: tuple[DevelopmentReleaseAsset, ...] | None = None,
+    ) -> None:
         reference = validate_symile_bundle_reference(
             bundle.bundle_directory, expected_bundle_id=bundle.bundle_id
         )
         self._source_root = Path(source_root).absolute()
         self._checksum_sha256 = reference.manifest["source"]["checksum_manifest_sha256"]
         self._arrays: dict[str, np.memmap] = {}
-        self._authorities: dict[str, AuthenticatedReleaseAsset] = {}
+        self._authorities: dict[str, DevelopmentReleaseAsset] = {}
         for split in DEVELOPMENT_SPLITS:
-            path = modality_asset_path(self._source_root, split, "cxr")
-            authority = establish_authenticated_release_asset(
-                self._source_root,
-                checksum_manifest_sha256=self._checksum_sha256,
-                relative_path=path.absolute().relative_to(self._source_root).as_posix(),
+            authority = (
+                establish_development_release_asset(
+                    self._source_root,
+                    checksum_manifest_sha256=self._checksum_sha256,
+                    official_split=split,
+                    modality="cxr",
+                )
+                if development_assets is None
+                else select_development_release_asset(
+                    development_assets,
+                    source_root=self._source_root,
+                    checksum_manifest_sha256=self._checksum_sha256,
+                    official_split=split,
+                    modality="cxr",
+                )
             )
-            array = reopen_authenticated_release_memmap(authority)
+            array = reopen_development_release_memmap(authority)
             if (
                 not isinstance(array, np.memmap)
                 or array.dtype != np.float32
@@ -299,7 +306,7 @@ class SymileCxrStore:
         self._arrays = {}
         self._authorities = {}
         for split, (authority, shape, dtype) in state["arrays"].items():
-            array = reopen_authenticated_release_memmap(authority)
+            array = reopen_development_release_memmap(authority)
             if not isinstance(array, np.memmap) or array.shape != shape or array.dtype.str != dtype:
                 raise ManifestBuildError("Symile CXR tensor header changed before worker access")
             self._arrays[split] = array

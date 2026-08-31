@@ -17,10 +17,10 @@ from beyondcxr.data.symile_artifacts import (
 )
 from beyondcxr.data.symile_schemas import DEVELOPMENT_SPLITS
 from beyondcxr.data.symile_source import (
-    AuthenticatedReleaseAsset,
-    establish_authenticated_release_asset,
-    modality_asset_path,
-    reopen_authenticated_release_memmap,
+    DevelopmentReleaseAsset,
+    establish_development_release_asset,
+    reopen_development_release_memmap,
+    select_development_release_asset,
 )
 from beyondcxr.training.symile_data import (
     SymileCxrStore,
@@ -32,22 +32,38 @@ from beyondcxr.training.symile_data import (
 class SymileEcgStore:
     """Authenticate and expose only development ECG tensor rows."""
 
-    def __init__(self, bundle: SymileBundlePaths, source_root: str | Path) -> None:
+    def __init__(
+        self,
+        bundle: SymileBundlePaths,
+        source_root: str | Path,
+        *,
+        development_assets: tuple[DevelopmentReleaseAsset, ...] | None = None,
+    ) -> None:
         reference = validate_symile_bundle_reference(
             bundle.bundle_directory, expected_bundle_id=bundle.bundle_id
         )
         self._source_root = Path(source_root).absolute()
         self._checksum_sha256 = reference.manifest["source"]["checksum_manifest_sha256"]
         self._arrays: dict[str, np.memmap] = {}
-        self._authorities: dict[str, AuthenticatedReleaseAsset] = {}
+        self._authorities: dict[str, DevelopmentReleaseAsset] = {}
         for split in DEVELOPMENT_SPLITS:
-            path = modality_asset_path(self._source_root, split, "ecg")
-            authority = establish_authenticated_release_asset(
-                self._source_root,
-                checksum_manifest_sha256=self._checksum_sha256,
-                relative_path=path.absolute().relative_to(self._source_root).as_posix(),
+            authority = (
+                establish_development_release_asset(
+                    self._source_root,
+                    checksum_manifest_sha256=self._checksum_sha256,
+                    official_split=split,
+                    modality="ecg",
+                )
+                if development_assets is None
+                else select_development_release_asset(
+                    development_assets,
+                    source_root=self._source_root,
+                    checksum_manifest_sha256=self._checksum_sha256,
+                    official_split=split,
+                    modality="ecg",
+                )
             )
-            array = reopen_authenticated_release_memmap(authority)
+            array = reopen_development_release_memmap(authority)
             if (
                 not isinstance(array, np.memmap)
                 or array.dtype != np.float32
@@ -75,7 +91,7 @@ class SymileEcgStore:
         self._arrays = {}
         self._authorities = {}
         for split, (authority, shape, dtype) in state["arrays"].items():
-            array = reopen_authenticated_release_memmap(authority)
+            array = reopen_development_release_memmap(authority)
             if not isinstance(array, np.memmap) or array.shape != shape or array.dtype.str != dtype:
                 raise ManifestBuildError("Symile ECG tensor header changed before worker access")
             self._arrays[split] = array

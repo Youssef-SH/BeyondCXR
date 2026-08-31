@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 import beyondcxr.training.symile_campaign_control as campaign_control
-import beyondcxr.training.symile_ecg_extension_result as extension_result
+import beyondcxr.training.symile_development_reports as subgroup_derivatives
 import beyondcxr.training.symile_statistics as symile_statistics
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.training.symile_statistics import (
@@ -21,30 +21,32 @@ from beyondcxr.training.symile_statistics import (
 )
 
 
-def test_subgroup_publication_is_atomic_idempotent_and_rejects_conflicts(tmp_path) -> None:
+def test_subgroup_publication_is_atomic_idempotent_and_repairs_stale_content(tmp_path) -> None:
     summary = {"policy": {}, "strata": {}}
 
     def publish():
-        return extension_result.publish_focused_subgroup_derivative(
+        return subgroup_derivatives.publish_focused_subgroup_derivative(
             report_root=tmp_path, summary=summary
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        identities = list(executor.map(lambda _: publish(), range(4)))
-    assert len(set(identities)) == 1
-    path = tmp_path / "development-subgroups" / f"{identities[0]}.json"
-    assert extension_result.validate_focused_subgroup_derivative(path) == {
+        paths = list(executor.map(lambda _: publish(), range(4)))
+    assert len(set(paths)) == 1
+    path = paths[0]
+    assert path == tmp_path / "development-subgroups" / "focused.json"
+    assert subgroup_derivatives.validate_focused_subgroup_derivative(path) == {
         "focused_subgroup_derivative_schema_version": 1,
         **summary,
     }
     inode = path.stat().st_ino
-    assert publish() == identities[0]
+    assert publish() == path
     assert path.stat().st_ino == inode
     path.write_bytes(b"conflicting content")
-    with pytest.raises(ManifestBuildError, match="conflicts"):
-        publish()
-    assert path.read_bytes() == b"conflicting content"
-    assert path.stat().st_ino == inode
+    assert publish() == path
+    assert subgroup_derivatives.validate_focused_subgroup_derivative(path) == {
+        "focused_subgroup_derivative_schema_version": 1,
+        **summary,
+    }
     assert list(path.parent.iterdir()) == [path]
 
 
@@ -365,7 +367,12 @@ def test_global_effect_computation_and_metadata_share_comparison_authority(monke
     monkeypatch.setattr(campaign_control, "operating_point_metrics", lambda *args: {})
 
     claims = campaign_control._derive_global_claims(
-        SimpleNamespace(manifest={"primary_thresholds": {"youden_j": 0.5}}), (), (), object()
+        SimpleNamespace(
+            development_decision=SimpleNamespace(manifest={"primary_thresholds": {"youden_j": 0.5}})
+        ),
+        (),
+        (),
+        object(),
     )
 
     assert campaign_control._global_evaluation_policy()["paired_effects"] == ["only_effect"]

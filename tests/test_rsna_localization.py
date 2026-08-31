@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import shlex
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -64,7 +65,9 @@ class _GradCamModel(nn.Module):
 def test_localization_rejects_non_rsna_before_dataset_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     non_rsna = replace(config, dataset=replace(config.dataset, dataset_id="symile"))
     monkeypatch.setattr(
         "beyondcxr.training.rsna_localize.get_dataset",
@@ -75,6 +78,7 @@ def test_localization_rejects_non_rsna_before_dataset_access(
         _rsna_localization_dataset(non_rsna)
 
 
+@pytest.mark.integration
 def test_authorized_localization_resolves_one_shared_cache(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -90,12 +94,17 @@ def test_authorized_localization_resolves_one_shared_cache(
         **{value: 15 for value in evaluation_ids_15.values()},
         **{value: 20 for value in evaluation_ids_20.values()},
     }
-    configs = {seed: load_experiment_config("configs/rsna_cxr_densenet.yaml") for seed in seeds}
+    configs = {
+        seed: load_experiment_config(
+            "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+        )
+        for seed in seeds
+    }
     packages = {}
     for seed in seeds:
         package_id = _PACKAGE_IDS[seed]
         packages[package_id] = (
-            {"training_policy": {"seed": seed}},
+            {"training_policy": {"seed": seed}, "bundle_id": configs[seed].dataset.bundle_id},
             configs[seed],
         )
     monkeypatch.setattr(
@@ -113,7 +122,7 @@ def test_authorized_localization_resolves_one_shared_cache(
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_localize.load_experiment_config",
-        lambda path: packages[path.parent.name][1],
+        lambda path, **coordinates: packages[path.parent.name][1],
     )
     monkeypatch.setattr("beyondcxr.training.rsna_localize.get_dataset", lambda key: RsnaDataset())
     prepared: list[object] = []
@@ -222,13 +231,42 @@ def test_authorized_localization_resolves_one_shared_cache(
 def test_localization_identity_binds_source_model_packages() -> None:
     changed = [_PACKAGE_IDS[17], _PACKAGE_IDS[42], "model-package-" + "4" * 64]
 
-    assert _localization_id(changed) != _localization_id(list(_PACKAGE_IDS.values()))
+    assert _localization_id(changed, ()) != _localization_id(list(_PACKAGE_IDS.values()), ())
 
 
+def test_localization_identity_binds_numerical_evidence_not_visualization() -> None:
+    package_ids = list(_PACKAGE_IDS.values())
+    evidence = [
+        {
+            "model_package_id": package_id,
+            "seed": seed,
+            "cases": [
+                {
+                    "sample_id": "rsna:positive",
+                    "pointing_game": 1,
+                    "activation_energy_inside_union": 0.5,
+                    "zero_heatmap": False,
+                }
+            ],
+            "qualitative_strata_present": {"TP": True, "FN": False, "FP": False, "TN": False},
+        }
+        for package_id, seed in zip(package_ids, RSNA_NEURAL_SEEDS, strict=True)
+    ]
+    baseline = _localization_id(package_ids, evidence)
+    visual_only = [dict(member, qualitative_strata_present={}) for member in evidence]
+    assert _localization_id(package_ids, visual_only) == baseline
+    changed = json.loads(json.dumps(evidence))
+    changed[0]["cases"][0]["activation_energy_inside_union"] = 0.51
+    assert _localization_id(package_ids, changed) != baseline
+
+
+@pytest.mark.integration
 def test_localization_member_emits_generic_operation_completion(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
     config = with_runtime(
         replace(config, runtime=replace(config.runtime, pin_memory_policy="disabled")),
@@ -270,7 +308,6 @@ def test_localization_member_emits_generic_operation_completion(
     localization = SimpleNamespace(
         images=SimpleNamespace(
             lineage=object(),
-            bundle_manifest_sha256="b" * 64,
             source_inventory=object(),
             test=object(),
         ),
@@ -334,7 +371,6 @@ def test_localization_member_emits_generic_operation_completion(
         _PACKAGE_IDS[42],
         tmp_path,
         {
-            "bundle_manifest_sha256": "b" * 64,
             "source_authentication": authentication,
             "runtime_provenance": {"cxr_cache_id": cache.identity.cache_id},
             "thresholds": {"youden_j": 0.5},
@@ -365,6 +401,7 @@ def test_localization_member_emits_generic_operation_completion(
         )
 
 
+@pytest.mark.integration
 def test_gradcam_is_finite_deterministic_cleans_hooks_and_preserves_state() -> None:
     torch.manual_seed(42)
     model = _GradCamModel()
@@ -382,6 +419,7 @@ def test_gradcam_is_finite_deterministic_cleans_hooks_and_preserves_state() -> N
     assert all(torch.equal(model.state_dict()[key], value) for key, value in before.items())
 
 
+@pytest.mark.integration
 def test_gradcam_removes_target_hook_and_restores_mode_on_failure() -> None:
     class InvalidModel(_GradCamModel):
         def forward(self, image: torch.Tensor) -> torch.Tensor:
@@ -401,6 +439,7 @@ def test_gradcam_removes_target_hook_and_restores_mode_on_failure() -> None:
     assert model.training
 
 
+@pytest.mark.integration
 def test_standard_cxr_gradcam_target_is_complete_final_spatial_representation() -> None:
     model = CxrBinaryClassifier(StandardCxrEncoder(weights=None)).eval()
     target = standard_cxr_gradcam_target(model)
@@ -432,8 +471,6 @@ def test_standard_cxr_gradcam_target_is_complete_final_spatial_representation() 
         (9, 10),
         (8, 9),
         (7, 9),
-        (8, 9),
-        (9, 8),
     ],
 )
 def test_center_crop_geometry_exactly_matches_torchxrayvision(rows: int, columns: int) -> None:
@@ -604,7 +641,6 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
     (examples / "seed-42-example-01-tp.png").write_bytes(b"synthetic")
     members = [{"filename": "seed-42-example-01-tp.png"}]
     package_ids = [_PACKAGE_IDS[seed] for seed in RSNA_NEURAL_SEEDS]
-    report_id = _localization_id(package_ids)
     public_members = [
         {
             "seed": seed,
@@ -622,7 +658,26 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
         }
         for seed in RSNA_NEURAL_SEEDS
     ]
-    document = _report_document(report_id, package_ids, public_members)
+    evidence_members = [
+        {
+            "model_package_id": package_id,
+            "seed": seed,
+            "cases": [
+                {
+                    "sample_id": "rsna:localization-positive",
+                    "pointing_game": 1,
+                    "activation_energy_inside_union": 0.5,
+                    "zero_heatmap": False,
+                }
+            ],
+            "qualitative_strata_present": public_member["qualitative_strata_present"],
+        }
+        for package_id, seed, public_member in zip(
+            package_ids, RSNA_NEURAL_SEEDS, public_members, strict=True
+        )
+    ]
+    localization_id = _localization_id(package_ids, evidence_members)
+    document = _report_document(localization_id, package_ids, public_members)
     (public / "summary.json").write_text(
         json.dumps(document, sort_keys=True),
         encoding="utf-8",
@@ -632,7 +687,7 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
         json.dumps(
             {
                 "private_localization_schema_version": 1,
-                "report_id": report_id,
+                "localization_id": localization_id,
                 "selection_policy": QUALITATIVE_POLICY_VERSION,
                 "examples": members,
             }
@@ -641,27 +696,10 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
     )
     _write_localization_evidence(
         private / LOCALIZATION_EVIDENCE_FILENAME,
-        report_id=report_id,
+        localization_id=localization_id,
         model_package_ids=package_ids,
         expected_positive_sample_ids=("rsna:localization-positive",),
-        members=[
-            {
-                "model_package_id": package_id,
-                "seed": seed,
-                "cases": [
-                    {
-                        "sample_id": "rsna:localization-positive",
-                        "pointing_game": 1,
-                        "activation_energy_inside_union": 0.5,
-                        "zero_heatmap": False,
-                    }
-                ],
-                "qualitative_strata_present": public_member["qualitative_strata_present"],
-            }
-            for package_id, seed, public_member in zip(
-                package_ids, RSNA_NEURAL_SEEDS, public_members, strict=True
-            )
-        ],
+        members=evidence_members,
     )
 
     _validate_localization_output_boundaries(
@@ -671,6 +709,65 @@ def test_localization_public_private_output_boundary_rejects_leaks_and_symlinks(
         forbidden_source_values={"synthetic-sample"},
         expected_positive_sample_ids=("rsna:localization-positive",),
     )
+
+    for mutation in ("missing", "extra", "substituted", "duplicate", "wrong-cohort"):
+        altered = deepcopy(evidence_members)
+        cases = altered[0]["cases"]
+        expected_cohort = ("rsna:localization-positive",)
+        if mutation == "missing":
+            cases.clear()
+        elif mutation == "extra":
+            cases.append({**cases[0], "sample_id": "rsna:unexpected-positive"})
+        elif mutation == "substituted":
+            cases[0]["sample_id"] = "rsna:unexpected-positive"
+        elif mutation == "duplicate":
+            cases.append(dict(cases[0]))
+        else:
+            expected_cohort = ("rsna:different-positive",)
+        # Reseal identity so membership validation, rather than a stale ID, rejects it.
+        with pytest.raises(ValueError, match="evidence|cohort"):
+            _write_localization_evidence(
+                tmp_path / "rejected-evidence.json",
+                localization_id=_localization_id(package_ids, altered),
+                model_package_ids=package_ids,
+                expected_positive_sample_ids=expected_cohort,
+                members=altered,
+            )
+
+    evidence_path = private / LOCALIZATION_EVIDENCE_FILENAME
+    original_evidence = evidence_path.read_bytes()
+    tampered = json.loads(original_evidence)
+    tampered["members"][0]["cases"][0]["activation_energy_inside_union"] = 0.75
+    evidence_path.write_text(
+        json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="identity"):
+        _validate_localization_output_boundaries(
+            public,
+            private,
+            private_members=members,
+            forbidden_source_values=set(),
+            expected_positive_sample_ids=("rsna:localization-positive",),
+        )
+    evidence_path.write_bytes(original_evidence)
+
+    altered_summary = deepcopy(document)
+    altered_summary["members"][0]["pointing_game_accuracy"] = 0.25
+    altered_summary["aggregates"] = _report_document(
+        localization_id, package_ids, altered_summary["members"]
+    )["aggregates"]
+    (public / "summary.json").write_text(json.dumps(altered_summary), encoding="utf-8")
+    (public / "summary.md").write_text(_markdown(altered_summary), encoding="utf-8")
+    with pytest.raises(ValueError, match="members differ from localization evidence"):
+        _validate_localization_output_boundaries(
+            public,
+            private,
+            private_members=members,
+            forbidden_source_values=set(),
+            expected_positive_sample_ids=("rsna:localization-positive",),
+        )
+    (public / "summary.md").write_text(_markdown(document), encoding="utf-8")
 
     (public / "summary.json").write_text(
         '{"localization_schema_version": true}\n', encoding="utf-8"

@@ -11,7 +11,10 @@ from rsna_authorization_test_support import authorize_rsna_package
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from beyondcxr.training.config import ConfigError, load_experiment_config, with_runtime
-from beyondcxr.training.rsna_datasets import RsnaDataset, _image_cache_frame
+from beyondcxr.training.rsna_datasets import (
+    RsnaDataset,
+    _validate_complete_cache_source_frame,
+)
 
 
 def _tables() -> dict[str, pa.Table]:
@@ -63,10 +66,15 @@ def _tables() -> dict[str, pa.Table]:
 
 
 def test_heldout_reader_rejects_forged_structural_authorization() -> None:
-    config = with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42)
+    config = with_runtime(
+        load_experiment_config(
+            "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+        ),
+        seed=42,
+    )
     forged = SimpleNamespace(require=lambda package_id: package_id)
 
-    with pytest.raises(PermissionError, match="validated package freeze"):
+    with pytest.raises(PermissionError, match="current-execution capability"):
         RsnaDataset().load_test(
             config,
             authorization=forged,
@@ -78,7 +86,9 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_runtime(
-        load_experiment_config("configs/rsna_metadata_logistic.yaml"),
+        load_experiment_config(
+            "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+        ),
         seed=42,
         manifest_directory=tmp_path / "manifests",
     )
@@ -90,27 +100,12 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
         validated.append(Path(path))
         assert expected_bundle_id == config.dataset.bundle_id
         return {
-            "membership": {"split": {"split_assignment_id": config.dataset.split_assignment_id}},
             "tasks": {
                 config.task.task_id: {"label_policy_version": config.task.label_policy_version}
             },
         }
 
     monkeypatch.setattr("beyondcxr.training.rsna_datasets.validate_bundle_directory", validate)
-
-    def validate_reference(
-        path, *, expected_bundle_id, expected_manifest_sha256
-    ) -> SimpleNamespace:
-        assert expected_bundle_id == config.dataset.bundle_id
-        assert expected_manifest_sha256 == config.dataset.bundle_manifest_sha256
-        return SimpleNamespace(
-            manifest=validate(path, expected_bundle_id=expected_bundle_id),
-            manifest_sha256=expected_manifest_sha256,
-        )
-
-    monkeypatch.setattr(
-        "beyondcxr.training.rsna_datasets.validate_bundle_reference", validate_reference
-    )
 
     def read_table(path, *, columns, filters):
         filename = Path(path).name
@@ -135,7 +130,7 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
     )
 
     expected_bundle = tmp_path / "manifests" / "rsna" / "bundles" / config.dataset.bundle_id
-    assert validated == [expected_bundle] * 4
+    assert validated == [expected_bundle] * 2
     assert tuple(data.train.features.columns) == SOURCE_FEATURES
     assert tuple(data.validation.features.columns) == SOURCE_FEATURES
     assert not {
@@ -197,39 +192,35 @@ def test_dataset_adapter_loads_exact_bundle_and_exposes_only_approved_features(
     )
 
 
-def test_config_cannot_omit_bundle_pin(tmp_path: Path) -> None:
+def test_yaml_rejects_bundle_pin_and_unbound_data_access_fails(tmp_path: Path) -> None:
     text = Path("configs/rsna_metadata_logistic.yaml").read_text(encoding="utf-8")
-    line = next(item for item in text.splitlines() if item.strip().startswith("bundle_id:"))
-    path = tmp_path / "unpinned.yaml"
-    path.write_text(text.replace(line + "\n", ""), encoding="utf-8")
-
-    with pytest.raises(ConfigError):
+    path = tmp_path / "pinned.yaml"
+    path.write_text(
+        text.replace("dataset_id: rsna", "dataset_id: rsna\n  bundle_id: bundle-" + "a" * 64),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="unknown fields"):
         load_experiment_config(path)
+    config = load_experiment_config("configs/rsna_metadata_logistic.yaml")
+    with pytest.raises(ManifestBuildError, match="explicit bundle identity"):
+        RsnaDataset().load_lineage(config)
 
 
 @pytest.mark.parametrize(
     "mismatch",
-    ["bundle_id", "manifest_sha256", "split_assignment_id", "task_id", "label_policy"],
+    ["bundle_id", "task_id", "label_policy"],
 )
-def test_rsna_adapter_rejects_every_mismatched_configured_witness_before_rows(
+def test_rsna_adapter_rejects_mismatched_authority_before_rows(
     monkeypatch: pytest.MonkeyPatch, mismatch: str
 ) -> None:
-    baseline = load_experiment_config("configs/rsna_metadata_logistic.yaml")
+    baseline = load_experiment_config(
+        "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+    )
     config = baseline
     if mismatch == "bundle_id":
         config = replace(
             baseline,
             dataset=replace(baseline.dataset, bundle_id="bundle-" + "0" * 64),
-        )
-    elif mismatch == "manifest_sha256":
-        config = replace(
-            baseline,
-            dataset=replace(baseline.dataset, bundle_manifest_sha256="0" * 64),
-        )
-    elif mismatch == "split_assignment_id":
-        config = replace(
-            baseline,
-            dataset=replace(baseline.dataset, split_assignment_id="split-assignment-" + "0" * 64),
         )
     elif mismatch == "task_id":
         config = replace(baseline, task=replace(baseline.task, task_id="unsupported"))
@@ -239,66 +230,40 @@ def test_rsna_adapter_rejects_every_mismatched_configured_witness_before_rows(
             task=replace(baseline.task, label_policy_version="unsupported"),
         )
     metadata = {
-        "membership": {"split": {"split_assignment_id": baseline.dataset.split_assignment_id}},
         "tasks": {
             baseline.task.task_id: {"label_policy_version": baseline.task.label_policy_version}
         },
     }
 
-    def validate_reference(path, *, expected_bundle_id, expected_manifest_sha256):
+    def validate(path, *, expected_bundle_id):
         del path
-        if (
-            expected_bundle_id != baseline.dataset.bundle_id
-            or expected_manifest_sha256 != baseline.dataset.bundle_manifest_sha256
-        ):
-            raise ManifestBuildError("configured integrity witness differs")
-        return SimpleNamespace(
-            manifest=metadata,
-            manifest_sha256=baseline.dataset.bundle_manifest_sha256,
-        )
+        if expected_bundle_id != baseline.dataset.bundle_id:
+            raise ManifestBuildError("configured bundle differs")
+        return metadata
 
     monkeypatch.setattr(
-        "beyondcxr.training.rsna_datasets.validate_bundle_reference", validate_reference
-    )
-    monkeypatch.setattr(
         "beyondcxr.training.rsna_datasets.validate_bundle_directory",
-        lambda *args, **kwargs: metadata,
+        validate,
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_datasets.pq.read_table",
-        lambda *args, **kwargs: pytest.fail("row access occurred before witness rejection"),
+        lambda *args, **kwargs: pytest.fail("row access occurred before authority rejection"),
     )
 
     with pytest.raises(ManifestBuildError):
         RsnaDataset().load_lineage(config)
 
 
-def test_cache_source_frame_reads_samples_and_splits_without_task_labels(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cache_source_frame_combines_builder_local_inputs_without_task_labels() -> None:
     tables = _tables()
-    reads: list[str] = []
-
-    def read_table(path, *, columns):
-        filename = Path(path).name
-        reads.append(filename)
-        rows = tables[filename].to_pylist()
-        return pa.Table.from_pylist([{column: row[column] for column in columns} for row in rows])
-
-    monkeypatch.setattr("beyondcxr.training.rsna_datasets.pq.read_table", read_table)
-    frame = _image_cache_frame(
-        SimpleNamespace(
-            splits_path=Path("splits.parquet"),
-            samples_path=Path("samples.parquet"),
-            source_inventory_path=Path("source_inventory.parquet"),
-        )
+    frame = _validate_complete_cache_source_frame(
+        tables["samples.parquet"].select(["sample_id", "patient_id", "image_path"]).to_pandas(),
+        tables["splits.parquet"].select(["sample_id", "split_name"]).to_pandas(),
+        tables["source_inventory.parquet"]
+        .select(["sample_id", "relative_path", "byte_size", "sha256"])
+        .to_pandas(),
     )
 
-    assert reads == [
-        "splits.parquet",
-        "samples.parquet",
-        "source_inventory.parquet",
-    ]
     assert tuple(frame.columns) == (
         "sample_id",
         "patient_id",

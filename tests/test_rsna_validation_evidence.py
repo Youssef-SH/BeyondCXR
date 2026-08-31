@@ -6,16 +6,95 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
+import pandas as pd
 import pytest
+from rsna_manifest_test_support import write_header, write_sources
 from rsna_validation_evidence_test_support import write_synthetic_validation_evidence
 
+from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.rsna_artifacts import build_and_write
 from beyondcxr.training.config import load_experiment_config, with_runtime
 from beyondcxr.training.rsna_validation_evidence import (
     CanonicalValidationCohort,
-    evidence_semantic_sha256,
+    _derive_canonical_held_out_cohort,
     validate_cxr_epoch_history,
     validate_validation_evidence,
+    validation_evidence_id,
 )
+
+
+def test_canonical_held_out_cohort_has_one_validated_derivation_owner(tmp_path: Path) -> None:
+    source = write_sources(tmp_path / "source")
+    labels_path = source / "stage_2_train_labels.csv"
+    classes_path = source / "stage_2_detailed_class_info.csv"
+    labels = pd.read_csv(labels_path)
+    classes = pd.read_csv(classes_path)
+    added_labels: list[dict[str, object]] = []
+    added_classes: list[dict[str, object]] = []
+    for target in (0, 1):
+        for index in (1, 2):
+            patient_id = f"target-{target}-{index}"
+            write_header(source / "stage_2_train_images" / f"{patient_id}.dcm", patient_id)
+            added_labels.append(
+                {
+                    "patientId": patient_id,
+                    "x": 1 if target else None,
+                    "y": 2 if target else None,
+                    "width": 3 if target else None,
+                    "height": 4 if target else None,
+                    "Target": target,
+                }
+            )
+            added_classes.append(
+                {
+                    "patientId": patient_id,
+                    "class": "Lung Opacity" if target else "Normal",
+                }
+            )
+    pd.concat([labels, pd.DataFrame(added_labels)], ignore_index=True).to_csv(
+        labels_path, index=False
+    )
+    pd.concat([classes, pd.DataFrame(added_classes)], ignore_index=True).to_csv(
+        classes_path, index=False
+    )
+    written = build_and_write(source, tmp_path / "manifests")
+    package = {
+        "bundle_id": written.paths.bundle_id,
+        "task_id": "pneumonia",
+        "label_policy_version": "rsna-stage-2-target-v1",
+    }
+
+    cohort = _derive_canonical_held_out_cohort(written.paths.bundle_directory, package)
+
+    assert cohort.sample_ids == tuple(sorted(cohort.sample_ids))
+    assert len(cohort.sample_ids) == 2
+    assert set(cohort.targets) == {0, 1}
+    with pytest.raises(ManifestBuildError, match="held-out cohort authority"):
+        _derive_canonical_held_out_cohort(
+            written.paths.bundle_directory,
+            {**package, "task_id": "other-task"},
+        )
+
+
+def test_validation_evidence_identity_excludes_calibration_rendering_policy(
+    tmp_path: Path,
+) -> None:
+    path = write_synthetic_validation_evidence(
+        tmp_path / "validation-evidence.json",
+        Path("configs/rsna_metadata_logistic.yaml"),
+        seed=42,
+    )
+    document = json.loads(path.read_bytes())
+    baseline = document["validation_evidence_id"]
+    assert baseline == validation_evidence_id(document)
+
+    changed_bins = deepcopy(document)
+    changed_bins["calibration_bins"] += 1
+    assert validation_evidence_id(changed_bins) == baseline
+
+    changed_target = deepcopy(document)
+    changed_target["sensitivity_target"] = 0.8
+    assert validation_evidence_id(changed_target) != baseline
 
 
 @pytest.mark.parametrize(
@@ -27,7 +106,9 @@ def test_repaired_validation_evidence_cannot_change_canonical_cohort(
     attack: str,
 ) -> None:
     config = with_runtime(
-        load_experiment_config("configs/rsna_metadata_logistic.yaml"),
+        load_experiment_config(
+            "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+        ),
         seed=42,
     )
     path = write_synthetic_validation_evidence(
@@ -57,6 +138,7 @@ def test_repaired_validation_evidence_cannot_change_canonical_cohort(
             document["sample_ids"][1],
             document["sample_ids"][0],
         )
+    document["validation_evidence_id"] = validation_evidence_id(document)
     path.write_bytes(
         (
             json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
@@ -67,18 +149,14 @@ def test_repaired_validation_evidence_cannot_change_canonical_cohort(
         for key in (
             "dataset_id",
             "bundle_id",
-            "bundle_manifest_sha256",
-            "split_assignment_id",
             "task_id",
             "label_policy_version",
             "family_id",
-            "config_source_sha256",
-            "config_semantic_sha256",
             "seed",
         )
     }
     package["validation_evidence_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    package["validation_evidence_semantic_sha256"] = evidence_semantic_sha256(document)
+    package["validation_evidence_id"] = validation_evidence_id(document)
 
     with pytest.raises(ValueError, match="canonical validation cohort"):
         validate_validation_evidence(
@@ -90,7 +168,10 @@ def test_repaired_validation_evidence_cannot_change_canonical_cohort(
 
 
 def _cxr_evidence(tmp_path: Path):
-    config = with_runtime(load_experiment_config("configs/rsna_cxr_densenet.yaml"), seed=42)
+    config = with_runtime(
+        load_experiment_config("configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64),
+        seed=42,
+    )
     path = write_synthetic_validation_evidence(
         tmp_path / "validation-evidence.json",
         Path("configs/rsna_cxr_densenet.yaml"),
@@ -105,16 +186,13 @@ def _cxr_evidence(tmp_path: Path):
         for key in (
             "dataset_id",
             "bundle_id",
-            "bundle_manifest_sha256",
-            "split_assignment_id",
             "task_id",
             "label_policy_version",
             "family_id",
-            "config_source_sha256",
-            "config_semantic_sha256",
             "seed",
         )
     }
+    package["thresholds"] = {"youden_j": 0.7, "target_sensitivity": 0.7}
     package["selection"] = {
         "selected_epoch": 3,
         "selected_stage": "fine_tune",
@@ -127,12 +205,13 @@ def _cxr_evidence(tmp_path: Path):
 def _repair_evidence_identity(
     path: Path, document: dict[str, object], package: dict[str, object]
 ) -> None:
+    document["validation_evidence_id"] = validation_evidence_id(document)
     encoded = (
         json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode()
     path.write_bytes(encoded)
     package["validation_evidence_sha256"] = hashlib.sha256(encoded).hexdigest()
-    package["validation_evidence_semantic_sha256"] = evidence_semantic_sha256(document)
+    package["validation_evidence_id"] = validation_evidence_id(document)
 
 
 @pytest.mark.parametrize(

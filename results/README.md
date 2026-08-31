@@ -4,12 +4,12 @@ This directory contains public aggregate results for the primary Symile study. S
 results remain reproducible through the RSNA campaign and aggregate-report workflow; they are
 separate evidence and not external validation of the Symile predictor.
 
-`make rsna-campaign` produces and validates the existing RSNA aggregate authorities under
-`reports/rsna/evaluations/`, `reports/rsna/seed-summaries/`, and `reports/rsna/localization/`, with
-the content-addressed deterministic comparison under `reports/rsna/comparisons/`.
+`make rsna` produces and validates the RSNA evaluation and localization authorities under
+`reports/rsna/evaluations/` and `reports/rsna/localization/`. Deterministic seed summaries and
+comparisons are rendered under `reports/rsna/seed-summaries/` and `reports/rsna/comparisons/`.
 
-Before formal execution no Symile result files exist here. After execution, `make results`
-restores and validates one explicit preservation export and writes the result binding,
+Before formal execution no Symile result files exist here. After `make symile-test`, `make release`
+resolves and validates the sole completed Symile preservation archive and writes the result binding,
 five aggregate CSVs, five matching Markdown tables, and three scientific SVGs under `symile/`.
 Synthetic outputs remain temporary test data.
 

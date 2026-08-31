@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import zipfile
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from symile_campaign_test_support import (
     _freeze,
@@ -16,12 +20,14 @@ from symile_campaign_test_support import (
 import beyondcxr.training.symile_campaign_control as campaign_control
 import beyondcxr.training.symile_statistics as symile_statistics
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.serving.authority import publish_serving_authority
 from beyondcxr.training.preservation import PreservationMember, export_and_verify
 from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
 )
 from beyondcxr.training.symile_test_data import (
     FrozenSymileTestData,
+    require_held_out_evaluation_projection,
 )
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
@@ -45,6 +51,7 @@ def result_evidence(tmp_path, monkeypatch):
         "validate_prediction_evidence",
         lambda directory, **kwargs: evidence_by_path[Path(directory)],
     )
+    monkeypatch.setattr(campaign_control, "_require_capability", lambda value: value)
     monkeypatch.setattr(
         campaign_control,
         "cluster_bootstrap_effect",
@@ -52,9 +59,8 @@ def result_evidence(tmp_path, monkeypatch):
     )
     projection = _projection_for_freeze(freeze, grouped=False)
     test_data = object.__new__(FrozenSymileTestData)
-    test_data.bundle = type("Bundle", (), {"bundle_id": projection.bundle_id})()
-    test_data.frame = projection.frame()
-    test_data.split_assignment_id = projection.split_assignment_id
+    test_data._bundle = SimpleNamespace(bundle_id=projection.bundle_id)
+    test_data._canonical_frame = projection.frame()
     test_data._capability = freeze
     result = campaign_control.publish_global_result(
         report_root=tmp_path / "reports",
@@ -107,6 +113,155 @@ def test_global_result_schema_and_idempotent_publication(tmp_path, result_eviden
     assert resumed_result.result_id == result.result_id
 
 
+@pytest.mark.parametrize("member", ["manifest.json", "claims.json", "reliability.svg"])
+def test_global_result_rejects_symlink_members(tmp_path, result_evidence, member):
+    review_arguments, result, _, _ = result_evidence
+    source = result.directory / member
+    external = tmp_path / member
+    source.rename(external)
+    source.symlink_to(external)
+
+    with pytest.raises(ManifestBuildError, match="directory is invalid"):
+        campaign_control.validate_global_result_integrity(result.directory, **review_arguments)
+
+
+def test_global_result_integrity_does_not_repeat_scientific_bootstrap(
+    result_evidence, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_arguments, result, _, _ = result_evidence
+    monkeypatch.setattr(
+        campaign_control,
+        "_derive_global_claims",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("scientific recomputation")),
+    )
+
+    validated = campaign_control.validate_global_result_integrity(
+        result.directory, **review_arguments
+    )
+
+    assert validated.result_id == result.result_id
+    assert validated.claims_sha256 == result.claims_sha256
+    assert validated.reliability_sha256 == result.reliability_sha256
+    assert isinstance(validated, campaign_control.GlobalResultIntegrity)
+    assert not isinstance(validated, campaign_control.CertifiedGlobalResult)
+    with pytest.raises(AssertionError, match="scientific recomputation"):
+        campaign_control.validate_global_result(result.directory, **review_arguments)
+
+
+def test_integrity_only_global_result_cannot_publish_serving_authority(result_evidence) -> None:
+    review_arguments, result, _, _ = result_evidence
+    claims_path = result.directory / "claims.json"
+    claims = json.loads(claims_path.read_bytes())
+    family_metrics = next(iter(claims["predictor_views"].values()))
+    metric = next(iter(family_metrics))
+    family_metrics[metric] = 0.0 if family_metrics[metric] != 0.0 else 1.0
+    claims_path.write_text(
+        json.dumps(claims, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+    integrity = campaign_control.validate_global_result_integrity(
+        result.directory, **review_arguments
+    )
+
+    with pytest.raises(PermissionError, match="full scientific certification"):
+        publish_serving_authority(
+            authority_root=result.directory.parent / "serving",
+            capability=review_arguments["capability"],
+            global_result=integrity,
+            global_predictions=review_arguments["predictions"],
+            global_test_data=review_arguments["test_data"],
+            final_packages=review_arguments["final_packages"],
+        )
+
+
+def test_certification_cannot_transfer_to_altered_integrity_result(
+    tmp_path: Path, result_evidence
+) -> None:
+    review_arguments, certified, _, _ = result_evidence
+    altered_directory = tmp_path / "foreign" / certified.directory.name
+    shutil.copytree(certified.directory, altered_directory)
+    claims_path = altered_directory / "claims.json"
+    claims = json.loads(claims_path.read_bytes())
+    family_metrics = next(iter(claims["predictor_views"].values()))
+    metric = next(iter(family_metrics))
+    family_metrics[metric] = 0.0 if family_metrics[metric] != 0.0 else 1.0
+    claims_path.write_text(
+        json.dumps(claims, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    integrity = campaign_control.validate_global_result_integrity(
+        altered_directory, **review_arguments
+    )
+
+    with pytest.raises(TypeError):
+        replace(
+            certified,
+            directory=integrity.directory,
+            manifest=integrity.manifest,
+            claims_sha256=integrity.claims_sha256,
+            reliability_sha256=integrity.reliability_sha256,
+        )
+    with pytest.raises(TypeError):
+        certified.manifest["global_result_id"] = integrity.result_id
+    assert copy.copy(certified) is certified
+    assert copy.deepcopy(certified) is certified
+
+    with pytest.raises(PermissionError, match="full scientific certification"):
+        publish_serving_authority(
+            authority_root=tmp_path / "serving",
+            capability=review_arguments["capability"],
+            global_result=integrity,
+            global_predictions=review_arguments["predictions"],
+            global_test_data=review_arguments["test_data"],
+            final_packages=review_arguments["final_packages"],
+        )
+
+
+def test_serving_rejects_global_result_changed_after_certification(result_evidence) -> None:
+    review_arguments, certified, _, _ = result_evidence
+    claims_path = certified.directory / "claims.json"
+    claims = json.loads(claims_path.read_bytes())
+    family_metrics = next(iter(claims["predictor_views"].values()))
+    metric = next(iter(family_metrics))
+    family_metrics[metric] = 0.0 if family_metrics[metric] != 0.0 else 1.0
+    claims_path.write_text(
+        json.dumps(claims, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    campaign_control.validate_global_result_integrity(certified.directory, **review_arguments)
+
+    with pytest.raises(ManifestBuildError, match="changed after certification"):
+        publish_serving_authority(
+            authority_root=certified.directory.parent / "serving",
+            capability=review_arguments["capability"],
+            global_result=certified,
+            global_predictions=review_arguments["predictions"],
+            global_test_data=review_arguments["test_data"],
+            final_packages=review_arguments["final_packages"],
+        )
+
+
+def test_escaped_frame_and_replaced_projection_cannot_change_global_result(result_evidence):
+    review_arguments, result, _, _ = result_evidence
+    freeze = review_arguments["capability"]
+    test_data = review_arguments["test_data"]
+    canonical = test_data.evaluation_projection().frame()
+    escaped = test_data.frame
+    escaped["subject_id"] = np.arange(100_000, 100_000 + len(escaped))
+    escaped["sample_id"] = [f"foreign:{index}" for index in range(len(escaped))]
+    escaped["target"] = 1 - escaped["target"]
+
+    campaign_control.validate_global_result(result.directory, **review_arguments)
+    assert test_data.evaluation_projection().frame().equals(canonical)
+
+    altered = canonical.copy()
+    altered["subject_id"] = np.arange(200_000, 200_000 + len(altered))
+    transferred = replace(test_data.evaluation_projection(), _frame=altered)
+    with pytest.raises(PermissionError, match="differs from canonical test data"):
+        require_held_out_evaluation_projection(transferred, freeze=freeze)
+
+
 def test_private_review_generation_and_regeneration(tmp_path, result_evidence):
     review_arguments, result, _, _ = result_evidence
     predictions = review_arguments["predictions"]
@@ -126,6 +281,7 @@ def test_private_review_generation_and_regeneration(tmp_path, result_evidence):
         if package.manifest["input"]["family"]["family_id"] == "cxr_labs_gated"
     ]
     review_document = json.loads(original_review)
+    assert "error_review_id" not in review_document
     assert "global_result_id" not in review_document
     assert "bundle" not in review_document
     assert "task" not in review_document
@@ -140,8 +296,11 @@ def test_private_review_generation_and_regeneration(tmp_path, result_evidence):
     review.write_bytes(b"corrupt")
     with pytest.raises(ManifestBuildError, match="does not rederive"):
         campaign_control.validate_error_review(review, **review_arguments)
-    with pytest.raises(ManifestBuildError, match="conflicts"):
-        campaign_control.publish_error_review(private_root=tmp_path / "private", **review_arguments)
+    recovered = campaign_control.publish_error_review(
+        private_root=tmp_path / "private", **review_arguments
+    )
+    assert recovered == review
+    assert recovered.read_bytes() == original_review
     campaign_control.validate_global_result(
         result.directory,
         **review_arguments,
@@ -184,21 +343,8 @@ def test_global_result_is_closed_to_frozen_packages_and_subject_grouping(result_
     alternate[0] = ValidatedFinalPackage(
         packages[0].directory,
         {**packages[0].manifest, "final_package_id": "final-package-" + "9" * 64},
-        packages[0].manifest_sha256,
     )
     package_by_path[packages[0].directory] = alternate[0]
-    with pytest.raises(ManifestBuildError, match="pre-test freeze"):
-        campaign_control.validate_global_result(
-            result.directory,
-            capability=freeze,
-            predictions=predictions,
-            final_packages=alternate,
-            test_data=test_data,
-        )
-
-    altered_hash = ValidatedFinalPackage(packages[0].directory, packages[0].manifest, "8" * 64)
-    alternate[0] = altered_hash
-    package_by_path[packages[0].directory] = altered_hash
     with pytest.raises(ManifestBuildError, match="pre-test freeze"):
         campaign_control.validate_global_result(
             result.directory,
@@ -213,7 +359,6 @@ def test_global_result_is_closed_to_frozen_packages_and_subject_grouping(result_
     changed_prediction = ValidatedPredictionEvidence(
         predictions[0].directory,
         prediction_manifest,
-        predictions[0].manifest_sha256,
         predictions[0].predictions,
     )
     changed_predictions = (changed_prediction, *predictions[1:])
@@ -229,7 +374,8 @@ def test_global_result_is_closed_to_frozen_packages_and_subject_grouping(result_
 
     evidence_by_path[predictions[0].directory] = predictions[0]
     projection = _projection_for_freeze(freeze, grouped=True)
-    test_data.frame = projection.frame()
+    test_data._bundle = SimpleNamespace(bundle_id=projection.bundle_id)
+    test_data._canonical_frame = projection.frame()
     with pytest.raises(ManifestBuildError, match="claims do not rederive"):
         campaign_control.validate_global_result(
             result.directory,
@@ -247,5 +393,5 @@ def test_private_review_does_not_depend_on_global_claims(tmp_path, result_eviden
     )
     (result.directory / "claims.json").write_text("{}\n", encoding="utf-8")
     campaign_control.validate_error_review(review, **review_arguments)
-    with pytest.raises(ManifestBuildError, match="claims do not rederive"):
+    with pytest.raises(ManifestBuildError, match="claims contract is invalid"):
         campaign_control.validate_global_result(result.directory, **review_arguments)

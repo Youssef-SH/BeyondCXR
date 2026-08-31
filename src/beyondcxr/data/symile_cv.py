@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import platform
 import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +17,11 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import sklearn
 from sklearn.model_selection import StratifiedGroupKFold
 
 from beyondcxr.data.bundle_contract import BUNDLE_PREFIX, valid_bundle_id
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import logical_arrow_sha256, sha256_file
+from beyondcxr.data.hashing import LogicalTableContract, logical_table_sha256
 from beyondcxr.data.symile_artifacts import (
     SymileBundlePaths,
     read_symile_samples,
@@ -45,13 +42,24 @@ from beyondcxr.utils.operational_logging import (
     get_operational_logger,
     timed_phase,
 )
-from beyondcxr.utils.publication import staging_directory
+from beyondcxr.utils.publication import install_immutable_directory, staging_directory
+from beyondcxr.utils.semantic_identity import (
+    canonical_json_bytes,
+    semantic_sha256,
+)
 
 CV_DIRECTORY = "cv"
 CV_ASSIGNMENTS_FILENAME = "assignments.parquet"
 CV_MANIFEST_FILENAME = "manifest.json"
 _EXPECTED_FILES = {CV_ASSIGNMENTS_FILENAME, CV_MANIFEST_FILENAME}
 _LOGGER = get_operational_logger(__name__)
+_CV_TABLE_CONTRACT = LogicalTableContract(
+    "symile.cv-assignments",
+    1,
+    CV_SCHEMA,
+    ("repeat_seed", "sample_id"),
+    ("repeat_seed", "sample_id"),
+)
 
 
 @dataclass(frozen=True)
@@ -59,7 +67,6 @@ class ValidatedSymileCvReference:
     """Validated CV declaration and assignments without bundle sample access."""
 
     manifest: dict[str, Any]
-    manifest_sha256: str
     assignments: pa.Table
 
 
@@ -137,9 +144,7 @@ def cv_assignment_id(
 ) -> str:
     """Hash the complete meaning-bearing CV design and assignment content."""
     payload = _cv_identity_payload(bundle_id, assignment_logical_hash)
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    digest = semantic_sha256("symile-cv-assignment", 1, payload)
     return "cv-assignment-" + digest
 
 
@@ -149,24 +154,17 @@ def publish_symile_cv(
     manifest_directory: str | Path = "data/manifests",
 ) -> tuple[str, Path]:
     """Generate, validate, and immutably publish the bundle-bound CV artifact."""
-    samples = read_symile_samples(bundle)
+    samples = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
     assignments = generate_cv_assignments(samples)
-    logical_hash = logical_arrow_sha256(assignments)
+    logical_hash = logical_table_sha256(assignments, _CV_TABLE_CONTRACT)
     assignment_id = cv_assignment_id(bundle.bundle_id, logical_hash)
     destination = Path(manifest_directory) / "symile" / CV_DIRECTORY / assignment_id
     stage = staging_directory(destination)
     try:
         pq.write_table(assignments, stage / CV_ASSIGNMENTS_FILENAME, compression="zstd")
-        manifest = _cv_manifest(bundle.bundle_id, assignment_id, assignments, logical_hash, stage)
-        (stage / CV_MANIFEST_FILENAME).write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        validate_symile_cv(stage, bundle=bundle, enforce_directory_name=False)
-        if destination.exists():
-            validate_symile_cv(destination, bundle=bundle)
-            shutil.rmtree(stage)
-        else:
-            os.replace(stage, destination)
+        manifest = _cv_manifest(bundle.bundle_id, assignment_id, assignments, logical_hash)
+        (stage / CV_MANIFEST_FILENAME).write_bytes(canonical_json_bytes(manifest))
+        install_immutable_directory(stage, destination, partial(validate_symile_cv, bundle=bundle))
     finally:
         if stage.exists():
             shutil.rmtree(stage)
@@ -187,7 +185,7 @@ def validate_symile_cv(
         expected_assignment_id=expected_assignment_id,
         enforce_directory_name=enforce_directory_name,
     )
-    samples = read_symile_samples(bundle)
+    samples = read_symile_samples(bundle, official_splits=DEVELOPMENT_SPLITS)
     validate_cv_table(reference.assignments, samples)
     return reference.manifest
 
@@ -197,7 +195,6 @@ def validate_symile_cv_reference(
     *,
     bundle_id: str,
     expected_assignment_id: str | None = None,
-    expected_manifest_sha256: str | None = None,
     enforce_directory_name: bool = True,
 ) -> ValidatedSymileCvReference:
     """Validate one immutable CV artifact without reading bundle sample rows."""
@@ -205,12 +202,11 @@ def validate_symile_cv_reference(
     _require_exact_files(root)
     try:
         manifest_bytes = (root / CV_MANIFEST_FILENAME).read_bytes()
-        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         manifest = json.loads(manifest_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ManifestBuildError("Symile CV manifest is unreadable") from exc
-    if expected_manifest_sha256 is not None and manifest_sha256 != expected_manifest_sha256:
-        raise ManifestBuildError("Symile CV manifest SHA-256 differs from expected identity")
+    if manifest_bytes != canonical_json_bytes(manifest):
+        raise ManifestBuildError("Symile CV manifest serialization is not canonical")
     _validate_cv_manifest(manifest)
     assignment_id = manifest["cv_assignment_id"]
     if expected_assignment_id is not None and assignment_id != expected_assignment_id:
@@ -221,18 +217,18 @@ def validate_symile_cv_reference(
         raise ManifestBuildError("Symile CV artifact is bound to a different bundle")
     artifact = manifest["artifact"]
     path = root / CV_ASSIGNMENTS_FILENAME
-    if sha256_file(path) != artifact["physical_file_sha256"] or pq.read_schema(path) != CV_SCHEMA:
-        raise ManifestBuildError("Symile CV artifact physical integrity is invalid")
+    if pq.read_schema(path) != CV_SCHEMA:
+        raise ManifestBuildError("Symile CV assignment schema is invalid")
     assignments = pq.read_table(path)
     if artifact["row_count"] != assignments.num_rows:
         raise ManifestBuildError("Symile CV artifact row count does not match")
-    logical_hash = logical_arrow_sha256(assignments)
+    logical_hash = logical_table_sha256(assignments, _CV_TABLE_CONTRACT)
     if (
-        logical_hash != artifact["logical_arrow_sha256"]
+        logical_hash != artifact["semantic_sha256"]
         or cv_assignment_id(bundle_id, logical_hash) != assignment_id
     ):
         raise ManifestBuildError("Symile CV semantic identity is invalid")
-    return ValidatedSymileCvReference(dict(manifest), manifest_sha256, assignments)
+    return ValidatedSymileCvReference(dict(manifest), assignments)
 
 
 def _cv_identity_payload(bundle_id: str, logical_hash: str) -> dict[str, object]:
@@ -256,9 +252,9 @@ def _cv_manifest(
     assignment_id: str,
     assignments: pa.Table,
     logical_hash: str,
-    stage: Path,
 ) -> dict[str, object]:
     return {
+        "schema_version": 1,
         "cv_assignment_id": assignment_id,
         "bundle_id": bundle_id,
         **{
@@ -268,18 +264,8 @@ def _cv_manifest(
         },
         "artifact": {
             "filename": CV_ASSIGNMENTS_FILENAME,
-            "logical_arrow_sha256": logical_hash,
-            "physical_file_sha256": sha256_file(stage / CV_ASSIGNMENTS_FILENAME),
+            "semantic_sha256": logical_hash,
             "row_count": assignments.num_rows,
-        },
-        "provenance": {
-            "python": platform.python_version(),
-            "scikit_learn": sklearn.__version__,
-            "pyarrow": pa.__version__,
-        },
-        "generation": {
-            "timestamp_utc": datetime.now(UTC).isoformat(),
-            "command": "python -m beyondcxr.data.symile_cv",
         },
     }
 
@@ -287,14 +273,15 @@ def _cv_manifest(
 def _validate_cv_manifest(manifest: object) -> None:
     identity_fields = _cv_identity_payload(BUNDLE_PREFIX + "0" * 64, "0" * 64)
     expected = {
+        "schema_version",
         "cv_assignment_id",
         *identity_fields,
         "artifact",
-        "provenance",
-        "generation",
     }
     if not isinstance(manifest, dict) or set(manifest) != expected:
         raise ManifestBuildError("Symile CV manifest field set is invalid")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ManifestBuildError("Symile CV manifest schema version is unsupported")
     bundle_id = manifest.get("bundle_id")
     semantic_artifacts = manifest.get("artifacts")
     logical_hash = (
@@ -322,14 +309,11 @@ def _validate_cv_manifest(manifest: object) -> None:
         or set(artifact)
         != {
             "filename",
-            "logical_arrow_sha256",
-            "physical_file_sha256",
+            "semantic_sha256",
             "row_count",
         }
         or artifact.get("filename") != CV_ASSIGNMENTS_FILENAME
-        or artifact.get("logical_arrow_sha256") != logical_hash
-        or not isinstance(artifact.get("physical_file_sha256"), str)
-        or len(artifact["physical_file_sha256"]) != 64
+        or artifact.get("semantic_sha256") != logical_hash
         or isinstance(artifact.get("row_count"), bool)
         or not isinstance(artifact.get("row_count"), int)
         or artifact["row_count"] <= 0

@@ -9,9 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from beyondcxr.data.errors import ManifestBuildError
-from beyondcxr.data.hashing import sha256_file
-from beyondcxr.data.symile_artifacts import build_symile_artifacts, write_symile_bundle
-from beyondcxr.data.symile_source import qualify_symile_source
+from beyondcxr.data.symile_source import publish_symile_source_bundle
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
     configure_logging,
@@ -44,12 +42,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
-        with timed_phase(_LOGGER, "source_qualification"):
-            source = qualify_symile_source(args.source_root)
-        with timed_phase(_LOGGER, "manifest_construction"):
-            result = build_symile_artifacts(source)
-        with timed_phase(_LOGGER, "bundle_publication"):
-            paths = write_symile_bundle(result, args.output_directory)
+        with timed_phase(_LOGGER, "source_qualification_and_bundle_publication"):
+            paths, sample_count = publish_symile_source_bundle(
+                args.source_root,
+                output_directory=args.output_directory,
+            )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
         print(f"Symile manifest build failed: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -57,11 +54,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "bundle_id": paths.bundle_id,
-                "bundle_manifest_sha256": sha256_file(paths.metadata_path),
                 "bundle_directory": paths.bundle_directory.as_posix(),
                 "current_marker": paths.current_path.as_posix(),
-                "sample_count": result.samples.num_rows,
-                "split_assignment_id": result.metadata["membership"]["split_assignment_id"],
+                "sample_count": sample_count,
             },
             indent=2,
         )

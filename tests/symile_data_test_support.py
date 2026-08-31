@@ -11,8 +11,6 @@ import pandas as pd
 
 from beyondcxr.data.symile_artifacts import (
     SymileBundlePaths,
-    build_symile_artifacts,
-    write_symile_bundle,
 )
 from beyondcxr.data.symile_schemas import (
     LAB_ITEM_IDS,
@@ -20,7 +18,7 @@ from beyondcxr.data.symile_schemas import (
 )
 from beyondcxr.data.symile_source import (
     EXPECTED_RELEASE_ASSETS,
-    qualify_symile_source,
+    publish_symile_source_bundle,
 )
 
 
@@ -173,6 +171,45 @@ def _synthetic_release(tmp_path: Path) -> Path:
 
 def _published_synthetic_release(tmp_path: Path) -> tuple[Path, SymileBundlePaths]:
     source_root = _synthetic_release(tmp_path)
-    source = qualify_symile_source(source_root, enforce_production_counts=False)
-    bundle = write_symile_bundle(build_symile_artifacts(source), tmp_path / "manifests")
+    bundle, _ = publish_symile_source_bundle(
+        source_root,
+        output_directory=tmp_path / "manifests",
+        enforce_production_counts=False,
+    )
+    assert isinstance(bundle, SymileBundlePaths)
     return source_root, bundle
+
+
+def _materialized_synthetic_test(bundle, monkeypatch):
+    """Exercise source semantics with a synthetic authorization boundary."""
+    from types import SimpleNamespace
+
+    from beyondcxr.data.symile_source import _validate_membership
+    from beyondcxr.training import symile_test_data
+    from beyondcxr.training.symile_test_data import FrozenSymileTestData
+
+    freeze = object()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            symile_test_data, "_require_test_materialization", lambda authority, frozen: frozen
+        )
+        patch.setattr(
+            symile_test_data,
+            "validated_pretest_freeze_manifest",
+            lambda frozen: {"bundle_id": bundle.bundle_id},
+        )
+        patch.setattr(
+            symile_test_data,
+            "_validate_membership",
+            lambda full, official, enforce: _validate_membership(full, official, False),
+        )
+        samples, labs, counts = symile_test_data._read_test_source(
+            SimpleNamespace(), freeze, bundle
+        )
+    data = object.__new__(FrozenSymileTestData)
+    data._source_samples = samples
+    data._source_reconciliation = counts
+    data._canonical_frame = samples.merge(labs, on="sample_id", validate="one_to_one")
+    data._bundle = bundle
+    data._capability = freeze
+    return data

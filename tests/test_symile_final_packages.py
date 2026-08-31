@@ -4,7 +4,7 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,7 @@ from symile_campaign_test_support import (
     _freeze,
     _synthetic_final_packages,
 )
+from symile_lifecycle_test_support import prospective_symile_mutation
 from torch import nn
 
 import beyondcxr.training.neural as neural
@@ -26,7 +27,7 @@ from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.symile_preprocess import LAB_FEATURE_COLUMNS
 from beyondcxr.models.cxr_baseline import PretrainedWeightIdentity
 from beyondcxr.models.symile_tabular import fit_symile_labs_logistic
-from beyondcxr.training.config import load_symile_development_config
+from beyondcxr.training.config import load_symile_development_config, with_runtime
 from beyondcxr.training.execution import reused_loader_policy
 from beyondcxr.training.neural import (
     build_terminal_training_loader,
@@ -45,6 +46,29 @@ from beyondcxr.training.symile_statistics import (
 )
 
 
+def test_final_config_loads_from_immutable_serving_manifest(tmp_path: Path) -> None:
+    from beyondcxr.utils.immutable_json import immutable_json
+
+    config = load_symile_development_config(
+        "configs/symile_cxr_labs_gated.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
+    path = tmp_path / "final_fit_config.json"
+    path.write_bytes(final_packages._final_config_bytes(config))
+    manifest = {"input": final_packages._final_input_projection(config)}
+    plain = ValidatedFinalPackage(tmp_path, manifest)
+    frozen = ValidatedFinalPackage(tmp_path, immutable_json(manifest))
+    assert final_packages.load_final_package_config(
+        frozen
+    ) == final_packages.load_final_package_config(plain)
+    document = json.loads(path.read_bytes())
+    document["family"]["modalities"].reverse()
+    path.write_text(json.dumps(document))
+    with pytest.raises(ManifestBuildError, match="differs from manifest"):
+        final_packages.load_final_package_config(frozen)
+
+
 @pytest.mark.parametrize("value", [None, {}, {"git_commit": "a" * 40}, {"unexpected": True}])
 @pytest.mark.parametrize("neural", [False, True])
 def test_final_provenance_rejects_missing_or_partial_fields(value, neural):
@@ -59,35 +83,57 @@ def test_final_provenance_rejects_malformed_runtime():
         final_packages._validate_execution_provenance(value, neural=True)
 
 
-def test_final_fit_apis_require_and_prevalidate_provenance(monkeypatch) -> None:
-    tabular = load_symile_development_config("configs/symile_labs_logistic.yaml")
-    neural_config = load_symile_development_config("configs/symile_cxr_densenet.yaml")
-
-    with pytest.raises(TypeError, match="operational"):
-        final_training.fit_final_tabular_family(tabular, development=None)
-    with pytest.raises(TypeError, match="operational"):
-        final_training.fit_final_neural_member(
-            neural_config,
-            development=None,
-            member_seed=17,
-            expected_pretrained_scientific_identity=None,
-        )
-
-    monkeypatch.setattr(
-        final_training,
-        "load_symile_development_cohort",
-        lambda config: (_ for _ in ()).throw(AssertionError("fitting began")),
+def test_final_fit_apis_require_and_prevalidate_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tabular = load_symile_development_config(
+        "configs/symile_labs_logistic.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
     )
-    with pytest.raises(ManifestBuildError, match="provenance"):
-        final_training.fit_final_tabular_family(tabular, development=None, operational={})
-    with pytest.raises(ManifestBuildError, match="provenance"):
-        final_training.fit_final_neural_member(
-            neural_config,
-            development=None,
-            member_seed=17,
-            expected_pretrained_scientific_identity=None,
-            operational={},
+    neural_config = load_symile_development_config(
+        "configs/symile_cxr_densenet.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
+
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        with pytest.raises(TypeError, match="operational"):
+            final_training.fit_final_tabular_family(
+                tabular,
+                prospective_mutation=mutation,
+                development=None,
+            )
+        with pytest.raises(TypeError, match="operational"):
+            final_training.fit_final_neural_member(
+                neural_config,
+                prospective_mutation=mutation,
+                development=None,
+                member_seed=17,
+                expected_pretrained_scientific_identity=None,
+            )
+
+        monkeypatch.setattr(
+            final_training,
+            "load_symile_development_cohort",
+            lambda config: (_ for _ in ()).throw(AssertionError("fitting began")),
         )
+        with pytest.raises(ManifestBuildError, match="provenance"):
+            final_training.fit_final_tabular_family(
+                tabular,
+                prospective_mutation=mutation,
+                development=None,
+                operational={},
+            )
+        with pytest.raises(ManifestBuildError, match="provenance"):
+            final_training.fit_final_neural_member(
+                neural_config,
+                prospective_mutation=mutation,
+                development=None,
+                member_seed=17,
+                expected_pretrained_scientific_identity=None,
+                operational={},
+            )
 
 
 def test_final_cardinalities_and_mean_logit_semantics_are_exact() -> None:
@@ -105,6 +151,7 @@ def test_final_cardinalities_and_mean_logit_semantics_are_exact() -> None:
 
 def test_final_training_plans_and_logistic_package_are_narrow_and_reconstructable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert final_training_plan("labs_logistic", None).budget is None
     assert final_training_plan("labs_lightgbm", 23).budget == 23
@@ -113,7 +160,11 @@ def test_final_training_plans_and_logistic_package_are_narrow_and_reconstructabl
     with pytest.raises(ManifestBuildError):
         final_training_plan("cxr_labs_gated_no_observedness", 9)
 
-    config = load_symile_development_config("configs/symile_labs_logistic.yaml")
+    config = load_symile_development_config(
+        "configs/symile_labs_logistic.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
     values = np.arange(400, dtype=np.float64).reshape(8, 50)
     features = pd.DataFrame(values, columns=LAB_FEATURE_COLUMNS[:50])
     for column in LAB_FEATURE_COLUMNS[50:]:
@@ -127,22 +178,93 @@ def test_final_training_plans_and_logistic_package_are_narrow_and_reconstructabl
         lab_policy=str(config.preprocessing["lab_policy"]),
         training_seed=42,
     )
-    package = publish_final_tabular_package(
-        model_root=tmp_path / "models",
-        config=config,
-        family_development_id=None,
-        plan=final_training_plan("labs_logistic", None),
-        model=fit.pipeline,
-        operational=_final_provenance(),
-    )
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        package = publish_final_tabular_package(
+            prospective_mutation=mutation,
+            model_root=tmp_path / "models",
+            config=config,
+            family_development_id="development-" + "d" * 64,
+            plan=final_training_plan("labs_logistic", None),
+            model=fit.pipeline,
+            operational=_final_provenance(),
+        )
+        same_science = publish_final_tabular_package(
+            prospective_mutation=mutation,
+            model_root=tmp_path / "models",
+            config=config,
+            family_development_id="development-" + "e" * 64,
+            plan=final_training_plan("labs_logistic", None),
+            model=fit.pipeline,
+            operational=_final_provenance(),
+        )
+        resume_config = with_runtime(config, model_directory=tmp_path / "models")
+        monkeypatch.setattr(
+            final_training,
+            "load_symile_development_cohort",
+            lambda config: pytest.fail("Completed final package was fitted again"),
+        )
+        resumed = final_training.fit_final_tabular_family(
+            resume_config,
+            prospective_mutation=mutation,
+            development=None,
+            operational={**_final_provenance(), "mlflow_run_id": "resumed-run"},
+        )
+        assert resumed.package_id == package.package_id
+        manifest_path = package.directory / "manifest.json"
+        original = manifest_path.read_bytes()
+        changed = json.loads(original)
+        changed["execution_provenance"]["git_commit"] = "f" * 40
+        manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(ManifestBuildError, match="conflicts with the prospective campaign"):
+            final_training.fit_final_tabular_family(
+                resume_config,
+                prospective_mutation=mutation,
+                development=None,
+                operational=_final_provenance(),
+            )
+        manifest_path.write_bytes(original)
+        fit.pipeline.named_steps["classifier"].intercept_ += 0.25
+        publish_final_tabular_package(
+            prospective_mutation=mutation,
+            model_root=tmp_path / "models",
+            config=config,
+            family_development_id=None,
+            plan=final_training_plan("labs_logistic", None),
+            model=fit.pipeline,
+            operational=_final_provenance(),
+        )
+        with pytest.raises(ManifestBuildError, match="selection is ambiguous"):
+            final_training.fit_final_tabular_family(
+                resume_config,
+                prospective_mutation=mutation,
+                development=None,
+                operational=_final_provenance(),
+            )
     validated = validate_final_package(package.directory)
     assert validated.manifest["execution_scope"] == "full_development"
     assert validated.manifest["family_development_id"] is None
+    assert same_science.package_id == package.package_id
     assert validated.manifest["seed_policy"] == 42
-    assert "bundle_manifest_sha256" not in validated.manifest["input"]["dataset"]
-    assert validated.manifest["bundle_manifest_sha256"] == config.dataset.bundle_manifest_sha256
-    assert "config_source_sha256" not in validated.manifest
-    assert "config_semantic_sha256" not in validated.manifest
+
+    manifest_path = package.directory / "manifest.json"
+    original_manifest = manifest_path.read_bytes()
+    manifest_path.write_text(
+        json.dumps(dict(reversed(list(validated.manifest.items()))), indent=4),
+        encoding="utf-8",
+    )
+    assert manifest_path.read_bytes() != original_manifest
+    reformatted = validate_final_package(package.directory, expected_package_id=package.package_id)
+    assert reformatted == validated
+    manifest_path.write_bytes(original_manifest)
+
+    for member in package.directory.iterdir():
+        altered = tmp_path / f"linked-{member.name}"
+        shutil.copytree(package.directory, altered)
+        linked_member = altered / member.name
+        linked_member.unlink()
+        linked_member.symlink_to(member)
+        with pytest.raises(ManifestBuildError, match="regular files"):
+            validate_final_package(altered, enforce_directory_name=False)
 
     for value in (True, 1.0):
         altered = tmp_path / f"altered-manifest-{value!r}"
@@ -189,7 +311,11 @@ def test_final_neural_checkpoint_requires_exact_integer_schema_version(
 def test_final_neural_lifecycle_uses_only_fixed_terminal_epoch_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = load_symile_development_config("configs/symile_cxr_densenet.yaml")
+    config = load_symile_development_config(
+        "configs/symile_cxr_densenet.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
     assert config.neural is not None
     runtime = cpu_runtime()
     loader = build_terminal_training_loader(
@@ -227,29 +353,67 @@ def test_final_neural_lifecycle_uses_only_fixed_terminal_epoch_budgets(
 def test_narrow_final_cxr_is_compatible_with_full_fusion_ancestry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cxr = load_symile_development_config("configs/symile_cxr_densenet.yaml")
-    fusion = load_symile_development_config("configs/symile_cxr_labs_concat.yaml")
+    cxr = load_symile_development_config(
+        "configs/symile_cxr_densenet.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
+    fusion = load_symile_development_config(
+        "configs/symile_cxr_labs_concat.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
     tiny = nn.Linear(2, 1)
     monkeypatch.setattr(final_packages, "_reconstruct_neural", lambda config: nn.Linear(2, 1))
     fingerprint = {
         "declared_name": cxr.family.parameters["weights"],
-        "stable_identifier": "synthetic-weight",
-        "cache_filename": "synthetic.pt",
-        "byte_size": 4,
-        "sha256": "a" * 64,
+        "stable_identifier": "weights",
+        "cache_filename": "weights.pt",
+        "byte_size": 1,
+        "sha256": "c" * 64,
     }
-    package = publish_final_neural_package(
-        model_root=tmp_path,
-        config=cxr,
-        family_development_id="development-" + "1" * 64,
-        plan=final_training_plan("cxr_densenet", 3),
-        seed=17,
-        state_dict=tiny.state_dict(),
-        lab_preprocessor=None,
-        source_cxr_package_id=None,
-        pretrained_weight=fingerprint,
-        operational=_final_provenance(neural=True),
-    )
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        package = publish_final_neural_package(
+            prospective_mutation=mutation,
+            model_root=tmp_path,
+            config=cxr,
+            family_development_id="development-" + "1" * 64,
+            plan=final_training_plan("cxr_densenet", 3),
+            seed=17,
+            state_dict=tiny.state_dict(),
+            lab_preprocessor=None,
+            source_cxr_package_id=None,
+            pretrained_weight=fingerprint,
+            operational=_final_provenance(neural=True),
+        )
+        resume_config = with_runtime(cxr, model_directory=tmp_path, source_root=tmp_path / "source")
+        monkeypatch.setattr(
+            final_training,
+            "load_symile_development_cohort",
+            lambda config: pytest.fail("Completed neural member was fitted again"),
+        )
+        development = SimpleNamespace(
+            manifest={
+                "family_id": "cxr_densenet",
+                "development_id": "development-" + "1" * 64,
+                "final_training_budget": 3,
+            }
+        )
+        arguments = {
+            "prospective_mutation": mutation,
+            "development": development,
+            "member_seed": 17,
+            "expected_pretrained_scientific_identity": package.manifest[
+                "pretrained_scientific_identity"
+            ],
+            "operational": _final_provenance(),
+        }
+        assert final_training.fit_final_neural_member(resume_config, **arguments).package_id == (
+            package.package_id
+        )
+        development.manifest["final_training_budget"] = 4
+        with pytest.raises(ManifestBuildError, match="conflicts with the prospective campaign"):
+            final_training.fit_final_neural_member(resume_config, **arguments)
     reconstructed = final_packages.load_final_package_config(package)
     checkpoint_loads = []
     original_load = torch.load
@@ -289,7 +453,13 @@ def test_narrow_final_cxr_is_compatible_with_full_fusion_ancestry(
         "configs/symile_cxr_labs_ecg_gated.yaml",
     ):
         final_training._validate_final_cxr_source(
-            load_symile_development_config(config_name), 17, package
+            load_symile_development_config(
+                config_name,
+                bundle_id="bundle-" + "a" * 64,
+                cv_assignment_id="cv-assignment-" + "c" * 64,
+            ),
+            17,
+            package,
         )
 
     invalid_configs = [
@@ -332,24 +502,25 @@ def test_narrow_final_cxr_is_compatible_with_full_fusion_ancestry(
                 "family": {**package.manifest["input"]["family"], "family_id": "cxr_labs_concat"},
             },
         },
-        package.manifest_sha256,
     )
     with pytest.raises(ManifestBuildError):
         final_training._validate_final_cxr_source(fusion, 17, wrong_family)
 
-    other = publish_final_neural_package(
-        model_root=tmp_path,
-        config=cxr,
-        family_development_id="development-" + "1" * 64,
-        plan=final_training_plan("cxr_densenet", 3),
-        seed=42,
-        state_dict=tiny.state_dict(),
-        lab_preprocessor=None,
-        source_cxr_package_id=None,
-        pretrained_weight=fingerprint,
-        operational=_final_provenance(neural=True),
-    )
-    mixed = ValidatedFinalPackage(package.directory, other.manifest, other.manifest_sha256)
+    with prospective_symile_mutation(tmp_path, monkeypatch) as mutation:
+        other = publish_final_neural_package(
+            prospective_mutation=mutation,
+            model_root=tmp_path,
+            config=cxr,
+            family_development_id="development-" + "1" * 64,
+            plan=final_training_plan("cxr_densenet", 3),
+            seed=42,
+            state_dict=tiny.state_dict(),
+            lab_preprocessor=None,
+            source_cxr_package_id=None,
+            pretrained_weight=fingerprint,
+            operational=_final_provenance(neural=True),
+        )
+    mixed = ValidatedFinalPackage(package.directory, other.manifest)
     monkeypatch.setattr(
         final_training,
         "load_final_neural_state",
@@ -362,7 +533,11 @@ def test_narrow_final_cxr_is_compatible_with_full_fusion_ancestry(
 def test_final_cxr_fit_rejects_pretrained_identity_different_from_development(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = load_symile_development_config("configs/symile_cxr_densenet.yaml")
+    config = load_symile_development_config(
+        "configs/symile_cxr_densenet.yaml",
+        bundle_id="bundle-" + "a" * 64,
+        cv_assignment_id="cv-assignment-" + "c" * 64,
+    )
     actual = PretrainedWeightIdentity(
         declared_name="densenet121-res224-chex",
         stable_identifier="identity-b",
@@ -404,7 +579,6 @@ def test_final_cxr_members_reject_inconsistent_pretrained_identities(
                 "sha256": "b" * 64,
             },
         },
-        packages[3].manifest_sha256,
     )
     package_by_path = {package.directory: package for package in packages}
     monkeypatch.setattr(

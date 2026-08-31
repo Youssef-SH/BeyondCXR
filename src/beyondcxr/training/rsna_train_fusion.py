@@ -16,7 +16,7 @@ from sklearn.pipeline import Pipeline
 
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
 from beyondcxr.data.hashing import sha256_file
-from beyondcxr.data.rsna_cxr_cache import ValidatedCxrCache
+from beyondcxr.data.rsna_cxr_cache import PreparedCxrCache
 from beyondcxr.data.rsna_metadata_preprocess import (
     SOURCE_FEATURES,
     build_rsna_preprocessor,
@@ -81,14 +81,13 @@ from beyondcxr.utils.mlflow_utils import (
     DEFAULT_TRACKING_URI,
     configure_mlflow,
     environment_provenance,
-    git_revision,
     log_source_config,
     serialize_modalities,
     tracked_run,
-    uv_lock_sha256,
 )
 from beyondcxr.utils.operational_logging import get_operational_logger, log_event, timed_phase
 from beyondcxr.utils.privacy import validate_public_reports
+from beyondcxr.utils.provenance import git_revision, uv_lock_sha256
 from beyondcxr.utils.publication import publish_directory, staging_directory
 from beyondcxr.utils.rsna_model_publication import threshold_contract
 from beyondcxr.utils.rsna_neural_publication import (
@@ -123,7 +122,7 @@ def train_fusion_experiment(
     *,
     source_cxr_package_id: str,
     tracking_uri: str = DEFAULT_TRACKING_URI,
-    cache: ValidatedCxrCache | None = None,
+    cache: PreparedCxrCache | None = None,
     execution: LoaderExecutionPolicy | None = None,
     runtime: ResolvedDevice | None = None,
 ) -> FusionModelResult:
@@ -152,14 +151,10 @@ def train_fusion_experiment(
         "family_id": family.family_id,
         "modalities": serialize_modalities(family.modalities),
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "seed": str(seed),
         "source_package_id": source_package_id,
         "git_commit": commit,
         "dependency_lock_sha256": lock_hash,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "run_complete": "false",
     }
     with tracked_run(
@@ -178,8 +173,6 @@ def train_fusion_experiment(
         with timed_phase(_LOGGER, "dataset_loading", **context):
             data = dataset_adapter.load_fusion_train_validation(config)
         _validate_source_dataset_lineage(data, source.manifest)
-        if data.lineage.split_assignment_id != config.dataset.split_assignment_id:
-            raise ValueError("Loaded split assignment differs from the configuration")
         with timed_phase(_LOGGER, "fusion_runtime_preparation", **context):
             seed_neural_runtime(seed)
             preprocessor, contract, train_matrix, validation_matrix = _fit_structured(data)
@@ -190,7 +183,6 @@ def train_fusion_experiment(
             )
             expected_cache_identity = expected_rsna_cxr_cache_identity(
                 lineage=data.lineage,
-                bundle_manifest_sha256=data.bundle_manifest_sha256,
                 source_inventory=data.source_inventory,
                 transform=evaluation_transform,
             )
@@ -520,8 +512,6 @@ def load_validated_rsna_fusion_preprocessor(
 def _validate_source_dataset_lineage(data: FusionRunData, manifest: Mapping[str, Any]) -> None:
     if (
         data.lineage.bundle_id != manifest["bundle_id"]
-        or data.bundle_manifest_sha256 != manifest["bundle_manifest_sha256"]
-        or data.lineage.split_assignment_id != manifest["split_assignment_id"]
         or data.lineage.task_id != manifest["task_id"]
         or data.lineage.label_policy_version != manifest["label_policy_version"]
     ):
@@ -574,11 +564,7 @@ def _manifest(
         "task_id": data.lineage.task_id,
         "positive_class": 1,
         "bundle_id": data.lineage.bundle_id,
-        "bundle_manifest_sha256": data.bundle_manifest_sha256,
-        "split_assignment_id": data.lineage.split_assignment_id,
         "label_policy_version": data.lineage.label_policy_version,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "source_provenance": {
             "git_commit": commit,
             "git_dirty": dirty,

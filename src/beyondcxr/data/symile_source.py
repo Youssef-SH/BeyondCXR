@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import stat
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -18,7 +19,7 @@ import pandas as pd
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.hashing import sha256_file
-from beyondcxr.data.symile_schemas import LAB_ITEM_IDS, LAB_NAMES, OFFICIAL_SPLITS
+from beyondcxr.data.symile_schemas import LAB_ITEM_IDS, LAB_NAMES
 from beyondcxr.utils.operational_logging import CountProgress, get_operational_logger
 
 CHECKSUM_FILENAME = "SHA256SUMS.txt"
@@ -72,7 +73,6 @@ _IMAGENET_MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 3,
 _IMAGENET_STD = np.array((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 3, 1, 1)
 _SPLIT_SOURCE_NAMES = {"train": "train", "validation": "val", "test": "test"}
 _LOGGER = get_operational_logger(__name__)
-_AUTHENTICATED_RELEASE_ASSETS: dict[tuple[str, str, str], AuthenticatedReleaseAsset] = {}
 
 
 @dataclass(frozen=True)
@@ -94,8 +94,8 @@ class SourceAsset:
 
 
 @dataclass(frozen=True)
-class AuthenticatedReleaseAsset:
-    """Process-transferable capability for one byte-authenticated physical asset."""
+class DevelopmentReleaseAsset:
+    """Process-transferable integrity witness restricted to development tensors."""
 
     source_root: Path
     checksum_manifest_sha256: str
@@ -103,9 +103,19 @@ class AuthenticatedReleaseAsset:
     expected_sha256: str
     physical_identity: tuple[int, int, int, int, int]
 
+    def __post_init__(self) -> None:
+        path = PurePosixPath(self.relative_path)
+        if (
+            len(path.parts) != 3
+            or path.parts[0] != "data_npy"
+            or path.parts[1] not in {"train", "val"}
+            or not path.name.endswith(f"_{path.parts[1]}.npy")
+        ):
+            raise ValueError("Development source assets cannot reference held-out material")
+
 
 @dataclass(frozen=True)
-class QualifiedSymileSource:
+class _QualifiedSymileSource:
     """Qualified classification spine plus aggregate source evidence."""
 
     samples: pd.DataFrame
@@ -113,6 +123,7 @@ class QualifiedSymileSource:
     source_assets: tuple[SourceAsset, ...]
     checksum_manifest_sha256: str
     evidence: Mapping[str, object]
+    source_root: Path
 
 
 def parse_sha256sums(text: str) -> dict[str, str]:
@@ -180,13 +191,15 @@ def authenticate_release(source_root: str | Path) -> tuple[tuple[SourceAsset, ..
     return tuple(assets), sha256_file(checksum_path)
 
 
-def authenticate_release_asset(
+def authenticate_development_source_asset(
     source_root: str | Path,
     *,
     checksum_manifest_sha256: str,
-    relative_path: str,
+    official_split: str,
+    modality: str,
 ) -> Path:
-    """Authenticate one physical release asset through the bundle-bound checksum manifest."""
+    """Authenticate one train/validation tensor through the bundle checksum manifest."""
+    relative_path = _development_modality_relative_path(official_split, modality)
     root = Path(source_root)
     expected = _authenticated_checksum_map(root, checksum_manifest_sha256)
     if relative_path not in expected:
@@ -199,24 +212,20 @@ def authenticate_release_asset(
     return path
 
 
-def establish_authenticated_release_asset(
+def establish_development_release_asset(
     source_root: str | Path,
     *,
     checksum_manifest_sha256: str,
-    relative_path: str,
-) -> AuthenticatedReleaseAsset:
-    """Authenticate expensive asset bytes once and return their physical authority."""
+    official_split: str,
+    modality: str,
+) -> DevelopmentReleaseAsset:
+    """Authenticate one development tensor once for safe worker reopening."""
+    relative_path = _development_modality_relative_path(official_split, modality)
     root = Path(source_root).absolute()
     expected = _authenticated_checksum_map(root, checksum_manifest_sha256)
     if relative_path not in expected:
         raise ManifestBuildError("Requested source asset is absent from SHA256SUMS")
     path = root / Path(*PurePosixPath(relative_path).parts)
-    key = (root.as_posix(), checksum_manifest_sha256, relative_path)
-    cached = _AUTHENTICATED_RELEASE_ASSETS.get(key)
-    if cached is not None:
-        descriptor = _open_authenticated_asset(cached)
-        os.close(descriptor)
-        return cached
     descriptor = _open_physical_asset(path)
     try:
         before = _physical_identity(os.fstat(descriptor))
@@ -226,19 +235,61 @@ def establish_authenticated_release_asset(
         os.close(descriptor)
     if before != after or observed != expected[relative_path]:
         raise ManifestBuildError("Requested source asset does not match SHA256SUMS")
-    authority = AuthenticatedReleaseAsset(
+    return DevelopmentReleaseAsset(
         source_root=root,
         checksum_manifest_sha256=checksum_manifest_sha256,
         relative_path=relative_path,
         expected_sha256=expected[relative_path],
         physical_identity=after,
     )
-    _AUTHENTICATED_RELEASE_ASSETS[key] = authority
-    return authority
 
 
-def reopen_authenticated_release_memmap(authority: AuthenticatedReleaseAsset) -> np.memmap:
-    """Reopen a byte-authenticated asset without re-hashing its bytes."""
+def establish_development_release_assets(
+    source_root: str | Path,
+    *,
+    checksum_manifest_sha256: str,
+) -> tuple[DevelopmentReleaseAsset, ...]:
+    """Authenticate the four development tensors for one explicit operation."""
+    return tuple(
+        establish_development_release_asset(
+            source_root,
+            checksum_manifest_sha256=checksum_manifest_sha256,
+            official_split=split,
+            modality=modality,
+        )
+        for modality in ("cxr", "ecg")
+        for split in ("train", "validation")
+    )
+
+
+def select_development_release_asset(
+    authorities: tuple[DevelopmentReleaseAsset, ...],
+    *,
+    source_root: str | Path,
+    checksum_manifest_sha256: str,
+    official_split: str,
+    modality: str,
+) -> DevelopmentReleaseAsset:
+    """Select one exact witness from an operation-owned development set."""
+    relative_path = _development_modality_relative_path(official_split, modality)
+    root = Path(source_root).absolute()
+    matches = tuple(
+        authority
+        for authority in authorities
+        if isinstance(authority, DevelopmentReleaseAsset)
+        and authority.source_root == root
+        and authority.checksum_manifest_sha256 == checksum_manifest_sha256
+        and authority.relative_path == relative_path
+    )
+    if len(matches) != 1:
+        raise ManifestBuildError("Development source witness set is incomplete or incompatible")
+    descriptor = _open_authenticated_asset(matches[0])
+    os.close(descriptor)
+    return matches[0]
+
+
+def reopen_development_release_memmap(authority: DevelopmentReleaseAsset) -> np.memmap:
+    """Reopen a byte-authenticated development tensor without re-hashing it."""
     descriptor = _open_authenticated_asset(authority)
     try:
         array = np.load(f"/proc/self/fd/{descriptor}", mmap_mode="r", allow_pickle=False)
@@ -254,9 +305,9 @@ def reopen_authenticated_release_memmap(authority: AuthenticatedReleaseAsset) ->
         os.close(descriptor)
 
 
-def _open_authenticated_asset(authority: AuthenticatedReleaseAsset) -> int:
+def _open_authenticated_asset(authority: DevelopmentReleaseAsset) -> int:
     if (
-        not isinstance(authority, AuthenticatedReleaseAsset)
+        not isinstance(authority, DevelopmentReleaseAsset)
         or not _is_sha256(authority.checksum_manifest_sha256)
         or not _is_sha256(authority.expected_sha256)
         or PurePosixPath(authority.relative_path).as_posix() != authority.relative_path
@@ -269,6 +320,21 @@ def _open_authenticated_asset(authority: AuthenticatedReleaseAsset) -> int:
         os.close(descriptor)
         raise ManifestBuildError("Authenticated source asset changed before worker access")
     return descriptor
+
+
+def _development_modality_relative_path(official_split: str, modality: str) -> str:
+    if official_split not in {"train", "validation"} or modality not in {"cxr", "ecg"}:
+        raise PermissionError("Symile source access is limited to development modalities")
+    split = _SPLIT_SOURCE_NAMES[official_split]
+    return f"data_npy/{split}/{modality}_{split}.npy"
+
+
+def development_modality_asset_path(
+    source_root: str | Path, official_split: str, modality: str
+) -> Path:
+    """Resolve a development-only modality path without opening its bytes."""
+    relative = _development_modality_relative_path(official_split, modality)
+    return Path(source_root) / Path(*PurePosixPath(relative).parts)
 
 
 def _open_physical_asset(path: Path) -> int:
@@ -310,15 +376,6 @@ def _authenticated_checksum_map(root: Path, expected_sha256: str) -> dict[str, s
     return parse_sha256sums(checksum_text)
 
 
-def select_test_queries(frame: pd.DataFrame) -> pd.DataFrame:
-    """Select only positive self-query rows while retaining original source-row indices."""
-    _require_columns(frame, {"hadm_id", "label_hadm_id", "label"}, "test.csv")
-    selected = frame.loc[(frame["label"] == 1) & (frame["label_hadm_id"] == frame["hadm_id"])]
-    if selected.empty or selected["hadm_id"].duplicated().any():
-        raise ManifestBuildError("Official test positive-query selection is invalid")
-    return selected.copy()
-
-
 def strict_pneumonia_target(value: object) -> int | None:
     """Derive the strict binary target from one preserved source state."""
     if value is None or pd.isna(value) or float(value) == -1.0:
@@ -328,52 +385,190 @@ def strict_pneumonia_target(value: object) -> int | None:
     raise ManifestBuildError("Pneumonia source state is outside {-1, 0, 1, null}")
 
 
-def qualify_symile_source(
+_SOURCE_COLUMNS = {
+    "subject_id",
+    "hadm_id",
+    "admittime",
+    "age",
+    "gender",
+    "cxr_dicom_id",
+    "cxr_study_id",
+    "cxr_ViewPosition",
+    "cxr_StudyDateTime",
+    "cxr_path",
+    "Pneumonia",
+    "ecg_study_id",
+    "ecg_time",
+    "ecg_path",
+    "labs_all_nan",
+    *LAB_ITEM_IDS,
+}
+
+
+def _validate_source_index(frame: pd.DataFrame) -> None:
+    _require_columns(frame, _SOURCE_COLUMNS, FULL_SOURCE_FILENAME)
+    if frame.empty or frame["hadm_id"].duplicated().any() or frame["subject_id"].isna().any():
+        raise ManifestBuildError("Symile source index is invalid")
+    if not set(frame["cxr_ViewPosition"]) <= {"AP", "PA"} or not frame["labs_all_nan"].eq(0).all():
+        raise ManifestBuildError("Symile modality eligibility is invalid")
+
+
+def _load_development_tensor(root: Path, split: str, field: str) -> np.memmap:
+    if split not in {"train", "val"}:
+        raise PermissionError("Source qualification is limited to development tensors")
+    try:
+        array = np.load(
+            root / "data_npy" / split / f"{field}_{split}.npy", mmap_mode="r", allow_pickle=False
+        )
+    except (OSError, ValueError) as exc:
+        raise ManifestBuildError(f"Unreadable Symile tensor: {field}_{split}.npy") from exc
+    if not isinstance(array, np.memmap):
+        raise ManifestBuildError("Symile tensor did not open as a memory map")
+    return array
+
+
+def publish_symile_source_bundle(
     source_root: str | Path,
     *,
+    output_directory: str | Path = "data/manifests",
     enforce_production_counts: bool = True,
-) -> QualifiedSymileSource:
-    """Authenticate the release and strongly qualify the official modeling spine."""
+) -> tuple[object, int]:
+    """Authenticate transport and publish qualified development scientific evidence."""
     root = Path(source_root)
     assets, checksum_sha256 = authenticate_release(root)
     lab_means = _load_lab_contract(root)
-    full = _load_full_source(root)
-    split_frames = _load_split_frames(root)
-    selected_test = select_test_queries(split_frames["test"])
-    official_frames = {
-        "train": split_frames["train"],
-        "validation": split_frames["val"],
-        "test": selected_test,
+    splits = {name: pd.read_csv(root / f"{name}.csv") for name in ("train", "val")}
+    required = {
+        "subject_id",
+        "hadm_id",
+        "cxr_path",
+        "ecg_path",
+        *LAB_ITEM_IDS,
+        *(f"{item}_percentile" for item in LAB_ITEM_IDS),
     }
-    reconciliation = _validate_membership(full, official_frames, enforce_production_counts)
+    for name, frame in splits.items():
+        _require_columns(frame, required, f"{name}.csv")
+        if frame.empty or frame["hadm_id"].duplicated().any():
+            raise ManifestBuildError("Official development admissions are not unique")
+    official = {"train": splits["train"], "validation": splits["val"]}
+    for column in ("hadm_id", "subject_id"):
+        if set(splits["train"][column]) & set(splits["val"][column]):
+            raise ManifestBuildError("Official development patients or admissions overlap")
+    counts = {f"{name}_admissions": len(frame) for name, frame in official.items()}
+    if enforce_production_counts and counts != {
+        "train_admissions": 10000,
+        "validation_admissions": 750,
+    }:
+        raise ManifestBuildError(
+            "Official Symile development membership differs from release contract"
+        )
+
+    def _read_development_index(path: Path, admission_ids: set[int]) -> pd.DataFrame:
+        """Decode only records selected by known development keys from a mixed CSV.
+
+        Record framing and key comparison operate on opaque bytes. Neither unselected keys
+        nor their scientific fields are decoded, converted to values, retained or summarized.
+        The source dialect has one physical record per line and decimal admission keys.
+        """
+        keys = {str(value).encode("ascii") for value in admission_ids}
+        with path.open("rb") as stream:
+            header = stream.readline()
+            columns = header.rstrip(b"\r\n").split(b",")
+            if columns.count(b"hadm_id") != 1:
+                raise ManifestBuildError("Source index admission column is invalid")
+            position = columns.index(b"hadm_id")
+            selected = bytearray(header)
+            # Quoted fields may contain commas and escaped quotes, but not record separators.
+            field = re.compile(rb'(?:"(?:[^"\r\n]|"")*"|[^,"\r\n]*)(?:,|$)')
+            for record in stream:
+                raw = record.rstrip(b"\r\n")
+                fields = []
+                cursor = 0
+                while cursor < len(raw):
+                    match = field.match(raw, cursor)
+                    if match is None or match.end() == cursor:
+                        raise ManifestBuildError("Source index CSV framing is invalid")
+                    fields.append(match.group().removesuffix(b","))
+                    cursor = match.end()
+                if raw.endswith(b","):
+                    fields.append(b"")
+                if len(fields) != len(columns):
+                    raise ManifestBuildError("Source index CSV framing is invalid")
+                if fields[position] in keys:
+                    selected.extend(record)
+        frame = pd.read_csv(io.BytesIO(selected), usecols=lambda name: name in _SOURCE_COLUMNS)
+        _validate_source_index(frame)
+        if set(frame["hadm_id"].astype(int)) != admission_ids:
+            raise ManifestBuildError("Development admissions are missing from source index")
+        return frame
+
+    full = _read_development_index(
+        root / FULL_SOURCE_FILENAME,
+        set().union(*(set(frame["hadm_id"].astype(int)) for frame in official.values())),
+    )
     modality_evidence = _qualify_modalities(
-        root,
-        split_frames,
-        official_frames,
+        splits,
+        official,
         full,
         lab_means,
+        load_npy=lambda split, field: _load_development_tensor(root, split, field),
         exact_contract=enforce_production_counts,
     )
-    samples, labs = _canonical_frames(official_frames, full)
-    evidence: dict[str, object] = {
-        "reconciliation": reconciliation,
-        "modality_qualification": modality_evidence,
-    }
-    return QualifiedSymileSource(samples, labs, assets, checksum_sha256, evidence)
+    samples, labs = _canonical_frames(official, full)
+    source = _QualifiedSymileSource(
+        samples,
+        labs,
+        assets,
+        checksum_sha256,
+        {"reconciliation": counts, "modality_qualification": modality_evidence},
+        root,
+    )
+    from beyondcxr.data.symile_artifacts import _build_symile_artifacts, _write_symile_bundle
+
+    result = _build_symile_artifacts(source)
+    paths = _write_symile_bundle(result, output_directory)
+    return paths, result.samples.num_rows
 
 
-def modality_asset_path(source_root: str | Path, official_split: str, modality: str) -> Path:
-    """Resolve one authenticated split-local modality asset without opening it."""
-    if official_split not in OFFICIAL_SPLITS or modality not in {
-        "cxr",
-        "ecg",
-        "labs_percentiles",
-        "labs_missingness",
-        "hadm_id",
-    }:
-        raise ManifestBuildError("Symile source-row locator arguments are invalid")
-    split = _SPLIT_SOURCE_NAMES[official_split]
-    return Path(source_root) / "data_npy" / split / f"{modality}_{split}.npy"
+def _canonical_frames(
+    official: Mapping[str, pd.DataFrame], full: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    full_lookup = full.set_index("hadm_id", verify_integrity=True)
+    sample_rows: list[dict[str, object]] = []
+    lab_rows: list[dict[str, object]] = []
+    for split in official:
+        frame = official[split]
+        for source_row, row in frame.iterrows():
+            hadm_id = int(row["hadm_id"])
+            source = full_lookup.loc[hadm_id]
+            sample_id = f"symile:{hadm_id}"
+            state = source["Pneumonia"]
+            pneumonia_state = None if pd.isna(state) else int(state)
+            strict_pneumonia_target(pneumonia_state)
+            sample_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "subject_id": int(source["subject_id"]),
+                    "hadm_id": hadm_id,
+                    "official_split": split,
+                    "source_row": int(source_row),
+                    "pneumonia_state": pneumonia_state,
+                    "age_years": int(source["age"]),
+                    "sex": str(source["gender"]),
+                    "view_position": str(source["cxr_ViewPosition"]),
+                }
+            )
+            lab_record: dict[str, object] = {"sample_id": sample_id}
+            for item_id in LAB_ITEM_IDS:
+                value = row[item_id]
+                lab_record[f"lab_{item_id}_value"] = None if pd.isna(value) else float(value)
+            for item_id in LAB_ITEM_IDS:
+                lab_record[f"lab_{item_id}_observed"] = not pd.isna(row[item_id])
+            lab_rows.append(lab_record)
+    return (
+        pd.DataFrame(sample_rows).sort_values("sample_id", kind="stable").reset_index(drop=True),
+        pd.DataFrame(lab_rows).sort_values("sample_id", kind="stable").reset_index(drop=True),
+    )
 
 
 def _load_lab_contract(root: Path) -> dict[str, float]:
@@ -409,58 +604,6 @@ def _load_lab_contract(root: Path) -> dict[str, float]:
             "Approved laboratory item/name mapping differs from reference code"
         )
     return {key: float(raw[key]) for key in expected_keys}
-
-
-def _load_full_source(root: Path) -> pd.DataFrame:
-    required = {
-        "subject_id",
-        "hadm_id",
-        "admittime",
-        "age",
-        "gender",
-        "cxr_dicom_id",
-        "cxr_study_id",
-        "cxr_ViewPosition",
-        "cxr_StudyDateTime",
-        "cxr_path",
-        "Pneumonia",
-        "ecg_study_id",
-        "ecg_time",
-        "ecg_path",
-        "labs_all_nan",
-        *LAB_ITEM_IDS,
-    }
-    frame = pd.read_csv(root / FULL_SOURCE_FILENAME, usecols=lambda column: column in required)
-    _require_columns(frame, required, FULL_SOURCE_FILENAME)
-    if frame.empty or frame["hadm_id"].duplicated().any() or frame["subject_id"].isna().any():
-        raise ManifestBuildError("Full Symile source index is invalid")
-    if set(frame["cxr_ViewPosition"]) != {"AP", "PA"} or not frame["labs_all_nan"].eq(0).all():
-        raise ManifestBuildError("Full Symile modality eligibility is invalid")
-    return frame
-
-
-def _load_split_frames(root: Path) -> dict[str, pd.DataFrame]:
-    frames = {
-        name: pd.read_csv(root / f"{name}.csv")
-        for name in ("train", "val", "test", "val_retrieval")
-    }
-    required = {
-        "subject_id",
-        "hadm_id",
-        "cxr_path",
-        "ecg_path",
-        *LAB_ITEM_IDS,
-        *(f"{item}_percentile" for item in LAB_ITEM_IDS),
-    }
-    for name, frame in frames.items():
-        _require_columns(frame, required, f"{name}.csv")
-        if name in {"test", "val_retrieval"}:
-            _require_columns(frame, {"label_hadm_id", "label"}, f"{name}.csv")
-    if frames["train"]["hadm_id"].duplicated().any() or frames["val"]["hadm_id"].duplicated().any():
-        raise ManifestBuildError("Official train/validation admissions are not unique")
-    _validate_retrieval_frame(frames["test"], "test")
-    _validate_retrieval_frame(frames["val_retrieval"], "val_retrieval")
-    return frames
 
 
 def _validate_retrieval_frame(frame: pd.DataFrame, name: str) -> None:
@@ -540,21 +683,22 @@ def _validate_membership(
 
 
 def _qualify_modalities(
-    root: Path,
     split_frames: Mapping[str, pd.DataFrame],
     official_frames: Mapping[str, pd.DataFrame],
     full: pd.DataFrame,
     lab_means: Mapping[str, float],
     *,
+    load_npy: Callable[[str, str], np.memmap],
     exact_contract: bool,
 ) -> dict[str, object]:
     full_lookup = full.set_index("hadm_id", verify_integrity=True)
     split_evidence: dict[str, object] = {}
-    for official_name, source_name in _SPLIT_SOURCE_NAMES.items():
+    for official_name in official_frames:
+        source_name = _SPLIT_SOURCE_NAMES[official_name]
         complete = split_frames[source_name]
         selected = official_frames[official_name]
         selected_rows = selected.index.to_numpy(dtype=np.int64)
-        hadm = _load_npy(root, source_name, "hadm_id")
+        hadm = load_npy(source_name, "hadm_id")
         if (
             hadm.dtype != np.int64
             or hadm.shape != (len(complete),)
@@ -563,7 +707,7 @@ def _qualify_modalities(
             raise ManifestBuildError(f"{source_name} identifier tensor is not row-aligned")
         if source_name == "test":
             for field in ("label", "label_hadm_id"):
-                array = _load_npy(root, source_name, field)
+                array = load_npy(source_name, field)
                 if (
                     array.dtype != np.int64
                     or array.shape != (len(complete),)
@@ -585,11 +729,18 @@ def _qualify_modalities(
                     f"{official_name} modality provenance differs from full source"
                 )
         _validate_temporal(joined, official_name)
-        cxr = _load_npy(root, source_name, "cxr")
-        ecg = _load_npy(root, source_name, "ecg")
+        cxr = load_npy(source_name, "cxr")
+        ecg = load_npy(source_name, "ecg")
         _validate_cxr(cxr, len(complete), selected_rows, exact_contract=exact_contract)
         _validate_ecg(ecg, len(complete), selected_rows, exact_contract=exact_contract)
-        _validate_labs(root, source_name, complete, selected_rows, lab_means, full_lookup)
+        _validate_labs(
+            source_name,
+            complete,
+            selected_rows,
+            lab_means,
+            full_lookup,
+            load_npy=load_npy,
+        )
         split_evidence[official_name] = {
             "source_rows": len(complete),
             "qualified_rows": len(selected),
@@ -601,29 +752,12 @@ def _qualify_modalities(
             "labs": "passed",
             "temporal": "passed",
         }
-    _validate_val_retrieval_headers(
-        root,
-        split_frames["val_retrieval"],
-        exact_contract=exact_contract,
-    )
     if (
         len({tuple(value["cxr_shape"]) for value in split_evidence.values()}) != 1
         or len({tuple(value["ecg_shape"]) for value in split_evidence.values()}) != 1
     ):
         raise ManifestBuildError("Classification modality shapes differ across splits")
-    return {"splits": split_evidence, "val_retrieval_structure": "passed"}
-
-
-def _load_npy(root: Path, split: str, field: str) -> np.memmap:
-    try:
-        array = np.load(
-            root / "data_npy" / split / f"{field}_{split}.npy", mmap_mode="r", allow_pickle=False
-        )
-    except (OSError, ValueError) as exc:
-        raise ManifestBuildError(f"Unreadable Symile tensor: {field}_{split}.npy") from exc
-    if not isinstance(array, np.memmap):
-        raise ManifestBuildError("Symile tensor did not open as a memory map")
-    return array
+    return {"splits": split_evidence}
 
 
 def _validate_cxr(
@@ -689,15 +823,16 @@ def _validate_ecg(
 
 
 def _validate_labs(
-    root: Path,
     split: str,
     frame: pd.DataFrame,
     rows: np.ndarray,
     lab_means: Mapping[str, float],
     full_lookup: pd.DataFrame,
+    *,
+    load_npy: Callable[[str, str], np.memmap],
 ) -> None:
-    percentiles = _load_npy(root, split, "labs_percentiles")
-    missingness = _load_npy(root, split, "labs_missingness")
+    percentiles = load_npy(split, "labs_percentiles")
+    missingness = load_npy(split, "labs_missingness")
     if (
         percentiles.dtype != np.float32
         or percentiles.shape != (len(frame), 50)
@@ -746,9 +881,9 @@ def _validate_temporal(rows: pd.DataFrame, split: str) -> None:
 
 
 def _validate_val_retrieval_headers(
-    root: Path,
     frame: pd.DataFrame,
     *,
+    load_npy: Callable[[str, str], np.memmap],
     exact_contract: bool,
 ) -> None:
     count = len(frame)
@@ -759,60 +894,19 @@ def _validate_val_retrieval_headers(
         "labs_missingness": (np.dtype("int64"), (count, 50)),
         "labs_percentiles": (np.dtype("float32"), (count, 50)),
     }
-    cxr = _load_npy(root, "val_retrieval", "cxr")
-    ecg = _load_npy(root, "val_retrieval", "ecg")
+    cxr = load_npy("val_retrieval", "cxr")
+    ecg = load_npy("val_retrieval", "ecg")
     _validate_cxr(cxr, count, np.array([], dtype=np.int64), exact_contract=exact_contract)
     _validate_ecg(ecg, count, np.array([], dtype=np.int64), exact_contract=exact_contract)
     for field, (dtype, shape) in expected.items():
-        array = _load_npy(root, "val_retrieval", field)
+        array = load_npy("val_retrieval", field)
         if array.dtype != dtype or array.shape != shape:
             raise ManifestBuildError("Validation retrieval tensor header contract does not match")
     for field in ("hadm_id", "label_hadm_id", "label"):
         if not np.array_equal(
-            _load_npy(root, "val_retrieval", field), frame[field].to_numpy(dtype=np.int64)
+            load_npy("val_retrieval", field), frame[field].to_numpy(dtype=np.int64)
         ):
             raise ManifestBuildError("Validation retrieval identifier structure is not aligned")
-
-
-def _canonical_frames(
-    official: Mapping[str, pd.DataFrame], full: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    full_lookup = full.set_index("hadm_id", verify_integrity=True)
-    sample_rows: list[dict[str, object]] = []
-    lab_rows: list[dict[str, object]] = []
-    for split in OFFICIAL_SPLITS:
-        frame = official[split]
-        for source_row, row in frame.iterrows():
-            hadm_id = int(row["hadm_id"])
-            source = full_lookup.loc[hadm_id]
-            sample_id = f"symile:{hadm_id}"
-            state = source["Pneumonia"]
-            pneumonia_state = None if pd.isna(state) else int(state)
-            strict_pneumonia_target(pneumonia_state)
-            sample_rows.append(
-                {
-                    "sample_id": sample_id,
-                    "subject_id": int(source["subject_id"]),
-                    "hadm_id": hadm_id,
-                    "official_split": split,
-                    "source_row": int(source_row),
-                    "pneumonia_state": pneumonia_state,
-                    "age_years": int(source["age"]),
-                    "sex": str(source["gender"]),
-                    "view_position": str(source["cxr_ViewPosition"]),
-                }
-            )
-            lab_record: dict[str, object] = {"sample_id": sample_id}
-            for item_id in LAB_ITEM_IDS:
-                value = row[item_id]
-                lab_record[f"lab_{item_id}_value"] = None if pd.isna(value) else float(value)
-            for item_id in LAB_ITEM_IDS:
-                lab_record[f"lab_{item_id}_observed"] = not pd.isna(row[item_id])
-            lab_rows.append(lab_record)
-    return (
-        pd.DataFrame(sample_rows).sort_values("sample_id", kind="stable").reset_index(drop=True),
-        pd.DataFrame(lab_rows).sort_values("sample_id", kind="stable").reset_index(drop=True),
-    )
 
 
 def _row_chunks(rows: np.ndarray, chunk_size: int) -> Iterable[np.ndarray]:

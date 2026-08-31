@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -22,7 +21,14 @@ from beyondcxr.data.rsna_artifacts import (
     validate_bundle_reference,
 )
 from beyondcxr.data.rsna_schemas import PNEUMONIA_LABEL_POLICY_VERSION, PNEUMONIA_TASK_ID
-from beyondcxr.training.config import ExperimentConfig, require_runtime_seed
+from beyondcxr.evaluation.metrics import target_sensitivity_threshold, youden_j_threshold
+from beyondcxr.training.config import (
+    ExperimentConfig,
+    load_experiment_config,
+    require_runtime_seed,
+    with_runtime,
+)
+from beyondcxr.utils.semantic_identity import canonical_json_bytes, canonical_scientific_id
 
 VALIDATION_EVIDENCE_FILENAME = "validation-evidence.json"
 VALIDATION_EVIDENCE_SCHEMA_VERSION = 1
@@ -50,29 +56,29 @@ class CanonicalValidationCohort:
     targets: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class CanonicalHeldOutCohort:
+    """Ordered held-out membership and labels derived from one exact RSNA bundle."""
+
+    sample_ids: tuple[str, ...]
+    targets: tuple[int, ...]
+
+
 def load_canonical_validation_cohort(
     bundle_directory: str | Path,
     *,
     expected_bundle_id: str,
-    expected_manifest_sha256: str,
-    expected_split_assignment_id: str,
     expected_task_id: str,
     expected_label_policy_version: str,
 ) -> CanonicalValidationCohort:
     """Derive the exact ordered validation cohort from a fully validated bundle."""
     bundle = Path(bundle_directory)
-    reference = validate_bundle_reference(
-        bundle,
-        expected_bundle_id=expected_bundle_id,
-        expected_manifest_sha256=expected_manifest_sha256,
-    )
+    validate_bundle_reference(bundle, expected_bundle_id=expected_bundle_id)
     manifest = validate_bundle_directory(bundle, expected_bundle_id=expected_bundle_id)
     tasks = manifest.get("tasks")
     bundle_task = tasks.get(PNEUMONIA_TASK_ID) if isinstance(tasks, dict) else None
     if (
-        reference.manifest_sha256 != expected_manifest_sha256
-        or manifest["membership"]["split"]["split_assignment_id"] != expected_split_assignment_id
-        or expected_task_id != PNEUMONIA_TASK_ID
+        expected_task_id != PNEUMONIA_TASK_ID
         or expected_label_policy_version != PNEUMONIA_LABEL_POLICY_VERSION
         or not isinstance(bundle_task, dict)
         or bundle_task.get("label_policy_version") != PNEUMONIA_LABEL_POLICY_VERSION
@@ -111,6 +117,72 @@ def load_canonical_validation_cohort(
     )
 
 
+def load_canonical_held_out_cohort(
+    authorization: object,
+    *,
+    model_package_id: str,
+) -> CanonicalHeldOutCohort:
+    """Derive a package-bound test cohort under current held-out authority."""
+    from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
+    from beyondcxr.training.rsna_evaluation_result import validate_rsna_model_package
+
+    capability = require_validated_rsna_held_out(authorization)
+    capability.require(model_package_id)
+    package = validate_rsna_model_package(capability.freeze.model_root, model_package_id)
+    return _derive_canonical_held_out_cohort(capability.freeze.bundle_directory, package)
+
+
+def _derive_canonical_held_out_cohort(
+    bundle_directory: str | Path,
+    package: Mapping[str, object],
+) -> CanonicalHeldOutCohort:
+    """Derive the canonical held-out cohort from validated authority coordinates."""
+    bundle = Path(bundle_directory)
+    expected_bundle_id = str(package["bundle_id"])
+    validate_bundle_reference(bundle, expected_bundle_id=expected_bundle_id)
+    manifest = validate_bundle_directory(bundle, expected_bundle_id=expected_bundle_id)
+    tasks = manifest.get("tasks")
+    bundle_task = tasks.get(PNEUMONIA_TASK_ID) if isinstance(tasks, dict) else None
+    if (
+        package["task_id"] != PNEUMONIA_TASK_ID
+        or package["label_policy_version"] != PNEUMONIA_LABEL_POLICY_VERSION
+        or not isinstance(bundle_task, dict)
+        or bundle_task.get("label_policy_version") != PNEUMONIA_LABEL_POLICY_VERSION
+    ):
+        raise ManifestBuildError("RSNA held-out cohort authority is inconsistent")
+    split_ids = tuple(
+        sorted(
+            pq.read_table(
+                bundle / SPLITS_FILENAME,
+                columns=["sample_id"],
+                filters=[("split_name", "=", "test")],
+            )
+            .to_pandas()["sample_id"]
+            .astype(str)
+        )
+    )
+    labels = (
+        pq.read_table(
+            bundle / LABELS_FILENAME,
+            columns=["sample_id", "label_value"],
+            filters=[("task_id", "=", PNEUMONIA_TASK_ID)],
+        )
+        .to_pandas()
+        .set_index("sample_id")["label_value"]
+        .to_dict()
+    )
+    if (
+        not split_ids
+        or len(split_ids) != len(set(split_ids))
+        or any(sample_id not in labels for sample_id in split_ids)
+    ):
+        raise ManifestBuildError("RSNA canonical held-out cohort is invalid")
+    targets = tuple(int(labels[sample_id]) for sample_id in split_ids)
+    if any(target not in {0, 1} for target in targets):
+        raise ManifestBuildError("RSNA canonical held-out targets are invalid")
+    return CanonicalHeldOutCohort(split_ids, targets)
+
+
 def write_validation_evidence(
     path: str | Path,
     *,
@@ -129,13 +201,9 @@ def write_validation_evidence(
         "rsna_validation_evidence_schema_version": VALIDATION_EVIDENCE_SCHEMA_VERSION,
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "task_id": config.task.task_id,
         "label_policy_version": config.task.label_policy_version,
         "family_id": config.family.family_id,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "seed": require_runtime_seed(config),
         "calibration_bins": config.evaluation.calibration_bins,
         "sensitivity_target": config.evaluation.sensitivity_target,
@@ -144,9 +212,10 @@ def write_validation_evidence(
         "probabilities": [float(value) for value in probability_values],
         "epoch_history": [dict(item) for item in epoch_history],
     }
+    document["validation_evidence_id"] = validation_evidence_id(document)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(_canonical_bytes(document))
+    destination.write_bytes(canonical_json_bytes(document))
     validate_validation_evidence(destination, package=None, config=config)
     return destination
 
@@ -169,15 +238,12 @@ def validate_validation_evidence(
         raise ValueError("RSNA validation evidence is unreadable") from exc
     fields = {
         "rsna_validation_evidence_schema_version",
+        "validation_evidence_id",
         "dataset_id",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "task_id",
         "label_policy_version",
         "family_id",
-        "config_source_sha256",
-        "config_semantic_sha256",
         "seed",
         "calibration_bins",
         "sensitivity_target",
@@ -191,19 +257,16 @@ def validate_validation_evidence(
         or set(document) != fields
         or type(document["rsna_validation_evidence_schema_version"]) is not int
         or document["rsna_validation_evidence_schema_version"] != VALIDATION_EVIDENCE_SCHEMA_VERSION
-        or raw != _canonical_bytes(document)
+        or document["validation_evidence_id"] != validation_evidence_id(document)
+        or raw != canonical_json_bytes(document)
     ):
         raise ValueError("RSNA validation evidence contract is invalid")
     expected = {
         "dataset_id": config.dataset.dataset_id,
         "bundle_id": config.dataset.bundle_id,
-        "bundle_manifest_sha256": config.dataset.bundle_manifest_sha256,
-        "split_assignment_id": config.dataset.split_assignment_id,
         "task_id": config.task.task_id,
         "label_policy_version": config.task.label_policy_version,
         "family_id": config.family.family_id,
-        "config_source_sha256": config.config_source_sha256,
-        "config_semantic_sha256": config.config_semantic_sha256,
         "seed": require_runtime_seed(config),
         "calibration_bins": config.evaluation.calibration_bins if config.evaluation else None,
         "sensitivity_target": config.evaluation.sensitivity_target if config.evaluation else None,
@@ -251,13 +314,9 @@ def validate_validation_evidence(
             for key in (
                 "dataset_id",
                 "bundle_id",
-                "bundle_manifest_sha256",
-                "split_assignment_id",
                 "task_id",
                 "label_policy_version",
                 "family_id",
-                "config_source_sha256",
-                "config_semantic_sha256",
             )
         }
         package_expected["seed"] = package_seed
@@ -266,9 +325,43 @@ def validate_validation_evidence(
         digest = package.get("validation_evidence_sha256")
         if not isinstance(digest, str) or digest != sha256_file(source):
             raise ValueError("RSNA validation evidence SHA-256 differs from its model package")
-        if package.get("validation_evidence_semantic_sha256") != evidence_semantic_sha256(document):
+        if package.get("validation_evidence_id") != validation_evidence_id(document):
             raise ValueError("RSNA validation evidence identity differs from its model package")
+        expected_thresholds = {
+            "youden_j": youden_j_threshold(targets, probabilities),
+            "target_sensitivity": target_sensitivity_threshold(
+                targets, probabilities, sensitivity=float(document["sensitivity_target"])
+            ),
+        }
+        if package.get("thresholds") != expected_thresholds:
+            raise ValueError("RSNA package thresholds differ from validation evidence")
     return document
+
+
+def validate_package_validation_cohort(
+    package_directory: str | Path,
+    *,
+    package: Mapping[str, Any],
+    expected_cohort: CanonicalValidationCohort,
+) -> None:
+    """Revalidate package evidence against bundle-derived validation membership."""
+    root = Path(package_directory)
+    package_seed = package.get("seed")
+    training_policy = package.get("training_policy")
+    if package_seed is None and isinstance(training_policy, Mapping):
+        package_seed = training_policy.get("seed")
+    if isinstance(package_seed, bool) or not isinstance(package_seed, int):
+        raise ValueError("RSNA model package seed coordinate is invalid")
+    config = with_runtime(
+        load_experiment_config(root / "resolved_config.yaml", bundle_id=package["bundle_id"]),
+        seed=package_seed,
+    )
+    validate_validation_evidence(
+        root / VALIDATION_EVIDENCE_FILENAME,
+        package=package,
+        config=config,
+        expected_cohort=expected_cohort,
+    )
 
 
 def validate_cxr_epoch_history(
@@ -413,30 +506,22 @@ def _probability(value: object) -> bool:
     return bool(_finite_nonnegative(value) and value <= 1.0)
 
 
-def evidence_semantic_sha256(document: Mapping[str, Any]) -> str:
-    """Hash only the validation observations and scientific lineage they represent."""
+def validation_evidence_id(document: Mapping[str, Any]) -> str:
+    """Identify the validation observations and scientific lineage they represent."""
     fields = (
         "dataset_id",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "task_id",
         "label_policy_version",
         "family_id",
         "seed",
+        "sensitivity_target",
         "sample_ids",
         "targets",
         "probabilities",
         "epoch_history",
     )
     payload = {field: document[field] for field in fields}
-    return hashlib.sha256(
-        b"beyondcxr-rsna-validation-evidence-v1\0"
-        + json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    ).hexdigest()
-
-
-def _canonical_bytes(value: object) -> bytes:
-    return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-    ).encode()
+    return canonical_scientific_id(
+        "validation-evidence-", payload, domain="validation-evidence", schema_version=1
+    )

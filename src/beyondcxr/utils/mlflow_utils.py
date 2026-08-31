@@ -22,7 +22,6 @@ import sklearn
 import skops
 from mlflow.tracking import MlflowClient
 
-from beyondcxr.data.hashing import sha256_file
 from beyondcxr.utils.operational_logging import get_operational_logger, log_event
 
 
@@ -113,25 +112,6 @@ def tracked_run(
             log_event(_LOGGER, "run_finished", **context)
 
 
-def git_revision(repository_root: str | Path = ".") -> tuple[str, bool]:
-    """Return the current Git commit and dirty-worktree flag."""
-    commit = subprocess.run(
-        ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    dirty = bool(
-        subprocess.run(
-            ["git", "-C", str(repository_root), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    )
-    return commit, dirty
-
-
 def discover_repository_root(start: str | Path = ".") -> Path:
     """Discover and validate the ordinary BeyondCXR repository root."""
     try:
@@ -159,21 +139,11 @@ def _operational_seed(value: object) -> int | None:
         return None
 
 
-def uv_lock_sha256(path: str | Path = "uv.lock") -> str:
-    """Return the SHA-256 of the exact dependency lock."""
-    lock = Path(path)
-    if not lock.is_file():
-        raise FileNotFoundError(f"Dependency lock is missing: {lock}")
-    return sha256_file(lock)
-
-
 def log_source_config(config: SourceConfig) -> None:
     """Log the exact loaded experiment configuration for the active MLflow run."""
     with tempfile.TemporaryDirectory(prefix="beyondcxr-config-") as temporary_directory:
         path = Path(temporary_directory) / "resolved_config.yaml"
         path.write_bytes(config.source_bytes)
-        if sha256_file(path) != config.config_source_sha256:
-            raise ValueError("Loaded source configuration SHA-256 mismatch")
         mlflow.log_artifact(str(path), artifact_path="config")
 
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import precision_recall_curve, roc_curve
@@ -27,6 +28,7 @@ from beyondcxr.training.symile_families import (
     SYMILE_ECG_GATED_FAMILY,
 )
 from beyondcxr.training.symile_statistics import SUBGROUP_POLICY, raw_probability_metrics, sigmoid
+from beyondcxr.training.symile_test_data import FrozenSymileTestData
 from beyondcxr.utils.symile_publication import validated_development_repeat_oof
 
 if TYPE_CHECKING:
@@ -35,10 +37,11 @@ if TYPE_CHECKING:
 
 def derive_result_binding(campaign: RestoredCampaignClosure) -> ResultBinding:
     """Derive canonical coordinates exclusively from a validated campaign closure."""
+    from beyondcxr.training.symile_campaign import require_restored_campaign
+
+    campaign = require_restored_campaign(campaign)
     frozen = campaign.freeze.manifest
-    analysis = campaign.analysis
-    extension = campaign.extension.manifest
-    bundle = frozen["bundle"]
+    decision = campaign.development_decision.manifest
     cv_ids = {
         development.manifest["scientific_context"]["cv_assignment_id"]
         for development in campaign.developments
@@ -47,19 +50,16 @@ def derive_result_binding(campaign: RestoredCampaignClosure) -> ResultBinding:
         raise ManifestBuildError("Validated campaign development has inconsistent CV lineage")
     document = {
         "result_binding_schema_version": 1,
-        "science_execution": {
-            "git_commit": frozen["science_git_commit"],
-        },
         "data": {
-            "bundle_id": bundle["bundle_id"],
-            "split_assignment_id": bundle["split_assignment_id"],
+            "bundle_id": frozen["bundle_id"],
             "cv_assignment_id": next(iter(cv_ids)),
         },
         "development": {
-            "core_analysis_id": analysis["analysis_id"],
-            "family_development_ids": analysis["family_development_ids"],
-            "ecg_development_id": extension["ecg_development_id"],
-            "ecg_extension_result_id": extension["ecg_extension_result_id"],
+            "family_development_ids": {
+                item["family_id"]: item["development_id"]
+                for item in decision["family_development_ids"]
+            },
+            "development_decision_id": decision["development_decision_id"],
         },
         "held_out": {
             "pretest_freeze_id": campaign.freeze.freeze_id,
@@ -80,8 +80,6 @@ def validate_release_inputs(
 ) -> PublicResultProjection:
     """Validate one result binding and aggregate public projection against a restored campaign."""
     root = Path(artifact_root)
-    frozen = campaign.freeze.manifest
-    bundle = frozen["bundle"]
     expected = derive_result_binding(campaign)
     if binding != expected:
         raise ManifestBuildError("Result binding differs from validated campaign state")
@@ -94,7 +92,7 @@ def validate_release_inputs(
         / binding.data.bundle_id
         / "manifest.json"
     )
-    extension_claims = _json(campaign.extension.directory / "claims.json")
+    decision_claims = _json(campaign.development_decision.directory / "claims.json")
     global_claims = _json(campaign.global_result.directory / "claims.json")
     global_claims["discrimination_curves"] = _held_out_curves(campaign)
     development_reliability = _development_reliability(campaign, root / "private")
@@ -114,19 +112,18 @@ def validate_release_inputs(
             / "bundles"
             / binding.data.bundle_id
             / "samples.parquet",
+            campaign.test_data,
         ),
         core_analysis=campaign.analysis,
-        extension_claims=extension_claims,
+        decision_claims=decision_claims,
         global_claims=global_claims,
         development_reliability=development_reliability,
-        thresholds=campaign.extension.manifest["primary_thresholds"],
+        thresholds=campaign.development_decision.manifest["primary_thresholds"],
         subgroups=_subgroup_projection(campaign.subgroup),
         provenance={
-            "science_git_commit": binding.science_execution.git_commit,
-            "science_dependency_lock_sha256": frozen["dependency_lock_sha256"],
+            "science_git_commit": campaign.execution.manifest["git_commit"],
+            "science_dependency_lock_sha256": campaign.execution.manifest["dependency_lock_sha256"],
             "bundle_id": binding.data.bundle_id,
-            "bundle_manifest_sha256": bundle["bundle_manifest_sha256"],
-            "split_assignment_id": binding.data.split_assignment_id,
             "cv_assignment_id": binding.data.cv_assignment_id,
             "pretest_freeze_id": binding.held_out.pretest_freeze_id,
             "global_result_id": binding.held_out.global_result_id,
@@ -151,15 +148,16 @@ def validate_release_inputs(
     return projection
 
 
-def _cohort_projection(manifest: dict[str, Any], samples_path: Path) -> dict[str, Any]:
-    qualification = manifest["qualification"]
-    strict = qualification["strict_pneumonia_counts"]
+def _cohort_projection(
+    manifest: dict[str, Any], samples_path: Path, test_data: FrozenSymileTestData
+) -> dict[str, Any]:
     task = manifest["tasks"]["pneumonia_strict"]
     membership = manifest["membership"]
     samples = pq.read_table(
         samples_path,
         columns=["official_split", "pneumonia_state", "age_years", "sex", "view_position"],
     ).to_pandas()
+    samples = pd.concat([samples, test_data.source_samples], ignore_index=True)
     eligible = samples.loc[samples["pneumonia_state"].isin((0, 1))]
     scopes = {
         "train": eligible.loc[eligible["official_split"] == "train"],
@@ -196,11 +194,16 @@ def _cohort_projection(manifest: dict[str, Any], samples_path: Path) -> dict[str
             )
     return {
         "rows": [
-            {"scope": scope, **strict[scope]}
-            for scope in ("train", "validation", "development", "test")
+            {
+                "scope": scope,
+                "eligible": len(frame),
+                "positive": int(frame["pneumonia_state"].eq(1).sum()),
+                "negative": int(frame["pneumonia_state"].eq(0).sum()),
+            }
+            for scope, frame in scopes.items()
         ],
         "source_reconciliation": {
-            key: qualification["membership_counts"][key]
+            key: test_data.source_reconciliation[key]
             for key in ("full_admissions", "official_admissions", "excluded_admissions")
         },
         "construction": [

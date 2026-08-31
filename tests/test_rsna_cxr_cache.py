@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import pickle
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,8 +18,11 @@ from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_cxr_cache import (
     CxrCacheIdentity,
+    PreparedCxrCache,
+    ValidatedCxrCache,
     build_cxr_cache,
     preprocessing_identity,
+    scope_cxr_cache,
     validate_cxr_cache,
 )
 from beyondcxr.training.config import load_experiment_config
@@ -77,9 +79,7 @@ def _cache_frame() -> pd.DataFrame:
 def _identity(transform: StandardCxrTransform) -> CxrCacheIdentity:
     return CxrCacheIdentity(
         bundle_id="bundle-" + "0" * 64,
-        bundle_manifest_sha256="1" * 64,
-        source_inventory_file_sha256="2" * 64,
-        source_inventory_arrow_sha256="3" * 64,
+        source_inventory_semantic_sha256="3" * 64,
         preprocessing_sha256=preprocessing_identity(transform),
     )
 
@@ -125,18 +125,28 @@ def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         identity=_identity(transform),
         transform=transform,
     )
-    return built, images, transform
+    return built, images, transform, tmp_path / "cache" / built.identity.cache_id
 
 
 def test_cache_preserves_deterministic_preprocessing_and_strict_identity(cache) -> None:
-    built, images, transform = cache
-    assert tuple(built.sample_rows) == tuple(_frame()["sample_id"])
-    assert built.images.shape == (4, 1, 224, 224)
-    assert built.images.dtype == np.float32
-    assert torch.equal(built.image("rsna:a"), transform.deterministic_base(images["a"]))
+    built, images, transform, directory = cache
+    scoped = scope_cxr_cache(
+        built,
+        sample_ids=("rsna:a", "rsna:b"),
+        partition="train",
+    )
+    assert torch.equal(scoped.image("rsna:a"), transform.deterministic_base(images["a"]))
+    with pytest.raises(ManifestBuildError, match="outside the authorized scope"):
+        scoped.image("rsna:d")
+    with pytest.raises(PermissionError, match="live package-bound authorization"):
+        scope_cxr_cache(
+            built,
+            sample_ids=("rsna:d",),
+            partition="test",
+        )
     with pytest.raises(ManifestBuildError):
         validate_cxr_cache(
-            built.directory,
+            directory,
             identity=replace(built.identity, bundle_id="bundle-" + "9" * 64),
             expected_sample_partitions=_sample_partitions(),
         )
@@ -160,9 +170,7 @@ def test_cache_identity_rejects_unsupported_source_authentication_policy() -> No
         replace(identity, source_authentication_policy="changed-policy")
     assert set(identity.as_dict()) == {
         "bundle_id",
-        "bundle_manifest_sha256",
-        "source_inventory_file_sha256",
-        "source_inventory_arrow_sha256",
+        "source_inventory_semantic_sha256",
         "preprocessing_sha256",
         "source_authentication_policy",
     }
@@ -204,28 +212,34 @@ def test_cache_source_frame_rejects_task_columns_before_decoding(
 
 
 def test_validated_cache_witness_is_immutable(cache) -> None:
-    built, _, _ = cache
-    with pytest.raises(TypeError):
-        built.sample_rows["rsna:a"] = 99  # type: ignore[index]
-    with pytest.raises(TypeError):
-        built.sample_partitions["rsna:a"] = "test"  # type: ignore[index]
+    built, _, _, _ = cache
     with pytest.raises((AttributeError, TypeError)):
         built.source_authentication.file_count = 0  # type: ignore[misc]
     assert set(built.source_authentication.as_dict()) == {
         "policy_version",
         "partitions",
         "file_count",
-        "source_inventory_arrow_sha256",
-        "source_inventory_file_sha256",
+        "source_inventory_semantic_sha256",
     }
-    with pytest.raises(ValueError):
-        replace(built, sample_rows=dict(built.sample_rows))
+    assert not hasattr(built, "directory")
+    scoped = scope_cxr_cache(built, sample_ids=("rsna:a", "rsna:b"), partition="train")
+    assert scoped.require_sample("rsna:a", "train") is None
     with pytest.raises(ValueError):
         replace(built.source_authentication, file_count=0)
 
 
+def test_cache_handles_do_not_expose_storage_or_support_manual_construction(cache) -> None:
+    built, _, _, _ = cache
+    assert not hasattr(built, "directory")
+    assert not hasattr(built, "mapping_sha256")
+    with pytest.raises(TypeError, match="issued only"):
+        PreparedCxrCache()
+    with pytest.raises(TypeError, match="issued only"):
+        ValidatedCxrCache()
+
+
 def test_cache_rejects_partial_or_corrupt_publication(cache, tmp_path: Path) -> None:
-    built, _, _ = cache
+    built, _, _, directory = cache
     partial = tmp_path / built.identity.cache_id
     partial.mkdir()
     (partial / "metadata.json").write_text("{}", encoding="utf-8")
@@ -235,45 +249,36 @@ def test_cache_rejects_partial_or_corrupt_publication(cache, tmp_path: Path) -> 
             identity=built.identity,
             expected_sample_partitions=_sample_partitions(),
         )
-    writable = np.load(built.directory / "images.npy", mmap_mode="r+")
+    writable = np.load(directory / "images.npy", mmap_mode="r+")
     writable[0, 0, 0, 0] = 0.5
     writable.flush()
     with pytest.raises(ManifestBuildError):
         validate_cxr_cache(
-            built.directory,
+            directory,
             identity=built.identity,
             expected_sample_partitions=_sample_partitions(),
         )
 
 
 def test_cache_rejects_self_consistent_but_false_sample_partition_mapping(cache) -> None:
-    built, _, _ = cache
-    index_path = built.directory / "index.parquet"
-    table = pq.read_table(index_path)
-    index = table.to_pandas()
-    index.loc[index["sample_id"] == "rsna:a", "split_name"] = "test"
-    index.loc[index["sample_id"] == "rsna:d", "split_name"] = "train"
-    pq.write_table(pa.Table.from_pandas(index, schema=table.schema), index_path)
-    metadata_path = built.directory / "metadata.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["mapping_sha256"] = sha256_file(index_path)
-    metadata_path.write_text(
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    built, _, _, directory = cache
+    false_partitions = tuple(
+        (sample_id, "test" if split == "train" else "train" if split == "test" else split)
+        for sample_id, split in _sample_partitions()
     )
-
     with pytest.raises(ManifestBuildError):
         validate_cxr_cache(
-            built.directory,
+            directory,
             identity=built.identity,
-            expected_sample_partitions=_sample_partitions(),
+            expected_sample_partitions=false_partitions,
         )
 
 
 def test_interrupted_cache_publication_cannot_leave_a_valid_destination(
     cache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    built, _, transform = cache
-    identity = replace(built.identity, bundle_manifest_sha256="3" * 64)
+    built, _, transform, directory = cache
+    identity = replace(built.identity, source_inventory_semantic_sha256="7" * 64)
 
     def interrupt(stage: Path, destination: Path) -> None:
         del stage, destination
@@ -283,19 +288,20 @@ def test_interrupted_cache_publication_cannot_leave_a_valid_destination(
     with pytest.raises(OSError):
         build_cxr_cache(
             _cache_frame(),
-            dataset_root=built.directory.parent,
-            cache_root=built.directory.parent,
+            dataset_root=directory.parent,
+            cache_root=directory.parent,
             identity=identity,
             transform=transform,
         )
-    assert not (built.directory.parent / identity.cache_id).exists()
-    assert not any(path.name.startswith(".") for path in built.directory.parent.iterdir())
+    assert not (directory.parent / identity.cache_id).exists()
+    assert not any(path.name.startswith(".") for path in directory.parent.iterdir())
 
 
 def test_cache_mmaps_close_on_build_and_validation_failure(
     cache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    built, _, transform = cache
+    built, _, transform, directory = cache
+    identity = replace(built.identity, source_inventory_semantic_sha256="7" * 64)
     opened_writers: list[np.memmap] = []
     original_open_memmap = np.lib.format.open_memmap
 
@@ -309,19 +315,18 @@ def test_cache_mmaps_close_on_build_and_validation_failure(
         "beyondcxr.data.rsna_cxr_cache.read_dicom",
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError((args, kwargs))),
     )
-    identity = replace(built.identity, bundle_manifest_sha256="4" * 64)
     with pytest.raises(ManifestBuildError):
         build_cxr_cache(
             _cache_frame(),
-            dataset_root=built.directory.parent,
-            cache_root=built.directory.parent,
+            dataset_root=directory.parent,
+            cache_root=directory.parent,
             identity=identity,
             transform=transform,
         )
     assert opened_writers
     assert all(mapping._mmap.closed for mapping in opened_writers)
 
-    metadata_path = built.directory / "metadata.json"
+    metadata_path = directory / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["content_sha256"] = "0" * 64
     metadata_path.write_text(
@@ -338,7 +343,7 @@ def test_cache_mmaps_close_on_build_and_validation_failure(
     monkeypatch.setattr(np, "load", tracked_load)
     with pytest.raises(ManifestBuildError):
         validate_cxr_cache(
-            built.directory,
+            directory,
             identity=built.identity,
             expected_sample_partitions=_sample_partitions(),
         )
@@ -349,16 +354,16 @@ def test_cache_mmaps_close_on_build_and_validation_failure(
 def test_cache_build_rejects_unsafe_paths_and_decoded_patient_mismatch(
     cache, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    built, _, transform = cache
-    identity = replace(built.identity, bundle_manifest_sha256="4" * 64)
+    built, _, transform, directory = cache
+    identity = replace(built.identity, source_inventory_semantic_sha256="7" * 64)
     unsafe = _cache_frame().assign(
         image_path=["../a.dcm", "images/b.dcm", "images/c.dcm", "images/d.dcm"]
     )
     with pytest.raises(ManifestBuildError):
         build_cxr_cache(
             unsafe,
-            dataset_root=built.directory.parent,
-            cache_root=built.directory.parent,
+            dataset_root=directory.parent,
+            cache_root=directory.parent,
             identity=identity,
             transform=transform,
         )
@@ -380,8 +385,8 @@ def test_cache_build_rejects_unsafe_paths_and_decoded_patient_mismatch(
     with pytest.raises(ManifestBuildError):
         build_cxr_cache(
             _cache_frame(),
-            dataset_root=built.directory.parent,
-            cache_root=built.directory.parent,
+            dataset_root=directory.parent,
+            cache_root=directory.parent,
             identity=identity,
             transform=transform,
         )
@@ -393,7 +398,9 @@ def _policy(workers: int, persistent: bool) -> LoaderExecutionPolicy:
 
 
 def _dataset_and_loader(cache, workers: int, persistent: bool, seed: int = 42):
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
     dataset = RsnaCachedImageDataset(
         _image_frame(),
@@ -431,7 +438,9 @@ def _epochs(cache, seed: int = 42):
 
 
 def _loader_epochs(cache, workers: int, persistent: bool, seed: int = 42):
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
     dataset = _WorkerDigestDataset(
         RsnaCachedImageDataset(
@@ -466,7 +475,7 @@ def _loader_epochs(cache, workers: int, persistent: bool, seed: int = 42):
 
 
 def test_order_and_augmentation_are_worker_and_persistence_independent(cache) -> None:
-    built, _, _ = cache
+    built, _, _, _ = cache
     single = _loader_epochs(built, 0, False)
     one_worker = _loader_epochs(built, 1, True)
     persistent = _loader_epochs(built, 2, True)
@@ -492,20 +501,52 @@ def test_order_and_augmentation_are_worker_and_persistence_independent(cache) ->
     assert not np.array_equal(_epochs(built, seed=17)[0][1], single[0][1])
 
 
-def test_validated_cache_process_transfer_reopens_the_memory_map(cache) -> None:
-    built, _, _ = cache
+def test_serialized_development_cache_reauthenticates_exact_scope(cache) -> None:
+    import pickle
 
-    encoded = pickle.dumps(built)
-    restored = pickle.loads(encoded)
+    built, _, _, _ = cache
+    scoped = scope_cxr_cache(
+        built,
+        sample_ids=("rsna:a", "rsna:b"),
+        partition="train",
+    )
+    restored = pickle.loads(pickle.dumps(scoped))
+    assert torch.equal(restored.image("rsna:a"), scoped.image("rsna:a"))
+    restore, arguments = scoped.__reduce__()
+    with pytest.raises(ManifestBuildError, match="crosses a partition boundary"):
+        restore(*arguments[:-2], ("rsna:d",), "train")
+    with pytest.raises(PermissionError, match="not a development partition"):
+        restore(*arguments[:-1], "test")
 
-    assert len(encoded) < built.images.nbytes
-    assert restored.images.filename == built.images.filename
-    np.testing.assert_array_equal(restored.images, built.images)
+    (arguments[0] / "metadata.json").write_text("[]\n", encoding="utf-8")
+    with pytest.raises(ManifestBuildError, match="prepared authority changed"):
+        restore(*arguments)
+    with pytest.raises(ManifestBuildError, match="prepared authority changed"):
+        scope_cxr_cache(built, sample_ids=("rsna:a", "rsna:b"), partition="train")
+
+
+def test_serialized_development_cache_rejects_rehashed_index_mutation(cache) -> None:
+    import pickle
+
+    built, _, _, directory = cache
+    scoped = scope_cxr_cache(built, sample_ids=("rsna:a", "rsna:b"), partition="train")
+    serialized = pickle.dumps(scoped)
+    index_path = directory / "index.parquet"
+    index = pq.read_table(index_path)
+    rows = index.to_pylist()
+    rows[0]["row_index"], rows[3]["row_index"] = rows[3]["row_index"], rows[0]["row_index"]
+    pq.write_table(pa.Table.from_pylist(rows, schema=index.schema), index_path)
+    metadata_path = directory / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["mapping_sha256"] = sha256_file(index_path)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ManifestBuildError, match="prepared authority changed"):
+        pickle.loads(serialized)
 
 
 @pytest.mark.parametrize("seed", [True, -1, 1.5])
 def test_cached_training_datasets_share_the_nonnegative_integer_seed_contract(cache, seed) -> None:
-    built, _, _ = cache
+    built, _, _, _ = cache
     with pytest.raises(ManifestBuildError):
         RsnaCachedImageDataset(
             _image_frame(),
@@ -518,7 +559,7 @@ def test_cached_training_datasets_share_the_nonnegative_integer_seed_contract(ca
 
 
 def test_fusion_uses_the_same_cache_contract(cache) -> None:
-    built, _, _ = cache
+    built, _, _, _ = cache
     frame = (
         _frame()
         .loc[_frame()["split_name"] == "train"]
@@ -594,14 +635,12 @@ def test_fusion_uses_the_same_cache_contract(cache) -> None:
     ("field", "value"),
     [
         ("bundle_id", "bundle-" + "9" * 64),
-        ("bundle_manifest_sha256", "8" * 64),
-        ("source_inventory_file_sha256", "7" * 64),
-        ("source_inventory_arrow_sha256", "6" * 64),
+        ("source_inventory_semantic_sha256", "6" * 64),
         ("preprocessing_sha256", "f" * 64),
     ],
 )
 def test_cached_image_consumer_rejects_incompatible_identity(cache, field: str, value: str) -> None:
-    built, _, _ = cache
+    built, _, _, _ = cache
     with pytest.raises(ManifestBuildError):
         RsnaCachedImageDataset(
             _image_frame(),
@@ -614,7 +653,7 @@ def test_cached_image_consumer_rejects_incompatible_identity(cache, field: str, 
 
 
 def test_cached_fusion_consumer_rejects_incompatible_identity(cache) -> None:
-    built, _, _ = cache
+    built, _, _, _ = cache
     frame = (
         _frame()
         .loc[_frame()["split_name"] == "train"]

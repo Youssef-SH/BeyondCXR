@@ -9,7 +9,7 @@ Generate the checkerboard JPEG and complete 50-key laboratory JSON:
 uv run --extra serving python examples/symile_serving/generate_synthetic_request.py
 ```
 
-With a validated, runtime-mounted authority loaded, submit them as multipart form data:
+After starting the accepted service with `make serve`, submit them as multipart form data:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/predict \
@@ -30,12 +30,8 @@ results):
   "probability": 0.5,
   "missing_labs": ["lab_<item_id>"],
   "serving_authority_id": "serving-authority-<sha256>",
-  "warning": "Research prototype only. Not for clinical decision-making. Not a medical device or physician replacement. Predicts a radiology-derived Pneumonia finding, not confirmed infectious pneumonia."
+  "warning": "Research use only. BeyondCXR is not intended for clinical decision-making, is not a medical device, does not replace physician judgment, and predicts a radiology-derived Pneumonia finding rather than confirmed infectious pneumonia."
 }
 ```
 
-Host-side final-release validation sends the same request through the in-process ASGI application
-against the staged candidate authority. Container acceptance mounts that staged authority and the
-restored final-package tree read-only, reconstructs inside the built image, and exercises
-`/health`, `/model-info`, and this synthetic `/predict` request. The final authority is atomically
-published only after all acceptance checks succeed. See [controlled serving](../../docs/serving.md).
+See [serving](../../docs/serving.md) for startup, input validation, and deployment requirements.

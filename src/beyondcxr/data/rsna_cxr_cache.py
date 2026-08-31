@@ -24,6 +24,7 @@ from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_source import resolve_image_path
 from beyondcxr.utils.operational_logging import CountProgress, get_operational_logger, log_event
 from beyondcxr.utils.publication import publish_directory, staging_directory
+from beyondcxr.utils.semantic_identity import canonical_scientific_id, semantic_sha256
 
 IMAGES_FILENAME = "images.npy"
 INDEX_FILENAME = "index.parquet"
@@ -42,7 +43,6 @@ _INDEX_SCHEMA = pa.schema(
     [
         pa.field("sample_id", pa.string(), nullable=False),
         pa.field("row_index", pa.int64(), nullable=False),
-        pa.field("split_name", pa.string(), nullable=False),
     ]
 )
 _LOGGER = get_operational_logger(__name__)
@@ -84,8 +84,7 @@ class CxrCacheSourceAuthentication:
     policy_version: str
     partitions: tuple[str, ...]
     file_count: int
-    source_inventory_arrow_sha256: str
-    source_inventory_file_sha256: str
+    source_inventory_semantic_sha256: str
 
     def __post_init__(self) -> None:
         if (
@@ -94,8 +93,7 @@ class CxrCacheSourceAuthentication:
             or isinstance(self.file_count, bool)
             or not isinstance(self.file_count, int)
             or self.file_count <= 0
-            or not _is_sha256(self.source_inventory_arrow_sha256)
-            or not _is_sha256(self.source_inventory_file_sha256)
+            or not _is_sha256(self.source_inventory_semantic_sha256)
         ):
             raise ValueError("CXR cache source-authentication witness is invalid")
 
@@ -105,8 +103,7 @@ class CxrCacheSourceAuthentication:
             "policy_version": self.policy_version,
             "partitions": list(self.partitions),
             "file_count": self.file_count,
-            "source_inventory_arrow_sha256": self.source_inventory_arrow_sha256,
-            "source_inventory_file_sha256": self.source_inventory_file_sha256,
+            "source_inventory_semantic_sha256": self.source_inventory_semantic_sha256,
         }
 
     @classmethod
@@ -116,8 +113,7 @@ class CxrCacheSourceAuthentication:
             "policy_version",
             "partitions",
             "file_count",
-            "source_inventory_arrow_sha256",
-            "source_inventory_file_sha256",
+            "source_inventory_semantic_sha256",
         }
         if not isinstance(value, Mapping) or set(value) != fields:
             raise ValueError("CXR cache source-authentication witness is invalid")
@@ -126,8 +122,9 @@ class CxrCacheSourceAuthentication:
                 policy_version=cast(str, value["policy_version"]),
                 partitions=tuple(cast(tuple[str, ...] | list[str], value["partitions"])),
                 file_count=cast(int, value["file_count"]),
-                source_inventory_arrow_sha256=cast(str, value["source_inventory_arrow_sha256"]),
-                source_inventory_file_sha256=cast(str, value["source_inventory_file_sha256"]),
+                source_inventory_semantic_sha256=cast(
+                    str, value["source_inventory_semantic_sha256"]
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("CXR cache source-authentication witness is invalid") from exc
@@ -138,9 +135,7 @@ class CxrCacheIdentity:
     """Source and deterministic-preprocessing identity for one cache."""
 
     bundle_id: str
-    bundle_manifest_sha256: str
-    source_inventory_file_sha256: str
-    source_inventory_arrow_sha256: str
+    source_inventory_semantic_sha256: str
     preprocessing_sha256: str
     source_authentication_policy: str = SOURCE_AUTHENTICATION_POLICY_VERSION
 
@@ -151,9 +146,7 @@ class CxrCacheIdentity:
             or not all(
                 _is_sha256(value)
                 for value in (
-                    self.bundle_manifest_sha256,
-                    self.source_inventory_file_sha256,
-                    self.source_inventory_arrow_sha256,
+                    self.source_inventory_semantic_sha256,
                     self.preprocessing_sha256,
                 )
             )
@@ -164,92 +157,271 @@ class CxrCacheIdentity:
     @property
     def cache_id(self) -> str:
         """Return the identity-addressed cache directory name."""
-        payload = json.dumps(
-            self.as_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-        return "cache-" + hashlib.sha256(payload).hexdigest()
+        return canonical_scientific_id("cache-", self.as_dict(), domain="cache", schema_version=1)
 
     def as_dict(self) -> dict[str, str]:
         """Return serializable cache identity fields."""
         return {
             "bundle_id": self.bundle_id,
-            "bundle_manifest_sha256": self.bundle_manifest_sha256,
-            "source_inventory_file_sha256": self.source_inventory_file_sha256,
-            "source_inventory_arrow_sha256": self.source_inventory_arrow_sha256,
+            "source_inventory_semantic_sha256": self.source_inventory_semantic_sha256,
             "preprocessing_sha256": self.preprocessing_sha256,
             "source_authentication_policy": self.source_authentication_policy,
         }
 
 
-@dataclass(frozen=True)
+class PreparedCxrCache:
+    """Opaque operation that can issue only validated exact-scope cache views."""
+
+    __slots__ = ("identity", "source_authentication", "_scope_request")
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("Prepared CXR cache handles are issued only by cache validation")
+
+    def __reduce__(self) -> object:
+        raise TypeError("Prepared CXR cache handles are process-local")
+
+
 class ValidatedCxrCache:
-    """Validated memory-mapped cache and stable sample mapping."""
+    """Opaque exact-scope image reader issued by a validated prepared cache."""
 
-    directory: Path
-    images: np.memmap
-    sample_rows: Mapping[str, int]
-    sample_partitions: Mapping[str, str]
-    identity: CxrCacheIdentity
-    source_authentication: CxrCacheSourceAuthentication
+    __slots__ = ("identity", "source_authentication", "_require", "_read", "_serialization")
 
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.directory, Path)
-            or not isinstance(self.images, np.memmap)
-            or not isinstance(self.sample_rows, _ImmutableStringMapping)
-            or not isinstance(self.sample_partitions, _ImmutableStringMapping)
-            or not isinstance(self.identity, CxrCacheIdentity)
-            or not isinstance(self.source_authentication, CxrCacheSourceAuthentication)
-            or tuple(self.sample_rows) != tuple(self.sample_partitions)
-            or tuple(self.sample_rows.values()) != tuple(range(len(self.sample_rows)))
-            or any(value not in _SPLIT_NAMES for value in self.sample_partitions.values())
-            or set(self.sample_partitions.values()) != set(_SPLIT_NAMES)
-            or self.images.dtype != np.float32
-            or self.images.shape
-            != (
-                len(self.sample_rows),
-                1,
-                STANDARD_CXR_IMAGE_SIZE,
-                STANDARD_CXR_IMAGE_SIZE,
-            )
-            or self.source_authentication.file_count != len(self.sample_rows)
-            or self.source_authentication.source_inventory_arrow_sha256
-            != self.identity.source_inventory_arrow_sha256
-            or self.source_authentication.source_inventory_file_sha256
-            != self.identity.source_inventory_file_sha256
-        ):
-            raise ValueError("Validated CXR cache object is invalid")
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("Scoped CXR cache views are issued only by validated cache scoping")
+
+    def require_sample(self, sample_id: str, partition: str) -> None:
+        """Require one sample to belong to this exact consumer scope."""
+        self._require(sample_id, partition)
 
     def image(self, sample_id: str) -> torch.Tensor:
-        """Return one writable float32 tensor copied from the memory map."""
+        """Return one copied tensor only when it belongs to this authorized scope."""
+        return self._read(sample_id)
+
+    def __reduce__(self) -> object:
+        if self._serialization is None:
+            raise TypeError("Held-out CXR cache authority cannot be serialized")
+        return self._serialization
+
+
+def _prepared_cache(
+    directory: Path,
+    identity: CxrCacheIdentity,
+    source_authentication: CxrCacheSourceAuthentication,
+    mapping_sha256: str,
+    sample_partitions: _ImmutableStringMapping[str],
+) -> PreparedCxrCache:
+    images_physical_identity = _physical_identity(directory / IMAGES_FILENAME)
+    development_partition_sha256 = _ImmutableStringMapping(
+        ("train", "validation"),
+        tuple(
+            _partition_authority_sha256(
+                tuple(
+                    (sample_id, split)
+                    for sample_id in sample_partitions
+                    if sample_partitions[sample_id] == split
+                )
+            )
+            for split in ("train", "validation")
+        ),
+    )
+    handle = object.__new__(PreparedCxrCache)
+    object.__setattr__(handle, "identity", identity)
+    object.__setattr__(handle, "source_authentication", source_authentication)
+
+    def scope_request(
+        sample_ids: tuple[str, ...],
+        partition: str,
+        held_out_authorization: object | None,
+        package_id: str | None,
+    ) -> ValidatedCxrCache:
+        return _scope_cxr_cache_state(
+            directory=directory,
+            identity=identity,
+            source_authentication=source_authentication,
+            mapping_sha256=mapping_sha256,
+            images_physical_identity=images_physical_identity,
+            development_partition_sha256=development_partition_sha256,
+            sample_ids=sample_ids,
+            partition=partition,
+            held_out_authorization=held_out_authorization,
+            package_id=package_id,
+        )
+
+    object.__setattr__(handle, "_scope_request", scope_request)
+    return handle
+
+
+def scope_cxr_cache(
+    prepared: PreparedCxrCache,
+    *,
+    sample_ids: tuple[str, ...],
+    partition: str,
+    held_out_authorization: object | None = None,
+    package_id: str | None = None,
+) -> ValidatedCxrCache:
+    """Create one exact consumer view; test scope requires live package authority."""
+    if not isinstance(prepared, PreparedCxrCache) or not hasattr(prepared, "_scope_request"):
+        raise PermissionError("CXR cache scoping requires a genuine prepared-cache handle")
+    return prepared._scope_request(
+        sample_ids,
+        partition,
+        held_out_authorization,
+        package_id,
+    )
+
+
+def _scope_cxr_cache_state(
+    *,
+    directory: Path,
+    identity: CxrCacheIdentity,
+    source_authentication: CxrCacheSourceAuthentication,
+    mapping_sha256: str,
+    images_physical_identity: tuple[int, int, int, int, int],
+    development_partition_sha256: _ImmutableStringMapping[str],
+    sample_ids: tuple[str, ...],
+    partition: str,
+    held_out_authorization: object | None,
+    package_id: str | None,
+) -> ValidatedCxrCache:
+    if partition not in _SPLIT_NAMES or not sample_ids or len(sample_ids) != len(set(sample_ids)):
+        raise ManifestBuildError("CXR cache consumer scope is invalid")
+    if partition == "test":
+        from beyondcxr.training.rsna_campaign_control import require_validated_rsna_held_out
+        from beyondcxr.training.rsna_validation_evidence import load_canonical_held_out_cohort
+
+        if not isinstance(package_id, str):
+            raise PermissionError("Test cache scope requires live package-bound authorization")
+        capability = require_validated_rsna_held_out(held_out_authorization)
+        cohort = load_canonical_held_out_cohort(
+            capability,
+            model_package_id=package_id,
+        )
+        dataset = capability.current_execution.execution.manifest.get("dataset")
+        if (
+            not isinstance(dataset, Mapping)
+            or identity.bundle_id != dataset.get("bundle_id")
+            or sample_ids != cohort.sample_ids
+        ):
+            raise ManifestBuildError(
+                "CXR cache or consumer scope differs from the authorized held-out cohort"
+            )
+    elif held_out_authorization is not None or package_id is not None:
+        raise ManifestBuildError("Development cache scopes do not accept held-out authority")
+    try:
+        metadata = json.loads((directory / METADATA_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ManifestBuildError("CXR cache metadata is unreadable") from exc
+    declared_development = (
+        metadata.get("development_partition_authority_sha256")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(declared_development, dict)
+        or metadata.get("identity") != identity.as_dict()
+        or metadata.get("source_authentication") != source_authentication.as_dict()
+        or metadata.get("mapping_sha256") != mapping_sha256
+        or declared_development != dict(development_partition_sha256)
+        or sha256_file(directory / INDEX_FILENAME) != mapping_sha256
+        or _physical_identity(directory / IMAGES_FILENAME) != images_physical_identity
+    ):
+        raise ManifestBuildError("CXR cache prepared authority changed after validation")
+    index = pq.read_table(directory / INDEX_FILENAME)
+    if index.schema != _INDEX_SCHEMA:
+        raise ManifestBuildError("CXR cache physical index schema changed")
+    physical = index.to_pandas().set_index("sample_id", verify_integrity=True)["row_index"]
+    rows: list[int] = []
+    for sample_id in sample_ids:
         try:
-            row = self.sample_rows[sample_id]
+            row = int(physical.loc[sample_id])
         except KeyError as exc:
-            raise ManifestBuildError(f"CXR cache has no sample {sample_id!r}") from exc
-        return torch.from_numpy(np.array(self.images[row], dtype=np.float32, copy=True))
+            raise ManifestBuildError(
+                "CXR cache does not cover the requested consumer scope"
+            ) from exc
+        rows.append(row)
+    if partition != "test" and development_partition_sha256[partition] != (
+        _partition_authority_sha256(tuple((sample_id, partition) for sample_id in sample_ids))
+    ):
+        raise ManifestBuildError("CXR cache consumer scope crosses a partition boundary")
+    try:
+        images = np.load(directory / IMAGES_FILENAME, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ManifestBuildError("CXR cache image array is unreadable") from exc
+    mapping = _ImmutableStringMapping(sample_ids, tuple(rows))
+    scoped = object.__new__(ValidatedCxrCache)
+    object.__setattr__(scoped, "identity", identity)
+    object.__setattr__(scoped, "source_authentication", source_authentication)
 
-    def __getstate__(self) -> dict[str, object]:
-        """Exclude mapped image bytes when crossing a process boundary."""
-        return {**self.__dict__, "images": None}
+    def require_sample(sample_id: str, requested_partition: str) -> None:
+        if requested_partition != partition or sample_id not in mapping:
+            raise ManifestBuildError("CXR cache sample is outside the authorized partition scope")
 
-    def __setstate__(self, state: dict[str, object]) -> None:
-        """Reopen the already-validated memory map in a worker process."""
-        directory = cast(Path, state["directory"])
-        state["images"] = np.load(directory / IMAGES_FILENAME, mmap_mode="r", allow_pickle=False)
-        for name, value in state.items():
-            object.__setattr__(self, name, value)
-        self.__post_init__()
+    def read_image(sample_id: str) -> torch.Tensor:
+        try:
+            row = mapping[sample_id]
+        except KeyError as exc:
+            raise ManifestBuildError("CXR cache sample is outside the authorized scope") from exc
+        return torch.from_numpy(np.array(images[row], dtype=np.float32, copy=True))
+
+    object.__setattr__(scoped, "_require", require_sample)
+    object.__setattr__(scoped, "_read", read_image)
+    object.__setattr__(
+        scoped,
+        "_serialization",
+        None
+        if partition == "test"
+        else (
+            _restore_development_cxr_cache,
+            (
+                directory,
+                identity,
+                source_authentication,
+                mapping_sha256,
+                images_physical_identity,
+                development_partition_sha256,
+                sample_ids,
+                partition,
+            ),
+        ),
+    )
+    return scoped
+
+
+def _restore_development_cxr_cache(
+    directory: Path,
+    identity: CxrCacheIdentity,
+    source_authentication: CxrCacheSourceAuthentication,
+    mapping_sha256: str,
+    images_physical_identity: tuple[int, int, int, int, int],
+    development_partition_sha256: _ImmutableStringMapping[str],
+    sample_ids: tuple[str, ...],
+    partition: str,
+) -> ValidatedCxrCache:
+    """Reauthenticate one development scope against its parent's validated evidence."""
+    if partition not in {"train", "validation"}:
+        raise PermissionError("Serialized CXR cache scope is not a development partition")
+    return _scope_cxr_cache_state(
+        directory=directory,
+        identity=identity,
+        source_authentication=source_authentication,
+        mapping_sha256=mapping_sha256,
+        images_physical_identity=images_physical_identity,
+        development_partition_sha256=development_partition_sha256,
+        sample_ids=sample_ids,
+        partition=partition,
+        held_out_authorization=None,
+        package_id=None,
+    )
 
 
 def preprocessing_identity(transform: StandardCxrTransform) -> str:
     """Hash deterministic CXR preprocessing meaning."""
-    return hashlib.sha256(
-        json.dumps(
-            deterministic_preprocessing_contract(transform),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    return semantic_sha256(
+        "cxr-preprocessing",
+        1,
+        deterministic_preprocessing_contract(transform),
+    )
 
 
 def deterministic_preprocessing_contract(
@@ -280,7 +452,7 @@ def build_cxr_cache(
     cache_root: str | Path,
     identity: CxrCacheIdentity,
     transform: StandardCxrTransform,
-) -> ValidatedCxrCache:
+) -> PreparedCxrCache:
     """Build and atomically publish one complete deterministic cache."""
     _validate_source_frame(frame)
     destination = Path(cache_root) / identity.cache_id
@@ -291,7 +463,7 @@ def build_cxr_cache(
             expected_sample_partitions=_sample_partitions(frame),
         )
     stage = staging_directory(destination)
-    validated_stage: ValidatedCxrCache | None = None
+    validated_stage: PreparedCxrCache | None = None
     images: np.memmap | None = None
     try:
         shape = (len(frame), 1, STANDARD_CXR_IMAGE_SIZE, STANDARD_CXR_IMAGE_SIZE)
@@ -338,7 +510,6 @@ def build_cxr_cache(
                 {
                     "sample_id": str(row.sample_id),
                     "row_index": row_index,
-                    "split_name": str(row.split_name),
                 }
             )
             progress.update(row_index + 1)
@@ -362,14 +533,20 @@ def build_cxr_cache(
             "dtype": "float32",
             "shape": list(shape),
             "mapping_sha256": sha256_file(stage / INDEX_FILENAME),
+            "partition_authority_sha256": _partition_authority_sha256(_sample_partitions(frame)),
+            "development_partition_authority_sha256": {
+                split: _partition_authority_sha256(
+                    tuple(value for value in _sample_partitions(frame) if value[1] == split)
+                )
+                for split in ("train", "validation")
+            },
             "content_sha256": content.hexdigest(),
             "deterministic_preprocessing": deterministic_preprocessing_contract(transform),
             "source_authentication": {
                 "policy_version": identity.source_authentication_policy,
                 "partitions": list(_SPLIT_NAMES),
                 "file_count": len(frame),
-                "source_inventory_arrow_sha256": identity.source_inventory_arrow_sha256,
-                "source_inventory_file_sha256": identity.source_inventory_file_sha256,
+                "source_inventory_semantic_sha256": identity.source_inventory_semantic_sha256,
             },
         }
         (stage / METADATA_FILENAME).write_text(
@@ -381,7 +558,6 @@ def build_cxr_cache(
             expected_sample_partitions=_sample_partitions(frame),
             enforce_directory_name=False,
         )
-        validated_stage.images._mmap.close()
         publish_directory(stage, destination)
     finally:
         if images is not None:
@@ -390,14 +566,10 @@ def build_cxr_cache(
             shutil.rmtree(stage)
     if validated_stage is None:
         raise ManifestBuildError("CXR cache staging validation did not complete")
-    published_images = np.load(destination / IMAGES_FILENAME, mmap_mode="r", allow_pickle=False)
-    return ValidatedCxrCache(
+    return validate_cxr_cache(
         destination,
-        published_images,
-        validated_stage.sample_rows,
-        validated_stage.sample_partitions,
-        identity,
-        validated_stage.source_authentication,
+        identity=identity,
+        expected_sample_partitions=_sample_partitions(frame),
     )
 
 
@@ -436,8 +608,8 @@ def validate_cxr_cache(
     identity: CxrCacheIdentity,
     expected_sample_partitions: tuple[tuple[str, str], ...],
     enforce_directory_name: bool = True,
-) -> ValidatedCxrCache:
-    """Strictly validate one cache against its expected current identity."""
+) -> PreparedCxrCache:
+    """Validate the complete cache and return an opaque prepared-cache handle."""
     root = Path(directory)
     if not root.is_dir() or (enforce_directory_name and root.name != identity.cache_id):
         raise ManifestBuildError("CXR cache directory does not match the expected identity")
@@ -455,6 +627,8 @@ def validate_cxr_cache(
         "dtype",
         "shape",
         "mapping_sha256",
+        "partition_authority_sha256",
+        "development_partition_authority_sha256",
         "content_sha256",
         "deterministic_preprocessing",
         "source_authentication",
@@ -482,6 +656,18 @@ def validate_cxr_cache(
         or set(expected_splits) != set(_SPLIT_NAMES)
     ):
         raise ManifestBuildError("Expected CXR cache sample partitions are incomplete or unordered")
+    if metadata.get("partition_authority_sha256") != _partition_authority_sha256(
+        expected_sample_partitions
+    ):
+        raise ManifestBuildError("CXR cache scientific partition authority does not match")
+    expected_development_hashes = {
+        split: _partition_authority_sha256(
+            tuple(value for value in expected_sample_partitions if value[1] == split)
+        )
+        for split in ("train", "validation")
+    }
+    if metadata.get("development_partition_authority_sha256") != expected_development_hashes:
+        raise ManifestBuildError("CXR cache development authority does not match")
     if (
         metadata.get("cache_id") != identity.cache_id
         or metadata.get("identity") != identity.as_dict()
@@ -490,10 +676,7 @@ def validate_cxr_cache(
     preprocessing = metadata.get("deterministic_preprocessing")
     if (
         not isinstance(preprocessing, dict)
-        or hashlib.sha256(
-            json.dumps(preprocessing, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        != identity.preprocessing_sha256
+        or semantic_sha256("cxr-preprocessing", 1, preprocessing) != identity.preprocessing_sha256
     ):
         raise ManifestBuildError("CXR cache deterministic preprocessing contract does not match")
     if metadata.get("sample_count") != len(sample_ids):
@@ -511,8 +694,7 @@ def validate_cxr_cache(
         raise ManifestBuildError("CXR cache source-authentication witness does not match") from exc
     if (
         witness.file_count != len(sample_ids)
-        or witness.source_inventory_arrow_sha256 != identity.source_inventory_arrow_sha256
-        or witness.source_inventory_file_sha256 != identity.source_inventory_file_sha256
+        or witness.source_inventory_semantic_sha256 != identity.source_inventory_semantic_sha256
     ):
         raise ManifestBuildError("CXR cache source-authentication witness does not match")
     if sha256_file(root / INDEX_FILENAME) != metadata.get("mapping_sha256"):
@@ -521,18 +703,14 @@ def validate_cxr_cache(
     if index.schema != _INDEX_SCHEMA:
         raise ManifestBuildError("CXR cache index schema does not match")
     index_frame = index.to_pandas()
-    index_splits = tuple(index_frame["split_name"].astype(str))
-    if (
-        tuple(index_frame["sample_id"].astype(str)) != sample_ids
-        or tuple(index_frame["row_index"].astype(int)) != tuple(range(len(sample_ids)))
-        or index_splits != expected_splits
-    ):
+    if tuple(index_frame["sample_id"].astype(str)) != sample_ids or tuple(
+        index_frame["row_index"].astype(int)
+    ) != tuple(range(len(sample_ids))):
         raise ManifestBuildError("CXR cache sample mapping does not match")
     try:
         images = np.load(root / IMAGES_FILENAME, mmap_mode="r", allow_pickle=False)
     except (OSError, ValueError) as exc:
         raise ManifestBuildError("CXR cache image array is unreadable") from exc
-    validation_succeeded = False
     try:
         if images.dtype != np.float32 or images.shape != (
             len(sample_ids),
@@ -549,14 +727,17 @@ def validate_cxr_cache(
             digest.update(memoryview(chunk).cast("B"))
         if digest.hexdigest() != metadata.get("content_sha256"):
             raise ManifestBuildError("CXR cache image content integrity does not match")
-        mapping = _ImmutableStringMapping(sample_ids, tuple(range(len(sample_ids))))
-        partitions = _ImmutableStringMapping(sample_ids, index_splits)
-        result = ValidatedCxrCache(root, images, mapping, partitions, identity, witness)
-        validation_succeeded = True
+        partitions = _ImmutableStringMapping(sample_ids, expected_splits)
+        result = _prepared_cache(
+            root,
+            identity,
+            witness,
+            cast(str, metadata["mapping_sha256"]),
+            partitions,
+        )
         return result
     finally:
-        if not validation_succeeded:
-            images._mmap.close()
+        images._mmap.close()
 
 
 def _validate_source_frame(frame: pd.DataFrame) -> None:
@@ -592,6 +773,22 @@ def _validate_source_frame(frame: pd.DataFrame) -> None:
 
 def _sample_partitions(frame: pd.DataFrame) -> tuple[tuple[str, str], ...]:
     return tuple((str(row.sample_id), str(row.split_name)) for row in frame.itertuples(index=False))
+
+
+def _partition_authority_sha256(value: tuple[tuple[str, str], ...]) -> str:
+    return semantic_sha256(
+        "rsna-cache-partition-authority",
+        1,
+        [{"sample_id": sample_id, "split_name": split_name} for sample_id, split_name in value],
+    )
+
+
+def _physical_identity(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        value = path.stat()
+    except OSError as exc:
+        raise ManifestBuildError("CXR cache image storage is unavailable") from exc
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
 def _relative_image_path(value: object) -> PurePosixPath:

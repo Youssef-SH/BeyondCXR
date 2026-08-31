@@ -15,11 +15,11 @@ from typing import Any
 
 import pandas as pd
 
+from beyondcxr.training.rsna_campaign_control import validate_execution, validate_freeze
 from beyondcxr.training.rsna_evaluation_result import validate_rsna_evaluation
 from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
-from beyondcxr.utils.package_identity import canonical_scientific_id
 from beyondcxr.utils.publication import (
-    install_immutable_directory,
+    install_regenerable_directory,
     staging_directory,
     validate_path_component,
 )
@@ -31,7 +31,6 @@ COMPARISON_COLUMNS = (
     "modalities",
     "seed",
     "bundle_id",
-    "split_assignment_id",
     "evaluation_id",
     "model_package_id",
     "average_precision",
@@ -53,15 +52,13 @@ COMPARISON_COLUMNS = (
 )
 COMPARISON_SCHEMA_VERSION = 1
 COMPARISON_POLICY_VERSION = 1
-COMPARISON_PREFIX = "comparison-"
 COMPARISON_FILENAMES = frozenset({"manifest.json", "table.csv", "table.md"})
 
 
 @dataclass(frozen=True)
 class ComparisonResult:
-    """One immutable comparison view over explicit evaluation authorities."""
+    """One regenerable comparison view over explicit evaluation authorities."""
 
-    comparison_id: str
     directory: Path
     csv_path: Path
     markdown_path: Path
@@ -75,8 +72,10 @@ def regenerate_comparison(
     output_directory: str | Path = "reports",
     private_directory: str | Path = "private",
     model_directory: str | Path = "models/rsna",
+    freeze: object,
+    execution: object,
 ) -> ComparisonResult:
-    """Publish an immutable comparison over exact validated evaluation identities."""
+    """Publish a regenerable comparison over exact validated evaluation identities."""
     identities = tuple(evaluation_ids)
     if not identities or len(identities) != len(set(identities)):
         raise ValueError("Comparison requires unique explicit evaluation IDs")
@@ -86,29 +85,22 @@ def regenerate_comparison(
         output_directory=output,
         private_directory=private_directory,
         model_directory=model_directory,
+        freeze=freeze,
+        execution=execution,
     )
     ordered_ids = [str(record["evaluation_id"]) for record in records]
-    comparison_id = canonical_scientific_id(
-        COMPARISON_PREFIX,
-        {
-            "comparison_policy_version": COMPARISON_POLICY_VERSION,
-            "evaluation_ids": ordered_ids,
-            "columns": list(COMPARISON_COLUMNS),
-        },
-    )
     document = {
         "comparison_schema_version": COMPARISON_SCHEMA_VERSION,
         "comparison_policy_version": COMPARISON_POLICY_VERSION,
-        "comparison_id": comparison_id,
         "evaluation_ids": ordered_ids,
         "columns": list(COMPARISON_COLUMNS),
         "row_count": len(records),
     }
-    destination = output / "rsna" / "comparisons" / comparison_id
+    destination = output / "rsna" / "comparisons" / "comparison"
     stage = staging_directory(destination)
     try:
         _write_comparison(stage, document, records)
-        install_immutable_directory(
+        install_regenerable_directory(
             stage,
             destination,
             lambda path, **kwargs: validate_comparison(
@@ -116,6 +108,8 @@ def regenerate_comparison(
                 report_root=output,
                 private_root=private_directory,
                 model_root=model_directory,
+                freeze=freeze,
+                execution=execution,
                 **kwargs,
             ),
         )
@@ -127,7 +121,8 @@ def regenerate_comparison(
         report_root=output,
         private_root=private_directory,
         model_root=model_directory,
-        expected_comparison_id=comparison_id,
+        freeze=freeze,
+        execution=execution,
     )
 
 
@@ -137,7 +132,8 @@ def validate_comparison(
     report_root: str | Path,
     private_root: str | Path,
     model_root: str | Path,
-    expected_comparison_id: str | None = None,
+    freeze: object,
+    execution: object,
     enforce_directory_name: bool = True,
 ) -> ComparisonResult:
     """Revalidate membership and deterministic renderings of one comparison."""
@@ -158,7 +154,6 @@ def validate_comparison(
     fields = {
         "comparison_schema_version",
         "comparison_policy_version",
-        "comparison_id",
         "evaluation_ids",
         "columns",
         "row_count",
@@ -185,23 +180,14 @@ def validate_comparison(
         output_directory=Path(report_root),
         private_directory=private_root,
         model_directory=model_root,
+        freeze=freeze,
+        execution=execution,
     )
     ordered_ids = [str(record["evaluation_id"]) for record in records]
-    expected = canonical_scientific_id(
-        COMPARISON_PREFIX,
-        {
-            "comparison_policy_version": COMPARISON_POLICY_VERSION,
-            "evaluation_ids": ordered_ids,
-            "columns": list(COMPARISON_COLUMNS),
-        },
-    )
-    if (
-        document["evaluation_ids"] != ordered_ids
-        or document["comparison_id"] != expected
-        or (expected_comparison_id is not None and expected != expected_comparison_id)
-        or (enforce_directory_name and root.name != expected)
+    if document["evaluation_ids"] != ordered_ids or (
+        enforce_directory_name and root.name != "comparison"
     ):
-        raise ValueError("RSNA comparison identity is invalid")
+        raise ValueError("RSNA comparison coordinate or membership is invalid")
     with tempfile.TemporaryDirectory(prefix="beyondcxr-comparison-validation-") as temporary:
         rendered = Path(temporary)
         _write_comparison(rendered, document, records)
@@ -211,7 +197,6 @@ def validate_comparison(
         ):
             raise ValueError("RSNA comparison rendering differs from its authorities")
     return ComparisonResult(
-        expected,
         root,
         root / "table.csv",
         root / "table.md",
@@ -226,6 +211,8 @@ def _comparison_records(
     output_directory: Path,
     private_directory: str | Path,
     model_directory: str | Path,
+    freeze: object,
+    execution: object,
 ) -> list[dict[str, object]]:
     records = []
     for evaluation_id in identities:
@@ -234,6 +221,8 @@ def _comparison_records(
             output_directory / "rsna/evaluations" / evaluation_id,
             private_root=private_directory,
             model_root=model_directory,
+            freeze=freeze,
+            execution=execution,
             expected_evaluation_id=evaluation_id,
         )
         document = result.manifest
@@ -247,7 +236,6 @@ def _comparison_records(
                 "modalities": ",".join(document["modalities"]),
                 "seed": document["seed"],
                 "bundle_id": document["bundle_id"],
-                "split_assignment_id": document["split_assignment_id"],
                 "evaluation_id": evaluation_id,
                 "model_package_id": document["model_package_id"],
                 **{key: probability[key] for key in COMPARISON_COLUMNS if key in probability},
@@ -327,6 +315,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-directory", type=Path, default=Path("reports"))
     parser.add_argument("--private-directory", type=Path, default=Path("private"))
     parser.add_argument("--model-directory", type=Path, default=Path("models/rsna"))
+    parser.add_argument("--execution-directory", type=Path, required=True)
+    parser.add_argument("--freeze-directory", type=Path, required=True)
+    parser.add_argument("--bundle-directory", type=Path, required=True)
     add_logging_argument(parser)
     return parser
 
@@ -335,11 +326,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(args.log_level)
     try:
+        execution = validate_execution(args.execution_directory)
+        freeze = validate_freeze(
+            args.freeze_directory,
+            model_root=args.model_directory,
+            bundle_directory=args.bundle_directory,
+        )
         result = regenerate_comparison(
             args.evaluation_ids,
             output_directory=args.output_directory,
             private_directory=args.private_directory,
             model_directory=args.model_directory,
+            freeze=freeze,
+            execution=execution,
         )
     except (OSError, ValueError, KeyError) as exc:
         print(f"Comparison failed: {type(exc).__name__}", file=sys.stderr)

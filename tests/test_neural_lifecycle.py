@@ -32,6 +32,8 @@ from beyondcxr.training.neural import (
     training_class_weight,
 )
 
+pytestmark = pytest.mark.integration
+
 
 class _MultiInputDataset(Dataset[dict[str, object]]):
     def __init__(self, targets: list[int]) -> None:
@@ -87,7 +89,9 @@ class _TinyMultiInputModel(nn.Module):
 
 
 def _rsna_cxr_neural_config():
-    config = load_experiment_config("configs/rsna_cxr_densenet.yaml")
+    config = load_experiment_config(
+        "configs/rsna_cxr_densenet.yaml", bundle_id="bundle-" + "a" * 64
+    )
     assert config.neural is not None
     return replace(
         config.neural,

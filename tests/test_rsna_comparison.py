@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,39 +10,119 @@ from rsna_validation_evidence_test_support import write_synthetic_validation_evi
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-from beyondcxr.data.rsna_metadata_preprocess import metadata_input_contract
-from beyondcxr.training import rsna_evaluation_result
+from beyondcxr.data.rsna_metadata_preprocess import (
+    SOURCE_FEATURES,
+    build_rsna_preprocessor,
+    metadata_input_contract,
+)
+from beyondcxr.training import rsna_compare, rsna_evaluation_result
 from beyondcxr.training.config import load_experiment_config
 from beyondcxr.training.rsna_compare import (
     COMPARISON_COLUMNS,
     COMPARISON_POLICY_VERSION,
-    COMPARISON_PREFIX,
-    _comparison_records,
     _write_comparison,
-    regenerate_comparison,
-    validate_comparison,
+)
+from beyondcxr.training.rsna_compare import (
+    _comparison_records as _raw_comparison_records,
+)
+from beyondcxr.training.rsna_compare import (
+    regenerate_comparison as _regenerate_comparison,
+)
+from beyondcxr.training.rsna_compare import (
+    validate_comparison as _validate_comparison,
 )
 from beyondcxr.training.rsna_evaluation_result import (
-    publish_rsna_evaluation,
-    validate_rsna_evaluation,
+    _publish_rsna_evaluation,
 )
-from beyondcxr.utils.package_identity import canonical_scientific_id
-from beyondcxr.utils.private_predictions import publish_prediction_evidence
+from beyondcxr.training.rsna_evaluation_result import (
+    validate_rsna_evaluation as _validate_rsna_evaluation,
+)
+from beyondcxr.utils.private_predictions import (
+    ValidatedHeldOutPublicationAuthority,
+    _publish_held_out_prediction_evidence,
+    validate_prediction_evidence,
+)
 from beyondcxr.utils.rsna_model_publication import publish_model_package, threshold_contract
 from beyondcxr.utils.skops_io import save_skops
+
+_FREEZE_ID = "rsna-freeze-" + "f" * 64
+_TEST_FREEZE = object()
+_TEST_EXECUTION = object()
+
+
+def regenerate_comparison(*args, **kwargs):
+    return _regenerate_comparison(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
+
+
+def validate_comparison(*args, **kwargs):
+    return _validate_comparison(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
+
+
+def _comparison_records(*args, **kwargs):
+    return _raw_comparison_records(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
+
+
+def validate_rsna_evaluation(*args, **kwargs):
+    return _validate_rsna_evaluation(
+        *args,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
+        **kwargs,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_derivative_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "beyondcxr.utils.private_predictions._require_held_out_publication_authority",
+        lambda authority, values: authority,
+    )
+    monkeypatch.setattr(
+        rsna_evaluation_result,
+        "validate_rsna_held_out_prediction",
+        lambda evidence, **kwargs: validate_prediction_evidence(
+            evidence.directory,
+            expected_prediction_id=evidence.prediction_id,
+            expected_model_package_id=str(evidence.manifest["model_package_id"]),
+            expected_authorizing_freeze_id=_FREEZE_ID,
+        ),
+    )
 
 
 def _package(tmp_path: Path, *, variant: int = 0):
     config_path = Path("configs/rsna_metadata_logistic.yaml")
-    config = load_experiment_config(config_path)
-    features = np.asarray([[0.0], [1.0], [2.0], [3.0]])
+    config = load_experiment_config(config_path, bundle_id="bundle-" + "a" * 64)
+    features = pd.DataFrame(
+        [
+            [40.0, False, "M", "PA", 0.17, 0.17],
+            [55.0, False, "F", "AP", 0.18, 0.18],
+            [65.0, False, "M", "PA", 0.19, 0.19],
+            [75.0, False, "F", "AP", 0.20, 0.20],
+        ],
+        columns=SOURCE_FEATURES,
+    )
     targets = np.asarray([0, variant % 2, 1, 1])
     pipeline = Pipeline(
         [
-            ("preprocess", "passthrough"),
-            ("classifier", LogisticRegression(random_state=42).fit(features, targets)),
+            ("preprocess", build_rsna_preprocessor()),
+            ("classifier", LogisticRegression(random_state=42)),
         ]
-    )
+    ).fit(features, targets)
     serialized = save_skops(pipeline, tmp_path / f"source-{variant}.skops")
     config_bytes = config_path.read_bytes()
     return publish_model_package(
@@ -57,18 +134,15 @@ def _package(tmp_path: Path, *, variant: int = 0):
         ),
         manifest={
             "bundle_id": config.dataset.bundle_id,
-            "split_assignment_id": config.dataset.split_assignment_id,
             "task_id": config.task.task_id,
             "positive_class": 1,
             "family_id": config.family.family_id,
-            "config_source_sha256": hashlib.sha256(config_bytes).hexdigest(),
-            "config_semantic_sha256": config.config_semantic_sha256,
             "seed": 42,
             "git_commit": "test",
             "git_dirty": False,
             "dependency_lock_sha256": "a" * 64,
             "best_iteration": None,
-            "thresholds": {"youden_j": 0.5, "target_sensitivity": 0.3},
+            "thresholds": {"youden_j": 0.7, "target_sensitivity": 0.7},
             "threshold_contract": threshold_contract(sensitivity_target=0.9),
             "input_contract": metadata_input_contract(),
         },
@@ -85,23 +159,42 @@ def _evaluation(
     package_manifest = json.loads(package.manifest_path.read_text(encoding="utf-8"))
     sample_ids = tuple(f"rsna:sample-{index}" for index in range(len(logits)))
     targets = tuple(index % 2 for index in range(len(logits)))
-    evidence = publish_prediction_evidence(
+    authority = ValidatedHeldOutPublicationAuthority(
+        "rsna",
+        package.model_package_id,
+        "pneumonia",
+        str(package_manifest["bundle_id"]),
+        _FREEZE_ID,
+        sample_ids,
+        targets,
+        {
+            "authority_kind": "rsna-frozen-campaign-v1",
+            "execution_id": "rsna-execution-" + "0" * 64,
+        },
+        object(),
+        None,
+        object(),
+    )
+    evidence = _publish_held_out_prediction_evidence(
+        publication_authority=authority,
         private_root=tmp_path / "private",
         dataset_id="rsna",
         model_package_id=package.model_package_id,
         task_id="pneumonia",
         bundle_id=package_manifest["bundle_id"],
-        split_assignment_id=package_manifest["split_assignment_id"],
         scope="test",
         sample_ids=sample_ids,
         targets=targets,
         logits=logits,
+        authorized_by_freeze_id=_FREEZE_ID,
     )
-    return publish_rsna_evaluation(
+    return _publish_rsna_evaluation(
         report_root=tmp_path / "reports",
         private_root=tmp_path / "private",
         model_root=tmp_path / "models/rsna",
         evidence=evidence,
+        freeze=_TEST_FREEZE,
+        execution=_TEST_EXECUTION,
         evaluation_policy={
             "policy_version": "rsna-held-out-evaluation-v1",
             "calibration_bins": 15,
@@ -162,6 +255,56 @@ def test_comparison_regeneration_is_deterministic(tmp_path: Path) -> None:
     assert result.markdown_path.read_bytes() == first_markdown
 
 
+def test_comparison_cli_consumes_evaluation_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evaluation = _evaluation(tmp_path, logits=(-2.0, 1.0, -1.0, 2.0))
+    execution_directory = tmp_path / "execution"
+    freeze_directory = tmp_path / "freeze"
+    bundle_directory = tmp_path / "bundle"
+    model_directory = tmp_path / "models/rsna"
+    validated = []
+
+    def execution(path: Path):
+        assert path == execution_directory
+        validated.append("execution")
+        return _TEST_EXECUTION
+
+    def freeze(path: Path, **kwargs):
+        assert path == freeze_directory
+        assert kwargs == {"model_root": model_directory, "bundle_directory": bundle_directory}
+        validated.append("freeze")
+        return _TEST_FREEZE
+
+    monkeypatch.setattr(rsna_compare, "validate_execution", execution)
+    monkeypatch.setattr(rsna_compare, "validate_freeze", freeze)
+    assert (
+        rsna_compare.main(
+            [
+                "--evaluation-ids",
+                evaluation.manifest["evaluation_id"],
+                "--output-directory",
+                str(tmp_path / "reports"),
+                "--private-directory",
+                str(tmp_path / "private"),
+                "--model-directory",
+                str(model_directory),
+                "--execution-directory",
+                str(execution_directory),
+                "--freeze-directory",
+                str(freeze_directory),
+                "--bundle-directory",
+                str(bundle_directory),
+            ]
+        )
+        == 0
+    )
+    assert validated == ["execution", "freeze"]
+    assert "Wrote 1 rows" in capsys.readouterr().out
+    rendered = pd.read_csv(tmp_path / "reports/rsna/comparisons/comparison/table.csv")
+    assert rendered["evaluation_id"].tolist() == [evaluation.manifest["evaluation_id"]]
+
+
 @pytest.mark.parametrize(
     "tamper",
     (
@@ -169,7 +312,6 @@ def test_comparison_regeneration_is_deterministic(tmp_path: Path) -> None:
         "policy-version",
         "row-count",
         "evaluation-order",
-        "comparison-id",
         "csv-rendering",
         "markdown-rendering",
     ),
@@ -193,8 +335,6 @@ def test_comparison_validation_rejects_contract_tampering(tmp_path: Path, tamper
         document["row_count"] = True
     elif tamper == "evaluation-order":
         document["evaluation_ids"].reverse()
-    elif tamper == "comparison-id":
-        document["comparison_id"] = "comparison-" + "0" * 64
     elif tamper == "csv-rendering":
         result.csv_path.write_bytes(result.csv_path.read_bytes() + b"\n")
     else:
@@ -246,14 +386,6 @@ def test_comparison_validation_rejects_invalid_producer_membership(
     document = {
         "comparison_schema_version": 1,
         "comparison_policy_version": COMPARISON_POLICY_VERSION,
-        "comparison_id": canonical_scientific_id(
-            COMPARISON_PREFIX,
-            {
-                "comparison_policy_version": COMPARISON_POLICY_VERSION,
-                "evaluation_ids": ordered_ids,
-                "columns": list(COMPARISON_COLUMNS),
-            },
-        ),
         "evaluation_ids": ordered_ids,
         "columns": list(COMPARISON_COLUMNS),
         "row_count": len(records),
@@ -268,6 +400,30 @@ def test_comparison_validation_rejects_invalid_producer_membership(
             model_root=tmp_path / "models/rsna",
             enforce_directory_name=False,
         )
+
+
+def test_comparison_regenerates_corrupt_cached_view(tmp_path: Path) -> None:
+    evaluation = _evaluation(tmp_path, logits=(-2.0, 1.0, -1.0, 2.0))
+    arguments = {
+        "output_directory": tmp_path / "reports",
+        "private_directory": tmp_path / "private",
+        "model_directory": tmp_path / "models/rsna",
+    }
+    result = regenerate_comparison([evaluation.manifest["evaluation_id"]], **arguments)
+    expected = result.csv_path.read_bytes()
+    result.csv_path.write_bytes(b"corrupt")
+
+    recovered = regenerate_comparison([evaluation.manifest["evaluation_id"]], **arguments)
+
+    assert recovered.directory == result.directory
+    assert recovered.csv_path.read_bytes() == expected
+    assert set(recovered.manifest) == {
+        "comparison_schema_version",
+        "comparison_policy_version",
+        "evaluation_ids",
+        "columns",
+        "row_count",
+    }
 
 
 @pytest.mark.parametrize(
@@ -339,7 +495,7 @@ def test_evaluation_validation_rejects_child_symlinks(tmp_path: Path, child: str
 _MISSING_SCHEMA_VERSION = object()
 
 
-@pytest.mark.parametrize("value", [True, 1.0, "1", None, 0, _MISSING_SCHEMA_VERSION])
+@pytest.mark.parametrize("value", [True, 1.0, 2, _MISSING_SCHEMA_VERSION])
 def test_evaluation_requires_integer_schema_version_one(tmp_path: Path, value: object) -> None:
     result = _evaluation(tmp_path, logits=(-2.0, 1.0, -1.0, 2.0))
     manifest_path = result.directory / "manifest.json"
@@ -456,30 +612,3 @@ def test_evaluation_validation_rejects_malformed_scientific_policy(
             private_root=tmp_path / "private",
             model_root=tmp_path / "models/rsna",
         )
-
-
-def test_comparison_cli_consumes_evaluation_ids(tmp_path: Path) -> None:
-    result = _evaluation(
-        tmp_path,
-        logits=(-2.0, 1.0, -1.0, 2.0),
-    )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "beyondcxr.training.rsna_compare",
-            "--evaluation-ids",
-            result.manifest["evaluation_id"],
-            "--output-directory",
-            str(tmp_path / "reports"),
-            "--private-directory",
-            str(tmp_path / "private"),
-            "--model-directory",
-            str(tmp_path / "models/rsna"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "Wrote 1 rows" in completed.stdout

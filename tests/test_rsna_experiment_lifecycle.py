@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlflow
 import numpy as np
@@ -13,7 +14,6 @@ from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 from rsna_authorization_test_support import authorize_rsna_package, rsna_test_runtime
 
-from beyondcxr.data.hashing import sha256_file
 from beyondcxr.data.rsna_artifacts import build_and_write
 from beyondcxr.data.rsna_metadata_preprocess import SOURCE_FEATURES
 from beyondcxr.training.config import load_experiment_config, with_runtime
@@ -25,6 +25,7 @@ from beyondcxr.training.rsna_evaluation_result import (
 from beyondcxr.training.rsna_interfaces import DatasetLineage, DatasetPartition, DatasetRunData
 from beyondcxr.training.rsna_train_metadata import train_metadata_experiment
 from beyondcxr.training.rsna_training_report import validate_report_set
+from beyondcxr.training.rsna_validation_evidence import CanonicalHeldOutCohort
 from beyondcxr.utils.mlflow_utils import configure_mlflow
 from beyondcxr.utils.operational_logging import configure_logging
 from beyondcxr.utils.private_predictions import validate_prediction_evidence
@@ -34,12 +35,16 @@ from beyondcxr.utils.rsna_model_publication import (
 )
 
 _SHA256 = "a" * 64
-_SPLIT_ASSIGNMENT_ID = "split-assignment-" + "b" * 64
+
+
+pytestmark = pytest.mark.integration
 
 
 def _partition(name: str) -> DatasetPartition:
     size = 12
-    targets = np.asarray([0, 1] * (size // 2), dtype=np.int8)
+    sample_ids = tuple(f"rsna:{name}-{index}" for index in range(size))
+    order = sorted(range(size), key=sample_ids.__getitem__)
+    targets = np.asarray([index % 2 for index in order], dtype=np.int8)
     features = pd.DataFrame(
         {
             "age_years": np.linspace(25.0, 75.0, size),
@@ -52,10 +57,10 @@ def _partition(name: str) -> DatasetPartition:
         columns=SOURCE_FEATURES,
     )
     return DatasetPartition(
-        features=features,
+        features=features.iloc[order].reset_index(drop=True),
         targets=targets,
-        sample_ids=tuple(f"rsna:{name}-{index}" for index in range(size)),
-        patient_ids=tuple(f"{name}-{index}" for index in range(size)),
+        sample_ids=tuple(sample_ids[index] for index in order),
+        patient_ids=tuple(f"{name}-{index}" for index in order),
         partition=name,
     )
 
@@ -66,18 +71,12 @@ def _config(
     bundle_id: str = "bundle-" + "a" * 64,
     manifest_directory: Path | None = None,
     filename: str = "rsna_metadata_logistic.yaml",
-    split_assignment_id: str = _SPLIT_ASSIGNMENT_ID,
-    bundle_manifest_sha256: str | None = None,
     calibration_bins: int | None = None,
     sensitivity_target: float | None = None,
     logistic_c: float | None = None,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     document = yaml.safe_load((Path("configs") / filename).read_text(encoding="utf-8"))
-    document["dataset"]["bundle_id"] = bundle_id
-    document["dataset"]["split_assignment_id"] = split_assignment_id
-    if bundle_manifest_sha256 is not None:
-        document["dataset"]["bundle_manifest_sha256"] = bundle_manifest_sha256
     if calibration_bins is not None:
         document["evaluation"]["calibration_bins"] = calibration_bins
     if sensitivity_target is not None:
@@ -87,7 +86,7 @@ def _config(
     path = tmp_path / "experiment.yaml"
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     return with_runtime(
-        load_experiment_config(path),
+        load_experiment_config(path, bundle_id=bundle_id),
         seed=42,
         report_directory=tmp_path / "reports",
         model_directory=tmp_path / "models" / "rsna",
@@ -116,10 +115,20 @@ def _train(config, tmp_path: Path):
     return train_metadata_experiment(config, tracking_uri=_tracking_uri(tmp_path))
 
 
+def _authorize_synthetic_package(config, package_id: str, *, monkeypatch: pytest.MonkeyPatch):
+    sample_ids = tuple(sorted(f"rsna:test-{index}" for index in range(12)))
+    return authorize_rsna_package(
+        config,
+        package_id,
+        monkeypatch=monkeypatch,
+        held_out_sample_ids=sample_ids,
+        held_out_targets=tuple(int(sample_id.rsplit("-", 1)[1]) % 2 for sample_id in sample_ids),
+    )
+
+
 def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, DatasetPartition]:
     lineage = DatasetLineage(
         bundle_id="bundle-" + "a" * 64,
-        split_assignment_id=_SPLIT_ASSIGNMENT_ID,
         label_policy_version="label-synthetic",
         task_id="pneumonia",
     )
@@ -143,6 +152,15 @@ def _install_dataset(monkeypatch: pytest.MonkeyPatch) -> tuple[DatasetRunData, D
         RsnaDataset,
         "load_lineage",
         lambda self, config: lineage,
+    )
+    target_by_id = dict(zip(test.sample_ids, test.targets, strict=True))
+    sample_ids = tuple(sorted(test.sample_ids))
+    cohort = CanonicalHeldOutCohort(
+        sample_ids, tuple(int(target_by_id[sample_id]) for sample_id in sample_ids)
+    )
+    monkeypatch.setattr(
+        "beyondcxr.training.rsna_validation_evidence._derive_canonical_held_out_cohort",
+        lambda *args, **kwargs: cohort,
     )
     return data, test
 
@@ -181,11 +199,12 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
     assert not hasattr(data, "test")
 
     configure_mlflow(tracking_uri=f"sqlite:///{(tmp_path / 'other.db').as_posix()}")
+    authorization = _authorize_synthetic_package(
+        config, training.model_package_id, monkeypatch=monkeypatch
+    )
     evaluation = evaluate_model_package(
         training.model_package_id,
-        authorization=authorize_rsna_package(
-            config, training.model_package_id, monkeypatch=monkeypatch
-        ),
+        authorization=authorization,
         evaluation_config=config,
         runtime=rsna_test_runtime(config),
         tracking_uri=_tracking_uri(tmp_path),
@@ -212,13 +231,9 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
         "family_id",
         "modalities",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "seed",
         "git_commit",
         "dependency_lock_sha256",
-        "config_source_sha256",
-        "config_semantic_sha256",
         "package_kind",
         "package_id",
         "run_complete",
@@ -231,13 +246,9 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
         "family_id",
         "modalities",
         "bundle_id",
-        "bundle_manifest_sha256",
-        "split_assignment_id",
         "seed",
         "git_commit",
         "dependency_lock_sha256",
-        "config_source_sha256",
-        "config_semantic_sha256",
         "package_kind",
         "package_id",
         "prediction_id",
@@ -257,19 +268,31 @@ def test_train_then_explicit_test_evaluation_uses_separate_partitions_and_runs(
     assert set(manifest["thresholds"]) == {"youden_j", "target_sensitivity"}
     assert manifest["model_package_id"] == training.model_package_id
     assert training_run.data.tags["package_id"] == training.model_package_id
+    validation_document = json.loads(
+        (training.model_path.parent / "validation-evidence.json").read_text(encoding="utf-8")
+    )
+    assert "authorized_by_freeze_id" not in validation_document
     evidence = validate_prediction_evidence(
         evaluation.private_prediction_directory,
         expected_prediction_id=evaluation.prediction_id,
         expected_model_package_id=training.model_package_id,
+        expected_authorizing_freeze_id=authorization.freeze.freeze_id,
     )
     scientific_result = validate_rsna_evaluation(
         evaluation.artifact_directory,
         private_root=evaluation.private_prediction_directory.parents[2],
         model_root=config.runtime.model_directory,
+        freeze=authorization.freeze,
+        execution=authorization.current_execution.execution,
         expected_evaluation_id=evaluation.evaluation_id,
     )
     assert evidence.manifest["scope"] == "test"
-    assert evidence.manifest["split_assignment_id"] == _SPLIT_ASSIGNMENT_ID
+    assert evidence.manifest["authorized_by_freeze_id"] == authorization.freeze.freeze_id
+    with pytest.raises(ValueError, match="different scientific freeze"):
+        validate_prediction_evidence(
+            evaluation.private_prediction_directory,
+            expected_authorizing_freeze_id="rsna-freeze-" + "0" * 64,
+        )
     assert scientific_result.manifest["prediction_id"] == evidence.prediction_id
     assert scientific_result.manifest["model_package_id"] == training.model_package_id
     assert scientific_result.manifest["claims"]["evaluation_scope"] == "test"
@@ -375,11 +398,12 @@ def test_explicit_evaluation_policy_controls_identity_and_package_compatibility(
     ):
         model_root = training.model_path.parent.parent.parent
         for bins, evaluation_config in ((15, config_15), (20, config_20)):
+            authorization = _authorize_synthetic_package(
+                evaluation_config, training.model_package_id, monkeypatch=monkeypatch
+            )
             result = evaluate_model_package(
                 training.model_package_id,
-                authorization=authorize_rsna_package(
-                    evaluation_config, training.model_package_id, monkeypatch=monkeypatch
-                ),
+                authorization=authorization,
                 evaluation_config=evaluation_config,
                 runtime=rsna_test_runtime(evaluation_config),
                 tracking_uri=tracking_uri,
@@ -391,6 +415,8 @@ def test_explicit_evaluation_policy_controls_identity_and_package_compatibility(
                 result.artifact_directory,
                 private_root=tmp_path / archive / "private",
                 model_root=model_root,
+                freeze=authorization.freeze,
+                execution=authorization.current_execution.execution,
             ).manifest
 
     assert results["archive-15", 15]["evaluation_policy"]["calibration_bins"] == 15
@@ -477,7 +503,6 @@ def test_fit_failure_leaves_failed_mlflow_run(
     assert "level=ERROR event=run_failed" in log_stream.getvalue()
     assert "error_type=RuntimeError" in log_stream.getvalue()
     assert "event=run_finished" not in log_stream.getvalue()
-    assert run.data.tags["split_assignment_id"] == _SPLIT_ASSIGNMENT_ID
     downloaded = Path(
         _client(tmp_path).download_artifacts(
             run.info.run_id,
@@ -573,7 +598,7 @@ def test_incomplete_report_set_fails_training_run(
 def test_training_report_publication_failure_does_not_complete_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _install_dataset(monkeypatch)
+    data, _ = _install_dataset(monkeypatch)
     _fixed_provenance(monkeypatch)
     config = _config(tmp_path)
     monkeypatch.setattr(
@@ -591,7 +616,50 @@ def test_training_report_publication_failure_does_not_complete_run(
     assert run.data.tags["run_complete"] != "true"
     packages = list((config.runtime.model_directory / "packages").glob("model-package-*"))
     assert len(packages) == 1
-    validate_published_model(packages[0])
+    package = validate_published_model(packages[0])
+
+    from beyondcxr.training import rsna_campaign, rsna_campaign_control
+    from beyondcxr.training.rsna_validation_evidence import CanonicalValidationCohort
+
+    # Isolate formal-plan admission; exercise real package and report recovery.
+    plan = SimpleNamespace(
+        configs=(config,),
+        roots=SimpleNamespace(
+            model_root=config.runtime.model_directory,
+            report_root=config.runtime.report_directory,
+        ),
+        authority=SimpleNamespace(
+            **{
+                key: package[key]
+                for key in ("dataset_id", "bundle_id", "task_id", "label_policy_version")
+            },
+            bundle_directory=tmp_path / "synthetic-bundle",
+        ),
+    )
+    execution = SimpleNamespace(
+        manifest={
+            "git_commit": package["git_commit"],
+            "dependency_lock_sha256": package["dependency_lock_sha256"],
+            "framework_versions": {"python": package["python_version"]},
+        }
+    )
+    cohort = CanonicalValidationCohort(
+        data.validation.sample_ids, tuple(int(value) for value in data.validation.targets)
+    )
+    monkeypatch.setattr(rsna_campaign_control, "require_validated_rsna_plan", lambda value: value)
+    monkeypatch.setattr(rsna_campaign_control, "_require_execution_for_plan", lambda *args: None)
+    for module in (rsna_campaign, rsna_campaign_control):
+        monkeypatch.setattr(module, "load_canonical_validation_cohort", lambda *a, **kw: cohort)
+    recovered = rsna_campaign_control.resolve_completed_rsna_packages(plan, execution)
+    assert recovered[0].model_package_id == packages[0].name
+    reports = rsna_campaign._ensure_training_report_derivatives(
+        plan,
+        recovered,
+        (SimpleNamespace(family_id=config.family.family_id, seed=config.runtime.seed),),
+    )
+    validate_report_set(reports[0].artifact_directory)
+    assert reports[0].model_package_id == packages[0].name
+    assert len(_client(tmp_path).search_runs([run.info.experiment_id])) == 1
 
 
 def test_training_archives_and_logs_loaded_config_bytes_after_source_mutation(
@@ -614,17 +682,6 @@ def test_training_archives_and_logs_loaded_config_bytes_after_source_mutation(
         )
     )
     assert downloaded.read_bytes() == original
-
-
-def test_evaluation_uses_model_package_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _install_dataset(monkeypatch)
-    _fixed_provenance(monkeypatch)
-    training = _train(_config(tmp_path), tmp_path)
-    package = validate_published_model(training.model_path.parent)
-    assert package["model_package_id"] == training.model_package_id
-    assert mlflow.get_run(training.run_id).data.tags["package_id"] == training.model_package_id
 
 
 @pytest.mark.parametrize("policy", ["youden_j", "target_sensitivity"])
@@ -669,7 +726,7 @@ def test_evaluator_rejects_lightgbm_best_iteration_mismatch_before_test_loading(
     with pytest.raises(ValueError):
         evaluate_model_package(
             training.model_package_id,
-            authorization=authorize_rsna_package(
+            authorization=_authorize_synthetic_package(
                 config, training.model_package_id, monkeypatch=monkeypatch
             ),
             evaluation_config=config,
@@ -694,7 +751,7 @@ def test_evaluation_report_publication_failure_does_not_complete_run(
     with pytest.raises(RuntimeError):
         evaluate_model_package(
             training.model_package_id,
-            authorization=authorize_rsna_package(
+            authorization=_authorize_synthetic_package(
                 config, training.model_package_id, monkeypatch=monkeypatch
             ),
             evaluation_config=config,
@@ -723,13 +780,14 @@ def test_operational_completion_failure_preserves_published_scientific_objects(
         "beyondcxr.training.rsna_evaluate.mlflow.log_metrics",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ledger write failed")),
     )
+    authorization = _authorize_synthetic_package(
+        config, training.model_package_id, monkeypatch=monkeypatch
+    )
 
     with pytest.raises(RuntimeError, match="ledger write failed"):
         evaluate_model_package(
             training.model_package_id,
-            authorization=authorize_rsna_package(
-                config, training.model_package_id, monkeypatch=monkeypatch
-            ),
+            authorization=authorization,
             evaluation_config=config,
             runtime=rsna_test_runtime(config),
             tracking_uri=_tracking_uri(tmp_path),
@@ -748,6 +806,8 @@ def test_operational_completion_failure_preserves_published_scientific_objects(
         evaluations[0],
         private_root=config.runtime.private_output_directory,
         model_root=config.runtime.model_directory,
+        freeze=authorization.freeze,
+        execution=authorization.current_execution.execution,
     )
     assert result.manifest["prediction_id"] == evidence.prediction_id
     runs = _client(tmp_path).search_runs(
@@ -782,7 +842,12 @@ def test_evaluator_rejects_noncanonical_package_identity_before_filesystem_acces
         def __fspath__(self) -> str:
             raise AssertionError("model root must not be inspected")
 
-    config = with_runtime(load_experiment_config("configs/rsna_metadata_logistic.yaml"), seed=42)
+    config = with_runtime(
+        load_experiment_config(
+            "configs/rsna_metadata_logistic.yaml", bundle_id="bundle-" + "a" * 64
+        ),
+        seed=42,
+    )
     with pytest.raises(ValueError, match="model package"):
         evaluate_model_package(
             model_package_id,
@@ -799,14 +864,11 @@ def test_synthetic_raw_source_to_bundle_training_and_explicit_test_evaluation(
     raw_root = _write_raw_source(tmp_path / "raw")
     manifest_root = tmp_path / "data" / "manifests"
     bundle = build_and_write(raw_root, manifest_root)
-    bundle_manifest = json.loads(bundle.paths.metadata_path.read_text(encoding="utf-8"))
     _fixed_provenance(monkeypatch)
     config = _config(
         tmp_path,
         bundle_id=bundle.paths.bundle_id,
         manifest_directory=manifest_root,
-        split_assignment_id=bundle_manifest["membership"]["split"]["split_assignment_id"],
-        bundle_manifest_sha256=sha256_file(bundle.paths.metadata_path),
     )
 
     tracking_uri = _tracking_uri(tmp_path)
