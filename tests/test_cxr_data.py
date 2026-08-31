@@ -160,35 +160,46 @@ def test_zero_augmentation_boundary_preserves_exact_normalization() -> None:
 def test_explicit_augmentation_is_isolated_from_all_caller_rng(monkeypatch) -> None:
     transform = StandardCxrTransform(training=True)
     base = torch.linspace(0.0, 1.0, 224 * 224, dtype=torch.float32).reshape(1, 224, 224)
-    random.seed(9)
-    np.random.seed(9)
-    torch.manual_seed(9)
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    torch_state = torch.random.get_rng_state().clone()
-    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    monkeypatch.setattr(
-        torch,
-        "manual_seed",
-        lambda seed: (_ for _ in ()).throw(AssertionError("global seed mutation")),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "manual_seed_all",
-        lambda seed: (_ for _ in ()).throw(AssertionError("CUDA seed mutation")),
-    )
-
-    first = transform.from_validated_cache_base(base, augmentation_seed=17)
-    second = transform.from_validated_cache_base(base, augmentation_seed=17)
-
-    assert torch.equal(first, second)
-    assert random.getstate() == python_state
-    assert np.random.get_state()[0] == numpy_state[0]
-    np.testing.assert_array_equal(np.random.get_state()[1], numpy_state[1])
-    assert np.random.get_state()[2:] == numpy_state[2:]
-    assert torch.equal(torch.random.get_rng_state(), torch_state)
-    if cuda_state is not None:
-        assert all(
-            torch.equal(before, after)
-            for before, after in zip(cuda_state, torch.cuda.get_rng_state_all(), strict=True)
+    caller_python_state = random.getstate()
+    caller_numpy_state = np.random.get_state()
+    caller_torch_state = torch.random.get_rng_state().clone()
+    caller_cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(9)
+        np.random.seed(9)
+        torch.manual_seed(9)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state().clone()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        monkeypatch.setattr(
+            torch,
+            "manual_seed",
+            lambda seed: (_ for _ in ()).throw(AssertionError("global seed mutation")),
         )
+        monkeypatch.setattr(
+            torch.cuda,
+            "manual_seed_all",
+            lambda seed: (_ for _ in ()).throw(AssertionError("CUDA seed mutation")),
+        )
+
+        first = transform.from_validated_cache_base(base, augmentation_seed=17)
+        second = transform.from_validated_cache_base(base, augmentation_seed=17)
+
+        assert torch.equal(first, second)
+        assert random.getstate() == python_state
+        assert np.random.get_state()[0] == numpy_state[0]
+        np.testing.assert_array_equal(np.random.get_state()[1], numpy_state[1])
+        assert np.random.get_state()[2:] == numpy_state[2:]
+        assert torch.equal(torch.random.get_rng_state(), torch_state)
+        if cuda_state is not None:
+            assert all(
+                torch.equal(before, after)
+                for before, after in zip(cuda_state, torch.cuda.get_rng_state_all(), strict=True)
+            )
+    finally:
+        random.setstate(caller_python_state)
+        np.random.set_state(caller_numpy_state)
+        torch.random.set_rng_state(caller_torch_state)
+        if caller_cuda_state is not None:
+            torch.cuda.set_rng_state_all(caller_cuda_state)

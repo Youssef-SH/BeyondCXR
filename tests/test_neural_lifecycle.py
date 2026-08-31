@@ -32,6 +32,8 @@ from beyondcxr.training.neural import (
     training_class_weight,
 )
 
+pytestmark = pytest.mark.integration
+
 
 class _MultiInputDataset(Dataset[dict[str, object]]):
     def __init__(self, targets: list[int]) -> None:
