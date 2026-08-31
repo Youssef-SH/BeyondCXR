@@ -32,7 +32,7 @@ DISPLAY = {
     "cxr_densenet": "CXR",
     "cxr_labs_concat": "CXR + labs concat",
     "cxr_labs_gated": "CXR + labs gated",
-    "cxr_labs_gated_no_observedness": "CXR + labs gated without observedness",
+    "cxr_labs_gated_no_observedness": "CXR + labs gated without explicit observedness indicators",
     "cxr_labs_ecg_gated": "CXR + labs + ECG gated",
 }
 EFFECT_ORDER = ("concat_vs_cxr", "primary", "gated_vs_concat", "ecg_vs_gated")

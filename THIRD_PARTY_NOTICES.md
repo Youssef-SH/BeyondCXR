@@ -25,7 +25,7 @@ This notice does not assert redistribution rights for that file.
 RSNA challenge data, Symile-MIMIC, MIMIC-CXR-JPG, MIMIC-IV, MIMIC-IV-ECG, and PhysioNet resources
 are not distributed here. Their licenses, rules, credentialing, training, citation, and data-use
 requirements apply independently. Dataset citations and access obligations are listed in the
-[data statement](https://github.com/Youssef-SH/BeyondCXR/blob/main/docs/data_statement.md). The
+[data statement](docs/data_statement.md). The
 repository's Apache-2.0 code license grants no rights
 to restricted datasets or trained artifacts, and source-data access does not establish permission
 to distribute fitted packages.

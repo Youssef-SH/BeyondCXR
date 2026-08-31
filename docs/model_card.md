@@ -34,15 +34,15 @@ fetching upstream weights.
 
 ## Architecture, development, and full-development fitting
 
-CXR and laboratory encoders emit 256-dimensional representations. A learned feature-wise gate
+CXR and laboratory representations are projected into a shared 256-dimensional fusion space. A learned feature-wise gate
 combines both modalities using laboratory observedness. Members use seeds 17, 42, and 2026;
 inference averages raw logits in that order and applies sigmoid once.
 
 Development uses one immutable patient-grouped CV assignment comprising three five-fold repeats.
 Neural selection uses deterministic inner validation. Terminal epoch budgets are medians of the 15
 development selections; ensemble members then fit all development admissions for that fixed
-budget. Test access requires all required packages, the pre-test freeze, and its same-freeze
-opening record.
+budget. Test access requires all required packages, the pre-test freeze, matching execution,
+and identical local and persistent external opening records.
 
 ## Output and evaluation
 
@@ -61,6 +61,9 @@ validation is claimed.
 
 ## Limitations, privacy, and distribution
 
+The CXR-plus-laboratories predictor is evaluated in a cohort that also requires ECG availability;
+its results do not establish performance across all admissions with CXR and laboratory data.
+
 The cohort is retrospective and credentialed; the held-out test size limits confirmatory precision;
 subgroup analyses are development-only, prespecified, and support-gated; missingness may encode care
 processes; and performance may not transfer across populations or acquisition systems. Learned
@@ -69,9 +72,10 @@ govern trained-artifact distribution independently of the code license.
 
 ## Reproducibility
 
-The generated result region records the bound scientific coordinates together with preservation
-and reproducibility witnesses, the pretrained scientific weight identity and materialization
-witnesses, and the development subgroup characterization. The private serving authority separately
-records release-candidate provenance. See [reproducibility](reproducibility.md) and
+The generated result region records scientific coordinates, validated aggregate evidence, and
+separately labeled operational and transport witnesses.
+Preservation authenticates private evidence bytes, formal execution records implementation and
+runtime provenance, and the deployment receipt records release-candidate provenance. See
+[reproducibility](reproducibility.md) and
 [controlled serving](serving.md). RSNA is separate supporting project context, not evidence for
 this served predictor.

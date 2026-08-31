@@ -1,25 +1,41 @@
 # Data bundle contract
 
-The common bundle manifest uses schema version `1`. Bundle IDs and declared hashes identify exact
-content.
+The common bundle manifest uses schema version `1`. Bundle IDs identify semantic scientific
+content; source hashes authenticate exact upstream bytes.
 
 Both datasets publish immutable `bundle-<sha256>` directories with `manifest.json` and typed
-Parquet artifacts. Their manifests use the common envelope `dataset`, `tasks`, `membership`,
-`source`, `modalities`, `privacy`, `bundle`, `artifacts`, `provenance`, `generation`, and
-`qualification`. Arrow artifacts declare `logical_arrow_sha256`, `physical_file_sha256`, and
-`row_count`. Dataset-specific scientific sections remain explicit.
+Parquet artifacts. Their manifests use exactly this common envelope:
 
-`CURRENT` is an optional interactive discovery pointer. Scientific configurations and consumers
-pin explicit bundle IDs and exact manifest-byte witnesses. Symile CV assignments are separate
-immutable experimental-design objects under `data/manifests/symile/cv/`; they are not dataset
-bundles.
+```text
+bundle_manifest_schema_version
+dataset
+tasks
+membership
+source
+modalities
+privacy
+bundle
+artifacts
+qualification
+```
+
+Arrow artifacts declare `semantic_sha256` and `row_count`. Dataset-specific scientific sections
+remain explicit.
+
+`CURRENT` is an optional interactive discovery pointer. Campaigns receive explicit semantic
+bundle IDs from dataset builders; reviewed YAML contains scientific policy without generated
+authority pins. The canonical patient-level RSNA split uses 70% train, 15% validation, and 15% test with seed 42; its policy and exact assignment are intrinsic to the RSNA
+bundle, with no separate split-assignment authority. Symile's official train, validation, and test
+partition is likewise intrinsic to its bundle. Symile's development design is a separate immutable
+three-repetition, five-fold, patient-grouped CV authority under `data/manifests/symile/cv/`, using
+repeat seeds 17, 42, and 2026.
 
 ## RSNA bundle
 
 An RSNA bundle contains five Parquet artifacts and one JSON manifest. Column order, Arrow types,
 nullability, and deterministic row order are contractual.
 
-## Samples
+### Samples
 
 File: `samples.parquet`. One row per labeled image, sorted by `sample_id`.
 
@@ -44,7 +60,7 @@ stored and are marked implausible. Pixel spacing is either a positive finite pai
 `image_path` has the form `stage_2_train_images/<image_id>.dcm`. Construction verifies that it
 resolves beneath the raw dataset root and agrees with the discovered source file.
 
-## Labels
+### Labels
 
 File: `labels.parquet`. One row per sample and task, sorted by
 `(sample_id, task_id)`.
@@ -61,7 +77,7 @@ target pairs with class 2; a negative target pairs with class 0 or 1. Task sourc
 semantics, allowed values, exclusions, and label-policy versions are declared once in the
 manifest.
 
-## Annotations
+### Annotations
 
 File: `annotations.parquet`. One row per positive bounding box, sorted by
 `annotation_id`.
@@ -80,7 +96,7 @@ negative samples have none. Validation checks `x + width <= image_columns` and
 `y + height <= image_rows` using the sample artifact, so portable validation does not need the
 source DICOMs.
 
-## Splits
+### Splits
 
 File: `splits.parquet`. One row per sample, sorted by `sample_id`.
 
@@ -93,7 +109,7 @@ Validation requires complete unique sample coverage and one split per patient. I
 assignments from the manifest recipe and verifies class presence when cohort size permits.
 Split-wide lineage is stored once in the manifest.
 
-## Source inventory
+### Source inventory
 
 File: `source_inventory.parquet`. One row per sample, sorted by `sample_id`.
 
@@ -108,20 +124,22 @@ Construction authenticates every inventory row against the external DICOM. Porta
 checks the inventory schema, relationships, paths, sizes, hashes, and artifact integrity; it does
 not rehash the external dataset.
 
-## Manifest
+### Manifest
 
 File: `manifest.json`.
 
-The manifest owns bundle-level data: dataset and release identity, task definitions, split
-lineage, source CSV hashes, artifact hashes, essential counts, source-quality evidence, privacy
-classification, bundle identity, and runtime provenance. Recomputable distributions belong to the
-bundle-qualified audit report.
+The manifest owns bundle-level data: dataset and release identity, task definitions, intrinsic
+partition lineage, source authentication and qualification evidence, artifact hashes, essential
+counts, privacy classification, and bundle identity. Recomputable distributions belong to the
+bundle-qualified audit report. Formal execution separately owns Git and dependency-lock witnesses,
+runtime and framework facts, hardware and CUDA policy, workers, determinism settings, and other
+operational execution provenance.
 
-Split metadata includes `split_source`, `split_recipe_id`, `split_assignment_id`,
-`algorithm_version`, seed, stratification target, and ordered train/validation/test ratios. It
-also records the algorithm mechanics needed to interpret the version.
+Split metadata includes `split_source`, `split_recipe_id`, `algorithm_version`, seed,
+stratification target, and ordered train/validation/test ratios. It also records the algorithm
+mechanics needed to interpret the version.
 
-## Bundle acceptance
+### Bundle acceptance
 
 A loader accepts a bundle only when:
 
@@ -130,7 +148,7 @@ A loader accepts a bundle only when:
 3. the manifest schema, tasks, and split algorithm are supported;
 4. the manifest and directory name declare the requested bundle ID;
 5. every artifact has its exact Arrow schema;
-6. every declared logical and physical hash matches;
+6. every declared semantic hash matches the canonical typed table content;
 7. the semantic bundle ID recomputes exactly;
 8. all cross-table, split, annotation, and source-inventory invariants pass.
 
@@ -140,25 +158,30 @@ rejected.
 
 ## Identity and publication
 
-The logical Arrow hash covers canonical ordered typed content and the exact schema. Its type-aware
+Canonical JSON uses UTF-8, NFC-normalized string keys and values, lexicographically sorted object
+keys, compact separators, and exactly one trailing newline. List order is preserved. Floats must
+be finite; negative zero is normalized. Booleans remain distinct from integers. Unsupported types
+and keys that collide after Unicode normalization fail rather than being coerced. Semantic hashes
+frame the domain, schema version, and payload explicitly.
+
+The logical table contract declares its schema name/version, ordered columns and scalar types,
+nullability, canonical sort key, and uniqueness constraints. Validation rejects incorrect columns,
+types, nulls, duplicate keys, and non-finite values before hashing.
+
+The logical table hash covers canonical ordered typed content, row count, and scientific schema. Its type-aware
 scalar encoding is independent of Arrow IPC serialization, chunking, Parquet encoding, file
-metadata, source paths, and null-buffer representation.
+metadata, Arrow field/schema metadata, source paths, and null-buffer representation.
 
-The physical Parquet SHA-256 covers serialized bytes. It detects corruption or replacement but
-does not participate in bundle identity.
-
-Bundle identity covers dataset and source release, task and interpretation policies, split source
-and compact recipe metadata, authoritative CSV hashes, and the five ordered logical artifact
-hashes. Representation-only schema discriminators, physical hashes, generated summaries,
-timestamps, commands, paths, tool diagnostics, and `CURRENT` are excluded.
+RSNA bundle identity covers dataset and source release, task and interpretation policies, split source
+and compact recipe metadata, authoritative CSV hashes, and the five ordered semantic artifact
+hashes. Representation-only schema discriminators, generated summaries, timestamps, commands,
+paths, tool diagnostics, and `CURRENT` are excluded.
 
 Publication validates a complete sibling staging directory once, atomically renames it to its
 immutable `bundle-<sha256>` directory, then atomically updates `CURRENT`. Independent consumers
-perform complete validation when loading a bundle. Formal configs pin the bundle ID, exact
-`manifest.json` SHA-256, and split assignment; formal campaigns resolve only that directory and
-never consult `CURRENT`. Because generation and provenance fields may change across independent
-builds, a semantically equal bundle ID does not imply equal manifest bytes. The exact published
-authority must be preserved and transferred once its byte witness is pinned.
+perform complete validation when loading a bundle. Formal campaigns receive the builder-returned
+bundle ID; the RSNA split assignment is part of that bundle's validated scientific content. Formal campaigns resolve
+only the selected directory and never consult `CURRENT`.
 
 Symile source-asset paths are canonical names within the authenticated official release, not local
 filesystem locations. Relocating the complete source root leaves semantic bundle identity
@@ -166,15 +189,17 @@ unchanged.
 
 ## Symile bundle and CV assignment
 
-A Symile bundle contains `manifest.json`, `samples.parquet`, and `labs.parquet`. The samples table
-has one row per official classification admission, ordered by `sample_id`:
+A Symile bundle contains `manifest.json`, development-only `samples.parquet` and `labs.parquet`,
+and opaque authenticated copies of `symile_mimic_data.csv` and `test.csv`. The source copies are
+hashed and transported without held-out scientific decoding before opening. The samples table
+has one row per official train or validation admission, ordered by `sample_id`:
 
 | Field | Arrow type | Nullable | Role |
 | --- | --- | --- | --- |
 | `sample_id` | `string` | no | Internal model key |
 | `subject_id` | `int64` | no | Patient grouping key |
 | `hadm_id` | `int64` | no | Admission alignment key |
-| `official_split` | `string` | no | Train, validation, or test |
+| `official_split` | `string` | no | Train or validation |
 | `source_row` | `int64` | no | Split-aligned tensor row |
 | `pneumonia_state` | `int8` | yes | Source label state |
 | `age_years` | `int16` | no | Prespecified subgroup attribute |
@@ -187,9 +212,13 @@ manifest-declared item order. Observedness must equal value presence; observed v
 finite.
 
 The manifest binds official membership, strict-label policy, source checksum inventory, modality
-alignment, temporal and view contracts, laboratory order, logical and physical artifact hashes,
-the 11,622-to-11,214 reconciliation, and the semantic bundle identity. Validation checks exact
-admission and patient isolation, tensor-row domains, AP/PA membership, and strict-task counts.
+alignment, temporal and view contracts, laboratory order, semantic artifact hashes,
+development qualification, and the semantic bundle identity. Development validation checks exact
+admission and patient isolation, tensor-row domains, AP/PA membership, and label domains without
+decoding the opaque sources. Authorized held-out reconstruction validates test rows, labels,
+laboratories and full source reconciliation against the same source identity. Live held-out
+execution additionally qualifies the authenticated test tensors before inference.
+Strict-task counts are derived from sample evidence within the authorized analysis scope.
 
 The separate CV directory contains `manifest.json` and `assignments.parquet`. Assignment rows have
 `sample_id:string`, `repeat_seed:int32`, and `outer_fold:int8`, ordered by repeat then sample. The

@@ -1,151 +1,90 @@
 # Architecture
 
-BeyondCXR separates source qualification, scientific execution, public reporting, and serving.
-Scientific consumers receive explicit validated object identities; MLflow records operational
-provenance.
+BeyondCXR separates scientific meaning, supporting evidence, operational execution, and transport
+integrity. Symile-MIMIC is the primary multimodal study; RSNA supplies supporting CXR, metadata,
+and localization qualification. The studies have different endpoints and separate evidence chains.
 
-## Study structure
+## Authority and evidence
 
-Symile-MIMIC carries the primary multimodal study. Its prespecified families test the incremental
-value of laboratory information beyond CXR, missingness-aware fusion, and the further contribution
-of ECG. RSNA Stage 2 supplies the supporting DICOM, image-modeling, metadata-fusion, and
-localization foundation. The datasets have
-different endpoints and separate evidence chains.
+| Layer | Responsibility | Examples |
+| --- | --- | --- |
+| Scientific identity | Identify canonical scientific content | Bundle, CV, package, prediction, freeze, result |
+| Scientific evidence | Support identities and claims through recursive validation | Cohort tables, fitted state, predictions, localization evidence |
+| Operational provenance | Record the reviewed implementation and runtime | Formal execution, MLflow records, deployment receipt |
+| Transport integrity | Authenticate exact preserved bytes | Archive membership, member hashes, backup checksum |
+
+Validators reconstruct semantic content and recompute its identity. Scientific identity is
+independent of paths, timestamps, runtime hardware, and serializer encoding. Source-byte hashes
+authenticate upstream inputs; preservation hashes authenticate archived bytes.
 
 ```text
 authenticated sources
         ↓
-immutable dataset bundle + split authority
+dataset bundle + separate Symile development CV
         ↓
-model package → prediction evidence → scientific result
+fitted packages + prediction evidence
         ↓
-validated preservation export
-        ├── aggregate public results
-        └── controlled serving
+validated scientific results
+        ↓
+preservation archive
+        ├── deterministic public results
+        └── self-contained serving authority
 ```
 
-## Data boundary
+## Dataset authorities
 
-Source adapters authenticate dataset-specific files and construct typed artifacts. Bundle
-validators enforce schemas, ordering, relationships, source witnesses, split isolation, logical
-content hashes, physical byte hashes, and semantic identity. Scientific consumers pin immutable
-bundle and split identities plus the exact manifest-byte witness. Authority publication is a
-separate lifecycle step. `CURRENT` is limited to interactive dataset operations and is never read
-by a formal campaign.
+The RSNA bundle owns cohort, labels, annotations, source inventory, and the exact patient-disjoint
+split. The Symile bundle owns cohort, laboratory values, authenticated modality references, and
+official partitions. Symile's repeated development CV is a separate bundle-bound authority.
 
-RSNA packages labeled DICOM metadata, labels, boxes, patient-disjoint splits, and a source
-inventory. A deterministic authenticated CXR cache separates raw DICOM decoding from model
-training. Symile packages the lean admission spine and raw laboratory values while retaining
-authenticated references to the large CXR and ECG tensors. Its separate CV assignment artifact fixes all
-repeat/fold assignments.
+The workflow captures builder-returned bundle and CV IDs and passes them explicitly to consumers.
+`CURRENT` is limited to interactive dataset operations. Exact schemas, canonicalization, and
+validation rules belong to the [data contract](data_contract.md); source qualification belongs to
+the [RSNA](datasets/rsna.md) and [Symile](datasets/symile.md) guides.
 
-Formal RSNA preflight constructs one immutable plan containing every root, exact authority
-coordinate, ordered family/seed member, loaded config witness, source revision, dependency lock,
-pretrained-weight fingerprint, and the training/evaluation and full-precision localization
-runtime witnesses. Every later phase consumes that plan;
-no phase re-resolves a root or mutable authority selector. The complete package/report freeze is
-the capability required by each held-out accessor and by localization.
-Each immutable model package contains the ordered validation sample IDs, their targets, their
-probabilities, and the minimal selection history needed to reconstruct validation claims. The
-package identity binds this scientific evidence; report and plot bytes are deterministic
-derivatives. Package-freeze validation independently rederives canonical validation membership and
-labels from the pinned bundle before accepting package evidence. The freeze binds ordered package
-membership and report coordinates, while preservation hashes witness transport bytes.
+## Packages, decisions, and results
 
-Exact schemas and identity rules live in the [data contract](data_contract.md). Dataset roles,
-access, and limitations live in the [data statement](data_statement.md).
+Packages identify fitted model and preprocessing state, scientific configuration, initialization,
+and supporting validation evidence. RSNA packages own their validation-derived thresholds.
+Symile family development authorities own complete fold and out-of-fold evidence; one development
+decision binds ordered family membership, final fitting budgets, and primary thresholds.
 
-## Model and evaluation evidence
+Prediction evidence binds package, cohort, inference policy, logical values, and the authorizing
+scientific freeze for held-out work. Evaluations and the Symile global result rederive aggregate
+claims from that evidence. Localization identifies numerical Grad-CAM evidence and its policy.
+Audits, comparisons, seed summaries, and private error reviews are regenerable views.
 
-At the model/evaluation layer, scientific claims follow a three-role evidence chain:
+See [training](training.md) for model development, fitting, and evaluation definitions.
 
-| Object | Responsibility |
-| --- | --- |
-| Model package | Reconstructable fitted model and preprocessing state |
-| Prediction evidence | Immutable package-bound sample-level outputs |
-| Scientific result | Aggregate claims rederived from validated prediction evidence |
+## Freeze, execution, and held-out access
 
-Semantic identity records scientific meaning. The sealed science-execution Git commit is a public
-code-state and scientific coordinate in the result binding. Integrity witnesses authenticate
-serialized bytes; the dependency lock, MLflow, paths, device, runtime, and ordinary execution
-facts are reproducibility or operational provenance. Validators keep those roles distinct.
+A scientific freeze fixes complete package membership and held-out policies. Formal execution
+records the reviewed Git commit, dependency lock, run plan, and numerical runtime separately.
+Execution is established before fitting; the freeze is published after the required packages exist.
 
-Dataset bundles, split and CV assignments, pre-test controls, and preservation exports are
-distinct data and control objects that support this evidence chain.
+| Study | Before held-out access | Operator boundary |
+| --- | --- | --- |
+| RSNA | Eight-package scientific freeze joined to current formal execution | `make rsna` continues through held-out evaluation and localization |
+| Symile | Development decision, 14 final packages, scientific freeze, current formal execution, and matching local/external opening receipts | `make symile` stops at freeze; `make symile-test` opens or resumes held-out work |
 
-Patient-level prediction evidence remains under the ignored `private/` workspace. Public reports
-contain aggregate derivatives only.
+Live held-out capabilities authenticate these relationships before source access. A freeze alone
+is not a live capability. Restored historical evidence supports validation and reproduction without
+granting live source access. After opening, Symile may complete missing predictions, results,
+derivatives, and preservation; development and fitting cannot resume. Recovery and receipt rules
+are documented in [reproducibility](reproducibility.md).
 
-## Primary Symile workflow
+## Preservation, release, and serving
 
-Development consumes official train and validation rows only:
+Preservation archives an explicit scientific closure and validates its restored content. Release
+selects exactly one valid completed Symile archive, derives aggregate public results, independently
+reproduces their bytes, and completes acceptance checks before publishing accepted serving state.
+The result binding is an index of scientific coordinates; public tables and figures are derivatives.
 
-```text
-pinned bundle + pinned 3 × 5 grouped CV assignment
-        ↓
-fold package + separate private OOF evidence
-        ↓
-family development result
-        ↓
-prespecified CXR/labs analysis + secondary ECG analysis
-        ↓
-14 terminal full-development packages
-```
+Serving authority contains the ordered primary gated package copies under their original package
+IDs, with inference and input/output policy. Deployment provenance records operational release
+facts separately. Startup authenticates the distribution against the preserved campaign and
+release evidence; inference averages the three raw logits and applies sigmoid once.
 
-The prespecified CXR/labs families share one repeated grouped cross-validation assignment. The
-secondary ECG family uses the same development design. Family results rederive repeat metrics and
-terminal budgets from all 15 fold coordinates; model definitions and fitting rules are documented
-in [training](training.md).
-
-Held-out test materialization requires a fully validated pre-test freeze and its atomic
-same-freeze opening record. The freeze binds all 14 packages, the two primary development-derived
-thresholds, held-out policy, numerical inference runtime, and formal execution provenance.
-
-```text
-validated freeze + same-freeze opening
-        ↓
-14 package-bound raw predictions
-        ↓
-six fixed predictor views
-        ↓
-one global result + private error review
-        ↓
-validated export, backup, and restoration
-```
-
-An opened campaign can complete missing deterministic post-open work; it cannot retrain or alter
-the freeze. The global result owns held-out claims. Private error review is regenerable and remains
-outside the public result surface.
-
-## Supporting RSNA workflow
-
-The RSNA bundle and split are published before formal execution and every RSNA config pins that
-same bundle ID, manifest SHA-256, and split-assignment ID. A read-only campaign preflight validates
-the complete bundle, raw-source availability, configuration agreement, Git and lock provenance,
-CUDA contract, storage, and external backup destination before creating campaign output.
-
-The campaign then authenticates source DICOM bytes while building or validating the deterministic
-CXR cache, fits metadata and three-seed neural families, and publishes an immutable eight-package
-freeze before held-out access. Package-bound completion records make held-out evaluation
-append-only and resumable. Aggregate evaluations, seed summaries, comparison, and localization
-are content-addressed or validated derivatives. The preservation ZIP contains an explicit
-scientific closure—not repository roots—and is restored and recursively validated before its
-checksum and external backup are accepted.
-Private localization state includes compact per-case numerical evidence from the completed
-Grad-CAM procedure. Restoration recomputes public member and aggregate statistics from that
-evidence without requiring the original DICOM files.
-
-## Release and serving
-
-The release layer restores the preserved Symile campaign, validates its scientific evidence,
-derives the path-neutral result binding, and constructs an aggregate-only public projection.
-Reproduction derives the same projection from the same preserved evidence. The tracked outputs are
-deterministic derivatives, not scientific authorities.
-
-Serving uses a separate immutable deployment control. It binds the ordered seed-17, seed-42, and
-seed-2026 primary CXR-plus-labs gated packages, the mean-logit policy, preprocessing, global-result
-lineage, thresholds as metadata, and science/release provenance. Startup validates and reconstructs
-all members. Runtime inference averages raw logits and applies sigmoid once.
-
-See [training](training.md), [reproducibility](reproducibility.md), [privacy](privacy.md), and
-[controlled serving](serving.md) for the operational contracts.
+See [reproducibility](reproducibility.md#preservation-and-release) for preservation and release,
+[serving](serving.md) for deployment and the API, and [privacy](privacy.md) for distribution limits.
+Make and the Python workflow compose these domain operations without owning scientific identities.

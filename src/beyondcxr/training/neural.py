@@ -265,7 +265,7 @@ def training_class_weight(targets: np.ndarray) -> tuple[int, int, float]:
 
 
 def candidate_is_improvement(candidate: float, best: float, minimum_delta: float) -> bool:
-    """Return whether validation AP is a strict qualifying improvement."""
+    """Require the candidate selection metric to exceed the best by minimum_delta."""
     if not np.isfinite(minimum_delta) or minimum_delta < 0.0:
         raise NeuralTrainingError("Checkpoint minimum delta must be finite and nonnegative")
     if not all(np.isfinite(value) for value in (candidate, best, minimum_delta)):

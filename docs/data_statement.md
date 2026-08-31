@@ -42,8 +42,9 @@ classification samples.
 The primary endpoint is `pneumonia_strict`: `Pneumonia = 1` is positive, `Pneumonia = 0` is
 negative, and uncertain or missing labels are excluded. Official splits are patient-disjoint.
 
-Development combines eligible official train and validation admissions; test remains closed until
-the validated pre-test freeze and same-freeze opening record exist.
+Development combines eligible official train and validation admissions. Test access requires a
+validated pre-test freeze, matching formal execution, and reconciled local and persistent opening
+receipts.
 
 The strict-label analytic cohort is fixed before model evaluation:
 
@@ -63,9 +64,11 @@ The source representation contains 50 laboratory values and corresponding observ
 Missing values remain distinct from observed finite measurements. Model-side transformation and
 imputation are documented in [training](training.md).
 
-Bundle construction verifies `SHA256SUMS.txt`, required CSV and NPY resources, schemas, dtypes,
-shapes, identifier alignment, split isolation, and modality contracts. Large arrays remain external;
-the immutable lean bundle records authenticated references and typed cohort data.
+Bundle construction verifies `SHA256SUMS.txt` and the complete release's transport integrity.
+Scientific validation before opening covers development schemas, dtypes, shapes, alignment,
+isolation and modality contracts. The bundle stores typed development evidence and authenticated
+opaque source CSVs; held-out scientific decoding, complete reconciliation and test modality
+qualification require authorized opening. Large arrays remain external.
 
 ## RSNA Stage 2
 

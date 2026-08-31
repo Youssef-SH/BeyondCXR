@@ -1,4 +1,4 @@
-"""Fit and apply the outer-fold Symile laboratory ECDF transform."""
+"""Fit and apply training-cohort laboratory ECDFs for Symile models."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ LAB_TRANSFORMED_DIMENSION = 100
 
 
 class SymileLabEcdfTransformer(TransformerMixin, BaseEstimator):
-    """Transform raw labs with outer-training right-rank ECDFs and observedness."""
+    """Transform raw labs with fitted right-rank ECDFs and observedness."""
 
     def fit(self, values: pd.DataFrame, targets: object = None) -> SymileLabEcdfTransformer:
         """Fit one ECDF and missing replacement per laboratory."""
