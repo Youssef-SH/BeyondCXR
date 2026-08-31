@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import io
 import json
@@ -187,6 +188,23 @@ def test_cli_failure_does_not_echo_private_exception_text(
     assert "/private/" not in captured.err
 
 
+def test_expected_cli_failure_logs_failed_phase(monkeypatch, capsys) -> None:
+    from beyondcxr.data import rsna_manifest
+
+    monkeypatch.setattr(
+        rsna_manifest,
+        "build_and_write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("private detail")),
+    )
+    assert rsna_manifest.main([]) == 1
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    assert any("event=phase_failed" in line and "phase=rsna_manifest_cli" in line for line in lines)
+    assert not any(
+        "event=phase_completed" in line and "phase=rsna_manifest_cli" in line for line in lines
+    )
+
+
 @pytest.mark.parametrize(
     ("module_name", "operation", "arguments"),
     [
@@ -266,6 +284,13 @@ def test_cli_logs_to_stderr_without_contaminating_json_stdout(monkeypatch, capsy
         assert json.loads(captured.out)["mlflow_run_id"] == "run-test"
         assert "event=test_progress" not in captured.out
         assert captured.err.count("event=test_progress") == 1
+        lines = captured.err.splitlines()
+        assert any(
+            "event=phase_completed" in line and "phase=rsna_training_cli" in line for line in lines
+        )
+        assert not any(
+            "event=phase_failed" in line and "phase=rsna_training_cli" in line for line in lines
+        )
 
 
 def test_configuration_owns_one_dedicated_handler_and_leaves_library_loggers_alone() -> None:
@@ -550,3 +575,44 @@ def test_timed_phase_logs_failure_and_preserves_exception(monkeypatch) -> None:
         "error_type=RuntimeError",
         "phase=model_fitting",
     ]
+
+
+def test_direct_operations_configure_logging_and_preserve_enclosing_file(tmp_path, capsys):
+    from beyondcxr.utils.operational_logging import observed_operation, operational_output
+
+    @observed_operation("synthetic_direct")
+    def operation(*, fail=False):
+        log_event(get_operational_logger(__name__), "synthetic_progress", source_path="PRIVATE")
+        if fail:
+            raise RuntimeError("PRIVATE")
+        return "result"
+
+    path = tmp_path / "operation.log"
+    with operational_output(path):
+        assert operation() == "result"
+        with pytest.raises(RuntimeError, match="PRIVATE"):
+            operation(fail=True)
+    text = path.read_text()
+    assert text.count("event=phase_started") == 2
+    assert text.count("event=phase_completed") == 1
+    assert text.count("event=phase_failed") == 1
+    assert "PRIVATE" not in text
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "phase=synthetic_direct" in output.err
+
+
+def test_cli_operation_uses_parsed_level_and_leaves_help_to_argparse(capsys):
+    from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
+
+    parser = argparse.ArgumentParser()
+    add_logging_argument(parser)
+    args = parser.parse_args(["--log-level", "DEBUG"])
+    with cli_operation("synthetic_cli", level=args.log_level):
+        log_event(get_operational_logger(__name__), "debug_progress", level=logging.DEBUG)
+    assert "level=DEBUG event=debug_progress" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as help_exit:
+        parser.parse_args(["--help"])
+    assert help_exit.value.code == 0
+    assert "synthetic_cli" not in capsys.readouterr().err
