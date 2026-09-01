@@ -45,6 +45,10 @@ from beyondcxr.utils.publication import (
 from beyondcxr.utils.rsna_model_publication import threshold_contract, validated_threshold_contract
 from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 NEURAL_MODEL_FILENAME = "model.pt"
 CONFIG_FILENAME = "resolved_config.yaml"
@@ -148,12 +152,12 @@ def save_neural_checkpoint(document: Mapping[str, Any], path: str | Path) -> Pat
 
 def load_neural_checkpoint(path: str | Path) -> dict[str, Any]:
     """Load a neural checkpoint safely on CPU and validate its exact schema."""
+
+    def load(candidate: Path):
+        return torch.load(candidate, map_location="cpu", weights_only=True)
+
     try:
-        document = torch.load(
-            Path(path),
-            map_location="cpu",
-            weights_only=True,
-        )
+        document = load_authenticated_file("rsna-neural-checkpoint", path, load)
     except (OSError, RuntimeError, TypeError, ValueError, pickle.UnpicklingError) as exc:
         raise ValueError("Neural checkpoint is unreadable by the safe tensor loader") from exc
     _validate_checkpoint(document)
@@ -260,14 +264,15 @@ def publish_neural_model_package(
     )
 
 
+@memoized_directory_validation("rsna-neural-package")
 def validate_published_neural_model(
     package_directory: str | Path, *, enforce_directory_name: bool = True
 ) -> dict[str, Any]:
     """Validate one exact neural package without reconstructing its architecture."""
-    document = validate_neural_package_metadata(
+    document, checkpoint = _validated_neural_package_metadata(
         package_directory, enforce_directory_name=enforce_directory_name
     )
-    load_validated_neural_checkpoint(package_directory, document)
+    _validate_checkpoint_binding(document, checkpoint)
     return document
 
 
@@ -275,6 +280,15 @@ def validate_neural_package_metadata(
     package_directory: str | Path, *, enforce_directory_name: bool = True
 ) -> dict[str, Any]:
     """Validate a neural package's exact files, manifest, and physical identities."""
+    document, _checkpoint = _validated_neural_package_metadata(
+        package_directory, enforce_directory_name=enforce_directory_name
+    )
+    return document
+
+
+def _validated_neural_package_metadata(
+    package_directory: str | Path, *, enforce_directory_name: bool
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
     directory = Path(package_directory)
     if directory.parent.name != "packages" or directory.is_symlink() or not directory.is_dir():
         raise ValueError("Neural model package must be a physical directory beneath packages")
@@ -300,7 +314,7 @@ def validate_neural_package_metadata(
         expected.add(STRUCTURED_PREPROCESSOR_FILENAME)
     if actual != expected:
         raise ValueError("Neural model package contains an unexpected artifact set")
-    _validate_manifest_metadata(
+    checkpoint = _validate_manifest_metadata(
         document,
         directory / NEURAL_MODEL_FILENAME,
         directory / CONFIG_FILENAME,
@@ -314,7 +328,7 @@ def validate_neural_package_metadata(
         directory / STRUCTURED_PREPROCESSOR_FILENAME
     ) != document.get("structured_preprocessor_sha256"):
         raise ValueError("Fusion structured preprocessor SHA-256 mismatch")
-    return document
+    return document, checkpoint
 
 
 def load_validated_neural_checkpoint(
@@ -411,7 +425,9 @@ def _validate_manifest(
     evidence_path: Path,
     checkpoint: Mapping[str, Any],
 ) -> None:
-    _validate_manifest_metadata(document, model_path, config_path, evidence_path)
+    _validate_manifest_metadata(
+        document, model_path, config_path, evidence_path, checkpoint=checkpoint
+    )
     _validate_checkpoint_binding(document, checkpoint)
 
 
@@ -420,7 +436,9 @@ def _validate_manifest_metadata(
     model_path: Path,
     config_path: Path,
     evidence_path: Path,
-) -> None:
+    *,
+    checkpoint: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
     if not isinstance(document, dict):
         raise ValueError("Neural model manifest contains an unexpected field set")
     package_kind = _manifest_package_kind(document)
@@ -529,8 +547,9 @@ def _validate_manifest_metadata(
     ):
         raise ValueError("Neural package training policy is invalid")
     _validate_nested_manifest(document, config)
+    validated_checkpoint = load_neural_checkpoint(model_path) if checkpoint is None else checkpoint
     if document["model_state_sha256"] != tensor_state_sha256(
-        load_neural_checkpoint(model_path)["model_state_dict"]
+        validated_checkpoint["model_state_dict"]
     ) or (package_kind == "cxr" and document["preprocessor_state_sha256"] is not None):
         raise ValueError("Neural reconstructed fitted state differs from semantic identity")
     if package_kind == "fusion":
@@ -541,6 +560,7 @@ def _validate_manifest_metadata(
             raise ValueError("Fusion fitted preprocessor differs from semantic identity")
     if document["model_package_id"] != neural_model_package_id(document):
         raise ValueError("Neural package ID does not match its identity payload")
+    return validated_checkpoint
 
 
 def _validate_nested_manifest(document: dict[str, Any], config: ExperimentConfig) -> None:

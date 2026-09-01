@@ -485,7 +485,12 @@ def _analysis_from_developments(developments, family_ids) -> dict[str, object]:
     }
     comparisons = SYMILE_DEVELOPMENT_COMPARISON_POLICY["paired_comparisons"]
     paired = {
-        name: _paired_effects(frames[left], frames[right])
+        name: _paired_effects(
+            frames[left],
+            frames[right],
+            left_metrics=repeat_metrics[left],
+            right_metrics=repeat_metrics[right],
+        )
         for name, (left, right) in comparisons.items()
     }
     neural = (
@@ -496,7 +501,10 @@ def _analysis_from_developments(developments, family_ids) -> dict[str, object]:
     )
     ensemble = {family: _ensemble_metrics(frames[family]) for family in neural}
     ablation_repeats = _paired_effects(
-        frames["cxr_labs_gated"], frames["cxr_labs_gated_no_observedness"]
+        frames["cxr_labs_gated"],
+        frames["cxr_labs_gated_no_observedness"],
+        left_metrics=repeat_metrics["cxr_labs_gated"],
+        right_metrics=repeat_metrics["cxr_labs_gated_no_observedness"],
     )
     ablation_ensemble = {
         metric: ensemble["cxr_labs_gated"][metric]
@@ -573,7 +581,13 @@ def _metrics(frame: pd.DataFrame) -> dict[str, float]:
     return symile_headline_metrics(truth, scores)
 
 
-def _paired_effects(left: pd.DataFrame, right: pd.DataFrame) -> dict[str, dict[str, float]]:
+def _paired_effects(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    left_metrics: Mapping[str, Mapping[str, float]],
+    right_metrics: Mapping[str, Mapping[str, float]],
+) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     for seed in REPEAT_SEEDS:
         left_seed = left.loc[left["repeat_seed"] == seed]
@@ -589,14 +603,8 @@ def _paired_effects(left: pd.DataFrame, right: pd.DataFrame) -> dict[str, dict[s
             or not aligned["target_left"].eq(aligned["target_right"]).all()
         ):
             raise ManifestBuildError("Symile analysis paired evidence is misaligned")
-        left_metrics = _metrics(
-            aligned.rename(columns={"target_left": "target", "probability_left": "probability"})
-        )
-        right_metrics = _metrics(
-            aligned.rename(columns={"target_right": "target", "probability_right": "probability"})
-        )
         result[str(seed)] = {
-            metric: left_metrics[metric] - right_metrics[metric]
+            metric: left_metrics[str(seed)][metric] - right_metrics[str(seed)][metric]
             for metric in headline_metric_names()
         }
     return result

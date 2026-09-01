@@ -50,6 +50,7 @@ from beyondcxr.training.rsna_seed_summary import (
 from beyondcxr.training.rsna_training_report import validate_training_report
 from beyondcxr.training.rsna_validation_evidence import load_canonical_validation_cohort
 from beyondcxr.utils.semantic_identity import canonical_json_bytes
+from beyondcxr.utils.validation_context import operation_scoped_validation
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,7 @@ def campaign_export_members(
     return tuple(members)
 
 
+@operation_scoped_validation
 def validate_restored_rsna_campaign(restored_root: Path) -> None:
     """Recursively validate an RSNA campaign using only restored closure members."""
     restored_root = _validated_restoration_context(restored_root).root

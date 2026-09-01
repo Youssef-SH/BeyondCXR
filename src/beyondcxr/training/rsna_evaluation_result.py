@@ -48,6 +48,7 @@ from beyondcxr.utils.rsna_neural_publication import (
     validate_published_neural_model,
 )
 from beyondcxr.utils.semantic_identity import canonical_scientific_id
+from beyondcxr.utils.validation_context import memoized_directory_validation
 
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_PREFIX = "evaluation-"
@@ -480,6 +481,10 @@ def validate_rsna_evaluation(
     )
 
 
+@memoized_directory_validation(
+    "rsna-model-package",
+    resolver=lambda model_root, package_id: Path(model_root) / "packages" / str(package_id),
+)
 def validate_rsna_model_package(model_root: str | Path, package_id: object) -> dict[str, Any]:
     """Resolve and fully validate one RSNA tabular or neural model package."""
     _require_identity(package_id, "model-package-", "model package")

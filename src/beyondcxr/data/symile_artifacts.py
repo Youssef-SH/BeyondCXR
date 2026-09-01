@@ -55,6 +55,10 @@ from beyondcxr.utils.semantic_identity import (
     canonical_json_bytes,
     semantic_sha256,
 )
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 OPAQUE_SOURCE_FILES = ("symile_mimic_data.csv", "test.csv")
 LABS_FILENAME = "labs.parquet"
@@ -243,6 +247,7 @@ def resolve_symile_bundle(
     return paths
 
 
+@memoized_directory_validation("symile-bundle-full")
 def validate_symile_bundle(
     bundle_directory: str | Path,
     *,
@@ -256,8 +261,10 @@ def validate_symile_bundle(
         enforce_directory_name=enforce_directory_name,
     )
     root = Path(bundle_directory)
-    samples = pq.read_table(root / SAMPLES_FILENAME)
-    labs = pq.read_table(root / LABS_FILENAME)
+    samples = load_authenticated_file(
+        "symile-bundle-samples", root / SAMPLES_FILENAME, pq.read_table
+    )
+    labs = load_authenticated_file("symile-bundle-labs", root / LABS_FILENAME, pq.read_table)
     _validate_tables(samples, labs)
     if set(samples.column("official_split").to_pylist()) != set(DEVELOPMENT_SPLITS):
         raise ManifestBuildError("Symile bundle tables must be development-only")
@@ -279,6 +286,7 @@ def validate_symile_bundle(
     return dict(reference.manifest)
 
 
+@memoized_directory_validation("symile-bundle")
 def validate_symile_bundle_reference(
     bundle_directory: str | Path,
     *,

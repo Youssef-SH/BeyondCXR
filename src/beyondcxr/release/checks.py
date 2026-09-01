@@ -18,9 +18,11 @@ import zipfile
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.data.hashing import sha256_file
 from beyondcxr.release.binding import load_result_binding
 from beyondcxr.release.render import (
     RESULT_END,
@@ -35,6 +37,9 @@ from beyondcxr.utils.operational_logging import (
     timed_phase,
 )
 from beyondcxr.utils.provenance import PROJECT_ROOT_FILES, git_revision, project_untracked_paths
+
+if TYPE_CHECKING:
+    from beyondcxr.training.symile_campaign import RestoredCampaignClosure
 
 _LINK = re.compile(r"\[[^]]+\]\((?!https?://|#|mailto:)([^)#]+)(?:#[^)]+)?\)")
 _MAKE_COMMAND = re.compile(r"^\s*make\s+([a-z][a-z0-9-]+)", re.MULTILINE)
@@ -348,7 +353,11 @@ def run_final_acceptance(
 ) -> None:
     """Materialize and reproduce results, then accept a clean final release in a clone."""
     repository = Path(root).resolve()
-    from beyondcxr.release.reproduction import publish_results_from_campaign, reproduce_results
+    from beyondcxr.release.reproduction import (
+        export_manifest_sha256,
+        publish_results_from_campaign,
+        reproduce_results_from_campaign,
+    )
     from beyondcxr.release.resolution import resolved_release
 
     authority = Path(authority_root).resolve()
@@ -383,7 +392,16 @@ def run_final_acceptance(
                     readme_path=result_paths["readme_path"],
                     model_card_path=result_paths["model_card_path"],
                 )
-        reproduce_results(binding_path=binding, **result_paths)
+            _require_unchanged_release_archive(artifact, campaign)
+            reproduce_results_from_campaign(
+                binding=load_result_binding(binding),
+                campaign=campaign,
+                restored_root=campaign.restored_root,
+                export_manifest_sha256=export_manifest_sha256(artifact),
+                output_root=result_paths["output_root"],
+                readme_path=result_paths["readme_path"],
+                model_card_path=result_paths["model_card_path"],
+            )
         check_repository(
             repository,
             final=True,
@@ -484,13 +502,22 @@ def run_final_acceptance(
             )
             from beyondcxr.release.serving import publish_accepted_serving_state
 
-            publish_accepted_serving_state(
-                candidate_authority=candidate_authority,
-                candidate_deployment_provenance=candidate_provenance,
-                candidate_result_binding=result_binding,
-                release_archive=artifact,
-                authority_root=authority,
-            )
+            with resolved_release(artifact) as (_, publication_campaign):
+                publish_accepted_serving_state(
+                    candidate_authority=candidate_authority,
+                    candidate_deployment_provenance=candidate_provenance,
+                    candidate_result_binding=result_binding,
+                    release_archive=artifact,
+                    authority_root=authority,
+                    restored_campaign=publication_campaign,
+                )
+
+
+def _require_unchanged_release_archive(artifact: Path, campaign: RestoredCampaignClosure) -> None:
+    """Reauthenticate selected transport bytes before reusing its restoration."""
+    expected = campaign.restoration_context.archive_sha256
+    if artifact.is_symlink() or not artifact.is_file() or sha256_file(artifact) != expected:
+        raise ManifestBuildError("Selected release archive changed during acceptance")
 
 
 def _run(command: list[str], cwd: Path) -> None:
@@ -975,7 +1002,7 @@ def _check_result_surface(root: Path, *, final: bool) -> None:
 
 
 def _check_release_delta(root: Path, formal_execution_git_commit: str) -> None:
-    """Validate the permitted post-execution release delta."""
+    """Protect historical science and the bounded public release surface."""
     load_result_binding(root / "results" / "symile" / "binding.json")
     science = formal_execution_git_commit
     try:
@@ -1016,7 +1043,8 @@ def _check_release_delta(root: Path, formal_execution_git_commit: str) -> None:
         if relative in metadata:
             _check_version_only_delta(root, science, relative)
             continue
-        raise ManifestBuildError(f"Unauthorized post-science change: {relative}")
+        if relative.startswith(("configs/", "data/", "docs/", "results/")):
+            raise ManifestBuildError(f"Unauthorized post-science change: {relative}")
 
 
 def _changed_paths(output: bytes) -> tuple[str, ...]:

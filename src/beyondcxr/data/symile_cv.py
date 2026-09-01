@@ -47,6 +47,10 @@ from beyondcxr.utils.semantic_identity import (
     canonical_json_bytes,
     semantic_sha256,
 )
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 CV_DIRECTORY = "cv"
 CV_ASSIGNMENTS_FILENAME = "assignments.parquet"
@@ -190,6 +194,7 @@ def validate_symile_cv(
     return reference.manifest
 
 
+@memoized_directory_validation("symile-cv")
 def validate_symile_cv_reference(
     directory: str | Path,
     *,
@@ -219,7 +224,7 @@ def validate_symile_cv_reference(
     path = root / CV_ASSIGNMENTS_FILENAME
     if pq.read_schema(path) != CV_SCHEMA:
         raise ManifestBuildError("Symile CV assignment schema is invalid")
-    assignments = pq.read_table(path)
+    assignments = load_authenticated_file("symile-cv", path, pq.read_table)
     if artifact["row_count"] != assignments.num_rows:
         raise ManifestBuildError("Symile CV artifact row count does not match")
     logical_hash = logical_table_sha256(assignments, _CV_TABLE_CONTRACT)

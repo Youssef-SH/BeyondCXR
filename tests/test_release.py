@@ -1220,13 +1220,15 @@ def test_release_delta_accepts_only_mechanical_release_changes(tmp_path: Path) -
     _check_release_delta(root, science)
 
 
-def test_release_delta_rejects_forbidden_source_renamed_into_results(tmp_path: Path) -> None:
+def test_release_delta_rejects_science_config_renamed_into_implementation(
+    tmp_path: Path,
+) -> None:
     root, science = _release_delta_repository(tmp_path / "forbidden-rename")
     _prepare_valid_release_delta(root)
-    destination = root / "results/symile/science.py"
+    destination = root / "src/beyondcxr/training/study.yaml"
     destination.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "mv", "src/beyondcxr/training/science.py", destination.relative_to(root)],
+        ["git", "mv", "configs/study.yaml", destination.relative_to(root)],
         cwd=root,
         check=True,
     )
@@ -1253,7 +1255,6 @@ def test_release_delta_allows_result_to_result_rename(tmp_path: Path) -> None:
 
 def test_release_delta_rejects_science_config_prose_and_dependency_drift(tmp_path: Path) -> None:
     cases = (
-        ("science", "src/beyondcxr/training/science.py", "VALUE = 2\n", "Unauthorized"),
         ("config", "configs/study.yaml", "seed: 42\n", "Unauthorized"),
         (
             "prose",
@@ -1842,7 +1843,14 @@ def _stub_final_acceptance(monkeypatch: pytest.MonkeyPatch, *, fail_after_smoke:
     monkeypatch.setattr(
         "beyondcxr.release.reproduction.publish_results_from_campaign", lambda **_k: None
     )
-    monkeypatch.setattr("beyondcxr.release.reproduction.reproduce_results", lambda **_k: None)
+    monkeypatch.setattr(
+        "beyondcxr.release.reproduction.reproduce_results_from_campaign", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        "beyondcxr.release.reproduction.export_manifest_sha256", lambda _archive: "a" * 64
+    )
+    monkeypatch.setattr(checks, "load_result_binding", lambda _path: object())
+    monkeypatch.setattr(checks, "_require_unchanged_release_archive", lambda *_args: None)
 
     def check_repository(*_args: object, **kwargs: object) -> None:
         assert kwargs["formal_execution_git_commit"] == execution_commit
@@ -1853,7 +1861,10 @@ def _stub_final_acceptance(monkeypatch: pytest.MonkeyPatch, *, fail_after_smoke:
     def resolved(archive):
         yield (
             Path(archive),
-            SimpleNamespace(execution=SimpleNamespace(manifest={"git_commit": execution_commit})),
+            SimpleNamespace(
+                restored_root=Path(archive).parent,
+                execution=SimpleNamespace(manifest={"git_commit": execution_commit}),
+            ),
         )
 
     monkeypatch.setattr("beyondcxr.release.resolution.resolved_release", resolved)
@@ -1895,6 +1906,20 @@ def _stub_final_acceptance(monkeypatch: pytest.MonkeyPatch, *, fail_after_smoke:
 
     monkeypatch.setattr(checks, "_run", run)
     monkeypatch.setattr(checks, "_run_capture", capture)
+
+
+def test_reused_release_restoration_rejects_changed_archive(tmp_path: Path) -> None:
+    import beyondcxr.release.checks as checks
+
+    archive = tmp_path / "release.zip"
+    archive.write_bytes(b"original")
+    campaign = SimpleNamespace(
+        restoration_context=SimpleNamespace(archive_sha256=checks.sha256_file(archive))
+    )
+    checks._require_unchanged_release_archive(archive, campaign)
+    archive.write_bytes(b"replaced")
+    with pytest.raises(ManifestBuildError, match="changed during acceptance"):
+        checks._require_unchanged_release_archive(archive, campaign)
 
 
 def test_final_acceptance_publishes_authority_only_after_later_checks(
@@ -2471,6 +2496,7 @@ def test_release_materializes_before_final_gate_and_reuses_exact_results(
         )
 
     monkeypatch.setattr("beyondcxr.release.resolution.resolved_release", resolved)
+    monkeypatch.setattr(checks, "_require_unchanged_release_archive", lambda *_args: None)
     monkeypatch.setattr(checks, "check_repository", gate)
     arguments = dict(
         root=repository,

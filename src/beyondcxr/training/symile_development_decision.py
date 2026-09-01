@@ -45,6 +45,7 @@ from beyondcxr.utils.symile_publication import (
     validate_fold_package,
     validated_development_repeat_oof,
 )
+from beyondcxr.utils.validation_context import memoized_directory_validation
 
 DEVELOPMENT_DECISION_SCHEMA_VERSION = 1
 DEVELOPMENT_DECISION_PREFIX = "development-decision-"
@@ -153,6 +154,7 @@ def publish_development_decision(
     return validator(destination)
 
 
+@memoized_directory_validation("symile-development-decision")
 def validate_development_decision(
     directory: str | Path,
     *,

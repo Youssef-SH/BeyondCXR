@@ -89,6 +89,10 @@ from beyondcxr.utils.publication import (
 )
 from beyondcxr.utils.semantic_identity import canonical_json_bytes, canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops, save_skops
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 FOLD_PACKAGE_SCHEMA_VERSION = 1
 DEVELOPMENT_SCHEMA_VERSION = 1
@@ -186,8 +190,12 @@ def neural_checkpoint_document(
 
 def load_symile_neural_checkpoint(path: str | Path) -> dict[str, object]:
     """Safely load a neural checkpoint for one Symile development fold."""
+
+    def load(candidate: Path):
+        return torch.load(candidate, map_location="cpu", weights_only=True)
+
     try:
-        document = torch.load(Path(path), map_location="cpu", weights_only=True)
+        document = load_authenticated_file("symile-fold-checkpoint", path, load)
     except (OSError, RuntimeError, TypeError, ValueError, pickle.UnpicklingError) as exc:
         raise ManifestBuildError("Symile neural checkpoint is unreadable") from exc
     _validate_neural_checkpoint(document)
@@ -320,6 +328,7 @@ def publish_fold_package(
     )
 
 
+@memoized_directory_validation("symile-fold-package")
 def validate_fold_package(
     directory: str | Path,
     *,
@@ -368,9 +377,9 @@ def validate_fold_package(
         raise ManifestBuildError("Symile fold resolved configuration is invalid") from exc
     _validate_fold_config(config, document)
     if document["family_id"] in SYMILE_TABULAR_FAMILIES:
-        _validate_tabular_reconstruction(root, config, document)
+        model = _validate_tabular_reconstruction(root, config, document)
         observed_model_state = fitted_object_state_sha256(
-            load_skops(root / TABULAR_MODEL_FILENAME),
+            model,
             selected_iteration=document["selection"].get("best_iteration"),
         )
     else:
@@ -582,6 +591,7 @@ def publish_development_result(
     )
 
 
+@memoized_directory_validation("symile-development")
 def validate_development_result(
     directory: str | Path,
     *,
@@ -1079,7 +1089,7 @@ def _validate_tabular_reconstruction(
     root: Path,
     config: ExperimentConfig,
     document: Mapping[str, Any],
-) -> None:
+) -> Pipeline:
     try:
         model = load_skops(root / TABULAR_MODEL_FILENAME)
     except (OSError, ValueError, TypeError) as exc:
@@ -1148,6 +1158,7 @@ def _validate_tabular_reconstruction(
         raise ManifestBuildError("Symile tabular fold cannot perform prediction") from exc
     if logits.shape != (1,) or not np.isfinite(logits).all():
         raise ManifestBuildError("Symile tabular fold prediction proof failed")
+    return model
 
 
 def _preprocessor_probe(transformer: SymileLabEcdfTransformer) -> pd.DataFrame:

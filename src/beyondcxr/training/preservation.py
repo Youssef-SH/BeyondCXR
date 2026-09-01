@@ -474,17 +474,9 @@ def _read_and_validate_archive(
     declared_members = _validate_export_manifest(document)
     expected_names = [EXPORT_MANIFEST_FILENAME]
     for member in declared_members:
-        for relative, expected_hash in member.files:
+        for relative, _expected_hash in member.files:
             name = f"{member.archive_identity}/{relative.as_posix()}"
             expected_names.append(name)
-            try:
-                observed_hash = _zip_member_sha256(archive, name)
-            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
-                raise ManifestBuildError(
-                    "Preservation archive has missing or unexpected members"
-                ) from exc
-            if observed_hash != expected_hash:
-                raise ManifestBuildError("Preservation archived file hash is invalid")
     if set(names) != set(expected_names):
         raise ManifestBuildError("Preservation archive has missing or unexpected members")
     if names != expected_names:
@@ -589,10 +581,13 @@ def _restore_archived_file(
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     digest = hashlib.sha256()
-    with os.fdopen(descriptor, "wb") as output, archive.open(name) as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-            output.write(chunk)
+    try:
+        with os.fdopen(descriptor, "wb") as output, archive.open(name) as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+                output.write(chunk)
+    except (KeyError, OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ManifestBuildError("Preservation archive has missing or invalid members") from exc
     if digest.hexdigest() != expected_hash:
         raise ManifestBuildError("Restored preservation file hash is invalid")
 
@@ -686,14 +681,6 @@ def _valid_sha256(value: object) -> bool:
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _zip_member_sha256(archive: zipfile.ZipFile, name: str) -> str:
-    digest = hashlib.sha256()
-    with archive.open(name) as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()

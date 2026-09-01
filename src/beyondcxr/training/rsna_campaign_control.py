@@ -49,6 +49,7 @@ from beyondcxr.utils.semantic_identity import (
     canonical_scientific_id,
     semantic_sha256,
 )
+from beyondcxr.utils.validation_context import memoized_directory_validation
 
 RSNA_EXECUTION_SCHEMA_VERSION = 1
 RSNA_FREEZE_SCHEMA_VERSION = 1
@@ -796,6 +797,7 @@ def publish_or_validate_freeze(
     )
 
 
+@memoized_directory_validation("rsna-freeze")
 def validate_freeze(
     directory: str | Path,
     *,

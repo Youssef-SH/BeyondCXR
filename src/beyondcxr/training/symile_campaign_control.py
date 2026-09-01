@@ -86,6 +86,7 @@ from beyondcxr.utils.symile_publication import (
     ValidatedFoldPackage,
     validate_development_result,
 )
+from beyondcxr.utils.validation_context import memoized_directory_validation
 
 if TYPE_CHECKING:
     from beyondcxr.training.symile_test_data import (
@@ -407,6 +408,7 @@ def pretest_freeze_document(
     return document
 
 
+@memoized_directory_validation("symile-pretest-freeze")
 def validate_pretest_freeze(
     directory: str | Path,
     *,

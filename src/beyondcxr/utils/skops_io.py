@@ -9,6 +9,8 @@ from typing import Any
 
 import skops.io as sio
 
+from beyondcxr.utils.validation_context import load_authenticated_file
+
 TRUSTED_MODEL_TYPES = frozenset(
     {
         "collections.OrderedDict",
@@ -42,8 +44,12 @@ def save_skops(value: Any, path: str | Path) -> Path:
 def load_skops(path: str | Path) -> Any:
     """Load a skops artifact after rejecting unexpected executable types."""
     source = Path(path)
-    trusted = trusted_types_for_file(source)
-    return sio.load(source, trusted=trusted)
+
+    def load(candidate: Path) -> Any:
+        trusted = trusted_types_for_file(candidate)
+        return sio.load(candidate, trusted=trusted)
+
+    return load_authenticated_file("skops", source, load)
 
 
 def trusted_types_for_file(path: str | Path) -> list[str]:

@@ -52,6 +52,10 @@ from beyondcxr.utils.package_identity import (
 from beyondcxr.utils.publication import install_immutable_directory, staging_directory
 from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops, save_skops
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 FINAL_PACKAGE_PREFIX = "final-package-"
 FINAL_PACKAGE_SCHEMA_VERSION = 1
@@ -289,6 +293,7 @@ def publish_final_tabular_package(
     return validate_final_package(destination, expected_package_id=package_id)
 
 
+@memoized_directory_validation("symile-final-package")
 def validate_final_package(
     directory: str | Path,
     *,
@@ -976,8 +981,11 @@ def _reconstruct_neural(config: FinalPackageConfig) -> torch.nn.Module:
 
 
 def _load_final_neural_checkpoint(path: Path) -> Mapping[str, object]:
+    def load(candidate: Path):
+        return torch.load(candidate, map_location="cpu", weights_only=True)
+
     try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        checkpoint = load_authenticated_file("symile-final-checkpoint", path, load)
     except (OSError, RuntimeError, TypeError, ValueError, pickle.UnpicklingError) as exc:
         raise ManifestBuildError("Final neural checkpoint is unreadable") from exc
     schema_version = (

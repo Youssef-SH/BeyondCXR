@@ -37,6 +37,7 @@ from beyondcxr.utils.publication import (
 )
 from beyondcxr.utils.semantic_identity import canonical_scientific_id
 from beyondcxr.utils.skops_io import load_skops, trusted_types_for_file
+from beyondcxr.utils.validation_context import memoized_directory_validation
 
 MODEL_FILENAME = "model.skops"
 CONFIG_FILENAME = "resolved_config.yaml"
@@ -160,6 +161,7 @@ def publish_model_package(
     )
 
 
+@memoized_directory_validation("rsna-tabular-package")
 def validate_published_model(
     package_directory: str | Path, *, enforce_directory_name: bool = True
 ) -> dict[str, Any]:

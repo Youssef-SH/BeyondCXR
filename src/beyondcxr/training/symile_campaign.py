@@ -153,6 +153,7 @@ from beyondcxr.utils.symile_publication import (
     validate_development_result,
     validated_development_repeat_oof,
 )
+from beyondcxr.utils.validation_context import operation_scoped_validation
 
 _LOGGER = get_operational_logger(__name__)
 
@@ -1062,6 +1063,7 @@ def _complete_opened_campaign(
     }
 
 
+@operation_scoped_validation
 def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
     """Recursively validate one campaign from its restored artifact tree."""
     restoration = _validated_restoration_context(restored_root)

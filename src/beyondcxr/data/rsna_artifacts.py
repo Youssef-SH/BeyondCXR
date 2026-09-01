@@ -421,10 +421,12 @@ def validate_bundle_directory(
     split_config = _validate_manifest_contract(metadata)
     hashes = metadata.get("artifacts", {})
     actual_arrow_hashes: dict[str, str] = {}
+    tables: dict[str, pa.Table] = {}
     for filename in expected_files:
         path = directory / filename
         declared = hashes.get(filename)
         table = pq.read_table(path)
+        tables[filename] = table
         actual_arrow_hash = logical_table_sha256(table, contracts[filename])
         actual_arrow_hashes[filename] = actual_arrow_hash
         if actual_arrow_hash != declared.get("semantic_sha256"):
@@ -437,11 +439,11 @@ def validate_bundle_directory(
         raise ManifestBuildError("Bundle metadata is missing identity fields") from exc
     if computed_bundle_id != bundle_id:
         raise ManifestBuildError("Bundle ID does not match deterministic bundle content")
-    samples = pq.read_table(directory / SAMPLES_FILENAME)
-    labels = pq.read_table(directory / LABELS_FILENAME)
-    annotations = pq.read_table(directory / ANNOTATIONS_FILENAME)
-    splits = pq.read_table(directory / SPLITS_FILENAME)
-    source_inventory = pq.read_table(directory / SOURCE_INVENTORY_FILENAME)
+    samples = tables[SAMPLES_FILENAME]
+    labels = tables[LABELS_FILENAME]
+    annotations = tables[ANNOTATIONS_FILENAME]
+    splits = tables[SPLITS_FILENAME]
+    source_inventory = tables[SOURCE_INVENTORY_FILENAME]
     validate_sample_table(samples)
     validate_label_table(labels, samples)
     validate_annotation_table(annotations, samples, labels)

@@ -28,6 +28,10 @@ from beyondcxr.utils.publication import (
     validate_path_component,
 )
 from beyondcxr.utils.semantic_identity import canonical_scientific_id
+from beyondcxr.utils.validation_context import (
+    load_authenticated_file,
+    memoized_directory_validation,
+)
 
 PREDICTION_SCHEMA_VERSION = 1
 PREDICTION_PREFIX = "prediction-"
@@ -337,6 +341,7 @@ def _publish_prediction_evidence(
     return replace(validated, created=created)
 
 
+@memoized_directory_validation("prediction-evidence")
 def validate_prediction_evidence(
     directory: str | Path,
     *,
@@ -386,7 +391,7 @@ def validate_prediction_evidence(
     prediction_path = root / PREDICTIONS_FILENAME
     if sha256_file(prediction_path) != manifest["prediction_file_sha256"]:
         raise ValueError("Prediction file SHA-256 mismatch")
-    table = pq.read_table(prediction_path)
+    table = load_authenticated_file("prediction-parquet", prediction_path, pq.read_table)
     _validate_table(table)
     _validate_dataset_sample_ids(manifest["dataset_id"], table["sample_id"].to_pylist())
     row_count = manifest["row_count"]
