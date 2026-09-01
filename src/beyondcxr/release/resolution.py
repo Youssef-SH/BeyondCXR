@@ -9,6 +9,7 @@ from pathlib import Path
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.utils.operational_logging import get_operational_logger, timed_phase
+from beyondcxr.utils.validation_context import validation_operation
 
 _SYMILE_ARCHIVE_NAME = re.compile(
     r"symile-global-result-[0-9a-f]{64}-symile-execution-[0-9a-f]{64}\.zip"
@@ -30,6 +31,7 @@ def _restored_candidate(candidate: Path):
         with timed_phase(get_operational_logger(__name__), "release_restoration"):
             validate_archive_checksum(candidate)
             root = restoration.enter_context(restored_export(candidate))
+            restoration.enter_context(validation_operation(root))
             campaign = validate_restored_campaign(root)
         yield campaign
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import httpx
@@ -17,6 +19,7 @@ import beyondcxr.serving.cli as serving_cli
 import beyondcxr.serving.predictor as serving_predictor
 import beyondcxr.training.symile_test_data as symile_test_data
 from beyondcxr.data.cxr_transforms import StandardCxrTransform
+from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.serving.api import MAX_REQUEST_BODY_BYTES, create_app
 from beyondcxr.serving.authority import LAB_KEYS, RESEARCH_WARNING, SERVING_SPATIAL_POLICY
 from beyondcxr.serving.predictor import SymileServingPredictor, mean_logit_probability
@@ -51,6 +54,8 @@ def test_model_info_uses_immutable_startup_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     predictor = object.__new__(SymileServingPredictor)
+    predictor._active = True
+    predictor._process_id = os.getpid()
     predictor._model_info = MappingProxyType(
         {"serving_authority_id": "serving-authority-" + "a" * 64, "seeds": (17, 42, 2026)}
     )
@@ -64,6 +69,33 @@ def test_model_info_uses_immutable_startup_snapshot(
     observed["seeds"].append(999)
 
     assert predictor.model_info()["seeds"] == [17, 42, 2026]
+
+
+def test_preloaded_predictor_is_bound_to_exact_release_inputs_and_revocable(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority"
+    provenance = tmp_path / "deployment.json"
+    binding = tmp_path / "binding.json"
+    archive = tmp_path / "release.zip"
+    predictor = object.__new__(SymileServingPredictor)
+    predictor._active = True
+    predictor._process_id = os.getpid()
+    predictor._authority_directory = authority.resolve()
+    predictor._release_inputs = tuple(path.resolve() for path in (provenance, binding, archive))
+
+    predictor.require_release_inputs(authority, provenance, binding, archive)
+    with pytest.raises(ManifestBuildError, match="different authority"):
+        predictor.require_release_inputs(tmp_path / "other", provenance, binding, archive)
+    with pytest.raises(ManifestBuildError, match="different release evidence"):
+        predictor.require_release_inputs(authority, tmp_path / "other.json", binding, archive)
+    predictor._process_id = -1
+    with pytest.raises(ManifestBuildError, match="lifetime has ended"):
+        predictor.require_release_inputs(authority, provenance, binding, archive)
+    predictor._process_id = os.getpid()
+    predictor.close()
+    with pytest.raises(ManifestBuildError, match="lifetime has ended"):
+        predictor.require_release_inputs(authority, provenance, binding, archive)
 
 
 _SPATIAL_CASES = (
@@ -428,6 +460,9 @@ class _FakePredictor:
         del request
         return mean_logit_probability([-4.0, 0.0, 2.0])
 
+    def close(self) -> None:
+        pass
+
 
 @pytest.fixture
 def anyio_backend() -> str:
@@ -632,7 +667,12 @@ async def test_api_rejects_unknown_or_duplicate_multipart_fields(
 async def test_serving_lifespan_observes_startup_and_cleans_up_on_interruption(monkeypatch):
     from beyondcxr.utils.operational_logging import configured_logging
 
-    predictor = object()
+    predictor = SimpleNamespace(closed=False)
+
+    def close() -> None:
+        predictor.closed = True
+
+    predictor.close = close
     monkeypatch.setattr(SymileServingPredictor, "load", lambda *args, **kwargs: predictor)
     application = create_app(
         authority_path="synthetic",
@@ -647,6 +687,7 @@ async def test_serving_lifespan_observes_startup_and_cleans_up_on_interruption(m
                 assert application.state.predictor is predictor
                 raise RuntimeError("PRIVATE")
     assert application.state.predictor is None
+    assert predictor.closed
     text = stream.getvalue()
     assert "phase=serving_startup" in text
     assert "event=serving_ready" in text

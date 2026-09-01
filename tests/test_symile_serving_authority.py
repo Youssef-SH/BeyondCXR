@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from beyondcxr.release.checks import _container_serving_command
 from beyondcxr.serving.authority import (
     ENSEMBLE_POLICY,
     PRIMARY_FAMILY,
+    LoadedServingDistribution,
     ServingDistributionIntegrity,
     ValidatedServingAuthority,
     validate_serving_distribution,
@@ -217,6 +219,52 @@ def test_serving_authority_rejects_invalid_release_provenance(
         )
 
 
+def test_distribution_reauthentication_uses_semantic_manifests_and_exact_artifacts(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "serving-authority-test"
+    package_root = directory / "packages"
+    package_root.mkdir(parents=True)
+    manifest = {
+        "serving_authority_id": "serving-authority-test",
+        "members": [{"package_id": "final-package-test"}],
+    }
+    manifest_path = directory / "manifest.json"
+    manifest_path.write_bytes(serving_authority.canonical_json_bytes(manifest))
+    package_id = "final-package-" + "1" * 64
+    package_directory = package_root / package_id
+    package_directory.mkdir()
+    artifact = package_directory / "model.pt"
+    artifact.write_bytes(b"authenticated model bytes")
+    package_manifest = {
+        "final_package_id": package_id,
+        "artifacts": {"model.pt": hashlib.sha256(artifact.read_bytes()).hexdigest()},
+    }
+    package_manifest_path = package_directory / "manifest.json"
+    package_manifest_path.write_bytes(serving_authority.canonical_json_bytes(package_manifest))
+    package = ValidatedFinalPackage(
+        package_directory,
+        serving_authority.immutable_json(package_manifest),
+    )
+    distribution = ServingDistributionIntegrity(
+        directory,
+        serving_authority.immutable_json(manifest),
+        (package,),
+    )
+
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    package_manifest_path.write_text(
+        json.dumps(package_manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    serving_authority._reauthenticate_distribution_integrity(distribution)
+
+    artifact.write_bytes(b"changed model bytes")
+    with pytest.raises(ManifestBuildError, match="package integrity changed"):
+        serving_authority._reauthenticate_distribution_integrity(distribution)
+
+
 def test_operationally_distinct_deployments_share_scientific_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -227,6 +275,7 @@ def test_operationally_distinct_deployments_share_scientific_authority(
         directory=tmp_path / ("serving-authority-" + "a" * 64),
         packages=(SimpleNamespace(directory=package_directory),),
         manifest={
+            "serving_authority_id": "serving-authority-" + "a" * 64,
             "members": [{"package_id": "final-package-" + "1" * 64}],
             "primary_thresholds": {"youden_j": 0.4, "target_sensitivity": 0.3},
         },
@@ -250,19 +299,46 @@ def test_operationally_distinct_deployments_share_scientific_authority(
         archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest()
     )
 
-    def publish_staged_authority(**kwargs: object) -> SimpleNamespace:
+    def publish_staged_authority(**kwargs: object) -> LoadedServingDistribution:
         directory = Path(kwargs["authority_root"]) / authority.authority_id
         directory.mkdir(parents=True)
         (directory / "manifest.json").write_bytes(b"authority")
-        return SimpleNamespace(**{**authority.__dict__, "directory": directory})
+        integrity = ServingDistributionIntegrity(directory, authority.manifest, ())
+        loaded = object.__new__(LoadedServingDistribution)
+        object.__setattr__(
+            loaded,
+            "_LoadedServingDistribution__integrity",
+            integrity,
+        )
+        object.__setattr__(loaded, "_LoadedServingDistribution__members", ())
+        object.__setattr__(
+            loaded,
+            "_LoadedServingDistribution__guard",
+            serving_authority._LOADED_DISTRIBUTION_GUARD,
+        )
+        object.__setattr__(loaded, "_LoadedServingDistribution__process_id", os.getpid())
+        return loaded
 
     monkeypatch.setattr(
         release_serving,
-        "publish_serving_authority",
+        "publish_loaded_serving_distribution",
         publish_staged_authority,
     )
     binding = SimpleNamespace(canonical_bytes=lambda: b"binding\n")
     monkeypatch.setattr(release_serving, "derive_result_binding", lambda _: binding)
+    monkeypatch.setattr(
+        release_serving,
+        "validate_loaded_serving_authority",
+        lambda distribution, *args, **kwargs: (
+            SimpleNamespace(**{**authority.__dict__, "directory": distribution.directory}),
+            (),
+        ),
+    )
+    monkeypatch.setattr(
+        release_serving,
+        "load_serving_distribution",
+        lambda path: SimpleNamespace(directory=Path(path)),
+    )
     monkeypatch.setattr(
         release_serving,
         "validate_serving_authority",
@@ -287,11 +363,12 @@ def test_operationally_distinct_deployments_share_scientific_authority(
             release_archive=archive,
             serving_release=release_serving.clean_release_provenance(tmp_path / name),
         )
+        publication = candidate.publication
         publications.append(
             release_serving.publish_accepted_serving_state(
-                candidate_authority=candidate.authority.directory,
-                candidate_deployment_provenance=candidate.deployment_provenance,
-                candidate_result_binding=candidate.result_binding,
+                candidate_authority=publication.authority.directory,
+                candidate_deployment_provenance=publication.deployment_provenance,
+                candidate_result_binding=publication.result_binding,
                 release_archive=archive,
                 authority_root=tmp_path / "accepted",
                 restored_campaign=campaign,

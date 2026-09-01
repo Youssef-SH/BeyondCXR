@@ -7,10 +7,12 @@ import hashlib
 import io
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +24,7 @@ from beyondcxr.release.binding import ResultBinding, load_result_binding
 from beyondcxr.release.filesystem import directory_bytes
 from beyondcxr.release.inputs import derive_result_binding, export_manifest_sha256
 from beyondcxr.release.reproduction import reproduce_results_from_campaign
-from beyondcxr.release.resolution import resolve_release_archive, resolved_release
+from beyondcxr.release.resolution import resolved_release
 from beyondcxr.serving.api import create_app
 from beyondcxr.serving.authority import (
     LAB_KEYS,
@@ -30,13 +32,18 @@ from beyondcxr.serving.authority import (
     SERVING_AUTHORITY_PREFIX,
     SERVING_DEPLOYMENT_SCHEMA_VERSION,
     ValidatedServingAuthority,
-    publish_serving_authority,
+    load_serving_distribution,
+    publish_loaded_serving_distribution,
+    reauthenticate_serving_authority_integrity,
+    require_serving_authority,
+    validate_loaded_serving_authority,
     validate_serving_authority,
 )
 from beyondcxr.serving.predictor import SymileServingPredictor
 from beyondcxr.training.symile_campaign import (
     RestoredCampaignClosure,
 )
+from beyondcxr.training.symile_final_packages import ValidatedFinalNeuralRuntime
 from beyondcxr.utils.operational_logging import observed_operation
 from beyondcxr.utils.provenance import git_revision
 from beyondcxr.utils.publication import publish_bytes_no_replace, rename_directory_no_replace
@@ -51,6 +58,45 @@ class ValidatedServingPublication:
     release_archive: Path
 
 
+@dataclass(frozen=True)
+class _LoadedServingPublication:
+    publication: ValidatedServingPublication
+    runtime_members: tuple[ValidatedFinalNeuralRuntime, ...]
+
+
+_SERVING_CONTEXT_GUARD = object()
+
+
+class ResolvedServingContext:
+    """Opaque process-local serving runtime owned by one active restoration."""
+
+    __slots__ = ("__active", "__guard", "__predictor", "__process_id", "__publication")
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("ResolvedServingContext is created only by serving resolution")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("ResolvedServingContext is immutable")
+
+    def _require_active(self) -> None:
+        if (
+            self.__guard is not _SERVING_CONTEXT_GUARD
+            or not self.__active
+            or self.__process_id != os.getpid()
+        ):
+            raise ManifestBuildError("Resolved serving context lifetime has ended")
+
+    @property
+    def predictor(self) -> SymileServingPredictor:
+        self._require_active()
+        return self.__predictor
+
+    @property
+    def publication(self) -> ValidatedServingPublication:
+        self._require_active()
+        return self.__publication
+
+
 @observed_operation("resolve_accepted_serving_state")
 def resolve_accepted_serving_state(
     *,
@@ -58,39 +104,107 @@ def resolve_accepted_serving_state(
     authority_root: str | Path,
 ) -> ValidatedServingPublication:
     """Resolve the sole recursively validated installed serving publication."""
-    archive = resolve_release_archive(artifact_root)
-    root = Path(authority_root)
-    if root.is_symlink() or not root.is_dir():
-        raise ManifestBuildError("No accepted serving authority exists")
+    with resolved_release(artifact_root) as (archive, campaign):
+        publications = _accepted_serving_publications(
+            authority_root=Path(authority_root),
+            archive=archive,
+            campaign=campaign,
+        )
+        return _sole_serving_publication([publication.publication for publication in publications])
 
-    publications: list[ValidatedServingPublication] = []
-    for authority in root.iterdir():
+
+@contextmanager
+def resolve_accepted_serving_context(
+    *, artifact_root: str | Path, authority_root: str | Path
+) -> Iterator[ResolvedServingContext]:
+    """Own one restoration, authority relationship, and three-model serving runtime."""
+    with resolved_release(artifact_root) as (archive, campaign):
+        loaded_publication = _sole_serving_publication(
+            _accepted_serving_publications(
+                authority_root=Path(authority_root),
+                archive=archive,
+                campaign=campaign,
+            )
+        )
+        publication = loaded_publication.publication
+        predictor = SymileServingPredictor.from_validated_runtime(
+            publication.authority,
+            loaded_publication.runtime_members,
+            deployment_provenance=publication.deployment_provenance,
+            result_binding=publication.result_binding,
+            release_archive=publication.release_archive,
+            device="cpu",
+        )
+        context = object.__new__(ResolvedServingContext)
+        object.__setattr__(context, "_ResolvedServingContext__guard", _SERVING_CONTEXT_GUARD)
+        object.__setattr__(context, "_ResolvedServingContext__process_id", os.getpid())
+        object.__setattr__(context, "_ResolvedServingContext__active", True)
+        object.__setattr__(context, "_ResolvedServingContext__publication", publication)
+        object.__setattr__(context, "_ResolvedServingContext__predictor", predictor)
+        try:
+            yield context
+        finally:
+            predictor.close()
+            object.__setattr__(context, "_ResolvedServingContext__active", False)
+
+
+def _accepted_serving_publications(
+    *,
+    authority_root: Path,
+    archive: Path,
+    campaign: RestoredCampaignClosure,
+) -> list[_LoadedServingPublication]:
+    if authority_root.is_symlink() or not authority_root.is_dir():
+        raise ManifestBuildError("No accepted serving authority exists")
+    publications: list[_LoadedServingPublication] = []
+    for authority_path in authority_root.iterdir():
         if (
-            not authority.name.startswith(SERVING_AUTHORITY_PREFIX)
-            or authority.is_symlink()
-            or not authority.is_dir()
+            not authority_path.name.startswith(SERVING_AUTHORITY_PREFIX)
+            or authority_path.is_symlink()
+            or not authority_path.is_dir()
         ):
             continue
-        binding = root / "release-evidence" / authority.name / "binding.json"
-        provenance_root = root / "deployment-provenance" / authority.name
+        binding = authority_root / "release-evidence" / authority_path.name / "binding.json"
+        provenance_root = authority_root / "deployment-provenance" / authority_path.name
         if provenance_root.is_symlink() or not provenance_root.is_dir():
             continue
-        for provenance in provenance_root.iterdir():
-            if provenance.is_symlink() or not provenance.is_file() or provenance.suffix != ".json":
-                continue
+        provenances = tuple(
+            provenance
+            for provenance in provenance_root.iterdir()
+            if not provenance.is_symlink() and provenance.is_file() and provenance.suffix == ".json"
+        )
+        if not provenances:
+            continue
+        try:
+            distribution = load_serving_distribution(authority_path)
+        except (ManifestBuildError, OSError, ValueError):
+            continue
+        for provenance in provenances:
             try:
-                validated = validate_serving_authority(
-                    authority,
+                authority, members = validate_loaded_serving_authority(
+                    distribution,
                     deployment_provenance=provenance,
                     result_binding=binding,
                     release_archive=archive,
+                    restored_campaign=campaign,
                 )
             except (ManifestBuildError, OSError, ValueError):
                 continue
             publications.append(
-                ValidatedServingPublication(validated, provenance, binding, archive)
+                _LoadedServingPublication(
+                    ValidatedServingPublication(
+                        authority,
+                        provenance,
+                        binding,
+                        archive,
+                    ),
+                    members,
+                )
             )
+    return publications
 
+
+def _sole_serving_publication[T](publications: list[T]) -> T:
     if not publications:
         raise ManifestBuildError("No valid accepted serving authority exists")
     if len(publications) != 1:
@@ -105,7 +219,7 @@ def _prepare_validated_campaign_serving_authority(
     release_archive: Path,
     serving_release: dict[str, str],
     result_binding: ResultBinding | None = None,
-) -> ValidatedServingPublication:
+) -> _LoadedServingPublication:
     """Prepare a complete serving publication in a caller-owned staging root."""
     restored = campaign
     derived_binding = derive_result_binding(restored)
@@ -115,7 +229,7 @@ def _prepare_validated_campaign_serving_authority(
     archive_sha256 = _file_sha256(release_archive)
     if archive_sha256 != restored.restoration_context.archive_sha256:
         raise ManifestBuildError("Serving release archive differs from restored campaign")
-    distribution = publish_serving_authority(
+    distribution = publish_loaded_serving_distribution(
         authority_root=authority_root,
         capability=restored.freeze,
         global_result=restored.global_result,
@@ -168,14 +282,17 @@ def _prepare_validated_campaign_serving_authority(
         and binding_path.read_bytes() != binding_bytes
     ):
         raise ManifestBuildError("Serving result binding conflicts with existing state")
-    authority = validate_serving_authority(
-        distribution.directory,
+    authority, members = validate_loaded_serving_authority(
+        distribution,
         deployment_provenance=path,
         result_binding=binding_path,
         release_archive=release_archive,
         restored_campaign=restored,
     )
-    return ValidatedServingPublication(authority, path, binding_path, release_archive)
+    return _LoadedServingPublication(
+        ValidatedServingPublication(authority, path, binding_path, release_archive),
+        members,
+    )
 
 
 def publish_accepted_serving_state(
@@ -186,6 +303,7 @@ def publish_accepted_serving_state(
     release_archive: str | Path,
     authority_root: str | Path,
     restored_campaign: RestoredCampaignClosure | None = None,
+    validated_candidate: ValidatedServingAuthority | None = None,
 ) -> ValidatedServingPublication:
     """Validate and failure-safely publish one complete accepted serving state."""
     candidate_directory = Path(candidate_authority)
@@ -193,13 +311,19 @@ def publish_accepted_serving_state(
     candidate_binding = Path(candidate_result_binding)
     archive = Path(release_archive)
     destination_root = Path(authority_root)
-    candidate = validate_serving_authority(
-        candidate_directory,
-        deployment_provenance=candidate_provenance,
-        result_binding=candidate_binding,
-        release_archive=archive,
-        restored_campaign=restored_campaign,
-    )
+    if validated_candidate is None:
+        candidate = validate_serving_authority(
+            candidate_directory,
+            deployment_provenance=candidate_provenance,
+            result_binding=candidate_binding,
+            release_archive=archive,
+            restored_campaign=restored_campaign,
+        )
+    else:
+        candidate = require_serving_authority(validated_candidate)
+        if candidate.directory.resolve() != candidate_directory.resolve():
+            raise ManifestBuildError("Validated serving candidate belongs to a different path")
+        reauthenticate_serving_authority_integrity(candidate)
     final_directory = destination_root / candidate_directory.name
     final_provenance = (
         destination_root
@@ -354,12 +478,16 @@ def _validated_existing_deployment(
     candidates = sorted(provenance_root.iterdir())
     if not candidates:
         return None
+    try:
+        distribution = load_serving_distribution(authority)
+    except (ManifestBuildError, OSError, ValueError):
+        return None
     for provenance in candidates:
         if provenance.is_symlink() or not provenance.is_file():
             raise ManifestBuildError("Existing serving publication differs from candidate")
         try:
-            validate_serving_authority(
-                authority,
+            validate_loaded_serving_authority(
+                distribution,
                 deployment_provenance=provenance,
                 result_binding=binding,
                 release_archive=archive,
@@ -437,34 +565,38 @@ def publish_and_smoke_test_serving_authority(
                     readme_path=repository / "README.md",
                     model_card_path=repository / "docs/model_card.md",
                 )
-                publication = _prepare_validated_campaign_serving_authority(
+                loaded_publication = _prepare_validated_campaign_serving_authority(
                     authority_root=candidate_root,
                     campaign=campaign,
                     release_archive=archive,
                     serving_release=release,
                     result_binding=release_binding,
                 )
+                publication = loaded_publication.publication
                 authority = publication.authority
-                predictor = SymileServingPredictor.load(
-                    authority.directory,
+                predictor = SymileServingPredictor.from_validated_runtime(
+                    authority,
+                    loaded_publication.runtime_members,
                     deployment_provenance=publication.deployment_provenance,
                     result_binding=publication.result_binding,
                     release_archive=archive,
                     device="cpu",
-                    restored_campaign=campaign,
                 )
-                if predictor.authority.authority_id != authority.authority_id:
-                    raise ManifestBuildError("Serving predictor loaded a different authority")
-                asyncio.run(
-                    _exercise_api(
-                        authority.directory,
-                        deployment_provenance=publication.deployment_provenance,
-                        result_binding=publication.result_binding,
-                        release_archive=archive,
-                        expected_model_info=predictor.model_info(),
-                        restored_campaign=campaign,
+                try:
+                    if predictor.authority.authority_id != authority.authority_id:
+                        raise ManifestBuildError("Serving predictor loaded a different authority")
+                    asyncio.run(
+                        _exercise_api(
+                            authority.directory,
+                            deployment_provenance=publication.deployment_provenance,
+                            result_binding=publication.result_binding,
+                            release_archive=archive,
+                            expected_model_info=predictor.model_info(),
+                            predictor=predictor,
+                        )
                     )
-                )
+                finally:
+                    predictor.close()
                 accepted = publish_accepted_serving_state(
                     candidate_authority=authority.directory,
                     candidate_deployment_provenance=publication.deployment_provenance,
@@ -472,6 +604,7 @@ def publish_and_smoke_test_serving_authority(
                     release_archive=archive,
                     authority_root=destination_root,
                     restored_campaign=campaign,
+                    validated_candidate=authority,
                 )
                 return accepted.authority.directory
 
@@ -501,7 +634,7 @@ async def _exercise_api(
     result_binding: Path,
     release_archive: Path,
     expected_model_info: dict[str, object],
-    restored_campaign: RestoredCampaignClosure,
+    predictor: SymileServingPredictor,
 ) -> None:
     import httpx
 
@@ -512,7 +645,7 @@ async def _exercise_api(
         result_binding=result_binding,
         release_archive=release_archive,
         device="cpu",
-        restored_campaign=restored_campaign,
+        predictor=predictor,
     )
     transport = httpx.ASGITransport(app=application)
     async with application.router.lifespan_context(application):

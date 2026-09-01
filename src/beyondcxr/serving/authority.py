@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -27,11 +28,13 @@ from beyondcxr.training.symile_campaign_control import (
 )
 from beyondcxr.training.symile_families import FINAL_NEURAL_MEMBER_SEEDS
 from beyondcxr.training.symile_final_packages import (
+    ValidatedFinalNeuralRuntime,
     ValidatedFinalPackage,
+    load_validated_final_neural_runtime,
     validate_final_package,
 )
 from beyondcxr.training.symile_test_data import FrozenSymileTestData
-from beyondcxr.utils.immutable_json import immutable_json
+from beyondcxr.utils.immutable_json import immutable_json, json_projection
 from beyondcxr.utils.private_predictions import ValidatedPredictionEvidence
 from beyondcxr.utils.publication import install_immutable_directory, staging_directory
 from beyondcxr.utils.semantic_identity import (
@@ -57,6 +60,7 @@ RESEARCH_WARNING = (
 )
 LAB_KEYS = tuple(f"lab_{item_id}" for item_id in LAB_ITEM_IDS)
 _GUARD = object()
+_LOADED_DISTRIBUTION_GUARD = object()
 
 
 @dataclass(frozen=True)
@@ -72,10 +76,48 @@ class ServingDistributionIntegrity:
         return str(self.manifest["serving_authority_id"])
 
 
+class LoadedServingDistribution:
+    """Opaque distribution retaining only its three validated fitted runtimes."""
+
+    __slots__ = ("__integrity", "__members", "__guard", "__process_id")
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("LoadedServingDistribution is created only by validation")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("LoadedServingDistribution is immutable")
+
+    @property
+    def integrity(self) -> ServingDistributionIntegrity:
+        _require_loaded_distribution(self)
+        return self.__integrity
+
+    @property
+    def members(self) -> tuple[ValidatedFinalNeuralRuntime, ...]:
+        _require_loaded_distribution(self)
+        return self.__members
+
+    @property
+    def authority_id(self) -> str:
+        return self.integrity.authority_id
+
+    @property
+    def directory(self) -> Path:
+        return self.integrity.directory
+
+    @property
+    def manifest(self) -> Mapping[str, Any]:
+        return self.integrity.manifest
+
+    @property
+    def packages(self) -> tuple[ValidatedFinalPackage, ...]:
+        return self.integrity.packages
+
+
 class ValidatedServingAuthority:
     """Opaque immutable authority minted only by the authenticated release join."""
 
-    __slots__ = ("__directory", "__manifest", "__packages", "__guard")
+    __slots__ = ("__directory", "__manifest", "__packages", "__guard", "__process_id")
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise TypeError("ValidatedServingAuthority is created only by release validation")
@@ -117,6 +159,47 @@ def publish_serving_authority(
     final_packages: Sequence[ValidatedFinalPackage],
 ) -> ServingDistributionIntegrity:
     """Publish and validate the primary three-member serving distribution."""
+    destination = _publish_serving_authority_directory(
+        authority_root=authority_root,
+        capability=capability,
+        global_result=global_result,
+        global_predictions=global_predictions,
+        global_test_data=global_test_data,
+        final_packages=final_packages,
+    )
+    return validate_serving_distribution(destination)
+
+
+def publish_loaded_serving_distribution(
+    *,
+    authority_root: str | Path,
+    capability: ValidatedPretestFreeze,
+    global_result: CertifiedGlobalResult,
+    global_predictions: Sequence[ValidatedPredictionEvidence],
+    global_test_data: FrozenSymileTestData,
+    final_packages: Sequence[ValidatedFinalPackage],
+) -> LoadedServingDistribution:
+    """Publish a serving distribution and retain its validated fitted runtimes."""
+    destination = _publish_serving_authority_directory(
+        authority_root=authority_root,
+        capability=capability,
+        global_result=global_result,
+        global_predictions=global_predictions,
+        global_test_data=global_test_data,
+        final_packages=final_packages,
+    )
+    return load_serving_distribution(destination)
+
+
+def _publish_serving_authority_directory(
+    *,
+    authority_root: str | Path,
+    capability: ValidatedPretestFreeze,
+    global_result: CertifiedGlobalResult,
+    global_predictions: Sequence[ValidatedPredictionEvidence],
+    global_test_data: FrozenSymileTestData,
+    final_packages: Sequence[ValidatedFinalPackage],
+) -> Path:
     frozen = validated_pretest_freeze_manifest(capability)
     global_reference = _validated_global_reference(
         global_result,
@@ -154,7 +237,7 @@ def publish_serving_authority(
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-    return validate_serving_distribution(destination)
+    return destination
 
 
 def validate_serving_distribution(
@@ -163,6 +246,65 @@ def validate_serving_distribution(
     enforce_directory_name: bool = True,
 ) -> ServingDistributionIntegrity:
     """Observe one self-contained manifest and recursively validate its package copies."""
+    distribution, _members = _validate_serving_distribution(
+        directory,
+        enforce_directory_name=enforce_directory_name,
+        retain_models=False,
+    )
+    return distribution
+
+
+def load_serving_distribution(
+    directory: str | Path,
+    *,
+    enforce_directory_name: bool = True,
+) -> LoadedServingDistribution:
+    """Validate a distribution and retain the exact three reconstructed serving models."""
+    distribution, members = _validate_serving_distribution(
+        directory,
+        enforce_directory_name=enforce_directory_name,
+        retain_models=True,
+    )
+    if members is None:
+        raise ManifestBuildError("Serving distribution models were not retained")
+    loaded = object.__new__(LoadedServingDistribution)
+    object.__setattr__(
+        loaded,
+        "_LoadedServingDistribution__integrity",
+        distribution,
+    )
+    object.__setattr__(loaded, "_LoadedServingDistribution__members", members)
+    object.__setattr__(
+        loaded,
+        "_LoadedServingDistribution__guard",
+        _LOADED_DISTRIBUTION_GUARD,
+    )
+    object.__setattr__(loaded, "_LoadedServingDistribution__process_id", os.getpid())
+    return loaded
+
+
+def _require_loaded_distribution(
+    distribution: LoadedServingDistribution,
+) -> LoadedServingDistribution:
+    if (
+        not isinstance(distribution, LoadedServingDistribution)
+        or getattr(distribution, "_LoadedServingDistribution__guard", None)
+        is not _LOADED_DISTRIBUTION_GUARD
+        or getattr(distribution, "_LoadedServingDistribution__process_id", None) != os.getpid()
+    ):
+        raise ManifestBuildError("Loaded serving distribution capability is invalid")
+    return distribution
+
+
+def _validate_serving_distribution(
+    directory: str | Path,
+    *,
+    enforce_directory_name: bool,
+    retain_models: bool,
+) -> tuple[
+    ServingDistributionIntegrity,
+    tuple[ValidatedFinalNeuralRuntime, ...] | None,
+]:
     root = Path(directory)
     if (
         root.is_symlink()
@@ -228,15 +370,30 @@ def validate_serving_distribution(
         or any(item.is_symlink() or not item.is_dir() for item in package_root.iterdir())
     ):
         raise ManifestBuildError("Serving package distribution membership is invalid")
-    packages = tuple(
-        validate_final_package(
-            package_root / member["package_id"],
-            expected_package_id=member["package_id"],
+    loaded = (
+        tuple(
+            load_validated_final_neural_runtime(
+                package_root / member["package_id"],
+                expected_package_id=member["package_id"],
+            )
+            for member in document["members"]
         )
-        for member in document["members"]
+        if retain_models
+        else None
+    )
+    packages = (
+        tuple(member.package for member in loaded)
+        if loaded is not None
+        else tuple(
+            validate_final_package(
+                package_root / member["package_id"],
+                expected_package_id=member["package_id"],
+            )
+            for member in document["members"]
+        )
     )
     _validate_package_members(packages, document)
-    return ServingDistributionIntegrity(root, document, packages)
+    return ServingDistributionIntegrity(root, document, packages), loaded
 
 
 def validate_serving_authority(
@@ -253,6 +410,67 @@ def validate_serving_authority(
         directory,
         enforce_directory_name=enforce_directory_name,
     )
+    return _validate_serving_authority_relationship(
+        distribution,
+        deployment_provenance=deployment_provenance,
+        result_binding=result_binding,
+        release_archive=release_archive,
+        restored_campaign=restored_campaign,
+    )
+
+
+def load_serving_authority(
+    directory: str | Path,
+    *,
+    deployment_provenance: str | Path,
+    result_binding: str | Path,
+    release_archive: str | Path,
+    enforce_directory_name: bool = True,
+    restored_campaign: RestoredCampaignClosure | None = None,
+) -> tuple[ValidatedServingAuthority, tuple[ValidatedFinalNeuralRuntime, ...]]:
+    """Authenticate and retain the three models from the exact validated distribution."""
+    loaded = load_serving_distribution(
+        directory,
+        enforce_directory_name=enforce_directory_name,
+    )
+    return validate_loaded_serving_authority(
+        loaded,
+        deployment_provenance=deployment_provenance,
+        result_binding=result_binding,
+        release_archive=release_archive,
+        restored_campaign=restored_campaign,
+    )
+
+
+def validate_loaded_serving_authority(
+    distribution: LoadedServingDistribution,
+    *,
+    deployment_provenance: str | Path,
+    result_binding: str | Path,
+    release_archive: str | Path,
+    restored_campaign: RestoredCampaignClosure | None,
+) -> tuple[ValidatedServingAuthority, tuple[ValidatedFinalNeuralRuntime, ...]]:
+    """Join an already authenticated distribution to its release relationship."""
+    distribution = _require_loaded_distribution(distribution)
+    _reauthenticate_distribution_integrity(distribution.integrity)
+    authority = _validate_serving_authority_relationship(
+        distribution.integrity,
+        deployment_provenance=deployment_provenance,
+        result_binding=result_binding,
+        release_archive=release_archive,
+        restored_campaign=restored_campaign,
+    )
+    return authority, distribution.members
+
+
+def _validate_serving_authority_relationship(
+    distribution: ServingDistributionIntegrity,
+    *,
+    deployment_provenance: str | Path,
+    result_binding: str | Path,
+    release_archive: str | Path,
+    restored_campaign: RestoredCampaignClosure | None,
+) -> ValidatedServingAuthority:
     binding = load_result_binding(result_binding)
     deployment = _validate_deployment_provenance(
         Path(deployment_provenance), distribution.authority_id
@@ -310,16 +528,84 @@ def validate_serving_authority(
     )
     object.__setattr__(authority, "_ValidatedServingAuthority__packages", packages)
     object.__setattr__(authority, "_ValidatedServingAuthority__guard", _GUARD)
+    object.__setattr__(authority, "_ValidatedServingAuthority__process_id", os.getpid())
     return authority
 
 
 def require_serving_authority(value: ValidatedServingAuthority) -> ValidatedServingAuthority:
     if (
         not isinstance(value, ValidatedServingAuthority)
-        or value._ValidatedServingAuthority__guard is not _GUARD
+        or getattr(value, "_ValidatedServingAuthority__guard", None) is not _GUARD
+        or getattr(value, "_ValidatedServingAuthority__process_id", None) != os.getpid()
     ):
         raise ManifestBuildError("A genuine validated serving authority is required")
     return value
+
+
+def reauthenticate_serving_authority_integrity(
+    value: ValidatedServingAuthority,
+) -> ValidatedServingAuthority:
+    """Reauthenticate distribution integrity without reconstructing fitted models.
+
+    Manifest identity is semantic JSON identity. Package artifact files retain
+    their exact authenticated hashes.
+    """
+    authority = require_serving_authority(value)
+    _reauthenticate_distribution_integrity(
+        ServingDistributionIntegrity(
+            authority.directory,
+            authority.manifest,
+            authority.packages,
+        )
+    )
+    return authority
+
+
+def _reauthenticate_distribution_integrity(
+    distribution: ServingDistributionIntegrity,
+) -> None:
+    root = distribution.directory
+    manifest_path = root / "manifest.json"
+    package_root = root / "packages"
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+        members = {item.name for item in root.iterdir()}
+        package_members = {item.name for item in package_root.iterdir()}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManifestBuildError("Serving authority bytes are unreadable") from exc
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or members != {"manifest.json", "packages"}
+        or manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest != json_projection(distribution.manifest)
+        or package_root.is_symlink()
+        or not package_root.is_dir()
+        or package_members != {package.package_id for package in distribution.packages}
+        or any(item.is_symlink() or not item.is_dir() for item in package_root.iterdir())
+    ):
+        raise ManifestBuildError("Serving authority integrity changed after validation")
+    for package in distribution.packages:
+        directory = package_root / package.package_id
+        try:
+            observed_manifest = json.loads((directory / "manifest.json").read_bytes())
+            observed_files = {item.name for item in directory.iterdir()}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ManifestBuildError("Serving package bytes are unreadable") from exc
+        expected_files = {"manifest.json", *package.manifest["artifacts"]}
+        observed_artifacts = {
+            name: _regular_file_sha256(directory / name) for name in package.manifest["artifacts"]
+        }
+        if (
+            directory.is_symlink()
+            or not directory.is_dir()
+            or any(item.is_symlink() or not item.is_file() for item in directory.iterdir())
+            or observed_manifest != json_projection(package.manifest)
+            or observed_files != expected_files
+            or package.manifest["artifacts"] != observed_artifacts
+        ):
+            raise ManifestBuildError("Serving package integrity changed after validation")
 
 
 def _validate_deployment_provenance(path: Path, authority_id: str) -> Mapping[str, Any]:

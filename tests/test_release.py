@@ -1504,7 +1504,6 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
     )
 
     monkeypatch.setattr(serving, "clean_release_provenance", lambda _: {})
-    monkeypatch.setattr(serving, "resolve_release_archive", lambda path: Path(path))
     monkeypatch.setattr(serving, "load_result_binding", lambda _: object())
     monkeypatch.setattr(serving, "export_manifest_sha256", lambda _: "a" * 64)
     monkeypatch.setattr(serving, "reproduce_results_from_campaign", lambda **_kwargs: None)
@@ -1526,19 +1525,24 @@ def test_failed_serving_smoke_leaves_authority_root_unchanged(
         binding = authority_root / "release-evidence/serving-authority-test/binding.json"
         binding.parent.mkdir(parents=True)
         binding.write_bytes(b"binding")
-        return SimpleNamespace(
+        publication = SimpleNamespace(
             authority=SimpleNamespace(directory=candidate, authority_id=candidate.name),
             deployment_provenance=provenance,
             result_binding=binding,
+        )
+        return SimpleNamespace(
+            publication=publication,
+            runtime_members=(object(),),
         )
 
     monkeypatch.setattr(serving, "_prepare_validated_campaign_serving_authority", publish_candidate)
     monkeypatch.setattr(
         serving.SymileServingPredictor,
-        "load",
+        "from_validated_runtime",
         lambda *_args, **_kwargs: SimpleNamespace(
             authority=SimpleNamespace(authority_id="serving-authority-test"),
             model_info=lambda: {},
+            close=lambda: None,
         ),
     )
 
@@ -1583,7 +1587,6 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
     existing_binding.parent.mkdir(parents=True)
     existing_binding.write_bytes(b"different" if divergent == "binding" else b"binding")
     monkeypatch.setattr(serving, "clean_release_provenance", lambda _: {})
-    monkeypatch.setattr(serving, "resolve_release_archive", lambda path: Path(path))
     monkeypatch.setattr(serving, "load_result_binding", lambda _: object())
     monkeypatch.setattr(serving, "export_manifest_sha256", lambda _: "a" * 64)
     monkeypatch.setattr(serving, "reproduce_results_from_campaign", lambda **_kwargs: None)
@@ -1620,10 +1623,14 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
         binding = authority_root / "release-evidence/serving-authority-test/binding.json"
         binding.parent.mkdir(parents=True)
         binding.write_bytes(b"binding")
-        return SimpleNamespace(
+        publication = SimpleNamespace(
             authority=SimpleNamespace(directory=candidate, authority_id=candidate.name),
             deployment_provenance=provenance,
             result_binding=binding,
+        )
+        return SimpleNamespace(
+            publication=publication,
+            runtime_members=(object(),),
         )
 
     monkeypatch.setattr(serving, "_prepare_validated_campaign_serving_authority", publish_candidate)
@@ -1636,12 +1643,15 @@ def test_existing_serving_authority_is_idempotent_only_when_identical(
     )
     monkeypatch.setattr(
         serving.SymileServingPredictor,
-        "load",
+        "from_validated_runtime",
         lambda *_args, **_kwargs: SimpleNamespace(
             authority=SimpleNamespace(authority_id="serving-authority-test"),
             model_info=lambda: {},
+            close=lambda: None,
         ),
     )
+    monkeypatch.setattr(serving, "require_serving_authority", lambda value: value)
+    monkeypatch.setattr(serving, "reauthenticate_serving_authority_integrity", lambda value: value)
 
     async def pass_smoke(*_: object, **__: object) -> None:
         return None
@@ -1694,11 +1704,21 @@ def test_accepted_serving_resolution_requires_one_valid_publication(
     archive = tmp_path / "release.zip"
     archive.write_bytes(b"archive")
     root = tmp_path / "authorities"
-    monkeypatch.setattr(serving, "resolve_release_archive", lambda _root: archive)
+
+    @contextmanager
+    def resolved_release(_root):
+        yield archive, object()
+
+    monkeypatch.setattr(serving, "resolved_release", resolved_release)
     monkeypatch.setattr(
         serving,
-        "validate_serving_authority",
-        lambda path, **_kwargs: SimpleNamespace(directory=Path(path)),
+        "load_serving_distribution",
+        lambda path: SimpleNamespace(directory=Path(path)),
+    )
+    monkeypatch.setattr(
+        serving,
+        "validate_loaded_serving_authority",
+        lambda distribution, **_kwargs: (SimpleNamespace(directory=distribution.directory), ()),
     )
 
     with pytest.raises(ManifestBuildError, match="No accepted"):
@@ -1727,6 +1747,54 @@ def test_accepted_serving_resolution_requires_one_valid_publication(
         serving.resolve_accepted_serving_state(
             artifact_root=tmp_path / "outbox", authority_root=root
         )
+
+
+def test_resolved_serving_context_revokes_predictor_and_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import beyondcxr.release.serving as serving
+
+    archive = tmp_path / "release.zip"
+    publication = serving.ValidatedServingPublication(
+        authority=object(),
+        deployment_provenance=tmp_path / "deployment.json",
+        result_binding=tmp_path / "binding.json",
+        release_archive=archive,
+    )
+    loaded_publication = serving._LoadedServingPublication(publication, (object(),))
+
+    @contextmanager
+    def resolved_release(_root):
+        yield archive, object()
+
+    class Predictor:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    predictor = Predictor()
+    monkeypatch.setattr(serving, "resolved_release", resolved_release)
+    monkeypatch.setattr(
+        serving,
+        "_accepted_serving_publications",
+        lambda **_kwargs: [loaded_publication],
+    )
+    monkeypatch.setattr(
+        serving.SymileServingPredictor,
+        "from_validated_runtime",
+        lambda *_args, **_kwargs: predictor,
+    )
+
+    with serving.resolve_accepted_serving_context(
+        artifact_root=tmp_path / "outbox", authority_root=tmp_path / "authorities"
+    ) as context:
+        retained = context
+        assert context.predictor is predictor
+        assert context.publication is publication
+    assert predictor.closed
+    with pytest.raises(ManifestBuildError, match="lifetime has ended"):
+        _ = retained.predictor
 
 
 @pytest.mark.parametrize("failure_call", (1, 2), ids=("provenance", "binding"))

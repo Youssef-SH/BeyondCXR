@@ -398,6 +398,18 @@ def bounded_restored_symile_consumers(tmp_path_factory: pytest.TempPathFactory):
             ),
         )
         patch.setattr(
+            serving_authority,
+            "load_validated_final_neural_runtime",
+            lambda path, *, expected_package_id=None, **_kwargs: SimpleNamespace(
+                package=replace(by_package[str(expected_package_id)], directory=Path(path))
+            ),
+        )
+        patch.setattr(
+            serving_authority,
+            "_reauthenticate_distribution_integrity",
+            lambda _distribution: None,
+        )
+        patch.setattr(
             campaign_control,
             "validate_final_package",
             lambda _path, *, expected_package_id=None, **_kwargs: by_package[
@@ -418,7 +430,7 @@ def bounded_restored_symile_consumers(tmp_path_factory: pytest.TempPathFactory):
         binding_path = authority_root / "binding.json"
         binding_path.parent.mkdir(parents=True, exist_ok=True)
         binding_path.write_bytes(binding.canonical_bytes())
-        publication = release_serving._prepare_validated_campaign_serving_authority(
+        loaded_publication = release_serving._prepare_validated_campaign_serving_authority(
             authority_root=authority_root,
             campaign=campaign,
             release_archive=backup,
@@ -427,6 +439,7 @@ def bounded_restored_symile_consumers(tmp_path_factory: pytest.TempPathFactory):
                 "dependency_lock_sha256": "3" * 64,
             },
         )
+        publication = loaded_publication.publication
         assert copy.copy(campaign) is campaign
         assert copy.deepcopy(campaign) is campaign
         with pytest.raises(TypeError):
@@ -572,9 +585,21 @@ def test_restored_bounded_authority_reaches_serving_publication(
         lambda path, **_kwargs: by_id[Path(path).name],
     )
     monkeypatch.setattr(
+        serving_authority,
+        "load_validated_final_neural_runtime",
+        lambda path, **_kwargs: SimpleNamespace(package=by_id[Path(path).name]),
+    )
+    monkeypatch.setattr(
+        serving_authority,
+        "_reauthenticate_distribution_integrity",
+        lambda _distribution: None,
+    )
+    monkeypatch.setattr(
         SymileServingPredictor,
-        "__init__",
-        lambda self, authority, **_kwargs: setattr(self, "authority", authority),
+        "from_validated_runtime",
+        classmethod(
+            lambda _cls, authority, _members, **_kwargs: SimpleNamespace(authority=authority)
+        ),
     )
     monkeypatch.setattr(
         symile_campaign,
@@ -605,6 +630,77 @@ def test_restored_campaign_authority_is_immutable_and_nontransferable(
         replace(authority, directory=Path("/foreign"))
     with pytest.raises(TypeError):
         authority.manifest["serving_authority_id"] = "serving-authority-" + "0" * 64
+
+
+def test_validated_serving_candidate_cannot_be_published_with_different_release_evidence(
+    bounded_restored_symile_consumers,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumers, _ = bounded_restored_symile_consumers
+    source = consumers.publication
+    candidate_directory = tmp_path / "candidate" / source.authority.authority_id
+    shutil.copytree(source.authority.directory, candidate_directory)
+    candidate_provenance = tmp_path / "candidate-deployment.json"
+    candidate_provenance.write_bytes(source.deployment_provenance.read_bytes())
+    candidate_binding = source.result_binding
+    restored = None
+
+    def exercise(restored_root: Path) -> None:
+        nonlocal restored
+        restored = consumers.restore_campaign(restored_root)
+        campaign = restored.campaign
+        by_id = {package.package_id: package for package in source.authority.packages}
+        monkeypatch.setattr(
+            serving_authority,
+            "validate_final_package",
+            lambda path, **_kwargs: replace(by_id[Path(path).name], directory=Path(path)),
+        )
+        monkeypatch.setattr(serving_authority, "_validate_package_members", lambda *_args: None)
+        validated_candidate = serving_authority.validate_serving_authority(
+            candidate_directory,
+            deployment_provenance=candidate_provenance,
+            result_binding=candidate_binding,
+            release_archive=source.release_archive,
+            restored_campaign=campaign,
+        )
+
+        deployment = json.loads(candidate_provenance.read_bytes())
+        deployment["global_result_id"] = "global-result-" + "8" * 64
+        deployment.pop("deployment_id")
+        deployment["deployment_id"] = serving_authority.semantic_sha256(
+            "serving-deployment-provenance",
+            serving_authority.SERVING_DEPLOYMENT_SCHEMA_VERSION,
+            deployment,
+        )
+        candidate_provenance.write_bytes(canonical_json_bytes(deployment))
+
+        # Physical reauthentication has its own focused coverage. Keep the real
+        # installed authority-to-release relationship validation below.
+        monkeypatch.setattr(
+            release_serving,
+            "reauthenticate_serving_authority_integrity",
+            lambda value: value,
+        )
+        destination = tmp_path / "accepted"
+        with pytest.raises(ManifestBuildError, match="release"):
+            release_serving.publish_accepted_serving_state(
+                candidate_authority=candidate_directory,
+                candidate_deployment_provenance=candidate_provenance,
+                candidate_result_binding=candidate_binding,
+                release_archive=source.release_archive,
+                authority_root=destination,
+                restored_campaign=campaign,
+                validated_candidate=validated_candidate,
+            )
+        assert not (destination / source.authority.authority_id).exists()
+        assert not any(path.is_file() for path in destination.rglob("*"))
+
+    try:
+        restore_and_validate_export(source.release_archive, restoration_validator=exercise)
+    finally:
+        if restored is not None:
+            restored.restoration_patches.undo()
 
 
 @pytest.mark.parametrize(

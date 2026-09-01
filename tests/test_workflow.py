@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import create_autospec
@@ -290,32 +291,43 @@ def test_serve_uses_validated_state_and_fixed_local_defaults(
         release_archive=tmp_path / "release.zip",
     )
     observed_resolution: list[dict[str, Path]] = []
+    predictor = object()
+
+    @contextmanager
+    def resolved_context(**kwargs):
+        observed_resolution.append(kwargs)
+        yield SimpleNamespace(publication=state, predictor=predictor)
+
     monkeypatch.setattr(
-        "beyondcxr.release.serving.resolve_accepted_serving_state",
-        lambda **kwargs: observed_resolution.append(kwargs) or state,
+        "beyondcxr.release.serving.resolve_accepted_serving_context",
+        resolved_context,
     )
-    observed: list[list[str]] = []
+    observed: list[tuple[list[str], object]] = []
     monkeypatch.setattr(
-        "beyondcxr.serving.cli.main", lambda arguments: observed.append(arguments) or 0
+        "beyondcxr.serving.cli.main",
+        lambda arguments, *, predictor: observed.append((arguments, predictor)) or 0,
     )
     workflow.run_serve()
     assert observed == [
-        [
-            "--authority",
-            str(state.authority.directory),
-            "--deployment-provenance",
-            str(state.deployment_provenance),
-            "--result-binding",
-            str(state.result_binding),
-            "--release-archive",
-            str(state.release_archive),
-            "--device",
-            "cpu",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8000",
-        ]
+        (
+            [
+                "--authority",
+                str(state.authority.directory),
+                "--deployment-provenance",
+                str(state.deployment_provenance),
+                "--result-binding",
+                str(state.result_binding),
+                "--release-archive",
+                str(state.release_archive),
+                "--device",
+                "cpu",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+            ],
+            predictor,
+        )
     ]
     assert observed_resolution == [
         {
@@ -358,9 +370,15 @@ def test_serve_rejects_missing_or_ambiguous_state_without_starting_service(
     public_message: str,
 ) -> None:
     _configured_repository(tmp_path, monkeypatch)
+
+    @contextmanager
+    def reject_context(**_kwargs):
+        raise ManifestBuildError(domain_message)
+        yield
+
     monkeypatch.setattr(
-        "beyondcxr.release.serving.resolve_accepted_serving_state",
-        lambda **_kwargs: (_ for _ in ()).throw(ManifestBuildError(domain_message)),
+        "beyondcxr.release.serving.resolve_accepted_serving_context",
+        reject_context,
     )
     monkeypatch.setattr(
         "beyondcxr.serving.cli.main", lambda *_args: pytest.fail("service must not start")

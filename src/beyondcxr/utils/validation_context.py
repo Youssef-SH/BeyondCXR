@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping
+import os
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -16,6 +18,7 @@ from beyondcxr.data.errors import ManifestBuildError
 @dataclass
 class _ValidationState:
     owner: Path | None
+    process_id: int = field(default_factory=os.getpid)
     loaded: dict[tuple[str, Path, str], object] = field(default_factory=dict)
     validated: dict[tuple[str, Path, str], tuple[dict[Path, str], object]] = field(
         default_factory=dict
@@ -43,36 +46,60 @@ def _register(state: _ValidationState, paths: set[Path], hashes: Mapping[Path, s
         state.baseline.setdefault(path, hashes[path])
 
 
+def _owned_by(state: _ValidationState, path: Path) -> bool:
+    """Return whether one path belongs to the active validation owner."""
+    return state.process_id == os.getpid() and (
+        state.owner is None or path == state.owner or path.is_relative_to(state.owner)
+    )
+
+
+def _verify_unchanged(state: _ValidationState) -> None:
+    try:
+        changed = any(
+            frozenset(path.resolve() for path in root.iterdir()) != members
+            for root, members in state.directories.items()
+        ) or any(_sha256(path) != digest for path, digest in state.baseline.items())
+    except OSError:
+        changed = True
+    if changed:
+        raise ManifestBuildError("Validated artifact bytes changed during the operation")
+
+
+@contextmanager
+def validation_operation(owner: str | Path | None = None) -> Iterator[None]:
+    """Own one process-local validation lifetime for an exact artifact root."""
+    supplied_owner = Path(owner) if owner is not None else None
+    if supplied_owner is not None and (supplied_owner.is_symlink() or not supplied_owner.is_dir()):
+        raise ManifestBuildError("Validation operation owner must be a regular directory")
+    resolved_owner = supplied_owner.resolve() if supplied_owner is not None else None
+    current = _STATE.get()
+    if (
+        current is not None
+        and current.process_id == os.getpid()
+        and resolved_owner is not None
+        and current.owner == resolved_owner
+    ):
+        yield
+        return
+    token = _STATE.set(_ValidationState(owner=resolved_owner))
+    try:
+        yield
+        state = _STATE.get()
+        if state is None:
+            raise ManifestBuildError("Validation operation state was revoked unexpectedly")
+        _verify_unchanged(state)
+    finally:
+        _STATE.reset(token)
+
+
 def operation_scoped_validation[**P, T](function: Callable[P, T]) -> Callable[P, T]:
-    """Share validation only inside one call tree and revoke it on return."""
+    """Own one call-tree lifetime or join an exact-root lifetime owned by the caller."""
 
     @wraps(function)
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
         owner = Path(args[0]).resolve() if args and isinstance(args[0], str | Path) else None
-        current = _STATE.get()
-        if current is not None and owner is not None and current.owner == owner:
+        with validation_operation(owner):
             return function(*args, **kwargs)
-        token = _STATE.set(_ValidationState(owner=owner))
-        try:
-            result = function(*args, **kwargs)
-            state = _STATE.get()
-            try:
-                changed = state is None or any(
-                    frozenset(path.resolve() for path in root.iterdir()) != members
-                    for root, members in state.directories.items()
-                )
-                changed = (
-                    changed
-                    or state is None
-                    or any(_sha256(path) != digest for path, digest in state.baseline.items())
-                )
-            except OSError:
-                changed = True
-            if changed:
-                raise ManifestBuildError("Validated artifact bytes changed during the operation")
-            return result
-        finally:
-            _STATE.reset(token)
 
     return wrapped
 
@@ -82,7 +109,7 @@ def load_authenticated_file[T](namespace: str, path: str | Path, loader: Callabl
 
     source = Path(path).resolve()
     state = _STATE.get()
-    if state is None:
+    if state is None or not _owned_by(state, source):
         return loader(source)
     digest = state.baseline.get(source)
     if digest is None:
@@ -117,6 +144,8 @@ def memoized_directory_validation(namespace: str, *, resolver: Callable[..., Pat
                 return function(*args, **kwargs)
             options = _validation_options(args[1:], kwargs)
             resolved_root = root.resolve()
+            if not _owned_by(state, resolved_root):
+                return function(*args, **kwargs)
             state.directories.setdefault(resolved_root, frozenset(direct))
             key = (f"{namespace}:{options}", resolved_root, "validation")
             cached = state.validated.get(key)

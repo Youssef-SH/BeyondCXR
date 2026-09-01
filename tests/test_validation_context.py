@@ -7,6 +7,7 @@ from beyondcxr.utils.validation_context import (
     load_authenticated_file,
     memoized_directory_validation,
     operation_scoped_validation,
+    validation_operation,
 )
 
 
@@ -98,3 +99,39 @@ def test_reused_directory_rejects_membership_change(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestBuildError, match="changed during the operation"):
         validate()
+
+
+def test_explicit_validation_lifetime_is_root_bound_and_revoked(tmp_path: Path) -> None:
+    owned = tmp_path / "owned"
+    external = tmp_path / "external"
+    owned.mkdir()
+    external.mkdir()
+    (owned / "manifest.json").write_bytes(b"owned")
+    (external / "manifest.json").write_bytes(b"external")
+
+    @memoized_directory_validation("test-explicit-owner")
+    def validate(directory: Path) -> object:
+        (directory / "manifest.json").read_bytes()
+        return object()
+
+    with validation_operation(owned):
+        retained = validate(owned)
+        assert validate(owned) is retained
+        assert validate(external) is not validate(external)
+    assert validate(owned) is not retained
+
+
+def test_explicit_validation_lifetime_detects_late_owned_mutation(tmp_path: Path) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    manifest = owned / "manifest.json"
+    manifest.write_bytes(b"owned")
+
+    @memoized_directory_validation("test-explicit-mutation")
+    def validate(directory: Path) -> bytes:
+        return (directory / "manifest.json").read_bytes()
+
+    with pytest.raises(ManifestBuildError, match="changed during the operation"):
+        with validation_operation(owned):
+            assert validate(owned) == b"owned"
+            manifest.write_bytes(b"changed")

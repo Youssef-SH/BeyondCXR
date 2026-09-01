@@ -8,6 +8,7 @@ from pathlib import Path
 import uvicorn
 
 from beyondcxr.serving.api import create_app
+from beyondcxr.serving.predictor import SymileServingPredictor
 from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 
 
@@ -24,7 +25,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    predictor: SymileServingPredictor | None = None,
+) -> int:
     args = _parser().parse_args(argv)
     with cli_operation("serving_cli", level=args.log_level):
         if not 1 <= args.port <= 65535:
@@ -35,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
             result_binding=args.result_binding,
             release_archive=args.release_archive,
             device=args.device,
+            predictor=predictor,
         )
         uvicorn.run(
             application,

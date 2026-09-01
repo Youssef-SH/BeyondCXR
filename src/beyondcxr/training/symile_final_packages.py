@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
 import shutil
 from collections.abc import Mapping
@@ -87,6 +88,55 @@ class ValidatedFinalPackage:
     @property
     def package_id(self) -> str:
         return str(self.manifest["final_package_id"])
+
+
+class ValidatedFinalNeuralRuntime:
+    """One neural package and the exact fitted objects validated from its bytes."""
+
+    __slots__ = (
+        "__config",
+        "__guard",
+        "__model",
+        "__package",
+        "__preprocessor",
+        "__process_id",
+    )
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("ValidatedFinalNeuralRuntime is created only by package validation")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("ValidatedFinalNeuralRuntime is immutable")
+
+    @property
+    def package(self) -> ValidatedFinalPackage:
+        return self.__package
+
+    @property
+    def model(self) -> torch.nn.Module:
+        return self.__model
+
+    @property
+    def lab_preprocessor(self) -> SymileLabEcdfTransformer:
+        return self.__preprocessor
+
+    @property
+    def config(self) -> FinalPackageConfig:
+        return self.__config
+
+
+_FINAL_NEURAL_RUNTIME_GUARD = object()
+
+
+def require_final_neural_runtime(value: object) -> ValidatedFinalNeuralRuntime:
+    if (
+        not isinstance(value, ValidatedFinalNeuralRuntime)
+        or getattr(value, "_ValidatedFinalNeuralRuntime__guard", None)
+        is not _FINAL_NEURAL_RUNTIME_GUARD
+        or getattr(value, "_ValidatedFinalNeuralRuntime__process_id", None) != os.getpid()
+    ):
+        raise ManifestBuildError("A genuine validated final neural runtime is required")
+    return value
 
 
 @dataclass(frozen=True)
@@ -301,6 +351,53 @@ def validate_final_package(
     enforce_directory_name: bool = True,
 ) -> ValidatedFinalPackage:
     """Validate exact artifacts, fitted state, and narrowed final semantic identity."""
+    package, _loaded = _validate_final_package_core(
+        directory,
+        expected_package_id=expected_package_id,
+        enforce_directory_name=enforce_directory_name,
+    )
+    return package
+
+
+def load_validated_final_neural_runtime(
+    directory: str | Path,
+    *,
+    expected_package_id: str | None = None,
+    enforce_directory_name: bool = True,
+) -> ValidatedFinalNeuralRuntime:
+    """Validate one serving package and retain its strictly reconstructed fitted objects."""
+    # This path is used only after scientific fitting. Reconstructing a serving model must not
+    # perturb process RNG state that belongs to its caller.
+    with torch.random.fork_rng(devices=[]):
+        package, loaded = _validate_final_package_core(
+            directory,
+            expected_package_id=expected_package_id,
+            enforce_directory_name=enforce_directory_name,
+        )
+    if loaded is None:
+        raise ManifestBuildError("Serving final package is not neural")
+    model, preprocessor, config = loaded
+    if preprocessor is None:
+        raise ManifestBuildError("Serving final package lacks laboratory preprocessing")
+    runtime = object.__new__(ValidatedFinalNeuralRuntime)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__package", package)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__model", model)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__preprocessor", preprocessor)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__config", config)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__guard", _FINAL_NEURAL_RUNTIME_GUARD)
+    object.__setattr__(runtime, "_ValidatedFinalNeuralRuntime__process_id", os.getpid())
+    return runtime
+
+
+def _validate_final_package_core(
+    directory: str | Path,
+    *,
+    expected_package_id: str | None,
+    enforce_directory_name: bool,
+) -> tuple[
+    ValidatedFinalPackage,
+    tuple[torch.nn.Module, SymileLabEcdfTransformer | None, FinalPackageConfig] | None,
+]:
     root = Path(directory)
     if root.is_symlink() or not root.is_dir():
         raise ManifestBuildError("Final package directory is invalid")
@@ -352,8 +449,10 @@ def validate_final_package(
     if document["artifacts"] != _artifact_hashes(root):
         raise ManifestBuildError("Final package physical integrity is invalid")
     config = _validated_config(root, document)
+    loaded = None
     if document["package_kind"] == "neural":
-        _validate_neural_final(root, document, config)
+        model, preprocessor = _validate_neural_final(root, document, config)
+        loaded = model, preprocessor, config
     elif document["package_kind"] == "tabular":
         _validate_tabular_final(root, document, config)
     else:
@@ -388,7 +487,7 @@ def validate_final_package(
         or (enforce_directory_name and root.name != expected)
     ):
         raise ManifestBuildError("Final package semantic identity is invalid")
-    return ValidatedFinalPackage(root, document)
+    return ValidatedFinalPackage(root, document), loaded
 
 
 def load_final_neural_state(package: ValidatedFinalPackage) -> Mapping[str, torch.Tensor]:
@@ -683,7 +782,7 @@ def _validate_neural_plan(
 
 def _validate_neural_final(
     root: Path, document: Mapping[str, object], config: FinalPackageConfig
-) -> None:
+) -> tuple[torch.nn.Module, SymileLabEcdfTransformer | None]:
     checkpoint = _load_final_neural_checkpoint(root / _NEURAL_FILENAME)
     state = checkpoint["model_state_dict"]
     if tensor_state_sha256(state) != document["model_state_sha256"]:
@@ -720,12 +819,14 @@ def _validate_neural_final(
         raise ManifestBuildError("Final neural package cannot reconstruct exactly") from exc
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise ManifestBuildError("Final neural package state is structurally incomplete")
+    transformer = None
     if family in FINAL_FUSION_FAMILIES:
         transformer = load_symile_lab_preprocessor(root / _LAB_PREPROCESSOR_FILENAME)
         if fitted_object_state_sha256(transformer) != document["preprocessor_state_sha256"]:
             raise ManifestBuildError("Final neural laboratory preprocessor differs from manifest")
     elif document["preprocessor_state_sha256"] is not None:
         raise ManifestBuildError("Final CXR package declares a laboratory preprocessor")
+    return model, transformer
 
 
 def _validate_tabular_final(

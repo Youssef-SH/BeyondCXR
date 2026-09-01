@@ -201,39 +201,40 @@ def run_serve() -> None:
     """Validate and run the sole installed accepted authority with local CPU defaults."""
     repository = discover_repository_root()
     config = _required_config(repository)
-    from beyondcxr.release.serving import resolve_accepted_serving_state
+    from beyondcxr.release.serving import resolve_accepted_serving_context
+    from beyondcxr.serving.cli import main as serving_main
 
     try:
-        state = resolve_accepted_serving_state(
+        with resolve_accepted_serving_context(
             artifact_root=repository / "outbox",
             authority_root=_serving_authority_root(config.backup_root),
-        )
+        ) as serving:
+            state = serving.publication
+            serving_main(
+                [
+                    "--authority",
+                    str(state.authority.directory),
+                    "--deployment-provenance",
+                    str(state.deployment_provenance),
+                    "--result-binding",
+                    str(state.result_binding),
+                    "--release-archive",
+                    str(state.release_archive),
+                    "--device",
+                    "cpu",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "8000",
+                ],
+                predictor=serving.predictor,
+            )
     except ManifestBuildError as exc:
         if "multiple" in str(exc).lower():
             raise WorkflowError(
                 "Multiple accepted serving states exist; select one with expert tooling"
             ) from exc
         raise WorkflowError("No accepted serving state exists; run `make release` first") from exc
-    from beyondcxr.serving.cli import main as serving_main
-
-    serving_main(
-        [
-            "--authority",
-            str(state.authority.directory),
-            "--deployment-provenance",
-            str(state.deployment_provenance),
-            "--result-binding",
-            str(state.result_binding),
-            "--release-archive",
-            str(state.release_archive),
-            "--device",
-            "cpu",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8000",
-        ]
-    )
 
 
 def _required_config(repository: Path):

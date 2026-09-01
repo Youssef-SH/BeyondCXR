@@ -38,7 +38,9 @@ from beyondcxr.serving.api import create_app
 from beyondcxr.serving.authority import (
     LAB_KEYS,
     SERVING_DEPLOYMENT_SCHEMA_VERSION,
+    LoadedServingDistribution,
     ValidatedServingAuthority,
+    publish_loaded_serving_distribution,
     publish_serving_authority,
     validate_serving_authority,
 )
@@ -53,6 +55,7 @@ from beyondcxr.training.symile_families import DEVELOPMENT_FAMILY_ORDER
 from beyondcxr.training.symile_final_packages import (
     ValidatedFinalPackage,
     final_training_plan,
+    load_validated_final_neural_runtime,
     publish_final_neural_package,
 )
 from beyondcxr.training.symile_test_data import FrozenSymileTestData
@@ -364,7 +367,7 @@ async def test_synthetic_distribution_rejects_incomplete_release_and_runs_cpu_in
         packages,
         monkeypatch,
     )
-    authority = publish_serving_authority(
+    authority = publish_loaded_serving_distribution(
         authority_root=tmp_path / "synthetic-authorities",
         capability=freeze,
         global_result=global_result,
@@ -372,6 +375,7 @@ async def test_synthetic_distribution_rejects_incomplete_release_and_runs_cpu_in
         global_test_data=test_data,
         final_packages=all_packages,
     )
+    assert isinstance(authority, LoadedServingDistribution)
     deployment, binding, attacker_archive = _release_evidence(
         tmp_path,
         authority,
@@ -403,16 +407,28 @@ async def test_synthetic_distribution_rejects_incomplete_release_and_runs_cpu_in
             release_archive=canonical_archive,
         )
 
+    torch.manual_seed(911)
+    rng_state = torch.random.get_rng_state().clone()
+    load_validated_final_neural_runtime(authority.packages[0].directory)
+    assert torch.equal(torch.random.get_rng_state(), rng_state)
+
     # Release admission is tested above. Isolate that boundary to exercise real
     # copied-package reconstruction, preprocessing, ensemble inference, and HTTP.
     admitted = SimpleNamespace(
         authority_id=authority.authority_id,
+        directory=authority.directory,
         manifest=authority.manifest,
         packages=authority.packages,
     )
     with monkeypatch.context() as inference_patch:
         inference_patch.setattr(serving_predictor, "require_serving_authority", lambda value: value)
-        predictor = SymileServingPredictor(admitted)
+        predictor = SymileServingPredictor.from_validated_runtime(
+            admitted,
+            authority.members,
+            deployment_provenance=deployment,
+            result_binding=binding,
+            release_archive=attacker_archive,
+        )
         assert predictor.device == torch.device("cpu")
         assert [package.manifest["seed_policy"] for package in predictor.authority.packages] == [
             17,
@@ -420,14 +436,16 @@ async def test_synthetic_distribution_rejects_incomplete_release_and_runs_cpu_in
             2026,
         ]
         assert all(not model.training for model in predictor._models)
-        inference_patch.setattr(
-            "beyondcxr.serving.api.SymileServingPredictor.load", lambda *args, **kwargs: predictor
+        assert all(
+            model is member.model
+            for model, member in zip(predictor._models, authority.members, strict=True)
         )
         application = create_app(
             authority_path=authority.directory,
             deployment_provenance=deployment,
             result_binding=binding,
             release_archive=attacker_archive,
+            predictor=predictor,
         )
         pixels = ((np.indices((360, 480)).sum(axis=0) % 2) * 255).astype(np.uint8)
         jpeg = io.BytesIO()
@@ -447,6 +465,7 @@ async def test_synthetic_distribution_rejects_incomplete_release_and_runs_cpu_in
         assert isinstance(probability, float)
         assert 0.0 <= probability <= 1.0
         assert response.json()["serving_authority_id"] == authority.authority_id
+        predictor.close()
 
     (global_result.directory / "claims.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ManifestBuildError, match="claims contract is invalid"):

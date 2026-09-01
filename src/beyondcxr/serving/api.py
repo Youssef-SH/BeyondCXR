@@ -96,6 +96,7 @@ def create_app(
     release_archive: str | Path | None = None,
     device: str = "cpu",
     restored_campaign: RestoredCampaignClosure | None = None,
+    predictor: SymileServingPredictor | None = None,
 ) -> FastAPI:
     """Create one app whose lifespan fails unless its complete authority loads."""
 
@@ -113,20 +114,31 @@ def create_app(
                         "A serving authority, deployment provenance, result binding, and canonical "
                         "release archive are required"
                     )
-                loaded = SymileServingPredictor.load(
-                    authority_path,
-                    deployment_provenance=deployment_provenance,
-                    result_binding=result_binding,
-                    release_archive=release_archive,
-                    device=device,
-                    restored_campaign=restored_campaign,
-                )
+                if predictor is None:
+                    loaded = SymileServingPredictor.load(
+                        authority_path,
+                        deployment_provenance=deployment_provenance,
+                        result_binding=result_binding,
+                        release_archive=release_archive,
+                        device=device,
+                        restored_campaign=restored_campaign,
+                    )
+                else:
+                    predictor.require_release_inputs(
+                        authority_path,
+                        deployment_provenance,
+                        result_binding,
+                        release_archive,
+                    )
+                    loaded = predictor
             app.state.predictor = loaded
             log_event(get_operational_logger(__name__), "serving_ready")
             try:
                 yield
             finally:
                 app.state.predictor = None
+                if predictor is None:
+                    loaded.close()
                 log_event(get_operational_logger(__name__), "serving_stopped")
 
     application = FastAPI(
