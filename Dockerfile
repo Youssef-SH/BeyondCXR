@@ -6,8 +6,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
 COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --extra serving --no-install-project
+
 COPY src ./src
-RUN uv sync --locked --no-dev --extra serving
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --extra serving
 
 RUN useradd --create-home --uid 10001 beyondcxr
 USER beyondcxr
