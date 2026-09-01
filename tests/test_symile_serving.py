@@ -34,6 +34,7 @@ from beyondcxr.serving.preprocessing import (
     validated_serving_input,
 )
 from beyondcxr.training.symile_test_data import FrozenSymileNeuralTestDataset
+from beyondcxr.utils.immutable_json import immutable_json
 
 
 def _jpeg(*, rows: int = 360, columns: int = 480) -> bytes:
@@ -50,14 +51,40 @@ def _labs(*, missing: str | None = None) -> str:
     )
 
 
-def test_model_info_uses_immutable_startup_snapshot(
+def test_model_info_uses_json_containers_and_immutable_startup_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    authority_id = "serving-authority-" + "a" * 64
+    authority = SimpleNamespace(
+        authority_id=authority_id,
+        manifest=immutable_json(
+            {
+                "task": {"task_id": "pneumonia_strict"},
+                "positive_class": {"value": 1},
+                "members": [{"package_id": "final-package-" + "b" * 64}],
+                "ordered_seeds": [17, 42, 2026],
+                "family": "cxr_labs_gated",
+                "input_contract": {
+                    "fields": ["image", "view_position", "labs"],
+                    "view_positions": ["AP", "PA"],
+                },
+                "preprocessing": {"lab_keys": ["lab_50802", "lab_50804"]},
+                "primary_thresholds": {"youden_j": 0.5},
+                "global_result": {"global_result_id": "global-result-" + "c" * 64},
+                "warning": RESEARCH_WARNING,
+            }
+        ),
+    )
+    monkeypatch.setattr(serving_predictor, "require_serving_authority", lambda value: value)
+    projected = serving_predictor.serving_model_info(authority)
+
+    assert projected == json.loads(json.dumps(projected))
+
     predictor = object.__new__(SymileServingPredictor)
     predictor._active = True
     predictor._process_id = os.getpid()
     predictor._model_info = MappingProxyType(
-        {"serving_authority_id": "serving-authority-" + "a" * 64, "seeds": (17, 42, 2026)}
+        {"serving_authority_id": authority_id, "seeds": (17, 42, 2026)}
     )
     monkeypatch.setattr(
         serving_predictor,

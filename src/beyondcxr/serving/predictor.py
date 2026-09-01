@@ -198,20 +198,22 @@ def serving_model_info(authority: ValidatedServingAuthority) -> dict[str, object
     """Project one validated serving authority onto the public model-info contract."""
     validated = require_serving_authority(authority)
     manifest = validated.manifest
-    return {
-        "task": manifest["task"]["task_id"],
-        "positive_class": dict(manifest["positive_class"]),
-        "serving_authority_id": validated.authority_id,
-        "model_package_ids": [item["package_id"] for item in manifest["members"]],
-        "seeds": list(manifest["ordered_seeds"]),
-        "family": manifest["family"],
-        "ensemble_policy": ENSEMBLE_POLICY,
-        "input_contract": dict(manifest["input_contract"]),
-        "preprocessing": dict(manifest["preprocessing"]),
-        "operating_thresholds": dict(manifest["primary_thresholds"]),
-        "global_result_id": manifest["global_result"]["global_result_id"],
-        "warning": manifest["warning"],
-    }
+    return json_projection(
+        {
+            "task": manifest["task"]["task_id"],
+            "positive_class": dict(manifest["positive_class"]),
+            "serving_authority_id": validated.authority_id,
+            "model_package_ids": [item["package_id"] for item in manifest["members"]],
+            "seeds": list(manifest["ordered_seeds"]),
+            "family": manifest["family"],
+            "ensemble_policy": ENSEMBLE_POLICY,
+            "input_contract": dict(manifest["input_contract"]),
+            "preprocessing": dict(manifest["preprocessing"]),
+            "operating_thresholds": dict(manifest["primary_thresholds"]),
+            "global_result_id": manifest["global_result"]["global_result_id"],
+            "warning": manifest["warning"],
+        }
+    )
 
 
 def mean_logit_probability(logits: list[float] | tuple[float, ...]) -> float:
