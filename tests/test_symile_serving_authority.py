@@ -13,6 +13,7 @@ from symile_campaign_test_support import _freeze
 import beyondcxr.release.serving as release_serving
 import beyondcxr.serving.authority as serving_authority
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.release.checks import _container_serving_command
 from beyondcxr.serving.authority import (
     ENSEMBLE_POLICY,
     PRIMARY_FAMILY,
@@ -190,6 +191,20 @@ def test_serving_authority_is_deterministic_immutable_and_path_neutral(
     )
     assert "science_execution" not in first.manifest
     assert "serving_release" not in first.manifest
+
+    command = _container_serving_command(
+        image="beyondcxr:test",
+        authority=first.directory,
+        deployment_provenance=tmp_path / "deployment.json",
+        result_binding=tmp_path / "binding.json",
+        release_archive=tmp_path / "release.zip",
+    )
+    container_authority = Path(command[command.index("--authority") + 1])
+    assert f"type=bind,src={first.directory},dst={container_authority},readonly" in command
+    mounted = tmp_path / "container" / container_authority.relative_to("/")
+    shutil.copytree(first.directory, mounted)
+    assert validate_serving_distribution(mounted).authority_id == first.authority_id
+    assert container_authority.name == first.authority_id
 
 
 def test_serving_authority_rejects_invalid_release_provenance(

@@ -569,14 +569,18 @@ def _container_serving_command(
     docker: str = "docker",
 ) -> list[str]:
     """Construct the read-only containerized serving acceptance command."""
+    container_authority = f"/artifacts/{authority.name}"
     return [
         docker,
         "run",
         "--rm",
         "--network",
         "none",
+        # Retain the host release process's access to its private mounted evidence.
+        "--user",
+        f"{os.geteuid()}:{os.getegid()}",
         "--mount",
-        f"type=bind,src={authority},dst=/artifacts/authority,readonly",
+        f"type=bind,src={authority},dst={container_authority},readonly",
         "--mount",
         f"type=bind,src={deployment_provenance},dst=/artifacts/deployment.json,readonly",
         "--mount",
@@ -589,7 +593,7 @@ def _container_serving_command(
         "-m",
         "beyondcxr.release.container_acceptance",
         "--authority",
-        "/artifacts/authority",
+        container_authority,
         "--deployment-provenance",
         "/artifacts/deployment.json",
         "--result-binding",

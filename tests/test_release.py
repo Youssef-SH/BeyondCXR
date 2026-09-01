@@ -4,6 +4,7 @@ import copy
 import csv
 import io
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -674,33 +675,59 @@ def test_incremental_effect_interval_need_not_contain_point(tmp_path: Path) -> N
     assert (tmp_path / "rendered/figures/incremental_effects.svg").is_file()
 
 
-def test_docker_acceptance_command_checks_brand_notices_and_private_roots() -> None:
+def test_docker_acceptance_command_checks_brand_notices_and_private_roots(tmp_path: Path) -> None:
+    from beyondcxr.utils.publication import publish_bytes_no_replace
+
     command = _docker_verification_command()
     assert "import beyondcxr" in command
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
         assert name in command
     for name in ("private", "models", "reports", "outbox", "data"):
         assert f"test ! -e /app/{name}" in command
+    authority = tmp_path / ("serving-authority-" + "a" * 64)
+    authority.mkdir(mode=0o700)
+    deployment = tmp_path / "deployment.json"
+    binding = tmp_path / "binding.json"
+    archive = tmp_path / "release.zip"
+    inputs = (authority / "manifest.json", deployment, binding, archive)
+    for path in inputs:
+        publish_bytes_no_replace(path, b"synthetic private evidence")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    container_authority = f"/artifacts/{authority.name}"
     container = _container_serving_command(
         image="beyondcxr:test",
-        authority=Path("/approved/authority"),
-        deployment_provenance=Path("/approved/deployment.json"),
-        result_binding=Path("/checkout/results/symile/binding.json"),
-        release_archive=Path("/approved/release.zip"),
+        authority=authority,
+        deployment_provenance=deployment,
+        result_binding=binding,
+        release_archive=archive,
     )
     assert container[:4] == ["docker", "run", "--rm", "--network"]
     assert sum(item.endswith(",readonly") for item in container) == 4
-    assert "type=bind,src=/approved/authority,dst=/artifacts/authority,readonly" in container
-    assert (
-        "type=bind,src=/approved/deployment.json,dst=/artifacts/deployment.json,readonly"
-        in container
-    )
-    assert (
-        "type=bind,src=/checkout/results/symile/binding.json,dst=/artifacts/binding.json,readonly"
-        in container
-    )
-    assert "type=bind,src=/approved/release.zip,dst=/artifacts/release.zip,readonly" in container
+    assert f"type=bind,src={authority},dst={container_authority},readonly" in container
+    assert container[container.index("--authority") + 1] == container_authority
+    assert f"type=bind,src={deployment},dst=/artifacts/deployment.json,readonly" in container
+    assert f"type=bind,src={binding},dst=/artifacts/binding.json,readonly" in container
+    assert f"type=bind,src={archive},dst=/artifacts/release.zip,readonly" in container
     assert "beyondcxr.release.container_acceptance" in container
+    uid, gid = map(int, container[container.index("--user") + 1].split(":"))
+    assert (uid, gid) == (os.geteuid(), os.getegid())
+    assert all(path.stat().st_uid == uid for path in inputs)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys, tempfile; "
+            "assert all(pathlib.Path(p).read_bytes() == b'synthetic private evidence' "
+            "for p in sys.argv[1:]); "
+            "f = tempfile.TemporaryFile(); f.write(b'scratch'); f.close()",
+            *(str(path) for path in inputs),
+        ],
+        user=uid,
+        group=gid,
+        check=True,
+        capture_output=True,
+    )
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in inputs)
 
 
 def test_container_serving_acceptance_revalidates_restored_science(
@@ -757,6 +784,84 @@ def test_container_acceptance_kills_server_after_termination_timeout() -> None:
 
     _stop_process(Process())  # type: ignore[arg-type]
     assert calls == ["terminate", "wait:15", "kill", "wait:None"]
+
+
+@pytest.mark.parametrize("outcome", ["ready", "deadline", "exited"])
+def test_container_acceptance_waits_for_startup_and_always_cleans_up(monkeypatch, outcome):
+    import beyondcxr.release.container_acceptance as acceptance
+
+    assert acceptance.STARTUP_TIMEOUT_SECONDS > 11
+    monkeypatch.setattr(acceptance, "STARTUP_TIMEOUT_SECONDS", 20)
+    now = [0.0]
+    calls = []
+
+    class Process:
+        def poll(self):
+            return 7 if outcome == "exited" and now[0] >= 5 else None
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            return 0
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    @contextmanager
+    def urlopen(request, *, timeout):
+        assert 0 < timeout <= 1
+        path = request.full_url.rsplit("/", 1)[-1]
+        if path == "health" and (outcome != "ready" or now[0] < 11):
+            raise ConnectionRefusedError("synthetic startup in progress")
+        calls.append(path)
+        response = io.BytesIO(json.dumps({"endpoint": path}).encode())
+        response.status = 200
+        yield response
+
+    monkeypatch.setattr(acceptance.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(acceptance.time, "sleep", sleep)
+    monkeypatch.setattr(acceptance.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(acceptance.subprocess, "Popen", lambda *a, **kw: Process())
+    monkeypatch.setattr(acceptance, "validate_serving_authority", lambda *a, **kw: object())
+    monkeypatch.setattr(acceptance, "serving_model_info", lambda _: {"expected": "model"})
+    monkeypatch.setattr(acceptance, "synthetic_serving_request", lambda: (b"synthetic", {}))
+
+    def validate(*args, **kwargs):
+        assert args[:6] == (
+            200,
+            {"endpoint": "health"},
+            200,
+            {"endpoint": "model-info"},
+            200,
+            {"endpoint": "predict"},
+        )
+        assert kwargs["expected_model_info"] == {"expected": "model"}
+        calls.append("validated")
+
+    monkeypatch.setattr(acceptance, "validate_serving_api_responses", validate)
+    arguments = [
+        "--authority",
+        "/synthetic/serving-authority-test",
+        "--deployment-provenance",
+        "/synthetic/deployment.json",
+        "--result-binding",
+        "/synthetic/binding.json",
+        "--release-archive",
+        "/synthetic/release.zip",
+    ]
+    if outcome == "ready":
+        assert acceptance.main(arguments) == 0
+        assert 11 <= now[0] < 20
+        assert calls[:-2] == ["health", "model-info", "predict", "validated"]
+    else:
+        message = "20-second deadline" if outcome == "deadline" else "exit code 7"
+        with pytest.raises(RuntimeError, match=message):
+            acceptance.main(arguments)
+        assert calls[:-2] == []
+        assert now[0] == 20 if outcome == "deadline" else 5 <= now[0] < 6
+    assert calls[-2:] == ["terminate", ("wait", 15)]
 
 
 def test_release_api_acceptance_validates_current_contract() -> None:

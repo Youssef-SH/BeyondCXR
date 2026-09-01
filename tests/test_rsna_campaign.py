@@ -33,6 +33,7 @@ from beyondcxr.training.rsna_formal import (
     ValidatedRsnaPlan,
 )
 from beyondcxr.training.rsna_localize import generate_localization_report
+from beyondcxr.training.rsna_seed_summary import SeedSummaryResult
 
 _PACKAGE_IDS = {
     name: "model-package-" + character * 64
@@ -378,10 +379,7 @@ def test_campaign_consumes_preflight_authority_and_freezes_before_test(
     def summarize(ids, **kwargs):
         del ids, kwargs
         directory = next(summary_directories)
-        return SimpleNamespace(
-            directory=directory,
-            report_directory=directory,
-        )
+        return SeedSummaryResult(directory=directory, manifest={})
 
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.publish_seed_summary", summarize)
     localization = tmp_path / "reports/rsna/localization/localization-test"
@@ -415,9 +413,17 @@ def test_campaign_consumes_preflight_authority_and_freezes_before_test(
         return comparison
 
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.regenerate_comparison", compare)
+
+    def validate_outputs(*args, **kwargs):
+        assert args[3:5] == (
+            tmp_path / "reports/rsna/seed-summaries/cxr_densenet",
+            tmp_path / "reports/rsna/seed-summaries/cxr_metadata_concat",
+        )
+        events.append(("outputs_validated", None))
+
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign._validate_outputs",
-        lambda *args, **kwargs: events.append(("outputs_validated", None)),
+        validate_outputs,
     )
     from beyondcxr.data.rsna_audit import generate_rsna_audit
 
@@ -533,7 +539,7 @@ def test_campaign_resume_reuses_frozen_packages_and_evaluations(
     monkeypatch.setattr("beyondcxr.training.rsna_campaign.load_evaluation_record", completed)
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.publish_seed_summary",
-        lambda ids, **kwargs: SimpleNamespace(directory=tmp_path, report_directory=tmp_path),
+        lambda ids, **kwargs: SeedSummaryResult(directory=tmp_path, manifest={}),
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.generate_localization_report",

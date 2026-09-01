@@ -14,6 +14,9 @@ from beyondcxr.release.serving import synthetic_serving_request, validate_servin
 from beyondcxr.serving.authority import validate_serving_authority
 from beyondcxr.serving.predictor import serving_model_info
 
+# Startup revalidates the complete preserved campaign before loading the ensemble.
+STARTUP_TIMEOUT_SECONDS = 30 * 60
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
     )
     try:
-        health = _request("GET", "/health")
+        health = _wait_for_ready(process)
         model = _request("GET", "/model-info")
         image, labs = synthetic_serving_request()
         prediction = _request("POST", "/predict", _multipart(image, labs))
@@ -87,14 +90,48 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _request(method: str, path: str, body: bytes | None = None) -> tuple[int, object]:
+def _wait_for_ready(process: subprocess.Popen[bytes]) -> tuple[int, object]:
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    while True:
+        if (returncode := process.poll()) is not None:
+            raise RuntimeError(
+                f"Serving application exited before readiness (exit code {returncode})"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Serving startup exceeded its {STARTUP_TIMEOUT_SECONDS}-second deadline"
+            )
+        try:
+            health = _request_once("GET", "/health", timeout=min(1.0, remaining))
+        except OSError:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            continue
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Serving startup exceeded its {STARTUP_TIMEOUT_SECONDS}-second deadline"
+            )
+        if (returncode := process.poll()) is not None:
+            raise RuntimeError(
+                f"Serving application exited before readiness (exit code {returncode})"
+            )
+        return health
+
+
+def _request_once(
+    method: str, path: str, body: bytes | None = None, *, timeout: float = 1
+) -> tuple[int, object]:
     request = urllib.request.Request(f"http://127.0.0.1:8765{path}", data=body, method=method)
     if body is not None:
         request.add_header("Content-Type", "multipart/form-data; boundary=beyondcxr")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, json.loads(response.read())
+
+
+def _request(method: str, path: str, body: bytes | None = None) -> tuple[int, object]:
     for _ in range(100):
         try:
-            with urllib.request.urlopen(request, timeout=1) as response:
-                return response.status, json.loads(response.read())
+            return _request_once(method, path, body)
         except OSError:
             time.sleep(0.1)
     raise RuntimeError("Serving application did not become ready")
