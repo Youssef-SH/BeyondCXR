@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -21,10 +21,16 @@ from beyondcxr.data.symile_source import (
     establish_development_release_assets,
 )
 from beyondcxr.models.cxr_baseline import fingerprint_pretrained_weights
+from beyondcxr.training.campaign_observability import (
+    CampaignSession,
+    campaign_log_members,
+    campaign_session,
+)
 from beyondcxr.training.config import ExperimentConfig, load_symile_development_config, with_runtime
 from beyondcxr.training.device import ResolvedDevice, resolve_device
 from beyondcxr.training.operational_validation import (
     validate_existing_sqlite_database,
+    validate_storage_capacity,
     validate_writable_directory_destination,
     validate_writable_file_destination,
 )
@@ -36,6 +42,7 @@ from beyondcxr.training.preservation import (
     export_and_verify,
     require_restoration_context,
     validate_exact_restored_closure,
+    validate_preservation_members,
     validate_preservation_paths,
 )
 from beyondcxr.training.symile_campaign_control import (
@@ -134,6 +141,7 @@ from beyondcxr.utils.mlflow_utils import (
     serialize_modalities,
     tracked_run,
 )
+from beyondcxr.utils.operational_logging import get_operational_logger, log_event, timed_phase
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
     validate_prediction_evidence,
@@ -146,9 +154,13 @@ from beyondcxr.utils.symile_publication import (
     validated_development_repeat_oof,
 )
 
+_LOGGER = get_operational_logger(__name__)
+
 _CONFIGS = {spec.family_id: spec.config_relative for spec in SYMILE_FORMAL_RUN_PLAN}
 _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES = 32 * 1024**3
-_SYMILE_BACKUP_MINIMUM_FREE_BYTES = 8 * 1024**3
+# One complete preservation closure, including packages and prediction evidence.
+# Reserve one copy for backup and two local copies: archive plus extraction.
+_SYMILE_PRESERVATION_COPY_BYTES = 8 * 1024**3
 _RESTORED_CAMPAIGN_GUARD = object()
 
 
@@ -320,90 +332,101 @@ def run_symile_campaign(
     )
     validate_existing_sqlite_database(tracking_database, "Symile campaign tracking database")
     _validate_symile_storage_readiness(repository_root, backup_root)
-    tracking_uri = f"sqlite:///{tracking_database}"
-    control_root = Path(private_root) / "control" / "symile"
-    if symile_test_is_open(
-        control_root / "test-open.json",
-        backup_root / "control/symile/test-open.json",
-    ):
-        raise ManifestBuildError(
-            "Official Symile test data are already open; resume only the held-out phase"
-        )
-    configs = {
-        family: with_runtime(
-            load_symile_development_config(
-                repository_root / path, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
-            ),
-            manifest_directory=manifest_root,
-            source_root=source_root,
-            model_directory=Path(model_root) / "development",
-            report_directory=Path(report_root) / "development",
-            private_output_directory=private_root,
-            device="cuda",
-            num_workers=2,
-        )
-        for family, path in _CONFIGS.items()
-    }
-    development_assets = _preflight_symile_campaign(
-        configs,
-        source_root=source_root,
-        require_pretrained_weights=True,
-    )
-    preflight = build_symile_formal_preflight(
-        repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
-    )
-    frozen = _resolve_unique_pretest_state(
-        control_root=control_root,
-        model_root=model_root,
+    with campaign_session(
+        repository_root=repository_root,
         report_root=report_root,
-        private_root=private_root,
-        manifest_root=manifest_root,
-    )
-    if frozen is not None:
-        freeze, _decision, _packages = frozen
-        execution = validate_active_symile_execution(control_root)
-        current = validate_current_symile_execution(execution, preflight)
+        study="symile",
+        operation="development",
+    ) as session:
+        tracking_uri = f"sqlite:///{tracking_database}"
+        control_root = Path(private_root) / "control" / "symile"
+        if symile_test_is_open(
+            control_root / "test-open.json",
+            backup_root / "control/symile/test-open.json",
+        ):
+            raise ManifestBuildError(
+                "Official Symile test data are already open; resume only the held-out phase"
+            )
+        with timed_phase(_LOGGER, "development_preflight"):
+            configs = {
+                family: with_runtime(
+                    load_symile_development_config(
+                        repository_root / path,
+                        bundle_id=bundle_id,
+                        cv_assignment_id=cv_assignment_id,
+                    ),
+                    manifest_directory=manifest_root,
+                    source_root=source_root,
+                    model_directory=Path(model_root) / "development",
+                    report_directory=Path(report_root) / "development",
+                    private_output_directory=private_root,
+                    device="cuda",
+                    num_workers=2,
+                )
+                for family, path in _CONFIGS.items()
+            }
+            development_assets = _preflight_symile_campaign(
+                configs,
+                source_root=source_root,
+                require_pretrained_weights=True,
+            )
+            preflight = build_symile_formal_preflight(
+                repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+            )
+        frozen = _resolve_unique_pretest_state(
+            control_root=control_root,
+            model_root=model_root,
+            report_root=report_root,
+            private_root=private_root,
+            manifest_root=manifest_root,
+        )
+        if frozen is not None:
+            freeze, _decision, _packages = frozen
+            execution = validate_active_symile_execution(control_root)
+            current = validate_current_symile_execution(execution, preflight)
+            session.bind_execution(execution.execution_id)
+            lifecycle = validate_symile_lifecycle(
+                current,
+                repository_root=repository_root,
+                private_root=private_root,
+                backup_root=backup_root,
+            )
+            with symile_prospective_mutation(lifecycle):
+                validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
+                return {
+                    "status": "pretest_ready",
+                    "execution_id": current.execution.execution_id,
+                    "freeze_id": freeze.freeze_id,
+                }
+        execution = publish_or_validate_symile_execution(preflight)
+        session.bind_execution(execution.execution_id)
+        current_execution = validate_current_symile_execution(
+            execution,
+            build_symile_formal_preflight(
+                repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+            ),
+        )
         lifecycle = validate_symile_lifecycle(
-            current,
+            current_execution,
             repository_root=repository_root,
             private_root=private_root,
             backup_root=backup_root,
         )
-        with symile_prospective_mutation(lifecycle):
-            validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
-            return {
-                "status": "pretest_ready",
-                "execution_id": current.execution.execution_id,
-                "freeze_id": freeze.freeze_id,
-            }
-    execution = publish_or_validate_symile_execution(preflight)
-    current_execution = validate_current_symile_execution(
-        execution,
-        build_symile_formal_preflight(
-            repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
-        ),
-    )
-    lifecycle = validate_symile_lifecycle(
-        current_execution,
-        repository_root=repository_root,
-        private_root=private_root,
-        backup_root=backup_root,
-    )
-    with symile_prospective_mutation(lifecycle) as prospective_mutation:
-        return _run_symile_prospective_campaign(
-            prospective_mutation=prospective_mutation,
-            repository_root=repository_root,
-            configs=configs,
-            source_root=source_root,
-            manifest_root=manifest_root,
-            model_root=model_root,
-            report_root=report_root,
-            private_root=private_root,
-            control_root=control_root,
-            tracking_uri=tracking_uri,
-            current_execution=current_execution,
-            development_assets=development_assets,
-        )
+        with symile_prospective_mutation(lifecycle) as prospective_mutation:
+            return _run_symile_prospective_campaign(
+                prospective_mutation=prospective_mutation,
+                repository_root=repository_root,
+                configs=configs,
+                source_root=source_root,
+                manifest_root=manifest_root,
+                model_root=model_root,
+                report_root=report_root,
+                private_root=private_root,
+                control_root=control_root,
+                tracking_uri=tracking_uri,
+                current_execution=current_execution,
+                development_assets=development_assets,
+            )
 
 
 def _run_symile_prospective_campaign(
@@ -422,154 +445,162 @@ def _run_symile_prospective_campaign(
     development_assets: tuple[DevelopmentReleaseAsset, ...] | None,
 ) -> dict[str, str]:
     """Create the complete prospectively fixed Symile scientific state."""
-    developments = {}
-    for family in SYMILE_CORE_DEVELOPMENT_FAMILIES:
-        source_id = (
-            developments["cxr_densenet"].manifest["development_id"]
-            if family in {"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"}
-            else None
-        )
-        developments[family] = run_symile_development(
-            configs[family],
+    with timed_phase(_LOGGER, "cross_validation"):
+        developments = {}
+        for family in SYMILE_CORE_DEVELOPMENT_FAMILIES:
+            source_id = (
+                developments["cxr_densenet"].manifest["development_id"]
+                if family in {"cxr_labs_concat", "cxr_labs_gated", "cxr_labs_gated_no_observedness"}
+                else None
+            )
+            developments[family] = run_symile_development(
+                configs[family],
+                prospective_mutation=prospective_mutation,
+                source_cxr_development_id=source_id,
+                tracking_uri=tracking_uri,
+                repository_root=repository_root,
+                development_assets=development_assets,
+            )
+        developments[SYMILE_ECG_GATED_FAMILY] = run_symile_development(
+            configs[SYMILE_ECG_GATED_FAMILY],
             prospective_mutation=prospective_mutation,
-            source_cxr_development_id=source_id,
+            source_cxr_development_id=developments["cxr_densenet"].manifest["development_id"],
             tracking_uri=tracking_uri,
             repository_root=repository_root,
             development_assets=development_assets,
         )
-    developments[SYMILE_ECG_GATED_FAMILY] = run_symile_development(
-        configs[SYMILE_ECG_GATED_FAMILY],
-        prospective_mutation=prospective_mutation,
-        source_cxr_development_id=developments["cxr_densenet"].manifest["development_id"],
-        tracking_uri=tracking_uri,
-        repository_root=repository_root,
-        development_assets=development_assets,
-    )
-    development_decision = publish_development_decision(
-        prospective_mutation=prospective_mutation,
-        report_root=report_root,
-        family_developments=developments,
-        model_root=Path(model_root) / "development",
-        prediction_root=private_root,
-        manifest_root=manifest_root,
-    )
-    analyze_symile_development(
-        [
-            developments[family].manifest["development_id"]
-            for family in SYMILE_CORE_DEVELOPMENT_FAMILIES
-        ],
-        report_root=Path(report_root) / "development",
-        model_root=Path(model_root) / "development",
-        prediction_root=private_root,
-        manifest_root=manifest_root,
-    )
-    primary_repeat_oof = validated_development_repeat_oof(
-        developments["cxr_labs_gated"], private_root
-    )
-    cxr_repeat_oof = validated_development_repeat_oof(developments["cxr_densenet"], private_root)
-    cohort = load_symile_development_cohort(configs["cxr_labs_gated"]).frame
-    attributes = cohort.loc[:, ["sample_id", "age_years", "sex", "view_position"]].copy()
-    attributes["observed_lab_count"] = cohort.loc[:, LAB_OBSERVED_COLUMNS].sum(axis=1)
-    publish_focused_subgroup_derivative(
-        report_root=report_root,
-        summary=focused_development_subgroups(cxr_repeat_oof, primary_repeat_oof, attributes),
-    )
-    provenance = {
-        "git_commit": current_execution.execution.manifest["git_commit"],
-        "git_dirty": False,
-        "dependency_lock_sha256": current_execution.execution.manifest["dependency_lock_sha256"],
-        "python_version": current_execution.execution.manifest["framework_versions"]["python"],
-    }
-    final_configs = {
-        family: with_runtime(
-            configs[family],
-            manifest_directory=manifest_root,
-            source_root=source_root,
-            model_directory=model_root,
-            report_directory=report_root,
-            private_output_directory=private_root,
-            device="cuda",
-            num_workers=2,
+    with timed_phase(_LOGGER, "development_decision"):
+        development_decision = publish_development_decision(
+            prospective_mutation=prospective_mutation,
+            report_root=report_root,
+            family_developments=developments,
+            model_root=Path(model_root) / "development",
+            prediction_root=private_root,
+            manifest_root=manifest_root,
         )
-        for family in (*FINAL_NEURAL_FAMILIES, *FINAL_TABULAR_FAMILIES)
-    }
-    packages = []
-    for family in FINAL_TABULAR_FAMILIES:
-        config = final_configs[family]
-        packages.append(
-            _tracked_final_fit(
-                config,
-                tracking_uri=tracking_uri,
-                member_seed=FINAL_TABULAR_SEED,
-                provenance=provenance,
-                fit=lambda operational, family=family, config=config: fit_final_tabular_family(
-                    config,
-                    prospective_mutation=prospective_mutation,
-                    development=developments[family],
-                    operational=operational,
-                ),
+        analyze_symile_development(
+            [
+                developments[family].manifest["development_id"]
+                for family in SYMILE_CORE_DEVELOPMENT_FAMILIES
+            ],
+            report_root=Path(report_root) / "development",
+            model_root=Path(model_root) / "development",
+            prediction_root=private_root,
+            manifest_root=manifest_root,
+        )
+        primary_repeat_oof = validated_development_repeat_oof(
+            developments["cxr_labs_gated"], private_root
+        )
+        cxr_repeat_oof = validated_development_repeat_oof(
+            developments["cxr_densenet"], private_root
+        )
+        cohort = load_symile_development_cohort(configs["cxr_labs_gated"]).frame
+        attributes = cohort.loc[:, ["sample_id", "age_years", "sex", "view_position"]].copy()
+        attributes["observed_lab_count"] = cohort.loc[:, LAB_OBSERVED_COLUMNS].sum(axis=1)
+        publish_focused_subgroup_derivative(
+            report_root=report_root,
+            summary=focused_development_subgroups(cxr_repeat_oof, primary_repeat_oof, attributes),
+        )
+    with timed_phase(_LOGGER, "final_fitting"):
+        provenance = {
+            "git_commit": current_execution.execution.manifest["git_commit"],
+            "git_dirty": False,
+            "dependency_lock_sha256": current_execution.execution.manifest[
+                "dependency_lock_sha256"
+            ],
+            "python_version": current_execution.execution.manifest["framework_versions"]["python"],
+        }
+        final_configs = {
+            family: with_runtime(
+                configs[family],
+                manifest_directory=manifest_root,
+                source_root=source_root,
+                model_directory=model_root,
+                report_directory=report_root,
+                private_output_directory=private_root,
+                device="cuda",
+                num_workers=2,
             )
-        )
-    cxr_by_seed = {}
-    for seed in FINAL_NEURAL_MEMBER_SEEDS:
-        config = final_configs["cxr_densenet"]
-        package = _tracked_final_fit(
-            config,
-            tracking_uri=tracking_uri,
-            member_seed=seed,
-            provenance=provenance,
-            fit=lambda operational, seed=seed, config=config: fit_final_neural_member(
-                config,
-                prospective_mutation=prospective_mutation,
-                development=developments["cxr_densenet"],
-                member_seed=seed,
-                expected_pretrained_scientific_identity=development_decision.manifest[
-                    "selected_family_authorities"
-                ]["cxr_densenet"]["pretrained_scientific_identity"],
-                operational=operational,
-                development_assets=development_assets,
-            ),
-        )
-        packages.append(package)
-        cxr_by_seed[seed] = package
-    for family in FINAL_NEURAL_FAMILIES:
-        if family == "cxr_densenet":
-            continue
-        for seed in FINAL_NEURAL_MEMBER_SEEDS:
+            for family in (*FINAL_NEURAL_FAMILIES, *FINAL_TABULAR_FAMILIES)
+        }
+        packages = []
+        for family in FINAL_TABULAR_FAMILIES:
             config = final_configs[family]
             packages.append(
                 _tracked_final_fit(
                     config,
                     tracking_uri=tracking_uri,
-                    member_seed=seed,
+                    member_seed=FINAL_TABULAR_SEED,
                     provenance=provenance,
-                    fit=lambda operational, family=family, seed=seed, config=config: (
-                        fit_final_neural_member(
-                            config,
-                            prospective_mutation=prospective_mutation,
-                            development=developments[family],
-                            member_seed=seed,
-                            expected_pretrained_scientific_identity=None,
-                            source_cxr_package=cxr_by_seed[seed],
-                            operational=operational,
-                            development_assets=development_assets,
-                        )
+                    fit=lambda operational, family=family, config=config: fit_final_tabular_family(
+                        config,
+                        prospective_mutation=prospective_mutation,
+                        development=developments[family],
+                        operational=operational,
                     ),
                 )
             )
-    first = configs["labs_logistic"]
-    freeze = publish_pretest_freeze(
-        prospective_mutation=prospective_mutation,
-        control_root=control_root,
-        bundle_id=first.dataset.bundle_id,
-        cv_assignment_id=str(first.dataset.cv_assignment_id),
-        task={
-            "task_id": first.task.task_id,
-            "label_policy_version": first.task.label_policy_version,
-        },
-        development_decision=development_decision,
-        final_packages=packages,
-    )
+        cxr_by_seed = {}
+        for seed in FINAL_NEURAL_MEMBER_SEEDS:
+            config = final_configs["cxr_densenet"]
+            package = _tracked_final_fit(
+                config,
+                tracking_uri=tracking_uri,
+                member_seed=seed,
+                provenance=provenance,
+                fit=lambda operational, seed=seed, config=config: fit_final_neural_member(
+                    config,
+                    prospective_mutation=prospective_mutation,
+                    development=developments["cxr_densenet"],
+                    member_seed=seed,
+                    expected_pretrained_scientific_identity=development_decision.manifest[
+                        "selected_family_authorities"
+                    ]["cxr_densenet"]["pretrained_scientific_identity"],
+                    operational=operational,
+                    development_assets=development_assets,
+                ),
+            )
+            packages.append(package)
+            cxr_by_seed[seed] = package
+        for family in FINAL_NEURAL_FAMILIES:
+            if family == "cxr_densenet":
+                continue
+            for seed in FINAL_NEURAL_MEMBER_SEEDS:
+                config = final_configs[family]
+                packages.append(
+                    _tracked_final_fit(
+                        config,
+                        tracking_uri=tracking_uri,
+                        member_seed=seed,
+                        provenance=provenance,
+                        fit=lambda operational, family=family, seed=seed, config=config: (
+                            fit_final_neural_member(
+                                config,
+                                prospective_mutation=prospective_mutation,
+                                development=developments[family],
+                                member_seed=seed,
+                                expected_pretrained_scientific_identity=None,
+                                source_cxr_package=cxr_by_seed[seed],
+                                operational=operational,
+                                development_assets=development_assets,
+                            )
+                        ),
+                    )
+                )
+    with timed_phase(_LOGGER, "pretest_freeze"):
+        first = configs["labs_logistic"]
+        freeze = publish_pretest_freeze(
+            prospective_mutation=prospective_mutation,
+            control_root=control_root,
+            bundle_id=first.dataset.bundle_id,
+            cv_assignment_id=str(first.dataset.cv_assignment_id),
+            task={
+                "task_id": first.task.task_id,
+                "label_policy_version": first.task.label_policy_version,
+            },
+            development_decision=development_decision,
+            final_packages=packages,
+        )
     return {
         "status": "pretest_ready",
         "execution_id": current_execution.execution.execution_id,
@@ -600,6 +631,7 @@ def _preservation_topology_sources(
 
 def complete_symile_test_phase(
     *,
+    session: CampaignSession,
     frozen_campaign: ValidatedSymileFrozenCampaign,
     development_decision: ValidatedDevelopmentDecision,
     packages: tuple[ValidatedFinalPackage, ...],
@@ -620,11 +652,13 @@ def complete_symile_test_phase(
         or Path(backup_root).resolve() != lifecycle.backup_root
     ):
         raise ManifestBuildError("Symile held-out phase roots differ from validated lifecycle")
-    capability = open_official_test(
-        frozen_campaign=frozen_campaign,
-    )
+    with timed_phase(_LOGGER, "test_opening"):
+        capability = open_official_test(
+            frozen_campaign=frozen_campaign,
+        )
     with held_out_operation(capability) as capability:
         return _complete_opened_campaign(
+            session=session,
             capability=capability,
             development_decision=development_decision,
             packages=packages,
@@ -673,70 +707,81 @@ def resume_symile_test_phase(
             destination, "Symile campaign directory destination"
         )
     _validate_symile_storage_readiness(repository_root, backup)
-    execution = validate_active_symile_execution(control_root)
-    bundle_id = execution.manifest["dataset"]["bundle_id"]
-    cv_assignment_id = execution.manifest["dataset"]["cv_assignment_id"]
-    configs = {
-        family: with_runtime(
-            load_symile_development_config(
-                repository_root / path, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
-            ),
-            manifest_directory=manifest_root,
-            source_root=source,
-            model_directory=model_root / "development",
-            report_directory=report_root / "development",
-            private_output_directory=private_root,
-            device="cuda",
-            num_workers=2,
-        )
-        for family, path in _CONFIGS.items()
-    }
-    _preflight_symile_campaign(configs, source_root=source, require_pretrained_weights=True)
-    preflight = build_symile_formal_preflight(
-        repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
-    )
-    execution = validate_active_symile_execution(control_root)
-    current = validate_current_symile_execution(execution, preflight)
-    lifecycle = validate_symile_lifecycle(
-        current,
+    with campaign_session(
         repository_root=repository_root,
-        private_root=private_root,
-        backup_root=backup,
-    )
-    resolved = _resolve_unique_pretest_state(
-        control_root=control_root,
-        model_root=model_root,
         report_root=report_root,
-        private_root=private_root,
-        manifest_root=manifest_root,
-    )
-    if resolved is None:
-        raise ManifestBuildError(
-            "No completed Symile pre-test freeze exists; run `make symile` first"
+        study="symile",
+        operation="test",
+    ) as session:
+        with timed_phase(_LOGGER, "test_preflight"):
+            execution = validate_active_symile_execution(control_root)
+            bundle_id = execution.manifest["dataset"]["bundle_id"]
+            cv_assignment_id = execution.manifest["dataset"]["cv_assignment_id"]
+            configs = {
+                family: with_runtime(
+                    load_symile_development_config(
+                        repository_root / path,
+                        bundle_id=bundle_id,
+                        cv_assignment_id=cv_assignment_id,
+                    ),
+                    manifest_directory=manifest_root,
+                    source_root=source,
+                    model_directory=model_root / "development",
+                    report_directory=report_root / "development",
+                    private_output_directory=private_root,
+                    device="cuda",
+                    num_workers=2,
+                )
+                for family, path in _CONFIGS.items()
+            }
+            _preflight_symile_campaign(configs, source_root=source, require_pretrained_weights=True)
+            preflight = build_symile_formal_preflight(
+                repository_root, bundle_id=bundle_id, cv_assignment_id=cv_assignment_id
+            )
+            execution = validate_active_symile_execution(control_root)
+            current = validate_current_symile_execution(execution, preflight)
+            session.bind_execution(execution.execution_id)
+            lifecycle = validate_symile_lifecycle(
+                current,
+                repository_root=repository_root,
+                private_root=private_root,
+                backup_root=backup,
+            )
+            resolved = _resolve_unique_pretest_state(
+                control_root=control_root,
+                model_root=model_root,
+                report_root=report_root,
+                private_root=private_root,
+                manifest_root=manifest_root,
+            )
+            if resolved is None:
+                raise ManifestBuildError(
+                    "No completed Symile pre-test freeze exists; run `make symile` first"
+                )
+            freeze, decision, packages = resolved
+            frozen_campaign = validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
+            neural_config = configs["cxr_labs_gated"]
+            if neural_config.neural is None:
+                raise ManifestBuildError("Symile formal neural runtime configuration is missing")
+            runtime = resolve_device(
+                neural_config.runtime.device,
+                mixed_precision=neural_config.neural.mixed_precision,
+                pin_memory_policy=neural_config.runtime.pin_memory_policy,
+            )
+        return complete_symile_test_phase(
+            session=session,
+            frozen_campaign=frozen_campaign,
+            development_decision=decision,
+            packages=packages,
+            source_root=source,
+            manifest_root=manifest_root,
+            model_root=model_root,
+            report_root=report_root,
+            private_root=private_root,
+            export_root=export_root,
+            backup_root=backup,
+            runtime=runtime,
         )
-    freeze, decision, packages = resolved
-    frozen_campaign = validate_symile_frozen_campaign(freeze=freeze, lifecycle=lifecycle)
-    neural_config = configs["cxr_labs_gated"]
-    if neural_config.neural is None:
-        raise ManifestBuildError("Symile formal neural runtime configuration is missing")
-    runtime = resolve_device(
-        neural_config.runtime.device,
-        mixed_precision=neural_config.neural.mixed_precision,
-        pin_memory_policy=neural_config.runtime.pin_memory_policy,
-    )
-    return complete_symile_test_phase(
-        frozen_campaign=frozen_campaign,
-        development_decision=decision,
-        packages=packages,
-        source_root=source,
-        manifest_root=manifest_root,
-        model_root=model_root,
-        report_root=report_root,
-        private_root=private_root,
-        export_root=export_root,
-        backup_root=backup,
-        runtime=runtime,
-    )
 
 
 def _preflight_symile_campaign(
@@ -937,6 +982,7 @@ def _ensure_decision_subgroup_derivative(
 
 def _complete_opened_campaign(
     *,
+    session: CampaignSession,
     capability: ValidatedHeldOutCapability,
     development_decision: ValidatedDevelopmentDecision,
     packages: list[ValidatedFinalPackage] | tuple[ValidatedFinalPackage, ...],
@@ -950,28 +996,31 @@ def _complete_opened_campaign(
     runtime: ResolvedDevice,
 ) -> dict[str, str]:
     freeze = capability.freeze
-    predictions, test_data = publish_frozen_test_predictions(
-        capability=capability,
-        final_packages=packages,
-        source_root=source_root,
-        manifest_root=manifest_root,
-        private_root=private_root,
-        runtime=runtime,
-    )
-    global_result = publish_global_result(
-        report_root=report_root,
-        capability=freeze,
-        predictions=predictions,
-        final_packages=packages,
-        test_data=test_data,
-    )
-    error_review = publish_error_review(
-        private_root=private_root,
-        capability=freeze,
-        predictions=predictions,
-        final_packages=packages,
-        test_data=test_data,
-    )
+    with timed_phase(_LOGGER, "held_out_predictions"):
+        predictions, test_data = publish_frozen_test_predictions(
+            capability=capability,
+            final_packages=packages,
+            source_root=source_root,
+            manifest_root=manifest_root,
+            private_root=private_root,
+            runtime=runtime,
+        )
+    with timed_phase(_LOGGER, "global_result"):
+        global_result = publish_global_result(
+            report_root=report_root,
+            capability=freeze,
+            predictions=predictions,
+            final_packages=packages,
+            test_data=test_data,
+        )
+    with timed_phase(_LOGGER, "error_review"):
+        error_review = publish_error_review(
+            private_root=private_root,
+            capability=freeze,
+            predictions=predictions,
+            final_packages=packages,
+            test_data=test_data,
+        )
     export_members = _campaign_export_members(
         freeze=freeze,
         execution=capability.execution,
@@ -988,7 +1037,12 @@ def _complete_opened_campaign(
         report_root=report_root,
         private_root=private_root,
     )
+    log_event(_LOGGER, "campaign_ready_for_export", phase="export")
+    export_members += campaign_log_members(
+        session.log_path, study="symile", execution_id=capability.execution.execution_id
+    )
 
+    archive_started_at = time.perf_counter()
     archive = export_and_verify(
         members=export_members,
         export_root=export_root,
@@ -999,6 +1053,7 @@ def _complete_opened_campaign(
         ),
         restoration_validator=validate_restored_campaign,
     )
+    log_event(_LOGGER, "archive_created", elapsed_s=time.perf_counter() - archive_started_at)
     return {
         "development_decision_id": development_decision.decision_id,
         "pretest_freeze_id": freeze.freeze_id,
@@ -1201,6 +1256,11 @@ def validate_restored_campaign(restored_root: Path) -> RestoredCampaignClosure:
             private_root=private_root,
             analysis_path=analysis_path,
             subgroup_path=subgroup_path,
+        )
+        + campaign_log_members(
+            report_root / "campaigns/export/execution.log",
+            study="symile",
+            execution_id=execution.execution_id,
         ),
     )
     restored = object.__new__(RestoredCampaignClosure)
@@ -1435,9 +1495,7 @@ def _project_campaign_export_members(
         Path("private/error-review/symile") / error_review.name,
         role="derivative",
     )
-    resolved = [member.path.resolve() for member in members]
-    if len(resolved) != len(set(resolved)):
-        raise ManifestBuildError("Campaign export authority paths contain duplicates")
+    validate_preservation_members(members)
     return tuple(members)
 
 
@@ -1484,28 +1542,15 @@ def _validate_symile_storage_readiness(
     repository_root: Path,
     backup_root: Path,
 ) -> None:
-    """Require headroom for campaign state/local export and the external backup."""
-    workspace_volume, workspace_free = _storage_volume(repository_root)
-    backup_volume, backup_free = _storage_volume(backup_root)
-    if workspace_volume == backup_volume:
-        required = _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES + _SYMILE_BACKUP_MINIMUM_FREE_BYTES
-        if workspace_free < required:
-            raise OSError("Symile campaign requires at least 40 GiB of free shared storage")
-        return
-    if workspace_free < _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES:
-        raise OSError("Symile campaign requires at least 32 GiB of free workspace storage")
-    if backup_free < _SYMILE_BACKUP_MINIMUM_FREE_BYTES:
-        raise OSError("Symile campaign requires at least 8 GiB of free backup storage")
-
-
-def _storage_volume(path: Path) -> tuple[int, int]:
-    """Return device identity and free bytes at the nearest existing ancestor."""
-    candidate = path.absolute()
-    while not candidate.exists():
-        if candidate.parent == candidate:
-            raise OSError("Symile storage destination has no existing ancestor")
-        candidate = candidate.parent
-    return candidate.stat().st_dev, shutil.disk_usage(candidate).free
+    """Account for working state, local archive/extraction, and external backup."""
+    validate_storage_capacity(
+        (
+            (repository_root, _SYMILE_WORKSPACE_MINIMUM_FREE_BYTES),
+            (repository_root / "outbox", 2 * _SYMILE_PRESERVATION_COPY_BYTES),
+            (backup_root, _SYMILE_PRESERVATION_COPY_BYTES),
+        ),
+        context="Symile campaign storage",
+    )
 
 
 def _repository_path(repository_root: Path, value: str | Path) -> Path:

@@ -52,6 +52,7 @@ from beyondcxr.training.symile_test_data import (
     test_laboratory_frame,
     validate_prediction_against_test_projection,
 )
+from beyondcxr.utils.operational_logging import get_operational_logger, timed_phase
 from beyondcxr.utils.private_predictions import (
     SYMILE_TEST_INFERENCE_POLICY,
     ValidatedPredictionEvidence,
@@ -156,39 +157,48 @@ def _infer_all(
     for package in pending:
         config = load_final_package_config(package)
         family = config.family_id
-        if family in FINAL_TABULAR_FAMILIES:
-            logits = symile_tabular_logits(
-                load_final_tabular_model(package), test_laboratory_frame(data)
+        with timed_phase(
+            get_operational_logger(__name__),
+            "held_out_member",
+            package_id=package.package_id,
+            family_id=family,
+            seed=package.manifest["seed_policy"],
+        ):
+            if family in FINAL_TABULAR_FAMILIES:
+                logits = symile_tabular_logits(
+                    load_final_tabular_model(package), test_laboratory_frame(data)
+                )
+            else:
+                if cxr_store is None:
+                    raise ManifestBuildError("Final neural test dependencies are unavailable")
+                model = load_final_neural_model(package).to(runtime.device)
+                transformer = (
+                    load_final_lab_preprocessor(package) if "labs" in config.modalities else None
+                )
+                labs = (
+                    None
+                    if transformer is None
+                    else transformer.transform(test_laboratory_frame(data))
+                )
+                if family == SYMILE_ECG_GATED_FAMILY and ecg_store is None:
+                    ecg_store = FrozenSymileTestEcgStore(capability, data.bundle, source_root)
+                dataset = FrozenSymileNeuralTestDataset(
+                    capability,
+                    data,
+                    cxr_store=cxr_store,
+                    transform=_evaluation_transform(config),
+                    labs=labs,
+                    ecg_store=ecg_store if family == SYMILE_ECG_GATED_FAMILY else None,
+                )
+                logits = deterministic_inference(
+                    model,
+                    build_evaluation_loader(dataset, batch_size=config.batch_size, runtime=runtime),
+                    runtime=runtime,
+                    input_keys=_input_keys(family),
+                ).logits
+            results[package.package_id] = _publish(
+                package.package_id, data, logits, private_root, capability
             )
-        else:
-            if cxr_store is None:
-                raise ManifestBuildError("Final neural test dependencies are unavailable")
-            model = load_final_neural_model(package).to(runtime.device)
-            transformer = (
-                load_final_lab_preprocessor(package) if "labs" in config.modalities else None
-            )
-            labs = (
-                None if transformer is None else transformer.transform(test_laboratory_frame(data))
-            )
-            if family == SYMILE_ECG_GATED_FAMILY and ecg_store is None:
-                ecg_store = FrozenSymileTestEcgStore(capability, data.bundle, source_root)
-            dataset = FrozenSymileNeuralTestDataset(
-                capability,
-                data,
-                cxr_store=cxr_store,
-                transform=_evaluation_transform(config),
-                labs=labs,
-                ecg_store=ecg_store if family == SYMILE_ECG_GATED_FAMILY else None,
-            )
-            logits = deterministic_inference(
-                model,
-                build_evaluation_loader(dataset, batch_size=config.batch_size, runtime=runtime),
-                runtime=runtime,
-                input_keys=_input_keys(family),
-            ).logits
-        results[package.package_id] = _publish(
-            package.package_id, data, logits, private_root, capability
-        )
     if len(results) != FINAL_PACKAGE_COUNT:
         raise ManifestBuildError("Test inference did not produce fourteen prediction objects")
     return tuple(results[package.package_id] for package in packages)

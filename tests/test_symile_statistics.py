@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -115,15 +116,26 @@ def test_subject_cluster_bootstrap_uses_accepted_draw_count() -> None:
             "comparator": [0.2, 0.3, 0.6, 0.7],
         }
     )
-    result = cluster_bootstrap_effect(
-        frame,
-        candidate="candidate",
-        comparator="comparator",
-        metric="brier_score",
-        policy={"resamples": 25, "seed": 2026, "maximum_attempts": 250, "ci": 0.95},
-    )
+    from beyondcxr.utils.operational_logging import configured_logging, parse_operational_record
+
+    stream = io.StringIO()
+    with configured_logging(stream=stream, context={"operation": "test"}):
+        result = cluster_bootstrap_effect(
+            frame,
+            candidate="candidate",
+            comparator="comparator",
+            metric="brier_score",
+            policy={"resamples": 25, "seed": 2026, "maximum_attempts": 250, "ci": 0.95},
+        )
     assert result["accepted"] == 25
     assert result["attempts"] >= 25
+    progress = next(
+        parse_operational_record(line)
+        for line in stream.getvalue().splitlines()
+        if "event=bootstrap_progress" in line
+    )
+    assert progress["metric_name"] == "brier_score"
+    assert progress["operation"] == "test"
 
 
 def test_subject_cluster_bootstrap_does_not_fit_calibration(

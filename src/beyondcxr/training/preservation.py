@@ -78,6 +78,7 @@ def validate_exact_restored_closure(
     members: Sequence[PreservationMember],
 ) -> None:
     """Require the restored tree to contain exactly the recomputed campaign closure."""
+    validate_preservation_members(members)
     root = Path(restored_root).resolve()
     expected: list[tuple[Path, bool]] = []
     for member in members:
@@ -134,6 +135,7 @@ def export_and_verify(
         export_root=export_root,
         backup_root=backup_root,
     )
+    validate_preservation_members(values)
     export_directory = Path(export_root)
     archive = export_directory / f"{export_name}.zip"
     checksum = archive.with_suffix(".zip.sha256")
@@ -152,7 +154,9 @@ def export_and_verify(
                 ):
                     raise ManifestBuildError("Preservation export conflicts with existing state")
         if not checksum.exists() or not backup.exists():
-            restore_and_validate_export(archive, restoration_validator=restoration_validator)
+            restore_and_validate_export(
+                archive, restoration_validator=restoration_validator, scratch_root=export_directory
+            )
             _write_or_validate(checksum, expected_checksum)
             backup_directory.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(
@@ -169,6 +173,7 @@ def export_and_verify(
             archive,
             backup_root=backup_directory,
             restoration_validator=restoration_validator,
+            scratch_root=export_directory,
         )
         return archive
 
@@ -203,7 +208,11 @@ def export_and_verify(
                         shutil.copyfileobj(source, destination)
             digest = _file_sha256(temporary)
             _validate_private_file(temporary, expected_sha256=digest)
-            restore_and_validate_export(temporary, restoration_validator=restoration_validator)
+            restore_and_validate_export(
+                temporary,
+                restoration_validator=restoration_validator,
+                scratch_root=export_directory,
+            )
             if _install_or_validate(temporary, archive):
                 created.append(archive)
         finally:
@@ -227,7 +236,9 @@ def export_and_verify(
         # Scientific restoration was certified from the temporary archive above. This final
         # validation joins the installed archive, sidecar, and byte-identical backup without
         # repeating the potentially expensive scientific validator.
-        validate_completed_preservation(archive, backup_root=backup_directory)
+        validate_completed_preservation(
+            archive, backup_root=backup_directory, scratch_root=export_directory
+        )
         return archive
     except BaseException:
         for path in reversed(created):
@@ -247,11 +258,14 @@ def validate_preservation_archive[RestorationResult](
     archive: str | Path,
     *,
     restoration_validator: Callable[[Path], RestorationResult] | None = None,
+    scratch_root: Path | None = None,
 ) -> RestorationResult | None:
     """Authenticate one canonical archive and sidecar, then restore and validate it."""
     source = Path(archive)
     validate_archive_checksum(source)
-    return restore_and_validate_export(source, restoration_validator=restoration_validator)
+    return restore_and_validate_export(
+        source, restoration_validator=restoration_validator, scratch_root=scratch_root
+    )
 
 
 def validate_archive_checksum(source: Path) -> None:
@@ -270,10 +284,13 @@ def validate_completed_preservation(
     *,
     backup_root: str | Path,
     restoration_validator: Callable[[Path], object] | None = None,
+    scratch_root: Path | None = None,
 ) -> Path:
     """Validate one completed canonical archive, its exact backup, and restored science."""
     source = Path(archive)
-    validate_preservation_archive(source, restoration_validator=restoration_validator)
+    validate_preservation_archive(
+        source, restoration_validator=restoration_validator, scratch_root=scratch_root
+    )
     digest = _file_sha256(source)
     backup = Path(backup_root) / source.name
     _validate_private_file(backup, expected_sha256=digest)
@@ -298,6 +315,7 @@ def restore_and_validate_export(
     archive: str | Path,
     *,
     restoration_validator: None = None,
+    scratch_root: Path | None = None,
 ) -> None: ...
 
 
@@ -306,6 +324,7 @@ def restore_and_validate_export[RestorationResult](
     archive: str | Path,
     *,
     restoration_validator: Callable[[Path], RestorationResult],
+    scratch_root: Path | None = None,
 ) -> RestorationResult: ...
 
 
@@ -313,23 +332,27 @@ def restore_and_validate_export[RestorationResult](
     archive: str | Path,
     *,
     restoration_validator: Callable[[Path], RestorationResult] | None = None,
+    scratch_root: Path | None = None,
 ) -> RestorationResult | None:
     """Restore a campaign using only its archive-owned manifest and validate it."""
-    with restored_export(archive) as root:
+    with restored_export(archive, scratch_root=scratch_root) as root:
         if restoration_validator is not None:
             return restoration_validator(root)
     return None
 
 
 @contextmanager
-def restored_export(archive: str | Path):
+def restored_export(archive: str | Path, *, scratch_root: Path | None = None):
     """Own one authenticated extraction and revoke its context on exit."""
     source = Path(archive)
+    # Campaign export owns scratch on its budgeted export filesystem. Independent
+    # readers (including read-only mounted archives) own their temporary environment.
+    scratch = None if scratch_root is None else _resolved_preservation_path(scratch_root)
     _validate_private_file(source)
     archive_sha256 = _file_sha256(source)
     with zipfile.ZipFile(source) as input_archive:
         members = _read_and_validate_archive(input_archive)
-        with tempfile.TemporaryDirectory() as temporary_directory:
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary_directory:
             restored_root = Path(temporary_directory) / "restored"
             restored_root.mkdir()
             for member in members:
@@ -359,9 +382,29 @@ def restored_export(archive: str | Path):
                 _ACTIVE_RESTORATION_ROOTS.pop(resolved, None)
 
 
+def _append_disjoint(path, existing, context: str) -> None:
+    if any(
+        path == other or path.is_relative_to(other) or other.is_relative_to(path)
+        for other in existing
+    ):
+        raise ManifestBuildError(f"Preservation {context} collide")
+    existing.append(path)
+
+
+def validate_preservation_members(members: Sequence[PreservationMember]) -> None:
+    """Validate the complete source and restore topology, including operational evidence."""
+    sources: list[Path] = []
+    destinations: list[PurePosixPath] = []
+    for member in members:
+        _append_disjoint(member.path.resolve(), sources, "source paths")
+        restore = _validated_relative_path(member.restore_relative.as_posix(), "restore target")
+        _append_disjoint(restore, destinations, "restore targets")
+
+
 def _build_export_manifest(
     members: tuple[PreservationMember, ...],
 ) -> tuple[dict[str, object], tuple[tuple[str, Path], ...]]:
+    validate_preservation_members(members)
     documents: list[dict[str, object]] = []
     entries: list[tuple[str, Path]] = []
     for index, member in enumerate(members):
@@ -483,14 +526,7 @@ def _validate_export_manifest(document: object) -> tuple[_ValidatedManifestMembe
             raise ManifestBuildError("Preservation member identity is invalid")
         archive_ids.add(identity)
         restore = _validated_relative_path(item["restore_relative"], "restore target")
-        if any(
-            restore == existing
-            or restore.is_relative_to(existing)
-            or existing.is_relative_to(restore)
-            for existing in restore_targets
-        ):
-            raise ManifestBuildError("Preservation restore targets collide")
-        restore_targets.append(restore)
+        _append_disjoint(restore, restore_targets, "restore targets")
         kind = item["kind"]
         role = item["role"]
         files = item["files"]

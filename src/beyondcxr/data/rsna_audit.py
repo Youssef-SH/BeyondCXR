@@ -18,7 +18,7 @@ from beyondcxr.data.rsna_source import RSNA_CLASS_VALUES
 from beyondcxr.data.rsna_splitting import SPLIT_NAMES
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
-    configure_logging,
+    cli_operation,
     get_operational_logger,
     timed_phase,
 )
@@ -381,13 +381,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Generate reports and print their bundle lineage."""
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        summary = generate_rsna_audit(
-            args.manifest_directory,
-            args.output_directory,
-            bundle_id=args.bundle_id,
-        )
+        with cli_operation("rsna_audit_cli", level=args.log_level):
+            summary = generate_rsna_audit(
+                args.manifest_directory,
+                args.output_directory,
+                bundle_id=args.bundle_id,
+            )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
         print(f"RSNA audit failed: {type(exc).__name__}", file=sys.stderr)
         return 1

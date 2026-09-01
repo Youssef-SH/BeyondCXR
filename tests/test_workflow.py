@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 
 from beyondcxr import workflow
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.rsna_campaign import execute_rsna_campaign
+from beyondcxr.training.symile_campaign import run_symile_campaign
 from beyondcxr.workflow import WorkflowError
 from beyondcxr.workflow_config import configure_local_machine
 
@@ -57,7 +60,10 @@ def test_rsna_workflow_composes_canonical_owners_in_order(
     )
     monkeypatch.setattr(
         "beyondcxr.training.rsna_campaign.execute_rsna_campaign",
-        lambda **kwargs: events.append(("campaign", kwargs)) or campaign,
+        create_autospec(
+            execute_rsna_campaign,
+            side_effect=lambda **kwargs: events.append(("campaign", kwargs)) or campaign,
+        ),
     )
 
     workflow.run_rsna()
@@ -106,8 +112,11 @@ def test_symile_workflow_never_acquires_source_and_stops_at_pretest_freeze(
     )
     monkeypatch.setattr(
         "beyondcxr.training.symile_campaign.run_symile_campaign",
-        lambda **kwargs: (
-            events.append(("campaign", kwargs)) or {"freeze_id": "pretest-freeze-test"}
+        create_autospec(
+            run_symile_campaign,
+            side_effect=lambda **kwargs: (
+                events.append(("campaign", kwargs)) or {"freeze_id": "pretest-freeze-test"}
+            ),
         ),
     )
 
@@ -360,3 +369,24 @@ def test_serve_rejects_missing_or_ambiguous_state_without_starting_service(
     error = capsys.readouterr().err
     assert public_message in error
     assert "private-detail" not in error
+
+
+@pytest.mark.parametrize("action", ["rsna", "symile", "symile-test", "release", "serve"])
+def test_direct_public_workflow_failure_is_structured_without_private_text(
+    tmp_path, monkeypatch, capsys, action
+):
+    from beyondcxr.utils.operational_logging import configured_logging
+
+    def reject(repository):
+        raise RuntimeError("PRIVATE_SOURCE_DETAIL")
+
+    monkeypatch.setattr(workflow, "discover_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(workflow, "_required_config", reject)
+    with configured_logging(stream=workflow.sys.stderr, context={}):
+        with pytest.raises(RuntimeError, match="PRIVATE_SOURCE_DETAIL"):
+            getattr(workflow, "run_" + action.replace("-", "_"))()
+    output = capsys.readouterr()
+    assert "event=phase_started" in output.err
+    assert "event=phase_failed" in output.err
+    assert "PRIVATE_SOURCE_DETAIL" not in output.err
+    assert output.out == ""

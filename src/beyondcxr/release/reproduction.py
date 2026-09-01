@@ -25,6 +25,7 @@ from beyondcxr.release.render import (
     replace_result_region,
 )
 from beyondcxr.release.resolution import resolved_release
+from beyondcxr.utils.operational_logging import observed_operation
 
 if TYPE_CHECKING:
     from beyondcxr.training.symile_campaign import RestoredCampaignClosure
@@ -38,6 +39,7 @@ class _Regenerated:
     temporary: tempfile.TemporaryDirectory[str]
 
 
+@observed_operation("publish_results")
 def publish_results(
     *,
     artifact_root: str | Path,
@@ -87,6 +89,7 @@ def publish_results_from_campaign(
         regenerated.temporary.cleanup()
 
 
+@observed_operation("reproduce_results")
 def reproduce_results(
     *,
     binding_path: str | Path,

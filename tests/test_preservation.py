@@ -78,6 +78,7 @@ def test_export_is_self_describing_private_and_byte_deterministic(tmp_path: Path
 
     def validate(root: Path) -> None:
         nonlocal restorations
+        assert root.is_relative_to(arguments["export_root"])
         assert (root / "reports/symile/result/artifact.bin").is_file()
         assert (root / "private/control/symile/test-open.json").is_file()
         restorations += 1
@@ -110,6 +111,7 @@ def test_export_is_self_describing_private_and_byte_deterministic(tmp_path: Path
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in archive.infolist())
     assert export_and_verify(**arguments).read_bytes() == before
     assert restorations == 2
+    assert {path.name for path in first.parent.iterdir()} == {"campaign.zip", "campaign.zip.sha256"}
 
     os.chmod(backup, 0o644)
     with pytest.raises(ManifestBuildError, match="permissions are unsafe"):

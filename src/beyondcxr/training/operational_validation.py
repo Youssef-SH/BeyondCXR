@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -96,3 +97,33 @@ def _validate_destination_kind(value: str | Path, context: str, *, kind: str) ->
     if not current.is_dir() or not os.access(current, os.W_OK | os.X_OK):
         raise ManifestBuildError(f"{context} has no writable and searchable directory ancestor")
     return path.resolve()
+
+
+def validate_storage_capacity(requirements: tuple[tuple[Path, int], ...], *, context: str) -> None:
+    """Check explicit reserves, summing destinations sharing a POSIX filesystem.
+
+    This is a readiness snapshot, not a reservation or a future capacity guarantee.
+    The caller owns the budgets; this function has no study or authority knowledge.
+    """
+    if not requirements:
+        raise ValueError("Storage readiness requires destination reserves")
+    volumes: dict[int, tuple[int, int]] = {}
+    for destination, reserve in requirements:
+        if type(reserve) is not int or reserve <= 0:
+            raise ValueError("Storage reserve must be a positive byte count")
+        path = validate_writable_directory_destination(destination, context)
+        device, available = _storage_volume(path)
+        needed, free = volumes.get(device, (0, available))
+        volumes[device] = (needed + reserve, min(free, available))
+    if any(free < needed for needed, free in volumes.values()):
+        raise OSError(f"{context} has insufficient filesystem capacity for destination reserves")
+
+
+def _storage_volume(path: Path) -> tuple[int, int]:
+    """Resolve the filesystem of an existing destination or its nearest ancestor."""
+    candidate = path
+    while not candidate.exists():
+        if candidate.parent == candidate:
+            raise OSError("Storage destination has no existing ancestor")
+        candidate = candidate.parent
+    return candidate.stat().st_dev, shutil.disk_usage(candidate).free

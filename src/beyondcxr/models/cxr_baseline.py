@@ -12,6 +12,7 @@ from torch import nn
 
 from beyondcxr.data.hashing import sha256_file
 from beyondcxr.training.config import FamilyConfig
+from beyondcxr.utils.operational_logging import observed_operation
 
 CXR_TRAINABILITY_SCOPES = frozenset({"frozen", "terminal", "all"})
 
@@ -233,6 +234,7 @@ def fingerprint_pretrained_weights(
     )
 
 
+@observed_operation("pretrained_weights")
 def ensure_pretrained_weights(
     weights: str = "densenet121-res224-chex",
 ) -> PretrainedWeightIdentity:

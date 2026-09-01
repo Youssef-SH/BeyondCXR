@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 
 import beyondcxr.training.rsna_preservation as rsna_preservation
 from beyondcxr.data.errors import ManifestBuildError
+from beyondcxr.training.campaign_observability import campaign_log_members, campaign_session
 from beyondcxr.training.preservation import (
     PreservationMember,
     export_and_verify,
@@ -17,6 +19,11 @@ from beyondcxr.training.preservation import (
 from beyondcxr.training.rsna_preservation import (
     campaign_export_members,
     validate_restored_rsna_campaign,
+)
+from beyondcxr.utils.operational_logging import (
+    get_operational_logger,
+    log_event,
+    parse_operational_record,
 )
 from beyondcxr.utils.semantic_identity import canonical_json_bytes
 
@@ -151,10 +158,6 @@ def _bounded_closure(
         manifest={"evaluation_ids": list(evaluation_ids)},
     )
     audit = _marker(report_root / "rsna/audit" / bundle_id)
-    campaign_log = report_root / "rsna/campaigns/bounded/execution.log"
-    campaign_log.parent.mkdir(parents=True)
-    campaign_log.write_text("event=campaign_ready_for_export\n", encoding="utf-8")
-
     execution_manifest = {
         "dataset": {"dataset_id": "rsna", "bundle_id": bundle_id},
         "task": {
@@ -266,7 +269,7 @@ def _bounded_closure(
             manifest={"evaluation_ids": list(ids)},
         ),
     )
-    monkeypatch.setattr(rsna_preservation, "generate_rsna_audit", audit_for)
+    monkeypatch.setattr("beyondcxr.data.rsna_audit._generate_rsna_audit", audit_for)
 
     execution = execution_for(execution_directory)
     frozen = freeze_for(
@@ -274,22 +277,37 @@ def _bounded_closure(
         model_root=model_root,
         bundle_directory=bundle,
     )
-    return campaign_export_members(
-        execution=execution,
-        freeze=frozen,
-        training_results=tuple(training_results),
-        evaluations=tuple(evaluations),
-        summaries=summaries,
-        localization=localization,
-        comparison=comparison,
-        audit_directory=audit,
-        campaign_log=campaign_log,
-        private_root=private_root,
-        report_root=report_root,
-    )
+    with campaign_session(
+        repository_root=root, report_root=report_root / "rsna", study="rsna", operation="campaign"
+    ) as session:
+        session.bind_execution(execution_id)
+        members = campaign_export_members(
+            execution=execution,
+            freeze=frozen,
+            training_results=tuple(training_results),
+            evaluations=tuple(evaluations),
+            summaries=summaries,
+            localization=localization,
+            comparison=comparison,
+            audit_directory=audit,
+            private_root=private_root,
+            report_root=report_root,
+        )
+        log_event(get_operational_logger("fixture"), "campaign_ready_for_export")
+        operational = campaign_log_members(
+            session.log_path, study="rsna", execution_id=execution_id
+        )
+        # Freeze the live boundary for the restoration tests, before session exit appends success.
+        snapshot = root / "campaign-snapshot"
+        snapshot.mkdir()
+        for member in operational:
+            path = snapshot / member.path.name
+            shutil.copyfile(member.path, path)
+            members += (PreservationMember(path, member.restore_relative, member.role),)
+    return members
 
 
-def test_training_reports_are_preserved_as_derivatives(
+def test_prepared_closure_preserves_derivatives_and_exact_operational_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     members = _bounded_closure(tmp_path, monkeypatch)
@@ -305,6 +323,15 @@ def test_training_reports_are_preserved_as_derivatives(
     ]
     assert len(packages) == 2
     assert all(member.role == "scientific_authority" for member in packages)
+    log = next(member.path for member in members if member.path.name == "execution.log")
+    records = [parse_operational_record(line) for line in log.read_text().splitlines()]
+    assert [(record["event"], record.get("phase")) for record in records] == [
+        ("campaign_started", "preparation"),
+        ("campaign_execution_bound", None),
+        ("phase_started", "audit_generation"),
+        ("phase_completed", "audit_generation"),
+        ("campaign_ready_for_export", None),
+    ]
 
 
 def _archive(

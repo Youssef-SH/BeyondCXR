@@ -1233,7 +1233,7 @@ def test_final_metadata_requires_v1_while_nonfinal_accepts_development_version(
         _check_package_metadata(tmp_path, final=True)
 
 
-def _release_check_repository(root: Path) -> None:
+def _release_check_repository(root: Path, *, ignore_generated_reports: bool = False) -> None:
     (root / "docs").mkdir(parents=True)
     (root / "results").mkdir()
     (root / "README.md").write_text(
@@ -1257,6 +1257,8 @@ def _release_check_repository(root: Path) -> None:
     )
     for name in ("uv.lock", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         (root / name).write_text("public\n", encoding="utf-8")
+    if ignore_generated_reports:
+        (root / ".gitignore").write_text("/reports/\n", encoding="utf-8")
     (root / "CITATION.cff").write_text(
         'title: "BeyondCXR"\ntype: software\nversion: 0.1.0\nlicense: Apache-2.0\n'
         'repository-code: "https://github.com/Youssef-SH/BeyondCXR"\n',
@@ -2314,7 +2316,7 @@ def test_release_materializes_before_final_gate_and_reuses_exact_results(
     import beyondcxr.release.reproduction as reproduction
 
     repository = tmp_path / "repository"
-    _release_check_repository(repository)
+    _release_check_repository(repository, ignore_generated_reports=True)
     (repository / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n")
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
     science_commit = _commit(repository, "scientific implementation")
@@ -2379,6 +2381,10 @@ def test_release_materializes_before_final_gate_and_reuses_exact_results(
         run_final_acceptance(**arguments)
     assert calls == ["reproduce", "final gate"]
     assert (repository / "results/symile/binding.json").stat().st_mtime_ns == before
+    logs = tuple((repository / "reports/release/operations").glob("*.log"))
+    assert len(logs) == 2
+    assert all("event=phase_failed" in path.read_text() for path in logs)
+    assert all("phase=release_acceptance" in path.read_text() for path in logs)
     assert not (tmp_path / "authorities").exists()
     calls.clear()
     for relative in ("pyproject.toml", "CITATION.cff"):

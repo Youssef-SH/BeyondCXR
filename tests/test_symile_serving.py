@@ -359,10 +359,17 @@ def test_view_position_is_validation_only() -> None:
     assert not hasattr(ap, "view_position")
 
 
-def test_cli_disables_uvicorn_access_log(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_disables_uvicorn_access_log(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     application = object()
     observed: dict[str, object] = {}
     monkeypatch.setattr(serving_cli, "create_app", lambda **kwargs: application)
+
+    with pytest.raises(SystemExit) as help_exit:
+        serving_cli.main(["--help"])
+    assert help_exit.value.code == 0
+    assert "phase=serving_cli" not in capsys.readouterr().err
 
     def run(app: object, **kwargs: object) -> None:
         observed["application"] = app
@@ -619,3 +626,29 @@ async def test_api_rejects_unknown_or_duplicate_multipart_fields(
     assert (await client.post("/predict", files=duplicate)).json() == {
         "error": "invalid_multipart_fields"
     }
+
+
+@pytest.mark.anyio
+async def test_serving_lifespan_observes_startup_and_cleans_up_on_interruption(monkeypatch):
+    from beyondcxr.utils.operational_logging import configured_logging
+
+    predictor = object()
+    monkeypatch.setattr(SymileServingPredictor, "load", lambda *args, **kwargs: predictor)
+    application = create_app(
+        authority_path="synthetic",
+        deployment_provenance="synthetic",
+        result_binding="synthetic",
+        release_archive="synthetic",
+    )
+    stream = io.StringIO()
+    with configured_logging(stream=stream, context={}):
+        with pytest.raises(RuntimeError, match="PRIVATE"):
+            async with application.router.lifespan_context(application):
+                assert application.state.predictor is predictor
+                raise RuntimeError("PRIVATE")
+    assert application.state.predictor is None
+    text = stream.getvalue()
+    assert "phase=serving_startup" in text
+    assert "event=serving_ready" in text
+    assert "event=serving_stopped" in text
+    assert "PRIVATE" not in text

@@ -8,11 +8,19 @@ import logging
 import math
 import re
 import sys
+import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any, TextIO
+from functools import wraps
+from pathlib import Path
+from typing import Any, ParamSpec, TextIO, TypeVar
+
+_LOGGING_OWNERSHIP_LOCK = threading.Lock()
+_LOGGING_OWNER_THREAD: int | None = None
+_LOGGING_OWNER_DEPTH = 0
+_CONTEXT_FIELDS = frozenset({"campaign_id", "dataset", "operation", "execution_id"})
 
 _HANDLER_MARKER = "_beyondcxr_console_handler"
 _DEFAULT_STREAM_MARKER = "_beyondcxr_uses_default_stream"
@@ -25,11 +33,13 @@ _COUNT_FIELDS = frozenset(
         "file_count",
         "global_epoch",
         "no_improvement_count",
+        "outer_fold",
         "partition_count",
         "patience",
         "planned_epochs",
         "record_count",
         "report_count",
+        "repeat_seed",
         "rows",
         "seed",
         "selected_epoch",
@@ -40,7 +50,13 @@ _COUNT_FIELDS = frozenset(
     }
 )
 _BOUNDED_NUMERIC_FIELDS = frozenset(
-    {"average_precision", "brier_score", "roc_auc", "validation_average_precision"}
+    {
+        "average_precision",
+        "brier_score",
+        "roc_auc",
+        "validation_average_precision",
+        "validation_metric",
+    }
 )
 _NONNEGATIVE_NUMERIC_FIELDS = frozenset(
     {
@@ -65,13 +81,17 @@ _TOKEN_FIELDS = frozenset(
         "device",
         "error_type",
         "experiment",
+        "execution_id",
         "family_id",
+        "metric_name",
         "operation",
+        "package_id",
         "partition",
         "phase",
         "run_id",
         "run_kind",
         "selected_stage",
+        "selection_metric",
         "stage",
         "training_run_id",
         "unit",
@@ -343,3 +363,223 @@ def _positive_number(value: object, name: str) -> float:
     if not math.isfinite(number) or number <= 0.0:
         raise ValueError(f"{name} must be a positive finite number")
     return number
+
+
+@contextmanager
+def logging_ownership() -> Iterator[None]:
+    """Own process-global operational handlers in one explicitly tracked thread."""
+    global _LOGGING_OWNER_DEPTH, _LOGGING_OWNER_THREAD
+    thread_id = threading.get_ident()
+    with _LOGGING_OWNERSHIP_LOCK:
+        if _LOGGING_OWNER_THREAD not in {None, thread_id}:
+            raise RuntimeError("Operational logging sessions cannot overlap across threads")
+        _LOGGING_OWNER_THREAD = thread_id
+        _LOGGING_OWNER_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _LOGGING_OWNERSHIP_LOCK:
+            if _LOGGING_OWNER_THREAD != thread_id or _LOGGING_OWNER_DEPTH <= 0:
+                raise RuntimeError("Operational logging ownership state is invalid")
+            _LOGGING_OWNER_DEPTH -= 1
+            if _LOGGING_OWNER_DEPTH == 0:
+                _LOGGING_OWNER_THREAD = None
+
+
+def _logging_owner_thread() -> int | None:
+    with _LOGGING_OWNERSHIP_LOCK:
+        return _LOGGING_OWNER_THREAD
+
+
+@contextmanager
+def configured_logging(
+    *, stream: TextIO, context: Mapping[str, object], level: str = "INFO"
+) -> Iterator[None]:
+    """Temporarily own operational handlers without changing caller logging state."""
+    if any(
+        key not in _CONTEXT_FIELDS or _safe_field_value(key, value) is None
+        for key, value in context.items()
+    ):
+        raise ValueError("Invalid operational session context")
+    with logging_ownership():
+        root = _OPERATIONAL_ROOT
+        previous = tuple(root.handlers)
+        state = (root.level, root.propagate, root.disabled)
+        campaign_owner = threading.get_ident() if "campaign_id" in context else None
+
+        class ContextFilter(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                if campaign_owner is not None and record.thread != campaign_owner:
+                    return False
+                fields = _sanitize_fields(getattr(record, "beyondcxr_fields", {}))
+                if campaign_owner is not None:
+                    fields = {
+                        key: value for key, value in fields.items() if key not in _CONTEXT_FIELDS
+                    }
+                protected = {key: value for key, value in context.items() if key in _CONTEXT_FIELDS}
+                record.beyondcxr_fields = {**fields, **protected}
+                return True
+
+        for handler in previous:
+            root.removeHandler(handler)
+        try:
+            root.disabled = False
+            configure_logging(level, stream=stream)
+            for handler in root.handlers:
+                handler.addFilter(ContextFilter())
+            yield
+        finally:
+            for handler in tuple(root.handlers):
+                root.removeHandler(handler)
+                handler.close()
+            for handler in previous:
+                root.addHandler(handler)
+            root.setLevel(state[0])
+            root.propagate, root.disabled = state[1:]
+
+
+def parse_operational_record(line: str) -> dict[str, str]:
+    """Parse one record that the canonical operational writer could emit."""
+    result: dict[str, str] = {}
+    position = 0
+    decoder = json.JSONDecoder()
+    if not line or any(character in line for character in "\r\n"):
+        raise ValueError("Operational log record must be one nonempty line")
+    while position < len(line):
+        key = re.match(r"([a-z_]+)=", line[position:])
+        if key is None or key[1] in result:
+            raise ValueError("Operational log key is malformed or duplicated")
+        position += key.end()
+        if position < len(line) and line[position] == '"':
+            value, consumed = decoder.raw_decode(line[position:])
+            if not isinstance(value, str):
+                raise ValueError("Operational quoted value must be a string")
+            position += consumed
+        else:
+            token = re.match(r"[^\s\"=]+", line[position:])
+            if token is None:
+                raise ValueError("Operational log value is malformed")
+            value = token[0]
+            position += token.end()
+        result[key[1]] = value
+        if position < len(line):
+            if line[position] != " " or position + 1 == len(line):
+                raise ValueError("Operational log separator is malformed")
+            position += 1
+    if (
+        not {"timestamp", "level", "event"} <= result.keys()
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", result["timestamp"])
+        or result["level"] not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        or not _SAFE_TOKEN.fullmatch(result["event"])
+        or not _writer_fields_are_valid(result)
+    ):
+        raise ValueError("Operational log envelope is invalid")
+    datetime.fromisoformat(result["timestamp"])
+    return result
+
+
+def _writer_fields_are_valid(record: Mapping[str, str]) -> bool:
+    envelope = {"timestamp", "level", "event"}
+    allowed = (
+        envelope
+        | _COUNT_FIELDS
+        | _BOUNDED_NUMERIC_FIELDS
+        | _NONNEGATIVE_NUMERIC_FIELDS
+        | _BOOLEAN_FIELDS
+        | _TOKEN_FIELDS
+    )
+    if not set(record) <= allowed:
+        return False
+    for key, value in record.items():
+        if key in envelope:
+            continue
+        if key in _COUNT_FIELDS:
+            if not re.fullmatch(r"0|[1-9]\d*", value):
+                return False
+            typed: object = int(value)
+        elif key in _BOUNDED_NUMERIC_FIELDS | _NONNEGATIVE_NUMERIC_FIELDS:
+            try:
+                typed = float(value)
+            except ValueError:
+                return False
+        elif key in _BOOLEAN_FIELDS:
+            if value not in {"true", "false"}:
+                return False
+            typed = value == "true"
+        else:
+            typed = value
+        safe = _safe_field_value(key, typed)
+        if safe is None or _format_value(safe) != value:
+            return False
+    return True
+
+
+class TeeStream:
+    """Immediately flush safe operational records to file and console."""
+
+    def __init__(self, *streams: TextIO) -> None:
+        self._streams = streams
+
+    def write(self, value: str) -> int:
+        for stream in self._streams:
+            if not stream.closed:
+                stream.write(value)
+                stream.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            if not stream.closed:
+                stream.flush()
+
+
+@contextmanager
+def operational_output(log_path: Path | None = None, *, level: str = "INFO") -> Iterator[None]:
+    """Configure terminal diagnostics, optionally teeing a new operational log."""
+    if log_path is not None:
+        with logging_ownership():
+            with log_path.open("x", encoding="utf-8", buffering=1) as stream:
+                with configured_logging(
+                    stream=TeeStream(sys.stderr, stream), context={}, level=level
+                ):
+                    yield
+    else:
+        owner = _logging_owner_thread()
+        if owner == threading.get_ident():
+            yield
+        elif owner is not None:
+            raise RuntimeError("Operational logging sessions cannot overlap across threads")
+        else:
+            with configured_logging(stream=sys.stderr, context={}, level=level):
+                yield
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def observed_operation(phase: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Observe a direct entry path without replacing an enclosing campaign's handlers."""
+
+    def decorate(function: Callable[_P, _R]) -> Callable[_P, _R]:
+        @wraps(function)
+        def observed(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            with (
+                operational_output(),
+                timed_phase(get_operational_logger(function.__module__), phase),
+            ):
+                return function(*args, **kwargs)
+
+        return observed
+
+    return decorate
+
+
+@contextmanager
+def cli_operation(phase: str, *, level: str) -> Iterator[None]:
+    """Observe a successfully parsed CLI invocation at its requested level."""
+    with (
+        operational_output(level=level),
+        timed_phase(get_operational_logger("cli"), phase),
+    ):
+        yield

@@ -17,7 +17,7 @@ import pandas as pd
 
 from beyondcxr.training.rsna_campaign_control import validate_execution, validate_freeze
 from beyondcxr.training.rsna_evaluation_result import validate_rsna_evaluation
-from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 from beyondcxr.utils.publication import (
     install_regenerable_directory,
     staging_directory,
@@ -324,22 +324,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        execution = validate_execution(args.execution_directory)
-        freeze = validate_freeze(
-            args.freeze_directory,
-            model_root=args.model_directory,
-            bundle_directory=args.bundle_directory,
-        )
-        result = regenerate_comparison(
-            args.evaluation_ids,
-            output_directory=args.output_directory,
-            private_directory=args.private_directory,
-            model_directory=args.model_directory,
-            freeze=freeze,
-            execution=execution,
-        )
+        with cli_operation("rsna_comparison_cli", level=args.log_level):
+            execution = validate_execution(args.execution_directory)
+            freeze = validate_freeze(
+                args.freeze_directory,
+                model_root=args.model_directory,
+                bundle_directory=args.bundle_directory,
+            )
+            result = regenerate_comparison(
+                args.evaluation_ids,
+                output_directory=args.output_directory,
+                private_directory=args.private_directory,
+                model_directory=args.model_directory,
+                freeze=freeze,
+                execution=execution,
+            )
     except (OSError, ValueError, KeyError) as exc:
         print(f"Comparison failed: {type(exc).__name__}", file=sys.stderr)
         return 1

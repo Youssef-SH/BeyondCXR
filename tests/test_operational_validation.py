@@ -127,3 +127,43 @@ def test_writable_directory_destination_rejects_files_and_symlinks(
         destination.symlink_to(physical, target_is_directory=True)
     with pytest.raises(ManifestBuildError, match="symlink|writable.*directory"):
         validate_writable_directory_destination(destination, "output root")
+
+
+@pytest.mark.parametrize(
+    "shared,workspace,backup,passes",
+    [
+        (False, 32, 8, True),
+        (False, 31, 8, False),
+        (False, 32, 7, False),
+        (True, 40, 40, True),
+        (True, 39, 39, False),
+        (True, 50, 39, False),
+    ],
+)
+def test_volume_capacity_accounting(tmp_path, monkeypatch, shared, workspace, backup, passes):
+    from beyondcxr.training import operational_validation as validation
+
+    destination = tmp_path / "backup"
+    gib = 1024**3
+    monkeypatch.setattr(
+        validation,
+        "_storage_volume",
+        lambda path: (
+            (1, workspace * gib) if path == tmp_path else (1 if shared else 2, backup * gib)
+        ),
+    )
+    requirements = ((tmp_path, 32 * gib), (destination, 8 * gib))
+    if passes:
+        validation.validate_storage_capacity(requirements, context="Synthetic campaign")
+    else:
+        with pytest.raises(OSError, match="insufficient filesystem capacity"):
+            validation.validate_storage_capacity(requirements, context="Synthetic campaign")
+    assert not destination.exists()
+
+
+def test_volume_identity_uses_nearest_existing_ancestor(tmp_path):
+    from beyondcxr.training.operational_validation import _storage_volume
+
+    device, free = _storage_volume(tmp_path / "absent/nested")
+    assert device == tmp_path.stat().st_dev
+    assert free >= 0

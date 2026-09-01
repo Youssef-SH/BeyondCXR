@@ -39,7 +39,7 @@ from beyondcxr.training.symile_statistics import (
 from beyondcxr.training.symile_statistics import (
     metrics as symile_headline_metrics,
 )
-from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 from beyondcxr.utils.privacy import validate_public_reports
 from beyondcxr.utils.publication import (
     install_regenerable_directory,
@@ -655,15 +655,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        directory = analyze_symile_development(
-            args.development_ids,
-            report_root=args.report_root,
-            model_root=args.model_root,
-            prediction_root=args.prediction_root,
-            manifest_root=args.manifest_root,
-        )
+        with cli_operation("symile_development_report_cli", level=args.log_level):
+            directory = analyze_symile_development(
+                args.development_ids,
+                report_root=args.report_root,
+                model_root=args.model_root,
+                prediction_root=args.prediction_root,
+                manifest_root=args.manifest_root,
+            )
     except (ManifestBuildError, OSError, ValueError) as exc:
         print(f"Symile development analysis failed: {type(exc).__name__}", file=sys.stderr)
         return 1

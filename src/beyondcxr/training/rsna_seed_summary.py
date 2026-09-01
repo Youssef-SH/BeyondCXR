@@ -21,7 +21,7 @@ from beyondcxr.training.rsna_evaluation_result import (
     validate_rsna_model_package,
 )
 from beyondcxr.training.rsna_formal import RSNA_NEURAL_SEEDS
-from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 from beyondcxr.utils.package_identity import pretrained_weight_semantic_identity
 from beyondcxr.utils.privacy import validate_public_reports
 from beyondcxr.utils.publication import (
@@ -576,22 +576,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        execution = validate_execution(args.execution_directory)
-        freeze = validate_freeze(
-            args.freeze_directory,
-            model_root=args.model_directory,
-            bundle_directory=args.bundle_directory,
-        )
-        result = publish_seed_summary(
-            args.evaluation_ids,
-            output_directory=args.output_directory,
-            model_directory=args.model_directory,
-            private_directory=args.private_directory,
-            freeze=freeze,
-            execution=execution,
-        )
+        with cli_operation("rsna_seed_summary_cli", level=args.log_level):
+            execution = validate_execution(args.execution_directory)
+            freeze = validate_freeze(
+                args.freeze_directory,
+                model_root=args.model_directory,
+                bundle_directory=args.bundle_directory,
+            )
+            result = publish_seed_summary(
+                args.evaluation_ids,
+                output_directory=args.output_directory,
+                model_directory=args.model_directory,
+                private_directory=args.private_directory,
+                freeze=freeze,
+                execution=execution,
+            )
     except (OSError, ValueError) as exc:
         print(f"Seed summary failed: {type(exc).__name__}", file=sys.stderr)
         return 1

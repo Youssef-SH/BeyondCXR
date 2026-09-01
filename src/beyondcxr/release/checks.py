@@ -18,6 +18,7 @@ import zipfile
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.release.binding import load_result_binding
@@ -26,6 +27,12 @@ from beyondcxr.release.render import (
     RESULT_START,
     parse_result_region,
     public_result_surface,
+)
+from beyondcxr.training.operational_validation import validate_directory_chain
+from beyondcxr.utils.operational_logging import (
+    get_operational_logger,
+    operational_output,
+    timed_phase,
 )
 from beyondcxr.utils.provenance import PROJECT_ROOT_FILES, git_revision, project_untracked_paths
 
@@ -347,131 +354,143 @@ def run_final_acceptance(
     authority = Path(authority_root).resolve()
     if authority.is_relative_to(repository):
         raise ManifestBuildError("Serving authorities must be published outside the repository")
-    binding = repository / "results/symile/binding.json"
-    _check_result_surface(repository, final=False)
-    with resolved_release(artifact_root) as (artifact, campaign):
-        artifact = artifact.resolve()
-        formal_execution_git_commit = str(campaign.execution.manifest["git_commit"])
-        result_paths = {
-            "artifact_root": artifact,
-            "output_root": repository / "results",
-            "readme_path": repository / "README.md",
-            "model_card_path": repository / "docs/model_card.md",
-        }
-        if not binding.exists() and not binding.is_symlink():
-            publish_results_from_campaign(
-                archive=artifact,
-                campaign=campaign,
-                output_root=result_paths["output_root"],
-                readme_path=result_paths["readme_path"],
-                model_card_path=result_paths["model_card_path"],
-            )
-    reproduce_results(binding_path=binding, **result_paths)
-    check_repository(
+    log_root = validate_directory_chain(
         repository,
-        final=True,
-        formal_execution_git_commit=formal_execution_git_commit,
+        repository / "reports/release/operations",
+        "Release log destination",
+        create=True,
     )
-    authority.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        dir=authority.parent, prefix=".beyondcxr-release-"
-    ) as temporary:
-        checkout = Path(temporary) / "checkout"
-        _run(["git", "clone", "--no-hardlinks", str(repository), str(checkout)], repository)
-        commands = (
-            ["uv", "sync", "--locked", "--group", "dev", "--extra", "serving"],
-            ["make", "check"],
-            ["uv", "run", "pre-commit", "run", "--all-files"],
-            ["uv", "build"],
-        )
-        for command in commands:
-            _run(command, checkout)
-        inspect_distribution_archives(
-            sorted((checkout / "dist").iterdir()), repository_root=checkout
-        )
-        staged_authorities = Path(temporary) / "authorities"
-        authority_name = _run_capture(
-            [
-                "uv",
-                "run",
-                "--locked",
-                "--extra",
-                "serving",
-                "python",
-                "-m",
-                "beyondcxr.release.cli",
-                "serving-authority",
-                "--artifact-root",
-                str(artifact),
-                "--authority-root",
-                str(staged_authorities),
-                "--repository-root",
-                str(checkout),
-            ],
-            checkout,
-        ).strip()
-        candidate_authority = staged_authorities / authority_name
-        provenance_candidates = tuple(
-            (staged_authorities / "deployment-provenance" / authority_name).glob("*.json")
-        )
-        if len(provenance_candidates) != 1:
-            raise ManifestBuildError("Serving deployment provenance is missing or ambiguous")
-        candidate_provenance = provenance_candidates[0]
-        result_binding = staged_authorities / "release-evidence" / authority_name / "binding.json"
-        if not result_binding.is_file():
-            raise ManifestBuildError("Serving result binding is missing")
-        docker = shutil.which("docker")
-        if docker is None:
-            raise ManifestBuildError("Final acceptance requires docker")
-        image = f"beyondcxr-release-check:{os.getpid()}"
-        try:
-            _run([docker, "build", "--tag", image, "."], checkout)
-            _run(
-                [
-                    docker,
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "/bin/sh",
-                    image,
-                    "-c",
-                    _docker_verification_command(),
-                ],
-                checkout,
-            )
-            _run_container_serving_acceptance(
-                artifact=artifact,
-                authority=candidate_authority,
-                deployment_provenance=candidate_provenance,
-                result_binding=result_binding,
-                image=image,
-                cwd=checkout,
-                docker=docker,
-            )
-        finally:
-            try:
-                subprocess.run(
-                    [docker, "image", "rm", "--force", image],
-                    cwd=checkout,
-                    check=False,
-                    capture_output=True,
+    with (
+        operational_output(log_root / f"release-{uuid4().hex}.log"),
+        timed_phase(get_operational_logger(__name__), "release_acceptance"),
+    ):
+        binding = repository / "results/symile/binding.json"
+        _check_result_surface(repository, final=False)
+        with resolved_release(artifact_root) as (artifact, campaign):
+            artifact = artifact.resolve()
+            formal_execution_git_commit = str(campaign.execution.manifest["git_commit"])
+            result_paths = {
+                "artifact_root": artifact,
+                "output_root": repository / "results",
+                "readme_path": repository / "README.md",
+                "model_card_path": repository / "docs/model_card.md",
+            }
+            if not binding.exists() and not binding.is_symlink():
+                publish_results_from_campaign(
+                    archive=artifact,
+                    campaign=campaign,
+                    output_root=result_paths["output_root"],
+                    readme_path=result_paths["readme_path"],
+                    model_card_path=result_paths["model_card_path"],
                 )
-            except OSError:
-                pass
+        reproduce_results(binding_path=binding, **result_paths)
         check_repository(
-            checkout,
+            repository,
             final=True,
             formal_execution_git_commit=formal_execution_git_commit,
         )
-        from beyondcxr.release.serving import publish_accepted_serving_state
+        authority.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=authority.parent, prefix=".beyondcxr-release-"
+        ) as temporary:
+            checkout = Path(temporary) / "checkout"
+            _run(["git", "clone", "--no-hardlinks", str(repository), str(checkout)], repository)
+            commands = (
+                ["uv", "sync", "--locked", "--group", "dev", "--extra", "serving"],
+                ["make", "check"],
+                ["uv", "run", "pre-commit", "run", "--all-files"],
+                ["uv", "build"],
+            )
+            for command in commands:
+                _run(command, checkout)
+            inspect_distribution_archives(
+                sorted((checkout / "dist").iterdir()), repository_root=checkout
+            )
+            staged_authorities = Path(temporary) / "authorities"
+            authority_name = _run_capture(
+                [
+                    "uv",
+                    "run",
+                    "--locked",
+                    "--extra",
+                    "serving",
+                    "python",
+                    "-m",
+                    "beyondcxr.release.cli",
+                    "serving-authority",
+                    "--artifact-root",
+                    str(artifact),
+                    "--authority-root",
+                    str(staged_authorities),
+                    "--repository-root",
+                    str(checkout),
+                ],
+                checkout,
+            ).strip()
+            candidate_authority = staged_authorities / authority_name
+            provenance_candidates = tuple(
+                (staged_authorities / "deployment-provenance" / authority_name).glob("*.json")
+            )
+            if len(provenance_candidates) != 1:
+                raise ManifestBuildError("Serving deployment provenance is missing or ambiguous")
+            candidate_provenance = provenance_candidates[0]
+            result_binding = (
+                staged_authorities / "release-evidence" / authority_name / "binding.json"
+            )
+            if not result_binding.is_file():
+                raise ManifestBuildError("Serving result binding is missing")
+            docker = shutil.which("docker")
+            if docker is None:
+                raise ManifestBuildError("Final acceptance requires docker")
+            image = f"beyondcxr-release-check:{os.getpid()}"
+            try:
+                _run([docker, "build", "--tag", image, "."], checkout)
+                _run(
+                    [
+                        docker,
+                        "run",
+                        "--rm",
+                        "--entrypoint",
+                        "/bin/sh",
+                        image,
+                        "-c",
+                        _docker_verification_command(),
+                    ],
+                    checkout,
+                )
+                _run_container_serving_acceptance(
+                    artifact=artifact,
+                    authority=candidate_authority,
+                    deployment_provenance=candidate_provenance,
+                    result_binding=result_binding,
+                    image=image,
+                    cwd=checkout,
+                    docker=docker,
+                )
+            finally:
+                try:
+                    subprocess.run(
+                        [docker, "image", "rm", "--force", image],
+                        cwd=checkout,
+                        check=False,
+                        capture_output=True,
+                    )
+                except OSError:
+                    pass
+            check_repository(
+                checkout,
+                final=True,
+                formal_execution_git_commit=formal_execution_git_commit,
+            )
+            from beyondcxr.release.serving import publish_accepted_serving_state
 
-        publish_accepted_serving_state(
-            candidate_authority=candidate_authority,
-            candidate_deployment_provenance=candidate_provenance,
-            candidate_result_binding=result_binding,
-            release_archive=artifact,
-            authority_root=authority,
-        )
+            publish_accepted_serving_state(
+                candidate_authority=candidate_authority,
+                candidate_deployment_provenance=candidate_provenance,
+                candidate_result_binding=result_binding,
+                release_archive=artifact,
+                authority_root=authority,
+            )
 
 
 def _run(command: list[str], cwd: Path) -> None:
@@ -479,7 +498,12 @@ def _run(command: list[str], cwd: Path) -> None:
     if executable is None:
         raise ManifestBuildError(f"Final acceptance requires {command[0]}")
     try:
-        subprocess.run([executable, *command[1:]], cwd=cwd, check=True)
+        with timed_phase(
+            get_operational_logger(__name__),
+            "release_command",
+            operation=_release_command_operation(command),
+        ):
+            subprocess.run([executable, *command[1:]], cwd=cwd, check=True)
     except subprocess.CalledProcessError as exc:
         raise ManifestBuildError(f"Final acceptance command failed: {command[0]}") from exc
 
@@ -489,11 +513,39 @@ def _run_capture(command: list[str], cwd: Path) -> str:
     if executable is None:
         raise ManifestBuildError(f"Final acceptance requires {command[0]}")
     try:
-        return subprocess.run(
-            [executable, *command[1:]], cwd=cwd, check=True, capture_output=True, text=True
-        ).stdout
+        with timed_phase(
+            get_operational_logger(__name__),
+            "release_command",
+            operation=_release_command_operation(command),
+        ):
+            return subprocess.run(
+                [executable, *command[1:]], cwd=cwd, check=True, capture_output=True, text=True
+            ).stdout
     except subprocess.CalledProcessError as exc:
         raise ManifestBuildError(f"Final acceptance command failed: {command[0]}") from exc
+
+
+def _release_command_operation(command: list[str]) -> str:
+    """Return a safe operator-facing name for one bounded acceptance command."""
+    executable = Path(command[0]).name
+    arguments = command[1:]
+    if executable == "git" and arguments[:1] == ["clone"]:
+        return "source_clone"
+    if executable == "uv" and arguments[:1] == ["sync"]:
+        return "dependency_sync"
+    if executable == "uv" and arguments[:1] == ["build"]:
+        return "package_build"
+    if executable == "uv" and "pre-commit" in arguments:
+        return "precommit_check"
+    if executable == "uv" and "serving-authority" in arguments:
+        return "serving_authority"
+    if executable == "make" and arguments[:1] == ["check"]:
+        return "repository_check"
+    if executable == "docker" and arguments[:1] == ["build"]:
+        return "container_build"
+    if executable == "docker" and arguments[:1] == ["run"]:
+        return "container_verification"
+    return "release_subprocess"
 
 
 def _docker_verification_command() -> str:

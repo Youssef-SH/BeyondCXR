@@ -17,7 +17,7 @@ from beyondcxr.training.rsna_train_cxr import train_cxr_experiment
 from beyondcxr.training.rsna_train_fusion import train_fusion_experiment
 from beyondcxr.training.rsna_train_metadata import train_metadata_experiment
 from beyondcxr.utils.mlflow_utils import DEFAULT_TRACKING_URI
-from beyondcxr.utils.operational_logging import add_logging_argument, configure_logging
+from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,25 +41,25 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Load one config, execute it, and print aggregate run lineage."""
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        config = with_runtime(
-            load_experiment_config(args.config, bundle_id=args.bundle_id), seed=args.seed
-        )
-        if config.family.family_id == "cxr_metadata_concat":
-            if not args.source_cxr_package_id:
-                raise ValueError("Fusion training requires --source-cxr-package-id")
-            result = train_fusion_experiment(
-                config,
-                source_cxr_package_id=args.source_cxr_package_id,
-                tracking_uri=args.tracking_uri,
+        with cli_operation("rsna_training_cli", level=args.log_level):
+            config = with_runtime(
+                load_experiment_config(args.config, bundle_id=args.bundle_id), seed=args.seed
             )
-        elif args.source_cxr_package_id:
-            raise ValueError("--source-cxr-package-id is accepted only for fusion training")
-        elif config.family.family_id == "cxr_densenet":
-            result = train_cxr_experiment(config, tracking_uri=args.tracking_uri)
-        else:
-            result = train_metadata_experiment(config, tracking_uri=args.tracking_uri)
+            if config.family.family_id == "cxr_metadata_concat":
+                if not args.source_cxr_package_id:
+                    raise ValueError("Fusion training requires --source-cxr-package-id")
+                result = train_fusion_experiment(
+                    config,
+                    source_cxr_package_id=args.source_cxr_package_id,
+                    tracking_uri=args.tracking_uri,
+                )
+            elif args.source_cxr_package_id:
+                raise ValueError("--source-cxr-package-id is accepted only for fusion training")
+            elif config.family.family_id == "cxr_densenet":
+                result = train_cxr_experiment(config, tracking_uri=args.tracking_uri)
+            else:
+                result = train_metadata_experiment(config, tracking_uri=args.tracking_uri)
     except (
         ConfigError,
         RegistryError,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 from dataclasses import replace
@@ -334,20 +335,37 @@ def test_final_neural_lifecycle_uses_only_fixed_terminal_epoch_budgets(
         return original_train(*args, **kwargs)
 
     monkeypatch.setattr(neural, "train_one_epoch", record_stage)
-    result = fit_terminal_two_stage_binary_model(
-        TinyImageModel(),
-        loader,
-        input_keys=("image",),
-        config=config.neural,
-        runtime=runtime,
-        pos_weight=1.0,
-        stage1_epochs=1,
-        stage2_epochs=1,
-        fine_tune_scope="all",
-    )
+    from beyondcxr.utils.operational_logging import configured_logging, parse_operational_record
+
+    stream = io.StringIO()
+    with configured_logging(stream=stream, context={}):
+        result = fit_terminal_two_stage_binary_model(
+            TinyImageModel(),
+            loader,
+            input_keys=("image",),
+            config=config.neural,
+            runtime=runtime,
+            pos_weight=1.0,
+            stage1_epochs=1,
+            stage2_epochs=1,
+            fine_tune_scope="all",
+            operational_fields={"family_id": "cxr_densenet", "seed": 17},
+        )
 
     assert stages == [True, False]
     assert all(value.device.type == "cpu" for value in result.state_dict.values())
+    records = [parse_operational_record(line) for line in stream.getvalue().splitlines()]
+    assert [(record["event"], record["stage"], record["global_epoch"]) for record in records] == [
+        ("epoch_started", "warmup", "1"),
+        ("epoch_completed", "warmup", "1"),
+        ("epoch_started", "fine_tune", "2"),
+        ("epoch_completed", "fine_tune", "2"),
+    ]
+    assert [record["stage_epoch"] for record in records] == ["1", "1", "1", "1"]
+    assert all(record["family_id"] == "cxr_densenet" for record in records)
+    assert all(record["seed"] == "17" for record in records)
+    completed = [record for record in records if record["event"] == "epoch_completed"]
+    assert all({"elapsed_s", "training_loss"} <= record.keys() for record in completed)
 
 
 def test_narrow_final_cxr_is_compatible_with_full_fusion_ancestry(

@@ -38,7 +38,7 @@ from beyondcxr.data.symile_schemas import (
 )
 from beyondcxr.utils.operational_logging import (
     add_logging_argument,
-    configure_logging,
+    cli_operation,
     get_operational_logger,
     timed_phase,
 )
@@ -350,19 +350,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    configure_logging(args.log_level)
     try:
-        with timed_phase(_LOGGER, "bundle_resolution"):
-            bundle = resolve_symile_bundle(
-                args.manifest_directory,
-                bundle_id=args.bundle_id,
-                full_validation=True,
-            )
-        with timed_phase(_LOGGER, "cv_publication"):
-            assignment_id, directory = publish_symile_cv(
-                bundle,
-                manifest_directory=args.manifest_directory,
-            )
+        with cli_operation("symile_cv_cli", level=args.log_level):
+            with timed_phase(_LOGGER, "bundle_resolution"):
+                bundle = resolve_symile_bundle(
+                    args.manifest_directory,
+                    bundle_id=args.bundle_id,
+                    full_validation=True,
+                )
+            with timed_phase(_LOGGER, "cv_publication"):
+                assignment_id, directory = publish_symile_cv(
+                    bundle,
+                    manifest_directory=args.manifest_directory,
+                )
     except (ManifestBuildError, OSError, ValueError, KeyError) as exc:
         print(f"Symile CV generation failed: {type(exc).__name__}", file=sys.stderr)
         return 1

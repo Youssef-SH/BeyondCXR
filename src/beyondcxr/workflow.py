@@ -9,6 +9,7 @@ from pathlib import Path
 
 from beyondcxr.data.errors import ManifestBuildError
 from beyondcxr.utils.mlflow_utils import discover_repository_root
+from beyondcxr.utils.operational_logging import observed_operation
 from beyondcxr.workflow_config import configure_local_machine, load_local_config
 
 
@@ -16,6 +17,7 @@ class WorkflowError(RuntimeError):
     """An actionable, privacy-safe public workflow failure."""
 
 
+@observed_operation("run_setup")
 def run_setup(
     *,
     backup_root: str | Path | None = None,
@@ -42,6 +44,7 @@ def run_setup(
     print("BeyondCXR machine setup complete.")
 
 
+@observed_operation("run_rsna")
 def run_rsna() -> None:
     """Run or resume the complete RSNA lifecycle using explicit authority coordinates."""
     repository = discover_repository_root()
@@ -74,6 +77,7 @@ def run_rsna() -> None:
     print(f"Archive: {result.archive_path.name}")
 
 
+@observed_operation("run_symile")
 def run_symile() -> None:
     """Run or resume Symile through its immutable pre-test freeze, then stop."""
     repository = discover_repository_root()
@@ -128,6 +132,7 @@ def run_symile() -> None:
     print("to cross the irreversible held-out boundary.")
 
 
+@observed_operation("run_symile_test")
 def run_symile_test() -> None:
     """Open or resume the sole exact frozen Symile execution."""
     repository = discover_repository_root()
@@ -155,6 +160,7 @@ def run_symile_test() -> None:
     print(f"Global result: {result['global_result_id']}")
 
 
+@observed_operation("run_release")
 def run_release() -> None:
     """Resolve the sole completed campaign and run canonical final acceptance."""
     repository = discover_repository_root()
@@ -190,6 +196,7 @@ def run_release() -> None:
     print("Final release accepted.")
 
 
+@observed_operation("run_serve")
 def run_serve() -> None:
     """Validate and run the sole installed accepted authority with local CPU defaults."""
     repository = discover_repository_root()

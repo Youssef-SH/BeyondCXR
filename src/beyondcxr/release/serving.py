@@ -37,6 +37,7 @@ from beyondcxr.serving.predictor import SymileServingPredictor
 from beyondcxr.training.symile_campaign import (
     RestoredCampaignClosure,
 )
+from beyondcxr.utils.operational_logging import observed_operation
 from beyondcxr.utils.provenance import git_revision
 from beyondcxr.utils.publication import publish_bytes_no_replace, rename_directory_no_replace
 from beyondcxr.utils.semantic_identity import canonical_json_bytes, semantic_sha256
@@ -50,6 +51,7 @@ class ValidatedServingPublication:
     release_archive: Path
 
 
+@observed_operation("resolve_accepted_serving_state")
 def resolve_accepted_serving_state(
     *,
     artifact_root: str | Path,
@@ -402,6 +404,7 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@observed_operation("publish_and_smoke_test_serving_authority")
 def publish_and_smoke_test_serving_authority(
     *, artifact_root: str | Path, authority_root: str | Path, repository_root: str | Path
 ) -> Path:

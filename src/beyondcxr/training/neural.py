@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -28,6 +28,7 @@ from beyondcxr.training.execution import (
     LoaderExecutionPolicy,
     one_shot_loader_policy,
 )
+from beyondcxr.utils.operational_logging import get_operational_logger, log_event
 
 CLASS_WEIGHT_POLICY_VERSION = "training-label-prevalence-pos-weight-v1"
 
@@ -761,6 +762,7 @@ def fit_terminal_two_stage_binary_model(
     stage1_epochs: int,
     stage2_epochs: int,
     fine_tune_scope: FineTuneScope,
+    operational_fields: Mapping[str, object] | None = None,
 ) -> TerminalTrainingResult:
     """Run a fixed terminal fit without validation, scheduling, or early stopping."""
     _validate_input_keys(input_keys)
@@ -778,20 +780,32 @@ def fit_terminal_two_stage_binary_model(
     ):
         raise NeuralTrainingError("Terminal neural fit schedule is invalid")
     neural_model = _validated_neural_model(model)
+    log_fields = dict(operational_fields or {})
     loss_function = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, dtype=torch.float32, device=runtime.device)
     )
     scaler = (
         torch.amp.GradScaler("cuda", enabled=True) if runtime.mixed_precision_effective else None
     )
+    logger = get_operational_logger(__name__)
     neural_model.freeze_encoder()
     stage1_optimizer = AdamW(
         neural_model.classifier.parameters(),
         lr=config.warmup_head_learning_rate,
         weight_decay=config.weight_decay,
     )
-    for _ in range(stage1_epochs):
-        train_one_epoch(
+    for stage_epoch in range(1, stage1_epochs + 1):
+        global_epoch = stage_epoch
+        log_event(
+            logger,
+            "epoch_started",
+            stage="warmup",
+            global_epoch=global_epoch,
+            stage_epoch=stage_epoch,
+            **log_fields,
+        )
+        started = time.perf_counter()
+        training_loss = train_one_epoch(
             neural_model,
             train_loader,
             optimizer=stage1_optimizer,
@@ -801,6 +815,16 @@ def fit_terminal_two_stage_binary_model(
             warmup=True,
             input_keys=input_keys,
             scaler=scaler,
+        )
+        log_event(
+            logger,
+            "epoch_completed",
+            stage="warmup",
+            global_epoch=global_epoch,
+            stage_epoch=stage_epoch,
+            training_loss=training_loss,
+            elapsed_s=time.perf_counter() - started,
+            **log_fields,
         )
     if stage2_epochs:
         if fine_tune_scope == "all":
@@ -827,8 +851,18 @@ def fit_terminal_two_stage_binary_model(
             ],
             weight_decay=config.weight_decay,
         )
-        for _ in range(stage2_epochs):
-            train_one_epoch(
+        for stage_epoch in range(1, stage2_epochs + 1):
+            global_epoch = stage1_epochs + stage_epoch
+            log_event(
+                logger,
+                "epoch_started",
+                stage="fine_tune",
+                global_epoch=global_epoch,
+                stage_epoch=stage_epoch,
+                **log_fields,
+            )
+            started = time.perf_counter()
+            training_loss = train_one_epoch(
                 neural_model,
                 train_loader,
                 optimizer=stage2_optimizer,
@@ -839,6 +873,16 @@ def fit_terminal_two_stage_binary_model(
                 input_keys=input_keys,
                 scaler=scaler,
                 encoder_trainability=fine_tune_scope,
+            )
+            log_event(
+                logger,
+                "epoch_completed",
+                stage="fine_tune",
+                global_epoch=global_epoch,
+                stage_epoch=stage_epoch,
+                training_loss=training_loss,
+                elapsed_s=time.perf_counter() - started,
+                **log_fields,
             )
     return TerminalTrainingResult(copy_state_dict_to_cpu(neural_model))
 
