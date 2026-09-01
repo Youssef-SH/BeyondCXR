@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
@@ -995,7 +996,7 @@ def validate_global_result(
         enforce_directory_name=enforce_directory_name,
     )
     expected_claims = _derive_global_claims(capability, packages, evidence, projection)
-    if observed_claims != expected_claims:
+    if not _global_claims_match(observed_claims, expected_claims):
         raise ManifestBuildError("Global-result claims do not rederive from prediction evidence")
     certified = object.__new__(CertifiedGlobalResult)
     object.__setattr__(
@@ -1024,6 +1025,46 @@ def validate_global_result(
         _GLOBAL_RESULT_CERTIFICATION_GUARD,
     )
     return certified
+
+
+def _global_claims_match(observed: Mapping[str, object], expected: Mapping[str, object]) -> bool:
+    """Compare claims exactly, allowing one ULP for fitted calibration coefficients."""
+    if observed.keys() != expected.keys():
+        return False
+    for name, expected_value in expected.items():
+        observed_value = observed[name]
+        if name != "predictor_views":
+            if observed_value != expected_value:
+                return False
+            continue
+        if not isinstance(observed_value, Mapping) or not isinstance(expected_value, Mapping):
+            return False
+        if observed_value.keys() != expected_value.keys():
+            return False
+        for family, expected_metrics in expected_value.items():
+            observed_metrics = observed_value[family]
+            if not isinstance(observed_metrics, Mapping) or not isinstance(
+                expected_metrics, Mapping
+            ):
+                return False
+            if observed_metrics.keys() != expected_metrics.keys():
+                return False
+            for metric, expected_metric in expected_metrics.items():
+                observed_metric = observed_metrics[metric]
+                if metric in {"calibration_slope", "calibration_intercept"}:
+                    if not _calibration_coefficient_matches(observed_metric, expected_metric):
+                        return False
+                elif observed_metric != expected_metric:
+                    return False
+    return True
+
+
+def _calibration_coefficient_matches(observed: object, expected: object) -> bool:
+    if type(observed) is not float or type(expected) is not float:
+        return False
+    if not math.isfinite(observed) or not math.isfinite(expected):
+        return False
+    return abs(observed - expected) <= max(math.ulp(observed), math.ulp(expected))
 
 
 def validate_global_result_integrity(

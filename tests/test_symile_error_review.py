@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import shutil
 import zipfile
 from dataclasses import replace
@@ -32,6 +33,43 @@ from beyondcxr.training.symile_test_data import (
 from beyondcxr.utils.private_predictions import (
     ValidatedPredictionEvidence,
 )
+
+
+def _claims_for_comparison() -> dict[str, object]:
+    return {
+        "paired_effects": {"primary": {"point": 0.012}},
+        "predictor_views": {
+            "primary": {
+                "roc_auc": 0.81,
+                "calibration_slope": 1.0,
+                "calibration_intercept": 0.5,
+            },
+        },
+    }
+
+
+def test_global_claim_comparison_accepts_one_ulp_calibration_variation() -> None:
+    observed = _claims_for_comparison()
+    expected = copy.deepcopy(observed)
+    expected["predictor_views"]["primary"]["calibration_slope"] = math.nextafter(1.0, 2.0)
+    assert campaign_control._global_claims_match(observed, expected)
+
+
+def test_global_claim_comparison_rejects_invalid_calibration_variation() -> None:
+    observed = _claims_for_comparison()
+    expected = copy.deepcopy(observed)
+    expected["predictor_views"]["primary"]["calibration_intercept"] += 1e-12
+    assert not campaign_control._global_claims_match(observed, expected)
+    observed["predictor_views"]["primary"]["calibration_intercept"] = float("nan")
+    expected["predictor_views"]["primary"]["calibration_intercept"] = float("nan")
+    assert not campaign_control._global_claims_match(observed, expected)
+
+
+def test_global_claim_comparison_keeps_other_numbers_exact() -> None:
+    observed = _claims_for_comparison()
+    expected = copy.deepcopy(observed)
+    expected["predictor_views"]["primary"]["roc_auc"] = math.nextafter(0.81, 1.0)
+    assert not campaign_control._global_claims_match(observed, expected)
 
 
 @pytest.fixture
