@@ -51,8 +51,19 @@ phase. See the [model card](docs/model_card.md) for the primary predictor's deve
 evaluation, and limitations.
 
 <!-- BEYONDCXR_RESULTS_START -->
-Awaiting formal Symile execution. The release workflow replaces this bounded region only after the
-preserved campaign and complete scientific evidence chain validate.
+### Development OOF evidence
+
+- CXR AUROC / AP / Brier: 0.718 / 0.679 / 0.214
+- Primary gated AUROC / AP / Brier: 0.723 / 0.686 / 0.212
+- Gated minus CXR ΔAUROC / ΔAP / ΔBrier: 0.005 / 0.006 / -0.003
+
+### Held-out test evidence
+
+- CXR AUROC / AP / Brier: 0.781 / 0.823 / 0.201
+- Primary gated AUROC / AP / Brier: 0.777 / 0.809 / 0.199
+- Gated minus CXR ΔAUROC: -0.003 (95% CI -0.018 to 0.009)
+
+See [aggregate tables and figures](https://github.com/Youssef-SH/BeyondCXR/tree/main/results/symile/).
 <!-- BEYONDCXR_RESULTS_END -->
 
 ## Documentation

@@ -1,0 +1,54 @@
+Symile cohort construction and strict-label eligibility.
+
+| Section | Cohort | Attribute | Category | Admissions | Positive | Negative | Definition / status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Strict endpoint | Train | — | — | 2194 | 1026 | 1168 | Eligible Pneumonia = 1 versus 0 |
+| Strict endpoint | Validation | — | — | 174 | 78 | 96 | Eligible Pneumonia = 1 versus 0 |
+| Strict endpoint | Development | — | — | 2368 | 1104 | 1264 | Eligible Pneumonia = 1 versus 0 |
+| Strict endpoint | Test | — | — | 110 | 58 | 52 | Eligible Pneumonia = 1 versus 0 |
+| Source reconciliation | Full source index | — | — | 11622 | — | — | Authenticated source admissions |
+| Source reconciliation | Official classification membership | — | — | 11214 | — | — | Train + validation + held-out test |
+| Source reconciliation | Audited excluded admissions | — | — | 408 | — | — | Audited and excluded |
+| Cohort construction | Train inclusion | — | — | — | — | — | All unique admissions in train.csv |
+| Cohort construction | Validation inclusion | — | — | — | — | — | All unique admissions in val.csv |
+| Cohort construction | Held-out test inclusion | — | — | — | — | — | positive self-query rows of test.csv; selector: label == 1 and label_hadm_id == hadm_id |
+| Cohort construction | Classification exclusions | — | — | — | — | — | Retrieval-negative candidates and val_retrieval.csv are excluded from classification |
+| Aggregate description | Train | age | 18-49 | 319 | — | — | Aggregate count |
+| Aggregate description | Train | age | 50-64 | 550 | — | — | Aggregate count |
+| Aggregate description | Train | age | 65-79 | 711 | — | — | Aggregate count |
+| Aggregate description | Train | age | 80-plus | 614 | — | — | Aggregate count |
+| Aggregate description | Train | sex | F | 1018 | — | — | Aggregate count |
+| Aggregate description | Train | sex | M | 1176 | — | — | Aggregate count |
+| Aggregate description | Train | view_position | AP | 1752 | — | — | Aggregate count |
+| Aggregate description | Train | view_position | PA | 442 | — | — | Aggregate count |
+| Aggregate description | Validation | age | 18-49 | 29 | — | — | Aggregate count |
+| Aggregate description | Validation | age | 50-64 | 36 | — | — | Aggregate count |
+| Aggregate description | Validation | age | 65-79 | 53 | — | — | Aggregate count |
+| Aggregate description | Validation | age | 80-plus | 56 | — | — | Aggregate count |
+| Aggregate description | Validation | sex | F | 84 | — | — | Aggregate count |
+| Aggregate description | Validation | sex | M | 90 | — | — | Aggregate count |
+| Aggregate description | Validation | view_position | AP | 142 | — | — | Aggregate count |
+| Aggregate description | Validation | view_position | PA | 32 | — | — | Aggregate count |
+| Aggregate description | Development | age | 18-49 | 348 | — | — | Aggregate count |
+| Aggregate description | Development | age | 50-64 | 586 | — | — | Aggregate count |
+| Aggregate description | Development | age | 65-79 | 764 | — | — | Aggregate count |
+| Aggregate description | Development | age | 80-plus | 670 | — | — | Aggregate count |
+| Aggregate description | Development | sex | F | 1102 | — | — | Aggregate count |
+| Aggregate description | Development | sex | M | 1266 | — | — | Aggregate count |
+| Aggregate description | Development | view_position | AP | 1894 | — | — | Aggregate count |
+| Aggregate description | Development | view_position | PA | 474 | — | — | Aggregate count |
+| Aggregate description | Test | age | 18-49 | 16 | — | — | Aggregate count |
+| Aggregate description | Test | age | 50-64 | 27 | — | — | Aggregate count |
+| Aggregate description | Test | age | 65-79 | 28 | — | — | Aggregate count |
+| Aggregate description | Test | age | 80-plus | 39 | — | — | Aggregate count |
+| Aggregate description | Test | sex | F | 45 | — | — | Aggregate count |
+| Aggregate description | Test | sex | M | 65 | — | — | Aggregate count |
+| Aggregate description | Test | view_position | AP | 80 | — | — | Aggregate count |
+| Aggregate description | Test | view_position | PA | 30 | — | — | Aggregate count |
+| Endpoint provenance | Endpoint | — | — | — | — | — | pneumonia_strict |
+| Endpoint provenance | Policy version | — | — | — | — | — | symile-pneumonia-strict-v1 |
+| Endpoint provenance | Label source | — | — | — | — | — | symile_mimic_data.csv:Pneumonia |
+| Endpoint provenance | State interpretation | — | — | — | — | — | Positive: pneumonia_state == 1; negative: pneumonia_state == 0; excluded: pneumonia_state == -1, pneumonia_state is null |
+| Endpoint provenance | Prospective selection | — | — | — | — | — | Broader and alternative label policies were audited prospectively before supervised modeling; their larger eligible cohorts resulted from changed target semantics and/or negative-class spectrum. The study therefore froze explicit Pneumonia = 1 versus explicit Pneumonia = 0 and excludes uncertain or unmentioned labels. |
+
+*Admissions are the analytic unit; subject identity defines grouping.*

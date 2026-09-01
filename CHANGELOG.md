@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-09-01
 
 - Initial public release of BeyondCXR.
 - Add reproducible RSNA CXR qualification with metadata baselines, three-seed neural evaluation,

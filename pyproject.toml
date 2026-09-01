@@ -1,6 +1,6 @@
 [project]
 name = "beyondcxr"
-version = "0.1.0"
+version = "1.0.0"
 description = "Multimodal prediction of a radiology-derived Pneumonia finding from chest radiography, laboratory data, and ECG."
 readme = "README.md"
 license = "Apache-2.0"

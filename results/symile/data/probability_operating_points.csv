@@ -1,0 +1,7 @@
+section,model_or_point,brier_score,calibration_slope,calibration_intercept,threshold,precision,sensitivity,specificity,f1,tn,fp,fn,tp
+Development OOF raw probability,CXR,0.21419010380669984,1.1214548779488844,0.049770707797192136,,,,,,,,,
+Held-out descriptive raw probability,CXR,0.20067967353914645,1.2929767327118415,0.5569213363979532,,,,,,,,,
+Development OOF raw probability,CXR + labs gated,0.21161634419002553,0.9287482559287096,0.004463063637387514,,,,,,,,,
+Held-out descriptive raw probability,CXR + labs gated,0.19890475814072225,1.1959613440839334,0.5335003281902203,,,,,,,,,
+Held-out behavior at development-derived operating point,Youden-J,,,,0.44797844929651676,0.7916666666666666,0.6551724137931034,0.8076923076923077,0.7169811320754716,42,10,20,38
+Held-out behavior at development-derived operating point,90% sensitivity target,,,,0.2629995468417687,0.6363636363636364,0.8448275862068966,0.46153846153846156,0.7259259259259259,24,28,9,49
