@@ -8,6 +8,7 @@ from pathlib import Path
 import uvicorn
 
 from beyondcxr.serving.api import create_app
+from beyondcxr.utils.operational_logging import add_logging_argument, cli_operation
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -19,27 +20,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    add_logging_argument(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if not 1 <= args.port <= 65535:
-        raise SystemExit("--port must be between 1 and 65535")
-    application = create_app(
-        authority_path=args.authority,
-        deployment_provenance=args.deployment_provenance,
-        result_binding=args.result_binding,
-        release_archive=args.release_archive,
-        device=args.device,
-    )
-    uvicorn.run(
-        application,
-        host=args.host,
-        port=args.port,
-        log_config=None,
-        access_log=False,
-    )
+    with cli_operation("serving_cli", level=args.log_level):
+        if not 1 <= args.port <= 65535:
+            raise SystemExit("--port must be between 1 and 65535")
+        application = create_app(
+            authority_path=args.authority,
+            deployment_provenance=args.deployment_provenance,
+            result_binding=args.result_binding,
+            release_archive=args.release_archive,
+            device=args.device,
+        )
+        uvicorn.run(
+            application,
+            host=args.host,
+            port=args.port,
+            log_config=None,
+            access_log=False,
+        )
     return 0
 
 

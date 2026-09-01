@@ -18,6 +18,12 @@ from beyondcxr.serving.preprocessing import (
     ServingInputError,
     validated_serving_input,
 )
+from beyondcxr.utils.operational_logging import (
+    get_operational_logger,
+    log_event,
+    operational_output,
+    timed_phase,
+)
 
 if TYPE_CHECKING:
     from beyondcxr.training.symile_campaign import RestoredCampaignClosure
@@ -95,27 +101,33 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if (
-            authority_path is None
-            or deployment_provenance is None
-            or result_binding is None
-            or release_archive is None
-        ):
-            raise RuntimeError(
-                "A serving authority, deployment provenance, result binding, and canonical "
-                "release archive are required"
-            )
-        loaded = SymileServingPredictor.load(
-            authority_path,
-            deployment_provenance=deployment_provenance,
-            result_binding=result_binding,
-            release_archive=release_archive,
-            device=device,
-            restored_campaign=restored_campaign,
-        )
-        app.state.predictor = loaded
-        yield
-        app.state.predictor = None
+        with operational_output():
+            with timed_phase(get_operational_logger(__name__), "serving_startup"):
+                if (
+                    authority_path is None
+                    or deployment_provenance is None
+                    or result_binding is None
+                    or release_archive is None
+                ):
+                    raise RuntimeError(
+                        "A serving authority, deployment provenance, result binding, and canonical "
+                        "release archive are required"
+                    )
+                loaded = SymileServingPredictor.load(
+                    authority_path,
+                    deployment_provenance=deployment_provenance,
+                    result_binding=result_binding,
+                    release_archive=release_archive,
+                    device=device,
+                    restored_campaign=restored_campaign,
+                )
+            app.state.predictor = loaded
+            log_event(get_operational_logger(__name__), "serving_ready")
+            try:
+                yield
+            finally:
+                app.state.predictor = None
+                log_event(get_operational_logger(__name__), "serving_stopped")
 
     application = FastAPI(
         title="BeyondCXR Research Serving",
