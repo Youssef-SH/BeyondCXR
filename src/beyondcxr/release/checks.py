@@ -417,7 +417,7 @@ def run_final_acceptance(
                 ["uv", "sync", "--locked", "--group", "dev", "--extra", "serving"],
                 ["make", "check"],
                 ["uv", "run", "pre-commit", "run", "--all-files"],
-                ["uv", "build"],
+                ["uv", "build", "--no-create-gitignore"],
             )
             for command in commands:
                 _run(command, checkout)
