@@ -26,6 +26,38 @@ canonical locations in the dataset guides.
 RSNA may be acquired through the standard Kaggle client only when the configured source root is
 absent. Symile is always operator supplied. Neither dataset is downloaded by `make setup`.
 
+## Campaign logs and storage readiness
+
+`make rsna`, `make symile`, and `make symile-test` establish the same durable operational session
+once readiness permits campaign work. Each attempt creates a durable
+`reports/<study>/campaigns/campaign-<attempt>/execution.log`. Once formal execution is established,
+`session.json` records its immutable association; exportable attempts therefore contain both.
+These files are operational evidence and grant no scientific or held-out authority.
+
+Preservation receives exactly the exporting attempt's log and association; it does not discover
+historical attempts. Both studies restore them at
+`reports/<study>/campaigns/export/{session.json,execution.log}`. The archived log ends exactly at
+`campaign_ready_for_export`; later archive-success events remain in the live log. A retry validates
+and reuses a completed immutable archive without rewriting it.
+
+Release acceptance additionally writes a unique `reports/release/operations/release-<attempt>.log`.
+These diagnostics remain local. Serving emits startup, ready, and stop diagnostics without request
+contents or access logs.
+
+Campaign preservation owns temporary extraction beneath `outbox/`, including verification of
+existing archives on retry. Each extraction is removed when its validation scope exits. Readiness
+accounts for working state, a local archive coexisting with one extracted closure, and the external
+backup. The same study-owned closure allowance applies to each preservation copy. Capacity
+readiness groups these destinations by filesystem and sums their reserves; separate filesystems
+must each satisfy the reserves assigned to them:
+
+| Study | Working-state reserve | Local archive + extraction | Backup reserve | All on one filesystem |
+| --- | --- | --- | --- | --- |
+| RSNA | 16 GiB | 6 GiB | 3 GiB | 25 GiB |
+| Symile | 32 GiB | 16 GiB | 8 GiB | 56 GiB |
+
+These are conservative readiness reserves, not file-size limits or future-capacity guarantees.
+
 ## Semantic reconstruction
 
 Canonical scientific identities use strict canonical JSON, explicit domain/schema separation,

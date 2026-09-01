@@ -73,6 +73,14 @@ granting live source access. After opening, Symile may complete missing predicti
 derivatives, and preservation; development and fitting cannot resume. Recovery and receipt rules
 are documented in [reproducibility](reproducibility.md).
 
+## Campaign operations
+
+RSNA, Symile development, and Symile test continuation share one operational-session model. Each
+invocation that reaches session entry creates a distinct attempt; earlier readiness failures do
+not. Once formal execution is established, the attempt is explicitly associated with it. Retries
+create new attempts. Attempts and logs cannot grant scientific authority, which remains with study
+locks, validators, and lifecycle owners.
+
 ## Preservation, release, and serving
 
 Preservation archives an explicit scientific closure and validates its restored content. Release
